@@ -51,7 +51,7 @@ class CSControlPlane:
 
             async for message in websocket:
                 msg = json.loads(message)
-                # Signature verification (simplified match to lm/spoke/src/main.py)
+                # Signature verification (simplified match to lm/hub/src/mock_spoke.py)
                 if not self._verify_signature(msg):
                     continue
 
