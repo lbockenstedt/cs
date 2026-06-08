@@ -18,7 +18,16 @@ class CSSpoke(BaseSpoke):
     async def handle_command(self, command_type: str, data: Dict[str, Any]) -> Dict[str, Any]:
         logger.info(f"Handling CS Command: {command_type} with data {data}")
 
-        if command_type == "SET_SIMULATION_PROFILE":
+        if command_type == "UPDATE_CONFIG":
+            # General configuration update from Hub
+            logger.info(f"Updating CS configuration: {data}")
+            self.config = data
+            # Update simulation engine if profiles are present
+            if "sim_profiles" in data:
+                self.engine.update_config(data["sim_profiles"])
+            return {"status": "SUCCESS", "message": "CS configuration updated from Hub"}
+
+        elif command_type == "SET_SIMULATION_PROFILE":
             # Update the simulation engine's configuration
             new_profile = data.get("profile", {})
             self.engine.update_config(new_profile)
