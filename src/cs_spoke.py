@@ -1,6 +1,6 @@
 import logging
 from typing import Dict, Any
-from lm.hub.src.base_spoke import BaseSpoke
+from base_spoke import BaseSpoke
 from .simulation_engine import SimulationEngine
 
 logger = logging.getLogger("CSSpoke")
