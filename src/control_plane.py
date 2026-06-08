@@ -10,19 +10,9 @@ import argparse
 import sys
 import os
 from pathlib import Path
+from typing import Dict, Any
 from fastapi import FastAPI, HTTPException
 import uvicorn
-
-# Attempt to resolve the Hub's base_spoke dependency
-try:
-    # Look for the hub source directory relative to this file
-    # Expected structure: ../../lm/hub/src/base_spoke.py
-    current_dir = Path(__file__).resolve().parent
-    hub_src = current_dir.parent.parent / "lm" / "hub" / "src"
-    if hub_src.exists():
-        sys.path.append(str(hub_src))
-except Exception as e:
-    print(f"Warning: Could not automatically resolve Hub source path: {e}")
 
 from .simulation_engine import SimulationEngine
 from .cs_spoke import CSSpoke
@@ -36,22 +26,27 @@ class CSControlPlane:
         self.secret = secret
         self.hub_secret = hub_secret
         self.hub_url = hub_url
-        # Use the same engine for both modes
         self.engine = SimulationEngine(hostname=spoke_id)
+        self.modules: Dict[str, Any] = {}
+
+    def register_module(self, name: str, module_instance: Any):
+        self.modules[name] = module_instance
+        logger.info(f"Registered module: {name}")
 
     async def run_hub_mode(self):
         """Native LM Spoke behavior."""
         logger.info(f"Starting CS Module in HUB MODE -> {self.hub_url}")
 
-        # Create the CSSpoke instance for command handling logic
+        # Create and register the CS module
         cs_spoke = CSSpoke(self.spoke_id, {"sim_profiles": {}})
+        self.register_module("cs", cs_spoke)
 
         async with websockets.connect(self.hub_url) as websocket:
             # 1. Spoke Authentication Handshake
             await websocket.send(json.dumps({"spoke_id": self.spoke_id, "secret": self.secret}))
             logger.info(f"Connected to Lab Manager Hub as {self.spoke_id}. Performing mutual authentication...")
 
-            # 2. Hub Mutual Authentication (Verify Hub's identity)
+            # 2. Hub Mutual Authentication
             try:
                 hub_proof_json = await asyncio.wait_for(websocket.recv(), timeout=5.0)
                 hub_proof = json.loads(hub_proof_json)
@@ -71,18 +66,17 @@ class CSControlPlane:
                             logger.info("Hub identity verified successfully.")
                             await websocket.send(json.dumps({"status": "HUB_OK"}))
                         else:
-                            logger.error("Hub identity verification failed: Invalid signature.")
+                            logger.error("Hub identity verification failed.")
                             await websocket.close(1008, "Hub verification failed")
                             return
                     else:
-                        logger.warning("Hub secret not configured. Skipping Hub identity verification (Insecure).")
+                        logger.warning("Hub secret not configured. Skipping verification.")
                         await websocket.send(json.dumps({"status": "HUB_OK"}))
                 else:
-                    logger.error(f"Unexpected response during Hub verification: {hub_proof.get('status')}")
                     await websocket.close(1008, "Mutual authentication failed")
                     return
             except Exception as e:
-                logger.error(f"Hub verification timed out or failed: {e}")
+                logger.error(f"Hub verification failed: {e}")
                 await websocket.close(1008, "Mutual authentication timed out")
                 return
 
@@ -101,21 +95,28 @@ class CSControlPlane:
 
             async for message in websocket:
                 msg = json.loads(message)
-                # Signature verification (simplified match to lm/hub/src/mock_spoke.py)
                 if not self._verify_signature(msg):
                     continue
 
                 payload = msg.get("payload", {})
                 cmd_type = payload.get("type")
                 data = payload.get("data", {})
+                corr_id = msg.get("header", {}).get("message_id")
 
-                # Route to the CSSpoke logic
-                result = await cs_spoke.handle_command(cmd_type, data)
+                # Multi-module routing
+                result = None
+                for module_name, module in self.modules.items():
+                    if cmd_type.startswith(module_name) or True: # Simplify: let module try
+                        result = await module.handle_command(cmd_type, data)
+                        if result is not None: break
 
-                # Send Ack/Result back to Hub
+                if result is None and self.modules:
+                    result = await list(self.modules.values())[0].handle_command(cmd_type, data)
+
                 resp = {
                     "header": {"message_id": str(uuid.uuid4()), "timestamp": time.time(),
-                               "sender_id": self.spoke_id, "destination_id": "hub"},
+                               "sender_id": self.spoke_id, "destination_id": "hub",
+                               "correlation_id": corr_id},
                     "payload": {"type": "COMMAND_RESULT", "data": result}
                 }
                 resp["signature"] = self._sign(resp)
