@@ -4,7 +4,7 @@ set -e
 # Default Configuration
 HUB_URL="ws://localhost:8765"
 SPOKE_ID="cs-spoke-1"
-SPOKE_SECRET="lm-manager-secret"
+SPOKE_SECRET="lm-secret"
 
 # Parse arguments
 while [[ "$#" -gt 0 ]]; do
@@ -18,9 +18,8 @@ while [[ "$#" -gt 0 ]]; do
 done
 
 # Auto-fetch secret if not provided
-if [ -z "$SPOKE_SECRET" ] || [ "$SPOKE_SECRET" == "lm-manager-secret" ]; then
+if [ -z "$SPOKE_SECRET" ] || [ "$SPOKE_SECRET" == "lm-secret" ]; then
     echo "🔑 No secret provided. Attempting to fetch first-secret from Hub..."
-    # Derive HTTP API URL from WebSocket URL (ws://...:8765 -> http://...:8000)
     API_URL="http://$(echo $HUB_URL | sed 's/ws\:\/\///' | cut -d: -f1):8000"
 
     SPOKE_SECRET=$(curl -s -X POST "$API_URL/setup/generate-secret" \
@@ -29,7 +28,7 @@ if [ -z "$SPOKE_SECRET" ] || [ "$SPOKE_SECRET" == "lm-manager-secret" ]; then
 
     if [ "$SPOKE_SECRET" == "null" ] || [ -z "$SPOKE_SECRET" ]; then
         echo "⚠️  Could not fetch secret from Hub. Falling back to default."
-        SPOKE_SECRET="lm-manager-secret"
+        SPOKE_SECRET="lm-secret"
     else
         echo "✅ Successfully fetched first-secret from Hub."
     fi
@@ -45,14 +44,17 @@ fi
 apt-get update
 apt-get install -y python3-pip python3-venv git curl
 
-INSTALL_DIR="/root/lm-manager"
+INSTALL_DIR="/root/lm"
+OLD_INSTALL_DIR="/root/lm-manager"
+
+# Cleanup legacy installation
+if [ -d "$OLD_INSTALL_DIR" ]; then
+    echo "🗑️  Removing legacy installation at $OLD_INSTALL_DIR..."
+    rm -rf "$OLD_INSTALL_DIR"
+fi
+
 mkdir -p "$INSTALL_DIR"
 cd "$INSTALL_DIR"
-
-if [ ! -d "lm/.git" ]; then
-    echo "🌐 Cloning required Hub repository..."
-    git clone https://github.com/lbockenstedt/lm.git
-fi
 
 if [ -d "cs/.git" ]; then
     echo "📂 CS repository already exists. Updating..."
@@ -77,9 +79,9 @@ if [ ! -f "venv/bin/python3" ]; then
 fi
 
 echo "Installing requirements..."
-./venv/bin/python3 -m pip install --upgrade pip
+./venv/bin/python3 -m pip install --upgrade pip -q
 if [ -f "requirements.txt" ]; then
-    ./venv/bin/python3 -m pip install -r requirements.txt
+    ./venv/bin/python3 -m pip install -r requirements.txt -q
 fi
 
 # --- Persistence Configuration ---
@@ -92,7 +94,7 @@ EOF
 
 # --- Systemd Service (For Remote/Independent Deployment) ---
 echo "⚙️ Creating systemd service for auto-start..."
-cat <<EOF > /etc/systemd/system/lm-manager-cs.service
+cat <<EOF > /etc/systemd/system/lm-cs.service
 [Unit]
 Description=Lab Manager Spoke - Client Simulator
 After=network.target
@@ -110,7 +112,7 @@ WantedBy=multi-user.target
 EOF
 
 systemctl daemon-reload
-systemctl enable lm-manager-cs
+systemctl enable lm-cs
 
 echo "🎉 Client Simulator installation complete!"
 echo "🌐 Hub Target: $HUB_URL"
