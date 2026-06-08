@@ -4,7 +4,7 @@ set -e
 # Default Configuration
 HUB_URL="ws://localhost:8765"
 SPOKE_ID="cs-spoke-1"
-SPOKE_SECRET="lab-manager-secret"
+SPOKE_SECRET="lm-manager-secret"
 
 # Parse arguments
 while [[ "$#" -gt 0 ]]; do
@@ -18,7 +18,7 @@ while [[ "$#" -gt 0 ]]; do
 done
 
 # Auto-fetch secret if not provided
-if [ -z "$SPOKE_SECRET" ] || [ "$SPOKE_SECRET" == "lab-manager-secret" ]; then
+if [ -z "$SPOKE_SECRET" ] || [ "$SPOKE_SECRET" == "lm-manager-secret" ]; then
     echo "🔑 No secret provided. Attempting to fetch first-secret from Hub..."
     # Derive HTTP API URL from WebSocket URL (ws://...:8765 -> http://...:8000)
     API_URL="http://$(echo $HUB_URL | sed 's/ws\:\/\///' | cut -d: -f1):8000"
@@ -29,7 +29,7 @@ if [ -z "$SPOKE_SECRET" ] || [ "$SPOKE_SECRET" == "lab-manager-secret" ]; then
 
     if [ "$SPOKE_SECRET" == "null" ] || [ -z "$SPOKE_SECRET" ]; then
         echo "⚠️  Could not fetch secret from Hub. Falling back to default."
-        SPOKE_SECRET="lab-manager-secret"
+        SPOKE_SECRET="lm-manager-secret"
     else
         echo "✅ Successfully fetched first-secret from Hub."
     fi
@@ -45,7 +45,7 @@ fi
 apt-get update
 apt-get install -y python3-pip python3-venv git curl
 
-INSTALL_DIR="/root/lab-manager"
+INSTALL_DIR="/root/lm-manager"
 mkdir -p "$INSTALL_DIR"
 cd "$INSTALL_DIR"
 
@@ -92,7 +92,7 @@ EOF
 
 # --- Systemd Service (For Remote/Independent Deployment) ---
 echo "⚙️ Creating systemd service for auto-start..."
-cat <<EOF > /etc/systemd/system/lab-manager-cs.service
+cat <<EOF > /etc/systemd/system/lm-manager-cs.service
 [Unit]
 Description=Lab Manager Spoke - Client Simulator
 After=network.target
@@ -110,7 +110,7 @@ WantedBy=multi-user.target
 EOF
 
 systemctl daemon-reload
-systemctl enable lab-manager-cs
+systemctl enable lm-manager-cs
 
 echo "🎉 Client Simulator installation complete!"
 echo "🌐 Hub Target: $HUB_URL"
