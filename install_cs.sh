@@ -1,6 +1,22 @@
 #!/bin/bash
 set -e
 
+# Default Configuration
+HUB_URL="ws://localhost:8765"
+SPOKE_ID="cs-spoke-1"
+SPOKE_SECRET="lab-manager-secret"
+
+# Parse arguments
+while [[ "$#" -gt 0 ]]; do
+    case $1 in
+        --hub) HUB_URL="$2"; shift ;;
+        --id) SPOKE_ID="$2"; shift ;;
+        --secret) SPOKE_SECRET="$2"; shift ;;
+        *) echo "Unknown parameter passed: $1"; exit 1 ;;
+    esac
+    shift
+done
+
 echo "🚀 Installing Client Simulator Module (Native)..."
 
 if [ "$(id -u)" -ne 0 ]; then
@@ -9,7 +25,7 @@ if [ "$(id -u)" -ne 0 ]; then
 fi
 
 apt-get update
-apt-get install -y python3-pip python3-venv git
+apt-get install -y python3-pip python3-venv git curl
 
 INSTALL_DIR="/root/lab-manager"
 mkdir -p "$INSTALL_DIR"
@@ -30,11 +46,55 @@ fi
 
 echo "🛠️ Setting up Client Simulator..."
 cd cs
-python3 -m venv venv
+
+if [ -d "venv" ] && [ ! -f "venv/bin/python3" ]; then
+    rm -rf venv
+fi
+if [ ! -d "venv" ]; then
+    python3 -m venv venv
+fi
+if [ ! -f "venv/bin/python3" ]; then
+    echo "❌ Critical Error: venv creation failed."
+    exit 1
+fi
+
+echo "Installing requirements..."
 ./venv/bin/python3 -m pip install --upgrade pip
 if [ -f "requirements.txt" ]; then
     ./venv/bin/python3 -m pip install -r requirements.txt
 fi
 
-echo "🎉 Client Simulator native installation complete!"
-echo "📦 Version: 0.03"
+# --- Persistence Configuration ---
+echo "⚙️ Configuring Spoke Identity..."
+cat <<EOF > .env
+HUB_URL=$HUB_URL
+SPOKE_ID=$SPOKE_ID
+SPOKE_SECRET=$SPOKE_SECRET
+EOF
+
+# --- Systemd Service (For Remote/Independent Deployment) ---
+echo "⚙️ Creating systemd service for auto-start..."
+cat <<EOF > /etc/systemd/system/lab-manager-cs.service
+[Unit]
+Description=Lab Manager Spoke - Client Simulator
+After=network.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=$INSTALL_DIR/cs
+ExecStart=$INSTALL_DIR/cs/venv/bin/python3 -m src.control_plane --id $SPOKE_ID --secret $SPOKE_SECRET --hub $HUB_URL
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+systemctl daemon-reload
+systemctl enable lab-manager-cs
+
+echo "🎉 Client Simulator installation complete!"
+echo "🌐 Hub Target: $HUB_URL"
+echo "🆔 Spoke ID: $SPOKE_ID"
+echo "📦 Version: 0.08"
