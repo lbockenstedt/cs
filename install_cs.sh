@@ -12,6 +12,7 @@ while [[ "$#" -gt 0 ]]; do
         --hub) HUB_URL="$2"; shift ;;
         --id|--name) SPOKE_ID="$2"; shift ;;
         --secret) SPOKE_SECRET="$2"; shift ;;
+        --hub-secret) HUB_SECRET="$2"; shift ;;
         *) echo "Unknown parameter passed: $1"; exit 1 ;;
     esac
     shift
@@ -44,7 +45,7 @@ fi
 apt-get update
 apt-get install -y python3-pip python3-venv git curl
 
-INSTALL_DIR="/root/lm"
+INSTALL_DIR="/opt/lm"
 OLD_INSTALL_DIR="/root/lm-manager"
 
 # Cleanup legacy installation
@@ -67,12 +68,11 @@ fi
 echo "🛠️ Setting up Client Simulator..."
 cd cs
 
-if [ -d "venv" ] && [ ! -f "venv/bin/python3" ]; then
-    rm -rf venv
-fi
-if [ ! -d "venv" ]; then
-    python3 -m venv venv
-fi
+# Always remove existing venv to ensure clean local environment (prevents cross-platform path issues)
+echo "♻️ Resetting virtual environment..."
+rm -rf venv
+
+python3 -m venv venv
 if [ ! -f "venv/bin/python3" ]; then
     echo "❌ Critical Error: venv creation failed."
     exit 1
@@ -90,6 +90,7 @@ cat <<EOF > .env
 HUB_URL=$HUB_URL
 SPOKE_ID=$SPOKE_ID
 SPOKE_SECRET=$SPOKE_SECRET
+HUB_SECRET=$HUB_SECRET
 EOF
 
 # --- Systemd Service (For Remote/Independent Deployment) ---
@@ -101,9 +102,10 @@ After=network.target
 
 [Service]
 Type=simple
-User=root
+User=svc_lm
 WorkingDirectory=$INSTALL_DIR/cs
-ExecStart=$INSTALL_DIR/cs/venv/bin/python3 -m src.control_plane --id $SPOKE_ID --secret $SPOKE_SECRET --hub $HUB_URL
+Environment="PYTHONPATH=$INSTALL_DIR/core/src:$INSTALL_DIR/cs/src"
+ExecStart=$INSTALL_DIR/cs/venv/bin/python3 -m src.control_plane --id $SPOKE_ID --secret $SPOKE_SECRET
 Restart=on-failure
 RestartSec=10
 
