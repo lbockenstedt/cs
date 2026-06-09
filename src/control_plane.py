@@ -89,7 +89,7 @@ class CSControlPlane:
                     }
                     msg["signature"] = self._sign(msg)
                     await websocket.send(json.dumps(msg))
-                    await asyncio.sleep(30)
+                    await asyncio.sleep(10)
 
             asyncio.create_task(heartbeat())
 
