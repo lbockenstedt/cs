@@ -107,11 +107,20 @@ class CSControlPlane:
                 result = None
                 for module_name, module in self.modules.items():
                     if cmd_type.startswith(module_name) or True: # Simplify: let module try
-                        result = await module.handle_command(cmd_type, data)
-                        if result is not None: break
+                        try:
+                            result = await module.handle_command(cmd_type, data)
+                            if result is not None: break
+                        except Exception as e:
+                            logger.error(f"Error in module {module_name} handling {cmd_type}: {e}", exc_info=True)
+                            result = {"status": "ERROR", "message": f"Module {module_name} crashed: {str(e)}"}
+                            break
 
                 if result is None and self.modules:
-                    result = await list(self.modules.values())[0].handle_command(cmd_type, data)
+                    try:
+                        result = await list(self.modules.values())[0].handle_command(cmd_type, data)
+                    except Exception as e:
+                        logger.error(f"Error in fallback module handling {cmd_type}: {e}", exc_info=True)
+                        result = {"status": "ERROR", "message": f"Fallback module crashed: {str(e)}"}
 
                 resp = {
                     "header": {"message_id": str(uuid.uuid4()), "timestamp": time.time(),
