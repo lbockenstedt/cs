@@ -31,7 +31,7 @@ class CSControlPlane(BaseControlPlane):
         self.modules[name] = module_instance
         logger.info(f"Registered module: {name}")
 
-    async def run_hub_mode(self):
+    async def run(self):
         """Native LM Spoke behavior."""
         logger.info(f"Starting CS Module in HUB MODE -> {self.hub_url}")
 
@@ -39,96 +39,7 @@ class CSControlPlane(BaseControlPlane):
         cs_spoke = CSSpoke(self.spoke_id, {"sim_profiles": {}})
         self.register_module("cs", cs_spoke)
 
-        async with websockets.connect(self.hub_url) as websocket:
-            # 1. Spoke Authentication Handshake
-            await websocket.send(json.dumps({"spoke_id": self.spoke_id, "secret": self.secret}))
-            logger.info(f"Connected to Lab Manager Hub as {self.spoke_id}. Performing mutual authentication...")
-
-            # 2. Hub Mutual Authentication
-            try:
-                hub_proof_json = await asyncio.wait_for(websocket.recv(), timeout=5.0)
-                hub_proof = json.loads(hub_proof_json)
-
-                if hub_proof.get("status") == "HUB_VERIFIED":
-                    challenge = hub_proof.get("challenge")
-                    signature = hub_proof.get("signature")
-
-                    if self.hub_secret:
-                        expected_sig = hmac.new(
-                            self.hub_secret.encode(),
-                            challenge.encode(),
-                            hashlib.sha256
-                        ).hexdigest()
-
-                        if hmac.compare_digest(expected_sig, signature):
-                            logger.info("Hub identity verified successfully.")
-                            await websocket.send(json.dumps({"status": "HUB_OK"}))
-                        else:
-                            logger.error(f"Hub identity verification failed. Expected: {expected_sig}, Got: {signature}")
-                            await websocket.close(1008, "Hub verification failed")
-                            return
-                    else:
-                        logger.warning("Hub secret not configured. Skipping verification.")
-                        await websocket.send(json.dumps({"status": "HUB_OK"}))
-                else:
-                    await websocket.close(1008, "Mutual authentication failed")
-                    return
-            except Exception as e:
-                logger.error(f"Hub verification failed: {e}")
-                await websocket.close(1008, "Mutual authentication timed out")
-                return
-
-            async def heartbeat():
-                while True:
-                    msg = {
-                        "header": {"message_id": str(uuid.uuid4()), "timestamp": time.time(),
-                                   "sender_id": self.spoke_id, "destination_id": "hub"},
-                        "payload": {"type": "HEARTBEAT", "data": {}}
-                    }
-                    msg["signature"] = self._sign(msg)
-                    await websocket.send(json.dumps(msg))
-                    await asyncio.sleep(10)
-
-            asyncio.create_task(heartbeat())
-
-            async for message in websocket:
-                msg = json.loads(message)
-                if not self._verify_signature(msg):
-                    continue
-
-                payload = msg.get("payload", {})
-                cmd_type = payload.get("type")
-                data = payload.get("data", {})
-                corr_id = msg.get("header", {}).get("message_id")
-
-                # Multi-module routing
-                result = None
-                for module_name, module in self.modules.items():
-                    if cmd_type.startswith(module_name) or True: # Simplify: let module try
-                        try:
-                            result = await module.handle_command(cmd_type, data)
-                            if result is not None: break
-                        except Exception as e:
-                            logger.error(f"Error in module {module_name} handling {cmd_type}: {e}", exc_info=True)
-                            result = {"status": "ERROR", "message": f"Module {module_name} crashed: {str(e)}"}
-                            break
-
-                if result is None and self.modules:
-                    try:
-                        result = await list(self.modules.values())[0].handle_command(cmd_type, data)
-                    except Exception as e:
-                        logger.error(f"Error in fallback module handling {cmd_type}: {e}", exc_info=True)
-                        result = {"status": "ERROR", "message": f"Fallback module crashed: {str(e)}"}
-
-                resp = {
-                    "header": {"message_id": str(uuid.uuid4()), "timestamp": time.time(),
-                               "sender_id": self.spoke_id, "destination_id": "hub",
-                               "correlation_id": corr_id},
-                    "payload": {"type": "COMMAND_RESULT", "data": result}
-                }
-                resp["signature"] = self._sign(resp)
-                await websocket.send(json.dumps(resp))
-
+        await super().run()
     def run_standalone_mode(self):
         """Standalone FastAPI server for local management."""
         logger.info(f"Starting CS Module in STANDALONE MODE on port 8000")
@@ -159,6 +70,6 @@ if __name__ == "__main__":
 
     cp = CSControlPlane(args.id, args.secret, args.hub_secret, args.hub)
     if args.hub:
-        asyncio.run(cp.run_hub_mode())
+        asyncio.run(cp.run())
     else:
         cp.run_standalone_mode()
