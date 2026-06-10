@@ -16,7 +16,7 @@ import uvicorn
 
 from .simulation_engine import SimulationEngine
 from .cs_spoke import CSSpoke
-from lm.core.src.messaging.control_plane import BaseControlPlane
+from core.src.messaging.control_plane import BaseControlPlane
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("CSControlPlane")
