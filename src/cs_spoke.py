@@ -21,6 +21,9 @@ class CSSpoke(BaseSpoke):
         # Normalize command type to uppercase for case-insensitive matching
         normalized_cmd = command_type.upper()
 
+        if normalized_cmd == "GET_VERSION":
+            return {"status": "SUCCESS", "version": self.get_version()}
+
         if normalized_cmd == "UPDATE_CONFIG":
             # General configuration update from Hub
             logger.info(f"Updating CS configuration: {data}")
@@ -29,6 +32,7 @@ class CSSpoke(BaseSpoke):
             if "sim_profiles" in data:
                 self.engine.update_config(data["sim_profiles"])
             return {"status": "SUCCESS", "message": "CS configuration updated from Hub"}
+
 
         elif normalized_cmd == "SET_SIMULATION_PROFILE":
             # Update the simulation engine's configuration
@@ -60,3 +64,7 @@ class CSSpoke(BaseSpoke):
             "active_sims": state["active_simulations"],
             "status": state["status"]
         }
+
+    def get_version(self) -> str:
+        """Returns the current version of the CS module."""
+        return "1.0.0"
