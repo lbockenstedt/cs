@@ -14,8 +14,8 @@ from typing import Dict, Any
 from fastapi import FastAPI, HTTPException
 import uvicorn
 
-from .simulation_engine import SimulationEngine
-from .cs_spoke import CSSpoke
+from simulation_engine import SimulationEngine
+from cs_spoke import CSSpoke
 from core.src.messaging.control_plane import BaseControlPlane
 
 logging.basicConfig(level=logging.INFO)
