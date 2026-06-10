@@ -18,7 +18,10 @@ class CSSpoke(BaseSpoke):
     async def handle_command(self, command_type: str, data: Dict[str, Any]) -> Dict[str, Any]:
         logger.info(f"Handling CS Command: {command_type} with data {data}")
 
-        if command_type == "UPDATE_CONFIG":
+        # Normalize command type to uppercase for case-insensitive matching
+        normalized_cmd = command_type.upper()
+
+        if normalized_cmd == "UPDATE_CONFIG":
             # General configuration update from Hub
             logger.info(f"Updating CS configuration: {data}")
             self.config = data
@@ -27,18 +30,18 @@ class CSSpoke(BaseSpoke):
                 self.engine.update_config(data["sim_profiles"])
             return {"status": "SUCCESS", "message": "CS configuration updated from Hub"}
 
-        elif command_type == "SET_SIMULATION_PROFILE":
+        elif normalized_cmd == "SET_SIMULATION_PROFILE":
             # Update the simulation engine's configuration
             new_profile = data.get("profile", {})
             self.engine.update_config(new_profile)
             return {"status": "SUCCESS", "message": f"Profile updated for {self.engine.simulation_id}"}
 
-        elif command_type == "TRIGGER_ITERATION":
+        elif normalized_cmd == "TRIGGER_ITERATION":
             # Force an immediate simulation run
             result = await self.engine.run_iteration()
             return result
 
-        elif command_type == "GET_SIMULATION_STATE":
+        elif normalized_cmd == "GET_SIMULATION_STATE":
             return self.engine.get_current_state()
 
         else:
