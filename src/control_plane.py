@@ -16,16 +16,14 @@ import uvicorn
 
 from .simulation_engine import SimulationEngine
 from .cs_spoke import CSSpoke
+from lm.core.src.messaging.control_plane import BaseControlPlane
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("CSControlPlane")
 
-class CSControlPlane:
+class CSControlPlane(BaseControlPlane):
     def __init__(self, spoke_id: str, secret: str, hub_secret: str = None, hub_url: str = None):
-        self.spoke_id = spoke_id
-        self.secret = secret
-        self.hub_secret = hub_secret
-        self.hub_url = hub_url
+        super().__init__(spoke_id, secret, hub_secret, hub_url)
         self.engine = SimulationEngine(hostname=spoke_id)
         self.modules: Dict[str, Any] = {}
 
@@ -150,18 +148,6 @@ class CSControlPlane:
             return {"status": "success"}
 
         uvicorn.run(app, host="0.0.0.0", port=8000)
-
-    def _sign(self, msg):
-        data = {k: v for k, v in msg.items() if k != "signature"}
-        message_bytes = json.dumps(data, sort_keys=True, separators=(',', ':')).encode()
-        return hmac.new(self.secret.encode(), message_bytes, hashlib.sha256).hexdigest()
-
-    def _verify_signature(self, msg):
-        sig = msg.get("signature")
-        data = {k: v for k, v in msg.items() if k != "signature"}
-        message_bytes = json.dumps(data, sort_keys=True, separators=(',', ':')).encode()
-        expected = hmac.new(self.secret.encode(), message_bytes, hashlib.sha256).hexdigest()
-        return hmac.compare_digest(expected, sig)
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
