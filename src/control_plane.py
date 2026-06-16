@@ -9,6 +9,9 @@ import hashlib
 import argparse
 import sys
 import os
+import threading
+import subprocess
+import git
 from pathlib import Path
 from typing import Dict, Any
 from fastapi import FastAPI, HTTPException
@@ -20,6 +23,39 @@ from core.src.messaging.control_plane import BaseControlPlane
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("CSControlPlane")
+
+def get_version():
+    try:
+        with open("VERSION", "r") as f:
+            return f.read().strip()
+    except FileNotFoundError:
+        return "unknown"
+
+version = get_version()
+
+def check_for_updates():
+    try:
+        self_repo = git.Repo(os.getcwd())
+        old_commit = self_repo.head.commit.hexsha
+        self_repo.remotes.origin.pull()
+        new_commit = self_repo.head.commit.hexsha
+        if old_commit != new_commit:
+            logger.info(f"New version detected! {old_commit[:7]} -> {new_commit[:7]}. Triggering restart...")
+            subprocess.Popen(["sudo", "systemctl", "restart", "lm-cs"])
+            return True
+        return False
+    except Exception as e:
+        logger.warning(f"Self-update check failed: {e}")
+        return False
+
+def updater_worker():
+    while True:
+        try:
+            logger.info("Checking for self-updates...")
+            check_for_updates()
+        except Exception as e:
+            logger.error(f"Updater worker error: {e}")
+        time.sleep(3600)
 
 class CSControlPlane(BaseControlPlane):
     def __init__(self, spoke_id: str, secret: str, hub_secret: str = None, hub_url: str = None):
@@ -33,7 +69,11 @@ class CSControlPlane(BaseControlPlane):
 
     async def run(self):
         """Native LM Spoke behavior."""
+        logger.info(f"Initializing module version: {version}")
         logger.info(f"Starting CS Module in HUB MODE -> {self.hub_url}")
+
+        # Start update worker
+        threading.Thread(target=updater_worker, daemon=True).start()
 
         # Create and register the CS module
         cs_spoke = CSSpoke(self.spoke_id, {"sim_profiles": {}})
@@ -42,7 +82,12 @@ class CSControlPlane(BaseControlPlane):
         await super().run()
     def run_standalone_mode(self):
         """Standalone FastAPI server for local management."""
+        logger.info(f"Initializing module version: {version}")
         logger.info(f"Starting CS Module in STANDALONE MODE on port 8000")
+
+        # Start update worker
+        threading.Thread(target=updater_worker, daemon=True).start()
+
         app = FastAPI()
 
         @app.get("/status")

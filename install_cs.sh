@@ -119,4 +119,4 @@ systemctl enable lm-cs
 echo "🎉 Client Simulator installation complete!"
 echo "🌐 Hub Target: $HUB_URL"
 echo "🆔 Spoke ID: $SPOKE_ID"
-echo "📦 Version: 0.08"
+echo "📦 Version: 1.0.0"
