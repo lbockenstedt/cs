@@ -133,6 +133,8 @@ ExecStart=$LM_DIR/cs/venv/bin/python3 -m src.control_plane \
     --hub-secret "${HUB_SECRET:-}" \
     --hub $HUB_URL \
     $ROLE_ARG
+StandardOutput=append:/var/log/lm/lm-cs.log
+StandardError=append:/var/log/lm/lm-cs.log
 Restart=on-failure
 RestartSec=10
 
