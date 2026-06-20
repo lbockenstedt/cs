@@ -1,136 +1,162 @@
 #!/bin/bash
-set -e
+set -euo pipefail
 
-# Default Configuration
+# ============================================================
+# Lab Manager — Generic Agent (CS) Installer
+#
+# Deploys the morphable LM agent spoke.  Starts in simulator
+# mode; the hub can push LOAD_ROLE to morph it into a
+# linux_monitor, dns, dhcp, or proxmox agent at runtime.
+# Safe to re-run (updates code, preserves credentials).
+#
+# Usage:
+#   curl -sSL https://raw.githubusercontent.com/lbockenstedt/cs/main/install_cs.sh \
+#     | sudo bash -s -- --hub ws://HUB_IP:8765 --admin-token LM_ADMIN_TOKEN [--role linux_monitor]
+# ============================================================
+
 HUB_URL="ws://localhost:8765"
 SPOKE_ID="cs-spoke-1"
-SPOKE_SECRET="lm-secret"
+SPOKE_SECRET=""
+HUB_SECRET=""
+ADMIN_TOKEN=""
+STARTUP_ROLE=""        # Optional: pre-load a role at startup
+SVC_USER="svc_lm"
+LM_DIR="/opt/lm"
 
-# Parse arguments
 while [[ "$#" -gt 0 ]]; do
     case $1 in
-        --hub) HUB_URL="$2"; shift ;;
-        --id|--name) SPOKE_ID="$2"; shift ;;
-        --secret) SPOKE_SECRET="$2"; shift ;;
-        --hub-secret) HUB_SECRET="$2"; shift ;;
-        --admin-token) ADMIN_TOKEN="$2"; shift ;;
-        --all-prereqs) ;;  # no-op (system prereqs are always installed); accepted so the Hub's install-module call doesn't abort
-        *) echo "Unknown parameter passed: $1"; exit 1 ;;
+        --hub)         HUB_URL="$2";      shift ;;
+        --id|--name)   SPOKE_ID="$2";     shift ;;
+        --secret)      SPOKE_SECRET="$2"; shift ;;
+        --hub-secret)  HUB_SECRET="$2";   shift ;;
+        --admin-token) ADMIN_TOKEN="$2";  shift ;;
+        --role)        STARTUP_ROLE="$2"; shift ;;
+        --all-prereqs) ;;
+        *) echo "Unknown argument: $1"; exit 1 ;;
     esac
     shift
 done
 
-# Admin token for auto-fetch (env fallback: LM_ADMIN_TOKEN)
-ADMIN_TOKEN="${ADMIN_TOKEN:-$LM_ADMIN_TOKEN}"
+ADMIN_TOKEN="${ADMIN_TOKEN:-${LM_ADMIN_TOKEN:-}}"
+[ "$(id -u)" -eq 0 ] || { echo "❌ Must be run as root."; exit 1; }
 
-# Auto-fetch secret if not provided. /setup/generate-secret is auth-protected,
-# so a Bearer admin token is required to mint a first-secret. If you cannot
-# provide one, pass --secret <first-secret> from the Hub dashboard instead.
-if [ -z "$SPOKE_SECRET" ] || [ "$SPOKE_SECRET" == "lm-secret" ]; then
-    if [ -z "$ADMIN_TOKEN" ]; then
-        echo "❌ No spoke secret provided and no admin token to fetch one."
-        echo "   Provide --secret <first-secret> (from the Hub dashboard), or"
-        echo "   --admin-token <LM_ADMIN_TOKEN> / export LM_ADMIN_TOKEN to auto-fetch."
-        exit 1
+GRN='\033[0;32m'; YLW='\033[1;33m'; NC='\033[0m'
+ok()   { echo -e "${GRN}✅  $*${NC}"; }
+warn() { echo -e "${YLW}⚠️   $*${NC}"; }
+step() { echo -e "\n${GRN}━━  $*  ━━${NC}"; }
+
+step "Lab Manager — Generic Agent Installer"
+
+# ── System packages ───────────────────────────────────────────────────────────
+step "Installing system packages"
+apt-get update -qq
+DEBIAN_FRONTEND=noninteractive apt-get install -y -q \
+    python3 python3-venv python3-pip git curl jq
+ok "Packages ready"
+
+# ── Service user ──────────────────────────────────────────────────────────────
+if ! id "$SVC_USER" &>/dev/null; then
+    useradd -r -s /bin/false -M "$SVC_USER"
+    ok "Created service user $SVC_USER"
+fi
+
+# ── Spoke secret (preserve on re-run) ────────────────────────────────────────
+EXISTING_SECRET=""
+[ -f "$LM_DIR/cs/.env" ] && \
+    EXISTING_SECRET=$(grep "^SPOKE_SECRET=" "$LM_DIR/cs/.env" | cut -d= -f2-)
+
+if [ -z "$SPOKE_SECRET" ]; then
+    if [ -n "$EXISTING_SECRET" ]; then
+        SPOKE_SECRET="$EXISTING_SECRET"
+        ok "Reusing existing spoke secret"
+    elif [ -n "$ADMIN_TOKEN" ]; then
+        API_HOST=$(echo "$HUB_URL" | sed 's|wss\?://||' | cut -d: -f1)
+        SPOKE_SECRET=$(curl -sf -X POST "http://$API_HOST:8000/setup/generate-secret" \
+            -H "Content-Type: application/json" \
+            -H "Authorization: Bearer $ADMIN_TOKEN" \
+            -d "{\"spoke_id\": \"$SPOKE_ID\"}" | jq -r '.secret' 2>/dev/null) || SPOKE_SECRET=""
+        [ -z "$SPOKE_SECRET" ] || [ "$SPOKE_SECRET" = "null" ] && \
+            { echo "❌ Could not fetch spoke secret from Hub."; exit 1; }
+        ok "Spoke secret fetched from Hub"
+    else
+        echo "❌ No secret available. Provide --secret or --admin-token."; exit 1
     fi
-    echo "🔑 No secret provided. Fetching first-secret from Hub with admin token..."
-    API_URL="http://$(echo $HUB_URL | sed 's/ws\:\/\///' | cut -d: -f1):8000"
-
-    SPOKE_SECRET=$(curl -s -X POST "$API_URL/setup/generate-secret" \
-        -H "Content-Type: application/json" \
-        -H "Authorization: Bearer $ADMIN_TOKEN" \
-        -d "{\"spoke_id\": \"$SPOKE_ID\"}" | jq -r '.secret' 2>/dev/null) || true
-
-    if [ "$SPOKE_SECRET" == "null" ] || [ -z "$SPOKE_SECRET" ]; then
-        echo "❌ Could not fetch secret from Hub (verify LM_ADMIN_TOKEN, Hub URL, and spoke_id)."
-        echo "   Alternatively, provide --secret <first-secret> from the Hub dashboard."
-        exit 1
-    fi
-    echo "✅ Successfully fetched first-secret from Hub."
 fi
 
-echo "🚀 Installing Client Simulator Module (Native)..."
-
-if [ "$(id -u)" -ne 0 ]; then
-    echo "⚠️  This script must be run as root."
-    exit 1
-fi
-
-apt-get update
-apt-get install -y python3-pip python3-venv git curl
-
-INSTALL_DIR="/opt/lm"
-OLD_INSTALL_DIR="/opt/lm-manager"
-
-# Cleanup legacy installation
-if [ -d "$OLD_INSTALL_DIR" ]; then
-    echo "🗑️  Removing legacy installation at $OLD_INSTALL_DIR..."
-    rm -rf "$OLD_INSTALL_DIR"
-fi
-
-mkdir -p "$INSTALL_DIR"
-cd "$INSTALL_DIR"
-
-if [ -d "cs/.git" ]; then
-    echo "📂 CS repository already exists. Updating..."
-    cd cs && git pull && cd ..
+# ── Clone / update ────────────────────────────────────────────────────────────
+step "Installing Generic Agent"
+mkdir -p "$LM_DIR"
+if [ -d "$LM_DIR/cs/.git" ]; then
+    echo "   Updating existing install"
+    git -C "$LM_DIR/cs" pull --rebase --autostash origin main -q
 else
-    echo "🌐 Cloning Client Simulator repository..."
-    git clone https://github.com/lbockenstedt/cs.git
+    echo "   Cloning CS / Generic Agent repo"
+    git clone -q https://github.com/lbockenstedt/cs.git "$LM_DIR/cs"
 fi
 
-echo "🛠️ Setting up Client Simulator..."
-cd cs
+# ── Python venv ───────────────────────────────────────────────────────────────
+rm -rf "$LM_DIR/cs/venv"
+python3 -m venv "$LM_DIR/cs/venv"
+"$LM_DIR/cs/venv/bin/pip" install --upgrade pip -q
+[ -f "$LM_DIR/cs/requirements.txt" ] && \
+    "$LM_DIR/cs/venv/bin/pip" install -r "$LM_DIR/cs/requirements.txt" -q
+ok "Dependencies installed"
 
-# Always remove existing venv to ensure clean local environment (prevents cross-platform path issues)
-echo "♻️ Resetting virtual environment..."
-rm -rf venv
-
-python3 -m venv venv
-if [ ! -f "venv/bin/python3" ]; then
-    echo "❌ Critical Error: venv creation failed."
-    exit 1
-fi
-
-echo "Installing requirements..."
-./venv/bin/python3 -m pip install --upgrade pip -q
-if [ -f "requirements.txt" ]; then
-    ./venv/bin/python3 -m pip install -r requirements.txt -q
-fi
-
-# --- Persistence Configuration ---
-echo "⚙️ Configuring Spoke Identity..."
-cat <<EOF > .env
+# ── .env ──────────────────────────────────────────────────────────────────────
+cat > "$LM_DIR/cs/.env" <<DOTENV
 HUB_URL=$HUB_URL
 SPOKE_ID=$SPOKE_ID
 SPOKE_SECRET=$SPOKE_SECRET
-HUB_SECRET=$HUB_SECRET
-EOF
+HUB_SECRET=${HUB_SECRET:-}
+STARTUP_ROLE=${STARTUP_ROLE:-}
+DOTENV
+chmod 600 "$LM_DIR/cs/.env"
 
-# --- Systemd Service (For Remote/Independent Deployment) ---
-echo "⚙️ Creating systemd service for auto-start..."
-cat <<EOF > /etc/systemd/system/lm-cs.service
+# ── systemd unit ──────────────────────────────────────────────────────────────
+ROLE_ARG=""
+[ -n "$STARTUP_ROLE" ] && ROLE_ARG="--role $STARTUP_ROLE"
+
+cat > /etc/systemd/system/lm-cs.service <<SYSD
 [Unit]
-Description=Lab Manager Spoke - Client Simulator
+Description=Lab Manager Spoke - Generic Agent
 After=network.target
 
 [Service]
 Type=simple
-User=svc_lm
-WorkingDirectory=$INSTALL_DIR/cs
-Environment="PYTHONPATH=$INSTALL_DIR/core/src:$INSTALL_DIR/cs/src"
-ExecStart=$INSTALL_DIR/cs/venv/bin/python3 -m src.control_plane --id $SPOKE_ID --secret $SPOKE_SECRET --hub $HUB_URL --hub-secret $HUB_SECRET
+User=$SVC_USER
+WorkingDirectory=$LM_DIR/cs
+EnvironmentFile=$LM_DIR/cs/.env
+Environment="PYTHONPATH=$LM_DIR/core/src:$LM_DIR/cs/src"
+ExecStart=$LM_DIR/cs/venv/bin/python3 -m src.control_plane \
+    --id $SPOKE_ID \
+    --secret $SPOKE_SECRET \
+    --hub-secret "${HUB_SECRET:-}" \
+    --hub $HUB_URL \
+    $ROLE_ARG
 Restart=on-failure
 RestartSec=10
 
 [Install]
 WantedBy=multi-user.target
-EOF
+SYSD
 
 systemctl daemon-reload
 systemctl enable lm-cs
+systemctl restart lm-cs
+ok "Generic Agent service started"
 
-echo "🎉 Client Simulator installation complete!"
-echo "🌐 Hub Target: $HUB_URL"
-echo "🆔 Spoke ID: $SPOKE_ID"
-echo "📦 Version: $(cat VERSION 2>/dev/null || echo unknown)"
+chown -R "$SVC_USER:$SVC_USER" "$LM_DIR/cs" 2>/dev/null || true
+
+LOCAL_IP=$(hostname -I 2>/dev/null | awk '{print $1}' || echo "this-host")
+echo ""
+echo "════════════════════════════════════════════"
+ok "Generic Agent installation complete!"
+echo "════════════════════════════════════════════"
+echo "  LM Hub:       $HUB_URL"
+echo "  Spoke ID:     $SPOKE_ID"
+[ -n "$STARTUP_ROLE" ] && echo "  Startup role: $STARTUP_ROLE" || echo "  Mode:         simulator (use LOAD_ROLE to morph)"
+echo "  Version:      $(cat $LM_DIR/cs/VERSION 2>/dev/null || echo unknown)"
+echo "  Status:       sudo systemctl status lm-cs"
+echo ""
+echo "To morph this agent into a linux monitor via LM hub:"
+echo "  POST /api/cs/command  {\"command\": \"LOAD_ROLE\", \"data\": {\"role\": \"linux_monitor\"}}"

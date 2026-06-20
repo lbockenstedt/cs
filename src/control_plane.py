@@ -25,24 +25,18 @@ class CSControlPlane(BaseControlPlane):
     def get_service_name(self) -> str:
         return "lm-cs"
 
-    def __init__(self, spoke_id: str, secret: str, hub_secret: str = None, hub_url: str = None):
+    def __init__(self, spoke_id: str, secret: str, hub_secret: str = None,
+                 hub_url: str = None, config: Dict[str, Any] = None):
         super().__init__(spoke_id, secret, hub_secret, hub_url)
         self.module_type = "simulation"
+        self.startup_config = config or {}
         self.engine = SimulationEngine(hostname=spoke_id)
-        self.modules: Dict[str, Any] = {}
-
-    def register_module(self, name: str, module_instance: Any):
-        self.modules[name] = module_instance
-        logger.info(f"Registered module: {name}")
 
     async def run(self):
         """Native LM Spoke behavior."""
-        logger.info(f"Starting CS Module in HUB MODE -> {self.hub_url}")
-
-        # Create and register the CS module
-        cs_spoke = CSSpoke(self.spoke_id, {"sim_profiles": {}})
+        logger.info(f"Starting Generic Agent in HUB MODE -> {self.hub_url}")
+        cs_spoke = CSSpoke(self.spoke_id, self.startup_config)
         self.register_module("cs", cs_spoke)
-
         await super().run()
     def run_standalone_mode(self):
         """Standalone FastAPI server for local management."""
@@ -65,14 +59,24 @@ class CSControlPlane(BaseControlPlane):
         uvicorn.run(app, host="0.0.0.0", port=8000)
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--id", required=True, help="Spoke ID")
-    parser.add_argument("--secret", nargs='?', const="lm-secret", default="lm-secret", help="Authentication secret (default: lm-secret)")
-    parser.add_argument("--hub-secret", help="Hub authentication secret for mutual auth")
-    parser.add_argument("--hub", help="Hub WebSocket URL (defaults to standalone mode if omitted)")
+    import os
+    from dotenv import load_dotenv
+    load_dotenv()
+
+    parser = argparse.ArgumentParser(description="Lab Manager Generic Agent")
+    parser.add_argument("--id",         default=os.getenv("SPOKE_ID", "cs-spoke-1"))
+    parser.add_argument("--secret",     default=os.getenv("SPOKE_SECRET", ""))
+    parser.add_argument("--hub-secret", default=os.getenv("HUB_SECRET", ""))
+    parser.add_argument("--hub",        default=os.getenv("HUB_URL", "ws://localhost:8765"))
+    parser.add_argument("--role",       default=os.getenv("STARTUP_ROLE", ""),
+                        help="Pre-load a role at startup (linux_monitor, dns, dhcp, ...)")
     args = parser.parse_args()
 
-    cp = CSControlPlane(args.id, args.secret, args.hub_secret, args.hub)
+    config = {}
+    if args.role:
+        config["role"] = args.role
+
+    cp = CSControlPlane(args.id, args.secret, args.hub_secret, args.hub, config=config)
     if args.hub:
         asyncio.run(cp.run())
     else:
