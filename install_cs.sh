@@ -119,7 +119,7 @@ Type=simple
 User=$SVC_USER
 WorkingDirectory=$LM_DIR/cs
 EnvironmentFile=$LM_DIR/cs/.env
-Environment="PYTHONPATH=$LM_DIR/core/src:$LM_DIR/cs/src"
+Environment="PYTHONPATH=$LM_DIR:$LM_DIR/core/src:$LM_DIR/cs/src"
 ExecStart=$LM_DIR/cs/venv/bin/python3 -m src.control_plane \
     --id $SPOKE_ID \
     --secret $SPOKE_SECRET \
