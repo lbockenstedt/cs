@@ -2,16 +2,14 @@
 set -euo pipefail
 
 # ============================================================
-# Lab Manager — Generic Agent (CS) Installer
+# Lab Manager — Client Simulator (CS) Spoke Installer
 #
-# Deploys the morphable LM agent spoke.  Starts in simulator
-# mode; the hub can push LOAD_ROLE to morph it into a
-# linux_monitor, dns, dhcp, or proxmox agent at runtime.
+# Deploys the LM client simulator spoke.
 # Safe to re-run (updates code, preserves credentials).
 #
 # Usage:
 #   curl -sSL https://raw.githubusercontent.com/lbockenstedt/cs/main/install_cs.sh \
-#     | sudo bash -s -- --hub ws://HUB_IP:8765 --admin-token LM_ADMIN_TOKEN [--role linux_monitor]
+#     | sudo bash -s -- --hub ws://HUB_IP:8765 --admin-token LM_ADMIN_TOKEN
 # ============================================================
 
 HUB_URL="ws://localhost:8765"
@@ -19,7 +17,6 @@ SPOKE_ID="cs-spoke-1"
 SPOKE_SECRET=""
 HUB_SECRET=""
 ADMIN_TOKEN=""
-STARTUP_ROLE=""        # Optional: pre-load a role at startup
 SVC_USER="svc_lm"
 LM_DIR="/opt/lm"
 
@@ -30,7 +27,6 @@ while [[ "$#" -gt 0 ]]; do
         --secret)      SPOKE_SECRET="$2"; shift ;;
         --hub-secret)  HUB_SECRET="$2";   shift ;;
         --admin-token) ADMIN_TOKEN="$2";  shift ;;
-        --role)        STARTUP_ROLE="$2"; shift ;;
         --all-prereqs) ;;
         *) echo "Unknown argument: $1"; exit 1 ;;
     esac
@@ -108,13 +104,10 @@ HUB_URL=$HUB_URL
 SPOKE_ID=$SPOKE_ID
 SPOKE_SECRET=$SPOKE_SECRET
 HUB_SECRET=${HUB_SECRET:-}
-STARTUP_ROLE=${STARTUP_ROLE:-}
 DOTENV
 chmod 600 "$LM_DIR/cs/.env"
 
 # ── systemd unit ──────────────────────────────────────────────────────────────
-ROLE_ARG=""
-[ -n "$STARTUP_ROLE" ] && ROLE_ARG="--role $STARTUP_ROLE"
 
 cat > /etc/systemd/system/lm-cs.service <<SYSD
 [Unit]
@@ -132,7 +125,7 @@ ExecStart=$LM_DIR/cs/venv/bin/python3 -m src.control_plane \
     --secret $SPOKE_SECRET \
     --hub-secret "${HUB_SECRET:-}" \
     --hub $HUB_URL \
-    $ROLE_ARG
+
 StandardOutput=append:/var/log/lm/lm-cs.log
 StandardError=append:/var/log/lm/lm-cs.log
 Restart=on-failure
@@ -156,9 +149,6 @@ ok "Generic Agent installation complete!"
 echo "════════════════════════════════════════════"
 echo "  LM Hub:       $HUB_URL"
 echo "  Spoke ID:     $SPOKE_ID"
-[ -n "$STARTUP_ROLE" ] && echo "  Startup role: $STARTUP_ROLE" || echo "  Mode:         simulator (use LOAD_ROLE to morph)"
 echo "  Version:      $(cat $LM_DIR/cs/VERSION 2>/dev/null || echo unknown)"
 echo "  Status:       sudo systemctl status lm-cs"
 echo ""
-echo "To morph this agent into a linux monitor via LM hub:"
-echo "  POST /api/cs/command  {\"command\": \"LOAD_ROLE\", \"data\": {\"role\": \"linux_monitor\"}}"

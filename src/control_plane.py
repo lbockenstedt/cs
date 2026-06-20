@@ -30,11 +30,9 @@ class CSControlPlane(BaseControlPlane):
         super().__init__(spoke_id, secret, hub_secret, hub_url)
         self.module_type = "simulation"
         self.startup_config = config or {}
-        self.engine = SimulationEngine(hostname=spoke_id)
 
     async def run(self):
-        """Native LM Spoke behavior."""
-        logger.info(f"Starting Generic Agent in HUB MODE -> {self.hub_url}")
+        logger.info(f"Starting CS (Client Simulator) -> {self.hub_url}")
         cs_spoke = CSSpoke(self.spoke_id, self.startup_config)
         self.register_module("cs", cs_spoke)
         await super().run()
@@ -68,15 +66,8 @@ if __name__ == "__main__":
     parser.add_argument("--secret",     default=os.getenv("SPOKE_SECRET", ""))
     parser.add_argument("--hub-secret", default=os.getenv("HUB_SECRET", ""))
     parser.add_argument("--hub",        default=os.getenv("HUB_URL", "ws://localhost:8765"))
-    parser.add_argument("--role",       default=os.getenv("STARTUP_ROLE", ""),
-                        help="Pre-load a role at startup (linux_monitor, dns, dhcp, ...)")
     args = parser.parse_args()
-
-    config = {}
-    if args.role:
-        config["role"] = args.role
-
-    cp = CSControlPlane(args.id, args.secret, args.hub_secret, args.hub, config=config)
+    cp = CSControlPlane(args.id, args.secret, args.hub_secret, args.hub)
     if args.hub:
         asyncio.run(cp.run())
     else:
