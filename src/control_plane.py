@@ -67,7 +67,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Lab Manager Generic Agent")
     parser.add_argument("--id",         default=os.getenv("SPOKE_ID", "cs-spoke-1"))
     parser.add_argument("--secret",     default=os.getenv("SPOKE_SECRET", ""))
-    parser.add_argument("--hub-secret", default=os.getenv("HUB_SECRET", ""))
+    parser.add_argument("--hub-secret", nargs='?', default=os.getenv("HUB_SECRET", ""), const="")
     parser.add_argument("--hub",        default=os.getenv("HUB_URL", "ws://localhost:8765"))
     args = parser.parse_args()
     cp = CSControlPlane(args.id, args.secret, args.hub_secret, args.hub)
