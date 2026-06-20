@@ -27,6 +27,7 @@ class CSControlPlane(BaseControlPlane):
 
     def __init__(self, spoke_id: str, secret: str, hub_secret: str = None, hub_url: str = None):
         super().__init__(spoke_id, secret, hub_secret, hub_url)
+        self.module_type = "simulation"
         self.engine = SimulationEngine(hostname=spoke_id)
         self.modules: Dict[str, Any] = {}
 
