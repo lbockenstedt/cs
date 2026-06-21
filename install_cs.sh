@@ -69,7 +69,7 @@ if [ -z "$SPOKE_SECRET" ]; then
         API_HOST=$(echo "$HUB_URL" | sed 's|wss\?://||' | cut -d: -f1)
         SPOKE_SECRET=$(curl -sf -X POST "http://$API_HOST:8000/setup/generate-secret" \
             -H "Content-Type: application/json" \
-            -H "Authorization: Bearer $ADMIN_TOKEN" \
+            -H "X-Admin-Token: $ADMIN_TOKEN" \
             -d "{\"spoke_id\": \"$SPOKE_ID\"}" | jq -r '.secret' 2>/dev/null) || SPOKE_SECRET=""
         [ -z "$SPOKE_SECRET" ] || [ "$SPOKE_SECRET" = "null" ] && \
             { echo "❌ Could not fetch spoke secret from Hub."; exit 1; }
