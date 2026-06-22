@@ -9,7 +9,7 @@ set -euo pipefail
 #
 # Usage:
 #   curl -sSL https://raw.githubusercontent.com/lbockenstedt/cs/main/install_cs.sh \
-#     | sudo bash -s -- --hub ws://HUB_IP:8765 --admin-token LM_ADMIN_TOKEN
+#     | sudo bash -s -- --hub ws://HUB_IP:8765
 # ============================================================
 
 HUB_URL="ws://localhost:8765"
@@ -26,14 +26,13 @@ while [[ "$#" -gt 0 ]]; do
         --id|--name)   SPOKE_ID="$2";     shift ;;
         --secret)      SPOKE_SECRET="$2"; shift ;;
         --hub-secret)  HUB_SECRET="$2";   shift ;;
-        --admin-token) ADMIN_TOKEN="$2";  shift ;;
+        --admin-token) ;; # deprecated
         --all-prereqs) ;;
         *) echo "Unknown argument: $1"; exit 1 ;;
     esac
     shift
 done
 
-ADMIN_TOKEN="${ADMIN_TOKEN:-${LM_ADMIN_TOKEN:-}}"
 [ "$(id -u)" -eq 0 ] || { echo "❌ Must be run as root."; exit 1; }
 
 GRN='\033[0;32m'; YLW='\033[1;33m'; NC='\033[0m'
@@ -65,17 +64,8 @@ if [ -z "$SPOKE_SECRET" ]; then
     if [ -n "$EXISTING_SECRET" ]; then
         SPOKE_SECRET="$EXISTING_SECRET"
         ok "Reusing existing spoke secret"
-    elif [ -n "$ADMIN_TOKEN" ]; then
-        API_HOST=$(echo "$HUB_URL" | sed 's|wss\?://||' | cut -d: -f1)
-        SPOKE_SECRET=$(curl -sf -X POST "http://$API_HOST:8000/setup/generate-secret" \
-            -H "Content-Type: application/json" \
-            -H "X-Admin-Token: $ADMIN_TOKEN" \
-            -d "{\"spoke_id\": \"$SPOKE_ID\"}" | jq -r '.secret' 2>/dev/null) || SPOKE_SECRET=""
-        [ -z "$SPOKE_SECRET" ] || [ "$SPOKE_SECRET" = "null" ] && \
-            { echo "❌ Could not fetch spoke secret from Hub."; exit 1; }
-        ok "Spoke secret fetched from Hub"
     else
-        echo "❌ No secret available. Provide --secret or --admin-token."; exit 1
+        warn "No pre-shared secret — spoke will connect unauthenticated and await admin approval in the LM WebUI."
     fi
 fi
 
