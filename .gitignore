@@ -13,3 +13,8 @@ __pycache__/
 keys.json
 hub_secret.json
 secrets.json
+
+# CS spoke runtime state (JSON store, logs)
+data/
+cs.log
+*.log

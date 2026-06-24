@@ -44,22 +44,36 @@ class CSControlPlane(BaseControlPlane):
         self.register_module("cs", cs_spoke)
         await super().run()
     def run_standalone_mode(self):
-        """Standalone FastAPI server for local management."""
-        logger.info(f"Starting CS Module in STANDALONE MODE on port 8000")
-        app = FastAPI()
+        """Standalone FastAPI server for local management / testing.
+
+        Phase 1: minimal surface (status / trigger / config / version) driven by
+        the same CSSpoke the hub mode uses. Phase 2 will mount the full
+        webui_spoke_api router here.
+        """
+        logger.info("Starting CS Module in STANDALONE MODE on port 8000")
+        spoke = CSSpoke(self.spoke_id, self.startup_config)
+        app = FastAPI(title="LM CS Spoke (standalone)")
 
         @app.get("/status")
         async def get_status():
-            return self.engine.get_current_state()
+            return spoke.engine.get_current_state()
 
         @app.post("/simulate/trigger")
         async def trigger_sim():
-            return await self.engine.run_iteration()
+            return await spoke.engine.run_iteration()
 
         @app.post("/config")
         async def update_config(config: Dict[str, Any]):
-            self.engine.update_config(config)
+            spoke.engine.update_config(config or {})
             return {"status": "success"}
+
+        @app.get("/config")
+        async def get_config():
+            return {"status": "success", "state": spoke.engine.get_current_state()}
+
+        @app.get("/version")
+        async def get_version():
+            return {"version": spoke.get_version()}
 
         uvicorn.run(app, host="0.0.0.0", port=8000)
 
