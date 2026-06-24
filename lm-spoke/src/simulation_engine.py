@@ -8,9 +8,9 @@ Two roles, one engine:
 2. **Runnable simulator** — :meth:`run_iteration` / :meth:`run_loop` execute the
    enabled simulation primitives in-process (the cs node acting as a client, or a
    standalone test). The same primitive code is the reference behaviour the
-   distributed ``linux/*.sh`` scripts replicate inside VMs.
+   distributed ``clients/linux/*.sh`` scripts replicate inside VMs.
 
-The 100-iteration loop mirrors ``linux/simulation.sh``: resolve profile →
+The 100-iteration loop mirrors ``clients/linux/simulation.sh``: resolve profile →
 kill-switch check → ``sim_phy`` adapter setup → ``sim_load`` skip gate → dispatch
 enabled sims concurrently (bounded, per-sim timeout) → status beacon → sleep.
 """

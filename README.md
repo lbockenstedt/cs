@@ -6,8 +6,8 @@
 
 - the **spoke backend** (`webui-spoke/`)
 - the **Proxmox host agent** (`proxmox/`)
-- the **Linux simulation scripts** (`linux/`)
-- related configs, Windows equivalents, and installer assets
+- the **Linux simulation scripts** (`clients/linux/`)
+- related configs, Windows equivalents (`clients/windows/`), T3 (`clients/t3/`), and installer assets
 
 This repo is the local execution plane. It can run standalone, or relay telemetry and commands to Hub. In v1.0 it also carries the Azure-backed VM backup/reseed path used by hub-managed Proxmox environments.
 
@@ -512,14 +512,13 @@ curl -X POST http://localhost:8000/api/update-all
 ### Repository structure
 
 ```text
-client-sim/
+cs/
+├── clients/         # platform clients: linux/, windows/, t3/
 ├── configs/         # simulation.conf and user-overrides.conf
-├── linux/           # Linux client scripts
 ├── proxmox/         # Proxmox host agent, watchdog, units, installers
 ├── webui-spoke/     # FastAPI spoke backend, installer, watchdog, docs
-├── windows/         # Windows equivalents
-├── kill_switch.txt  # Global kill switch source file
-└── CHANGELOG.md / VERSION.md / SECURITY.md
+├── lm-spoke/        # Lab Manager spoke glue (src/, installer, Dockerfile)
+└── kill_switch.txt  # Global kill switch source file
 ```
 
 ### `webui-spoke/server.py` architecture
@@ -680,11 +679,11 @@ On Linux clients, the websocket agent is intended to run under `client-sim-agent
 
 ### Adding a new inbox/agent command
 
-#### VM-side command (`linux/agent.sh`)
+#### VM-side command (`clients/linux/agent.sh`)
 
 1. Add the command producer in the spoke or hub.
 2. Ensure it is returned by `/api/inbox`.
-3. Add a new `case` branch in `linux/agent.sh`.
+3. Add a new `case` branch in `clients/linux/agent.sh`.
 4. Perform the local action.
 5. POST the result to `/api/inbox/ack`.
 

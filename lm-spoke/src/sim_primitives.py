@@ -1,7 +1,7 @@
 """Simulation primitives — one async coroutine per simulation flag.
 
 Each ``sim_<name>(profile, ctx)`` mirrors the behaviour of the corresponding
-``linux/<name>.sh`` leaf script, but runs in-process and is **bounded** per call
+``clients/linux/<name>.sh`` leaf script, but runs in-process and is **bounded** per call
 (the engine's 100-iteration loop repeats them). Every primitive detects its
 required tool and **degrades gracefully** — returning
 ``{"ok": False, "degraded": True, "missing": "<tool>"}`` — rather than raising,

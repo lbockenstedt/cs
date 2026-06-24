@@ -15,7 +15,7 @@ Resolution order (last wins), mirroring ``configs/README.md``::
           ↓
     [username] override       (user-overrides.conf — may also pin ``simulation_id``)
 
-The shipped ``linux/simulation.sh`` only reads ``simulation.conf`` (it cannot
+The shipped ``clients/linux/simulation.sh`` only reads ``simulation.conf`` (it cannot
 load a second INI without resetting section state), so the server bakes
 per-username overrides into the file it serves via ``/api/config``. This Python
 resolver loads both files directly — the canonical behaviour the webui-hub used.
