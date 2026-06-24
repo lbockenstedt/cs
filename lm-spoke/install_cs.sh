@@ -99,6 +99,16 @@ chmod 600 "$LM_DIR/cs/.env"
 
 # ── systemd unit ──────────────────────────────────────────────────────────────
 
+# Only pass --secret/--hub-secret when a value is present. Passing them with an
+# empty value makes argparse abort with "argument --secret: expected one
+# argument", crash-looping the service. Zero-touch provisioning handles the
+# empty case (control_plane.py falls back to SPOKE_SECRET from the .env, then
+# awaits admin approval in the WebUI).
+SECRET_ARG=""
+[ -n "$SPOKE_SECRET" ] && SECRET_ARG="--secret $SPOKE_SECRET"
+HUB_SECRET_ARG=""
+[ -n "${HUB_SECRET:-}" ] && HUB_SECRET_ARG="--hub-secret $HUB_SECRET"
+
 cat > /etc/systemd/system/lm-cs.service <<SYSD
 [Unit]
 Description=Lab Manager Spoke - Generic Agent
@@ -109,12 +119,8 @@ Type=simple
 User=$SVC_USER
 WorkingDirectory=$LM_DIR/cs
 EnvironmentFile=$LM_DIR/cs/.env
-Environment="PYTHONPATH=$LM_DIR:$LM_DIR/core/src:$LM_DIR/cs/src"
-ExecStart=$LM_DIR/cs/venv/bin/python3 -m src.control_plane \
-    --id $SPOKE_ID \
-    --secret $SPOKE_SECRET \
-    --hub-secret "${HUB_SECRET:-}" \
-    --hub $HUB_URL \
+Environment="PYTHONPATH=$LM_DIR:$LM_DIR/core/src:$LM_DIR/cs/lm-spoke"
+ExecStart=$LM_DIR/cs/venv/bin/python3 -m src.control_plane --id $SPOKE_ID --hub $HUB_URL $SECRET_ARG $HUB_SECRET_ARG
 
 StandardOutput=append:/var/log/lm/lm-cs.log
 StandardError=append:/var/log/lm/lm-cs.log

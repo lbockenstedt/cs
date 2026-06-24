@@ -1,0 +1,20 @@
+// Polkit rule: allow NetworkManager WiFi actions without prompting.
+// WHY: The simulation script manages WiFi connections via nmcli. Without
+// this rule, the desktop graphical agent (nm-applet / lxpolkit) intercepts
+// NM authentication requests and pops up a password dialog mid-simulation.
+// Granting these actions unconditionally suppresses all NM auth prompts.
+polkit.addRule(function(action, subject) {
+    var nmActions = [
+        "org.freedesktop.NetworkManager.network-control",
+        "org.freedesktop.NetworkManager.wifi.connect",
+        "org.freedesktop.NetworkManager.settings.modify.system",
+        "org.freedesktop.NetworkManager.settings.modify.own",
+        "org.freedesktop.NetworkManager.wifi.share.protected",
+        "org.freedesktop.NetworkManager.wifi.share.open"
+    ];
+    for (var i = 0; i < nmActions.length; i++) {
+        if (action.id === nmActions[i]) {
+            return polkit.Result.YES;
+        }
+    }
+});

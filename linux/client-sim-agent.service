@@ -1,0 +1,16 @@
+[Unit]
+Description=Client-Sim Linux Agent
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/scripts/agent.sh --daemon
+Restart=on-failure
+RestartSec=10
+StartLimitBurst=10
+StartLimitIntervalSec=300
+KillMode=control-group
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,8 @@
+[Unit]
+Description=Client-Sim Linux Agent Watchdog
+After=network-online.target client-sim-agent.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/scripts/sys_mon.sh --check-once
