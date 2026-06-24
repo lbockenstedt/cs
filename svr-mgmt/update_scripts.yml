@@ -1,0 +1,6 @@
+---
+- hosts: primary
+  become: true
+  tasks:
+  - name: Update PVE Script Repository
+    ansible.builtin.shell: wget -4 https://raw.githubusercontent.com/solutions-hpe/pxmx-mgmt/main/clone.sh -O /etc/pve/scripts/clone.sh

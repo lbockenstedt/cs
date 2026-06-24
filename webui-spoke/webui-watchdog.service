@@ -1,0 +1,13 @@
+[Unit]
+Description=Client Simulator WebUI watchdog
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/webui-watchdog.sh
+# Kill the watchdog if it hangs (e.g. curl blocked, installer stalled)
+TimeoutStartSec=300
+# Restart the one-shot if it exits non-zero (e.g. pipefail on unexpected error)
+Restart=on-failure
+RestartSec=60

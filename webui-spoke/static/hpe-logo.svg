@@ -1,0 +1,12 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 260 48" role="img" aria-label="Hewlett Packard Enterprise">
+  <!-- HPE chevron mark: two right-pointing chevrons -->
+  <polygon fill="#01A982" points="0,0 11,0 28,24 11,48 0,48 17,24"/>
+  <polygon fill="#01A982" points="20,0 31,0 48,24 31,48 20,48 37,24"/>
+  <!-- Wordmark -->
+  <text x="62" y="34"
+        font-family="'MetricHPE','Metric','Arial Narrow','Arial',sans-serif"
+        font-size="26"
+        font-weight="400"
+        letter-spacing="0.5"
+        fill="#ffffff">Hewlett Packard Enterprise</text>
+</svg>

@@ -1,0 +1,1641 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Client Simulator</title>
+  <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+  <div id="spoke-login-overlay" class="hidden" style="display:none;" role="dialog" aria-modal="true" aria-labelledby="spoke-login-title">
+    <div class="hub-login-card">
+      <div class="hub-login-brand">
+        <svg class="hpe-logo-mark" xmlns="http://www.w3.org/2000/svg" viewBox="0 180 504 144" role="img" aria-label="HPE">
+          <path fill="#01a982" d="M391.2 261.27v35.46H504V324H362.4v-90H504v27.27H391.2Z"/>
+          <path fill="currentColor" d="M276.67 180h-89.25v144h28.8v-36.6h60c37.92 0 59.7-21.6 59.7-53.4 0-32.01-21.78-54-59.25-54Zm-1.88 79.8h-58.57v-52.54h58.57c22.68 0 31.28 10.48 31.28 26.73 0 16.08-8.6 25.8-31.28 25.8Zm116.41-39.18h-28.8V180H504v27.27H391.2v13.36ZM151.2 180v144h-28.8v-59.02H28.8V324H0V180h28.8v57.38h93.6V180h28.8Z"/>
+        </svg>
+        <div class="hub-login-copy">
+          <h2 id="spoke-login-title">Client Simulator</h2>
+          <p>Sign in to manage simulations and clients.</p>
+        </div>
+      </div>
+      <div class="hub-login-form">
+        <div id="spoke-login-username-group" class="form-group">
+          <label class="form-label" for="spoke-login-username">Username</label>
+          <input id="spoke-login-username" class="form-input" type="text" autocomplete="username" placeholder="admin" value="admin">
+        </div>
+        <div class="form-group">
+          <label class="form-label" for="spoke-login-password">Password</label>
+          <input id="spoke-login-password" class="form-input" type="password" autocomplete="current-password" placeholder="Password">
+        </div>
+        <div id="spoke-login-error" class="form-msg" aria-live="polite"></div>
+        <div class="hub-login-actions">
+          <button id="spoke-login-btn" class="btn btn-primary" type="button">Sign In</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <header class="topbar">
+    <div class="topbar-content">
+      <div>
+        <h1>
+          <!-- Official HPE wordmark — sourced from hpe.com/content/dam/hpe/favicons/favicon.svg -->
+          <svg class="hpe-logo-mark" xmlns="http://www.w3.org/2000/svg" viewBox="0 180 504 144" role="img" aria-label="HPE">
+            <path fill="#01a982" d="M391.2 261.27v35.46H504V324H362.4v-90H504v27.27H391.2Z"/>
+            <path fill="currentColor" d="M276.67 180h-89.25v144h28.8v-36.6h60c37.92 0 59.7-21.6 59.7-53.4 0-32.01-21.78-54-59.25-54Zm-1.88 79.8h-58.57v-52.54h58.57c22.68 0 31.28 10.48 31.28 26.73 0 16.08-8.6 25.8-31.28 25.8Zm116.41-39.18h-28.8V180H504v27.27H391.2v13.36ZM151.2 180v144h-28.8v-59.02H28.8V324H0V180h28.8v57.38h93.6V180h28.8Z"/>
+          </svg>
+          <span class="brand-divider" aria-hidden="true"></span>
+          Client Simulator
+        </h1>
+      </div>
+      <div class="topbar-right">
+        <div id="repo-status" class="repo-status" title="GitHub sync status">
+          <span id="repo-dot" class="status-dot offline"></span>
+          <span id="repo-label" class="repo-label">GitHub Sync:</span>
+          <span id="repo-text">Syncing…</span>
+        </div>
+        <div id="central-api-status" class="repo-status" title="Aruba Central API connection status" aria-live="polite">
+          <span id="central-api-dot" class="status-dot offline"></span>
+          <span class="repo-label">Central API:</span>
+          <span id="central-api-text">Unknown</span>
+        </div>
+        <span id="relay-indicator" class="ind-dot grey" title="Hub not configured" style="display:none;"></span>
+        <span id="gkill-indicator" class="gkill-banner" style="display:none;"></span>
+        <!-- Shows when hub config pushes are paused so operators can spot isolation immediately from the header. --><span id="hub-isolation-banner" class="gkill-banner" style="display:none;background:#b45309;color:#fff;"></span>
+        <div class="ws-status" aria-live="polite">
+          <span id="ws-dot" class="status-dot offline"></span>
+          <span class="repo-label">API Status:</span>
+          <span id="ws-text">Disconnected</span>
+        </div>
+        <div class="ws-status" title="Auto-refresh interval">
+          <span class="repo-label">Refresh:</span>
+          <select id="refresh-interval-select" style="font-size:12px;padding:2px 4px;border:1px solid var(--border);border-radius:4px;background:var(--panel);color:var(--text);">
+            <option value="0">Off</option>
+            <option value="10" selected>10s</option>
+            <option value="30">30s</option>
+            <option value="60">1m</option>
+            <option value="300">5m</option>
+          </select>
+        </div>
+        <span id="installer-version" class="installer-version-badge" title="Installer version"></span>
+        <button id="update-all-btn" class="btn btn-primary" title="Update all Proxmox agents then the WebUI server" style="font-size:13px;padding:5px 12px;">⬆ Update All</button>
+      </div>
+    </div>
+  </header>
+
+  <nav class="tab-nav" role="tablist">
+    <button class="tab active" role="tab" aria-selected="true"  data-tab="simulations">Simulations</button>
+    <button class="tab" role="tab" aria-selected="false" data-tab="dashboard">Clients</button>
+    <button class="tab" role="tab" aria-selected="false" data-tab="central">Central</button>
+    <button class="tab tab-btn" id="tab-server-btn" role="tab" aria-selected="false" data-tab="server" style="display:none;">Server</button>
+    <span class="tab-nav-sep" aria-hidden="true"></span>
+    <button class="tab tab-nav-right" role="tab" aria-selected="false" data-tab="config">⚙ Config</button>
+    <button class="tab" role="tab" aria-selected="false" data-tab="setup">⚙ Setup</button>
+  </nav>
+
+  <!-- ── Dashboard tab ── -->
+  <main id="tab-dashboard" class="page tab-content hidden">
+    <div id="clients-node-bar" class="server-node-bar">
+      <span class="server-node-name">Clients</span>
+      <span class="server-stat-pill" id="client-count" title="Connected clients">0 clients</span>
+      <button id="purge-history-btn" class="btn btn-danger btn-small" type="button" style="margin-left:auto;" title="Remove all client records from memory and disk">🗑 Purge History</button>
+    </div>
+
+    <div class="setup-card">
+      <table class="data-table" id="clients-table">
+        <thead>
+          <tr>
+            <th>Status</th>
+            <th>Hostname</th>
+            <th>Platform</th>
+            <th>SIM Bucket</th>
+            <th>SSID</th>
+            <th>Active Simulations</th>
+            <th>Aruba Central Impact</th>
+            <th>Last Seen</th>
+            <th>Errors</th>
+            <th>Actions</th>
+          </tr>
+        </thead>
+        <tbody id="clients-body">
+          <tr id="empty-row">
+            <td colspan="10" class="empty-state">No clients connected — waiting for beacons…</td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+  </main>
+
+  <main id="tab-server" class="page tab-content hidden tab-panel" style="display:none;">
+    <nav class="setup-subnav" role="tablist">
+      <button class="setup-subtab server-subtab active" data-subtab="server-vms" role="tab">VMs</button>
+      <button class="setup-subtab server-subtab" data-subtab="server-usb" role="tab">USB (T2)</button>
+      <button class="setup-subtab server-subtab" data-subtab="server-t3" role="tab">IoT (T3)</button>
+      <button class="setup-subtab server-subtab" data-subtab="server-other" role="tab">Other</button>
+      <button class="setup-subtab server-subtab" data-subtab="server-vh" role="tab">VirtualHere</button>
+      <button class="setup-subtab server-subtab" data-subtab="server-commands" role="tab">Command Queue</button>
+      <button class="setup-subtab server-subtab" data-subtab="server-node" role="tab">Details</button>
+    </nav>
+
+    <!-- VMs sub-tab -->
+    <div id="server-vms" class="setup-subpanel">
+
+      <!-- 2-col grid: Fleet Reclone (left) | Auto-Provisioning Live Status (right) -->
+      <div class="reclone-autoprov-grid setup-section-gap">
+
+      <!-- Left: Fleet Reclone -->
+      <div id="reclone-status-panel" class="setup-card">
+        <div class="setup-card-header">
+          <span id="reclone-status-badge" class="badge badge-grey">Idle</span>
+          <button id="reclone-now-btn" class="btn btn-secondary" onclick="triggerRecloneAll()">⟳ Reclone All Now</button>
+        </div>
+        <div id="reclone-progress-wrap" class="hidden">
+          <div class="reclone-meta">
+            <span id="reclone-type-label" class="badge badge-grey"></span>
+            <span id="reclone-current-vm" class="muted"></span>
+            <span id="reclone-eta" class="muted"></span>
+          </div>
+          <div class="progress-bar-wrap"><div id="reclone-progress-bar" class="progress-bar"></div></div>
+          <div id="reclone-progress-label"></div>
+          <div id="reclone-vm-log" class="reclone-log"></div>
+        </div>
+        <div id="reclone-last-run" class="reclone-last-run"></div>
+        <div id="reclone-auto-recovery-section" class="hidden" style="margin-top:12px;border-top:1px solid var(--border);padding-top:10px;">
+          <div class="reclone-section-title">↺ Auto-Recovery Log</div>
+          <div id="reclone-auto-recovery-log" class="reclone-log"></div>
+        </div>
+      </div>
+
+      <!-- Right: Auto-Provisioning Live Status -->
+      <div id="autoprov-live-panel" class="setup-card">
+        <div class="setup-card-header" style="margin-bottom:10px;">
+          <h2 style="font-size:1rem;margin:0;">⚡ Auto-Provisioning</h2>
+          <span id="autoprov-live-badge" class="badge badge-grey">Off</span>
+        </div>
+        <div id="autoprov-live-summary" class="autoprov-live-summary"></div>
+        <div id="auto-prov-log" class="reclone-log" style="max-height:300px;margin-top:8px;"></div>
+      </div>
+
+      </div><!-- end reclone-autoprov-grid -->
+
+      <!-- VM category inner tab nav + auto-provisioning status (right side) -->
+      <div id="vm-cat-tab-nav" class="vm-cat-tab-nav setup-section-gap">
+        <button class="vm-cat-tab setup-subtab active" data-cat="sim">Simulation Clients <span class="badge-count" id="vm-count-sim">0</span></button>
+        <button class="vm-cat-tab setup-subtab" data-cat="other">Other Clients <span class="badge-count" id="vm-count-other">0</span></button>
+        <button class="vm-cat-tab setup-subtab" data-cat="containers">Containers <span class="badge-count" id="vm-count-containers">0</span></button>
+        <button class="vm-cat-tab setup-subtab" data-cat="templates">Templates <span class="badge-count" id="vm-count-tpl">0</span></button>
+        <div id="autoprov-status-bar" class="autoprov-status-bar hidden">
+          <span id="autoprov-status-icon"></span>
+          <span id="autoprov-status-text"></span>
+        </div>
+      </div>
+
+      <!-- Bulk action bar — hidden when Templates tab is active -->
+      <div class="server-bulk-bar" id="vm-bulk-bar">
+        <label><input type="checkbox" id="server-select-all"> Select All</label>
+        <button class="btn btn-secondary" id="server-bulk-start">▶ Start</button>
+        <button class="btn btn-secondary" id="server-bulk-stop">■ Stop</button>
+        <button class="btn btn-warning" id="server-bulk-reclone">↺ Reclone</button>
+        <button class="btn btn-danger" id="server-bulk-delete">✕ Delete</button>
+      </div>
+
+      <!-- Simulation Clients panel -->
+      <div id="vm-cat-panel-sim" class="setup-card">
+        <table class="data-table" id="server-vm-table-sim">
+          <thead>
+            <tr>
+              <th style="width:36px;"><input type="checkbox" id="server-th-check-sim" disabled></th>
+              <th>Status</th>
+              <th>VM ID</th>
+              <th>Name</th>
+              <th>CPU %</th>
+              <th>RAM</th>
+              <th>Actions</th>
+            </tr>
+          </thead>
+          <tbody id="server-vm-tbody-sim"></tbody>
+        </table>
+        <div id="server-empty-sim" style="text-align:center;color:var(--muted);padding:32px;">
+          Waiting for Proxmox agent to check in…
+        </div>
+      </div>
+
+      <!-- Other Clients panel -->
+      <div id="vm-cat-panel-other" class="setup-card hidden">
+        <table class="data-table" id="server-vm-table-other">
+          <thead>
+            <tr>
+              <th style="width:36px;"><input type="checkbox" id="server-th-check-other" disabled></th>
+              <th>Status</th>
+              <th>VM ID</th>
+              <th>Name</th>
+              <th>CPU %</th>
+              <th>RAM</th>
+              <th>Actions</th>
+            </tr>
+          </thead>
+          <tbody id="server-vm-tbody-other"></tbody>
+        </table>
+        <div id="server-empty-other" style="text-align:center;color:var(--muted);padding:32px;">
+          No other VMs found.
+        </div>
+      </div>
+
+      <!-- Containers panel -->
+      <div id="vm-cat-panel-containers" class="setup-card hidden">
+        <table class="data-table" id="server-vm-table-containers">
+          <thead>
+            <tr>
+              <th style="width:36px;"><input type="checkbox" id="server-th-check-containers" disabled></th>
+              <th>Status</th>
+              <th>CT ID</th>
+              <th>Name</th>
+              <th>CPU %</th>
+              <th>RAM</th>
+              <th>Actions</th>
+            </tr>
+          </thead>
+          <tbody id="server-vm-tbody-containers"></tbody>
+        </table>
+        <div id="server-empty-containers" style="text-align:center;color:var(--muted);padding:32px;">
+          No containers found.
+        </div>
+      </div>
+
+      <!-- Templates panel (read-only, no checkboxes) -->
+      <div id="vm-cat-panel-templates" class="setup-card hidden">
+        <table class="data-table" id="server-template-table">
+          <thead>
+            <tr>
+              <th>VM ID</th>
+              <th>Name</th>
+              <th>CPU %</th>
+              <th>RAM</th>
+              <th>Status</th>
+            </tr>
+          </thead>
+          <tbody id="server-template-tbody"></tbody>
+        </table>
+        <div id="server-empty-tpl" style="text-align:center;color:var(--muted);padding:32px;">
+          No templates detected.
+        </div>
+      </div>
+
+    </div>
+
+    <!-- USB sub-tab -->
+    <div id="server-usb" class="setup-subpanel hidden">
+      <div id="usb-summary-panel" class="setup-card setup-section-gap">
+        <div class="setup-card-header">
+          <h2>USB Devices</h2>
+          <div id="usb-vm-stat-pills" style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;"></div>
+        </div>
+        <table class="data-table" id="usb-summary-table">
+          <thead>
+            <tr><th>Device</th><th>VID:PID</th><th>Type</th><th title="VMs with this USB device actively assigned via USB provisioning">Active VMs</th><th>Missing</th><th>Count</th></tr>
+          </thead>
+          <tbody id="usb-summary-tbody"></tbody>
+        </table>
+        <div id="unknown-usb-section" class="hidden" style="margin-top:16px;">
+          <div class="setup-card-header" style="padding:0 0 8px;">
+            <h3>⚠️ Uncertified Devices Detected</h3>
+            <p>These USB devices are connected but not in the certified list. Add or ignore them below.</p>
+          </div>
+          <div class="table-scroll">
+            <table class="data-table" id="unknown-usb-table">
+              <thead><tr><th>Device</th><th>VID:PID</th><th>Actions</th></tr></thead>
+              <tbody id="unknown-usb-tbody"></tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- IoT (T3) sub-tab — shows VMs with PCI passthrough of T3 IoT adapters -->
+    <div id="server-t3" class="setup-subpanel hidden">
+      <div class="setup-card setup-section-gap">
+        <div class="setup-card-header">
+          <h2>IoT (T3) Clients</h2>
+          <p>VMs with PCI passthrough of a T3 IoT adapter (VID 168c:0034).</p>
+        </div>
+        <table class="data-table" id="server-t3-vm-table">
+          <colgroup>
+            <col style="width:70px">
+            <col>
+            <col style="width:80px">
+            <col style="width:90px">
+            <col>
+          </colgroup>
+          <thead><tr><th>VMID</th><th>Name</th><th>Type</th><th>Status</th><th>PCI</th></tr></thead>
+          <tbody id="server-t3-vm-tbody"></tbody>
+        </table>
+      </div>
+    </div>
+
+    <!-- Other sub-tab — non-sim, non-IoT VMs and containers -->
+    <div id="server-other" class="setup-subpanel hidden">
+      <div class="setup-card setup-section-gap">
+        <div class="setup-card-header">
+          <h2>Other VMs &amp; Containers</h2>
+          <p>VMs and LXC containers not classified as USB (T2) or IoT (T3).</p>
+        </div>
+        <table class="data-table" id="server-other-vm-table">
+          <colgroup>
+            <col style="width:70px">
+            <col>
+            <col style="width:80px">
+            <col style="width:90px">
+            <col>
+          </colgroup>
+          <thead><tr><th>VMID</th><th>Name</th><th>Type</th><th>Status</th><th>Actions</th></tr></thead>
+          <tbody id="server-other-vm-tbody"></tbody>
+        </table>
+      </div>
+    </div>
+
+    <!-- VirtualHere sub-tab -->
+    <div id="server-vh" class="setup-subpanel hidden">
+      <div class="setup-card setup-section-gap">
+        <div class="setup-card-header" style="display:flex;justify-content:space-between;align-items:flex-start;flex-wrap:wrap;gap:8px;">
+          <div>
+            <h2>🔌 VirtualHere Devices</h2>
+            <div id="vh-stat-pills" style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-top:6px;"></div>
+          </div>
+        </div>
+        <div id="vh-device-list" style="margin-top:12px;"></div>
+      </div>
+    </div>
+
+    <!-- Command Queue sub-tab -->
+    <div id="server-commands" class="setup-subpanel hidden">
+      <div class="setup-card setup-section-gap" id="commands-card">
+        <div class="setup-card-header">
+          <h2>📨 Command Queue</h2>
+        </div>
+          <div class="form-group" style="min-width:160px;">
+            <label>Target</label>
+            <select id="cmd-target">
+              <option value="all">— All Clients —</option>
+              <option value="proxmox">Proxmox Host</option>
+            </select>
+          </div>
+          <div class="form-group" style="min-width:160px;">
+            <label>Action</label>
+            <select id="cmd-action">
+              <optgroup label="Client Actions">
+                <option value="restart_sim">Restart Simulation</option>
+                <option value="reboot">Reboot Device</option>
+                <option value="update_now">Force Update</option>
+                <option value="kill_switch">Kill Switch</option>
+              </optgroup>
+              <optgroup label="Proxmox Actions">
+                <option value="reclone_vms">Reclone VMs</option>
+                <option value="snapshot_vms">Snapshot VMs</option>
+                <option value="start_vms">Start VMs</option>
+                <option value="stop_vms">Stop VMs</option>
+              </optgroup>
+            </select>
+          </div>
+          <button class="btn btn-primary" id="cmd-send-btn" type="button">Send Command</button>
+          <button class="btn btn-secondary" id="cmd-clear-btn" type="button" style="margin-left:auto;">Clear History</button>
+        </div>
+        <div id="cmd-msg" class="form-msg" style="margin-bottom:6px;"></div>
+        <div class="table-scroll">
+          <table class="data-table" id="cmd-table" style="table-layout:fixed;width:100%;">
+            <colgroup>
+              <col style="width:90px">
+              <col style="width:130px">
+              <col>
+              <col style="width:90px">
+              <col style="width:70px">
+              <col style="width:32px">
+            </colgroup>
+            <thead>
+              <tr>
+                <th>Target</th>
+                <th>Action</th>
+                <th>Info</th>
+                <th>Status</th>
+                <th>Age</th>
+                <th></th>
+              </tr>
+            </thead>
+            <tbody id="cmd-tbody"></tbody>
+          </table>
+        </div>
+        <div id="cmd-empty" style="text-align:center;color:var(--muted);padding:16px;display:none;">No commands yet</div>
+      </div>
+    </div>
+
+    <!-- Details sub-tab -->
+    <div id="server-node" class="setup-subpanel">
+      <div class="setup-card setup-section-gap">
+        <div style="display:flex;justify-content:space-between;align-items:center;gap:12px;">
+          <div style="display:flex;align-items:baseline;gap:16px;flex-wrap:wrap;">
+            <h2 id="server-node-name" style="margin:0;">—</h2>
+            <span class="server-stat-pill" title="CPU">⚡ CPU: <span id="server-cpu">—</span>%</span>
+            <span class="server-stat-pill" title="RAM">🧠 RAM: <span id="server-ram">—</span></span>
+            <span class="server-stat-pill" title="1-hour rolling average CPU" id="server-cpu-avg-pill">📊 CPU avg: <span id="server-cpu-avg">…</span>%</span>
+            <span class="server-stat-pill" title="1-hour rolling average memory" id="server-mem-avg-pill">📊 Mem avg: <span id="server-mem-avg">…</span>%</span>
+            <span id="server-storage-pills"></span>
+            <span class="server-stat-pill" id="server-agent-version-pill" title="Agent version" style="display:none;">🤖 Agent v<span id="server-agent-version">—</span></span>
+          </div>
+          <div style="display:flex;flex-direction:column;align-items:stretch;gap:4px;flex-shrink:0;min-width:130px;">
+            <button id="agent-approve-btn" class="btn btn-secondary" style="display:none;"></button>
+            <button id="agent-update-btn" class="btn btn-secondary" title="Pull latest agent script from GitHub and restart">⬆ Update Agent</button>
+            <span class="server-last-seen" style="font-size:11px;">Last seen: <span id="server-last-seen">—</span></span>
+          </div>
+        </div>
+      </div>
+
+      <div id="proxmox-extra-pending" class="setup-card setup-section-gap hidden" style="padding:10px 16px;">
+        <span style="font-size:13px;font-weight:600;">⚠ Pending agents: </span><span id="proxmox-extra-pending-list" style="font-size:13px;"></span>
+      </div>
+
+      <div class="setup-card setup-section-gap" style="padding:14px 16px;display:flex;justify-content:space-between;align-items:center;gap:12px;">
+        <div>
+          <div style="font-weight:600;font-size:13px;">🗑 Clear Server Cache</div>
+          <div style="font-size:12px;color:var(--muted);">Resets Proxmox state, VM list, command history, and reclone logs. No restart required.</div>
+        </div>
+        <button id="server-clear-cache-btn" class="btn btn-danger" style="flex-shrink:0;">Clear Cache</button>
+      </div>
+
+      <!-- Combined Logs section -->
+      <div id="server-logs" class="setup-card setup-section-gap">
+        <section class="toolbar">
+          <div class="toolbar-actions">
+            <button id="logs-tail-btn" class="btn btn-primary" type="button">▶ Start Tail</button>
+            <button id="logs-stop-btn" class="btn btn-secondary hidden" type="button">⏹ Stop</button>
+            <button id="logs-refresh-btn" class="btn btn-secondary" type="button">↺ Reload History</button>
+            <label class="logs-filter-label" id="logs-filter-label">
+              Filter:
+              <input id="logs-filter" class="logs-filter-input" type="text" placeholder="e.g. wireless clients" spellcheck="false" />
+            </label>
+            <label class="logs-lines-label" id="logs-lines-label">
+              Lines:
+              <select id="logs-lines-select">
+                <option value="100">100</option>
+                <option value="300" selected>300</option>
+                <option value="500">500</option>
+                <option value="1000">1000</option>
+              </select>
+            </label>
+            <label class="logs-filter-label">
+              Source:
+              <select id="logs-source-select">
+                <option value="journal">Service journal</option>
+                <option value="install">Install log</option>
+                <option value="agent">Proxmox Agent</option>
+              </select>
+            </label>
+            <!-- Agent log controls — shown only when source=agent -->
+            <label class="logs-filter-label hidden" id="agent-log-filter-label">
+              Filter:
+              <input id="agent-log-filter" class="logs-filter-input" type="text" placeholder="Filter…" spellcheck="false" />
+            </label>
+          </div>
+          <div class="toolbar-actions">
+            <label class="logs-autoscroll-label">
+              <input id="logs-autoscroll" type="checkbox" checked /> Auto-scroll
+            </label>
+            <button id="logs-clear-btn" class="btn btn-secondary" type="button">🗑 Clear</button>
+            <button id="agent-log-clear" class="btn btn-secondary hidden" type="button">Clear</button>
+          </div>
+        </section>
+        <div id="logs-output" class="logs-output" role="log" aria-live="polite" aria-label="Service logs"></div>
+        <div id="agent-log-viewer" class="agent-log-viewer hidden"></div>
+      </div>
+    </div>
+
+    <!-- Agent Log sub-tab -->
+  </main>
+  <main id="tab-simulations" class="page tab-content">
+    <nav class="setup-subnav" role="tablist">
+      <button class="setup-subtab simtop-subtab active" data-simtop="simtop-checks" role="tab">Checks</button>
+      <button class="setup-subtab simtop-subtab" data-simtop="simtop-hardware" role="tab">Hardware</button>
+      <button class="setup-subtab simtop-subtab" data-simtop="simtop-clients" role="tab">Client Count</button>
+      <button class="setup-subtab simtop-subtab" data-simtop="simtop-insights" role="tab">Insights</button>
+    </nav>
+
+    <!-- Checks sub-panel -->
+    <div id="simtop-checks" class="setup-subpanel">
+      <div id="sim-overview">
+        <section class="central-toolbar">
+          <div>
+            <div id="sim-last-refreshed" class="central-last-synced">Last refreshed: —</div>
+          </div>
+          <div class="toolbar-actions">
+            <button id="sim-refresh-btn" class="btn btn-secondary btn-small" type="button">Refresh Now</button>
+          </div>
+        </section>
+        <nav class="setup-subnav" role="tablist">
+          <button class="setup-subtab sim-subtab active" data-simtab="failing" role="tab">🔴 Failing <span id="sim-tab-failing-count" class="badge-count">0</span></button>
+          <button class="setup-subtab sim-subtab" data-simtab="warning" role="tab">⚠ Warning <span id="sim-tab-warning-count" class="badge-count">0</span></button>
+          <button class="setup-subtab sim-subtab" data-simtab="functional" role="tab">🟢 Functional <span id="sim-tab-functional-count" class="badge-count">0</span></button>
+        </nav>
+        <div class="checks-toolbar">
+          <input id="checks-filter" class="checks-filter-input" type="text" placeholder="Filter checks…" spellcheck="false" />
+          <span id="checks-count" class="checks-count-badge">0 checks</span>
+        </div>
+        <div id="sim-checks-list" class="sim-checks-list">
+          <div id="sim-checks-empty" class="central-empty hidden">No checks configured — sync simulation.conf and configure hardware alerts.</div>
+        </div>
+      </div>
+
+      <div id="sim-detail" class="central-detail-panel hidden">
+        <div class="central-detail-header">
+          <button id="sim-detail-back" class="btn btn-secondary btn-small" type="button">← Back</button>
+          <div>
+            <h2 id="sim-detail-title">Simulation Detail</h2>
+            <p id="sim-detail-sub" class="central-detail-sub">—</p>
+          </div>
+          <div id="sim-detail-badge" class="sim-status-badge sim-unknown">—</div>
+        </div>
+        <div id="sim-site-list" class="sim-site-list"></div>
+      </div>
+
+      <div id="sim-clients-panel" class="central-detail-panel hidden">
+        <div class="central-detail-header">
+          <button id="sim-clients-back" class="btn btn-secondary btn-small" type="button">← Sites</button>
+          <div>
+            <h2 id="sim-clients-title">Clients</h2>
+            <p id="sim-clients-sub" class="central-detail-sub">—</p>
+          </div>
+          <div id="sim-clients-central-badge" class="sim-status-badge sim-unknown hidden"></div>
+        </div>
+        <div id="sim-clients-list" class="sim-clients-list">
+          <div class="sim-clients-loading">Loading…</div>
+        </div>
+      </div>
+      <div id="spoke-monitored-checks-content" style="margin-top:1rem;"></div>
+    </div>
+
+    <!-- Hardware sub-panel -->
+    <div id="simtop-hardware" class="setup-subpanel hidden">
+      <div id="hw-overview">
+        <div id="hw-checks-list" class="sim-checks-list"></div>
+      </div>
+      <div id="hw-detail" class="central-detail-panel hidden">
+        <div class="central-detail-header">
+          <button id="hw-detail-back" class="btn btn-secondary btn-small" type="button">← Back</button>
+          <div>
+            <h2 id="hw-detail-title">Hardware Alert</h2>
+            <p id="hw-detail-sub" class="central-detail-sub">—</p>
+          </div>
+          <div id="hw-detail-badge" class="sim-status-badge sim-unknown">—</div>
+        </div>
+        <div id="hw-site-list" class="sim-site-list"></div>
+      </div>
+      <div id="spoke-monitored-hardware-content" style="margin-top:1rem;"></div>
+    </div>
+
+    <!-- Client Count sub-panel -->
+    <div id="simtop-clients" class="setup-subpanel hidden">
+      <div id="cc-overview">
+        <div id="cc-checks-list" class="sim-checks-list"></div>
+      </div>
+      <div id="cc-detail" class="central-detail-panel hidden">
+        <div class="central-detail-header">
+          <button id="cc-detail-back" class="btn btn-secondary btn-small" type="button">← Back</button>
+          <div>
+            <h2 id="cc-detail-title">Client Count Monitor</h2>
+            <p id="cc-detail-sub" class="central-detail-sub">—</p>
+          </div>
+          <div id="cc-detail-badge" class="sim-status-badge sim-unknown">—</div>
+        </div>
+        <div id="cc-site-detail" class="sim-site-list"></div>
+      </div>
+      <div id="spoke-monitored-clients-content" style="margin-top:1rem;"></div>
+    </div>
+
+    <!-- Insights sub-panel -->
+    <div id="simtop-insights" class="setup-subpanel hidden">
+      <div id="spoke-monitored-insights-content">
+        <div class="central-empty">Loading…</div>
+      </div>
+    </div>
+  </main>
+
+  <!-- ── Central tab ── -->
+  <main id="tab-central" class="page tab-content hidden">
+    <nav class="setup-subnav" role="tablist">
+      <button class="setup-subtab central-subtab active" data-subtab="central-sites-panel" role="tab">Sites</button>
+      <button class="setup-subtab central-subtab" data-subtab="central-alerts-panel" role="tab">Alerts</button>
+      <button class="setup-subtab central-subtab" data-subtab="central-clients-panel" role="tab">Clients</button>
+      <button class="setup-subtab central-subtab" data-subtab="central-history-panel" role="tab">History</button>
+    </nav>
+
+    <!-- Sites sub-tab -->
+    <div id="central-sites-panel" class="setup-subpanel">
+      <div id="central-overview">
+        <section class="central-toolbar">
+          <div>
+            <div id="central-last-synced" class="central-last-synced">Last synced: —</div>
+          </div>
+          <div class="toolbar-actions">
+            <button id="central-refresh-btn" class="btn btn-secondary btn-small" type="button">Refresh Now</button>
+            <div id="central-token-status" class="central-token-status">
+              <span id="central-token-dot" class="status-dot offline"></span>
+              <span id="central-token-text">Token status unknown</span>
+            </div>
+          </div>
+        </section>
+
+        <div class="setup-card">
+          <table class="data-table" id="central-sites-table">
+            <thead>
+              <tr>
+                <th>Workspace Site</th>
+                <th>Central Site</th>
+                <th>✓ OK</th>
+                <th>✗ Errors</th>
+                <th>? Pending</th>
+                <th>Clients</th>
+                <th>Actions</th>
+              </tr>
+            </thead>
+            <tbody id="central-sites-tbody"></tbody>
+          </table>
+          <div id="central-empty" class="central-empty hidden">No Aruba Central site mappings configured yet.</div>
+        </div>
+      </div>
+
+      <div id="central-site-detail" class="central-detail-panel hidden">
+        <div class="central-detail-header">
+          <button id="central-detail-back" class="btn btn-secondary btn-small" type="button">← Back</button>
+          <div>
+            <h2 id="central-detail-title">Site Detail</h2>
+            <p id="central-detail-sub" class="central-detail-sub">—</p>
+          </div>
+        </div>
+
+        <div class="central-detail-grid">
+          <section class="central-panel-card">
+            <h3>Clients at Site</h3>
+            <div id="central-site-clients" class="client-mini-list"></div>
+          </section>
+
+          <section class="central-panel-card">
+            <h3>Check Status</h3>
+            <div id="central-site-checks" class="check-status-list"></div>
+          </section>
+        </div>
+
+        <section class="history-section">
+          <h3>Active Alerts from Central <span id="central-site-alerts-count" class="badge-count"></span></h3>
+          <div id="central-site-alerts"></div>
+        </section>
+
+        <section class="history-section">
+          <h3>Last 24 Hours</h3>
+          <div id="central-site-history"></div>
+        </section>
+      </div>
+    </div>
+
+    <!-- Alerts sub-tab -->
+    <div id="central-alerts-panel" class="setup-subpanel hidden">
+      <div class="setup-card setup-section-gap">
+        <div class="setup-card-header">
+          <h2>Active Alerts <span id="central-all-alerts-count" class="badge-count"></span></h2>
+        </div>
+        <div id="central-all-alerts-body"><p class="form-hint">Select this tab to load alerts across all sites.</p></div>
+      </div>
+    </div>
+
+    <!-- Clients sub-tab -->
+    <div id="central-clients-panel" class="setup-subpanel hidden">
+      <div class="setup-card setup-section-gap">
+        <div class="setup-card-header">
+          <h2>Wireless Clients by Site</h2>
+        </div>
+        <table class="data-table" id="central-clients-table">
+          <thead>
+            <tr>
+              <th>Workspace Site</th>
+              <th>Central Site</th>
+              <th>Wireless Clients</th>
+              <th>Sim Clients Connected</th>
+            </tr>
+          </thead>
+          <tbody id="central-clients-tbody"></tbody>
+        </table>
+        <div id="central-clients-empty" class="central-empty hidden">No client data available.</div>
+      </div>
+    </div>
+
+    <!-- History sub-tab -->
+    <div id="central-history-panel" class="setup-subpanel hidden">
+      <div class="setup-card setup-section-gap">
+        <div class="setup-card-header">
+          <h2>Alert History — All Sites (Last 24h)</h2>
+        </div>
+        <div id="central-all-history-body"><p class="form-hint">Select this tab to load history across all sites.</p></div>
+      </div>
+    </div>
+
+  </main>
+
+  <!-- ── Config tab ── -->
+  <main id="tab-config" class="page tab-content hidden">
+    <nav class="setup-subnav" role="tablist">
+      <button class="config-subtab active" data-subtab="config-simulation-panel" role="tab">Simulation Config</button>
+      <button class="config-subtab" data-subtab="config-user-overrides" role="tab">User Overrides</button>
+    </nav>
+
+    <div id="config-simulation-panel" class="config-subpanel"></div>
+
+    <div id="config-user-overrides" class="config-subpanel hidden">
+      <!-- Rendered by renderSpokeUserOverridesEditor() -->
+    </div>
+  </main>
+
+  <!-- ── Setup tab ── -->
+  <main id="tab-setup" class="page tab-content hidden">
+    <nav class="setup-subnav" role="tablist">
+      <button class="setup-subtab" data-subtab="setup-github" role="tab">GitHub</button>
+      <button class="setup-subtab" data-subtab="setup-simulation" role="tab">Simulation</button>
+      <button class="setup-subtab" data-subtab="setup-proxmox" role="tab">Proxmox</button>
+      <button class="setup-subtab" data-subtab="setup-relay" role="tab">Hub</button>
+      <button class="setup-subtab" data-subtab="setup-central" role="tab">Central API</button>
+      <button class="setup-subtab" data-subtab="setup-notifications" role="tab">Notifications</button>
+      <button class="setup-subtab" data-subtab="setup-tls" role="tab">TLS Certificate</button>
+      <button class="setup-subtab" data-subtab="setup-account" role="tab">Account</button>
+      <button class="setup-subtab" data-subtab="setup-troubleshoot" role="tab">Troubleshooting</button>
+    </nav>
+
+    <div id="setup-github" class="setup-subpanel active">
+      <div class="setup-card">
+            <div class="setup-card-header">
+              <h2>Repository Settings</h2>
+              <p>Choose which branch of <strong>solutions-hpe/client-sim</strong> the dashboard syncs from.
+                 The repository URL is fixed. Changes take effect immediately and persist across restarts.</p>
+            </div>
+
+            <div class="setup-form">
+              <div class="form-group">
+                <label class="form-label" for="repo-url-input">Repository</label>
+                <input id="repo-url-input" class="form-input input-readonly" type="text"
+                       value="https://github.com/solutions-hpe/client-sim.git" readonly>
+                <span class="form-hint">Fixed — only branch can be changed.</span>
+              </div>
+
+              <div class="form-group">
+                <label class="form-label" for="branch-input">Branch</label>
+                <input id="branch-input" class="form-input" type="text"
+                       placeholder="e.g. main, dev, feature/test" autocomplete="off" spellcheck="false">
+                <span class="form-hint">Letters, numbers, hyphens, underscores, dots, and slashes only.</span>
+              </div>
+
+              <div class="form-group">
+                <label class="form-label" for="github-token-input">GitHub Token</label>
+                <input id="github-token-input" class="form-input" type="password"
+                       placeholder="Paste token — leave blank to keep current" autocomplete="new-password">
+                <span class="form-hint" id="github-token-status"></span>
+              </div>
+
+              <div class="form-actions" style="display:flex;justify-content:flex-end">
+                <button id="sync-now-btn" class="btn btn-primary" type="button">⬇ Sync from GitHub Now</button>
+              </div>
+
+              <div id="sync-now-message" class="settings-message hidden" role="alert"></div>
+
+              <div id="settings-message" class="settings-message hidden" role="alert"></div>
+            </div>
+
+            <hr class="setup-divider">
+
+            <div class="setup-status-grid">
+              <div class="setup-status-item">
+                <span class="setup-status-label">GitHub Sync Status</span>
+                <span id="setup-sync-state" class="setup-status-value">—</span>
+              </div>
+              <div class="setup-status-item">
+                <span class="setup-status-label">Last Synced</span>
+                <span id="setup-sync-time" class="setup-status-value">—</span>
+              </div>
+              <div class="setup-status-item">
+                <span class="setup-status-label">Active branch</span>
+                <span id="setup-active-branch" class="setup-status-value">—</span>
+              </div>
+              <div class="setup-status-item">
+                <span class="setup-status-label">Repo version</span>
+                <span id="setup-repo-version" class="setup-status-value">—</span>
+              </div>
+              <div class="setup-status-item">
+                <span class="setup-status-label">Last error</span>
+                <span id="setup-sync-error" class="setup-status-value muted">—</span>
+              </div>
+            </div>
+          </div>
+
+      <div class="setup-card setup-section-gap">
+            <div class="setup-card-header">
+              <h2>GitHub Sync</h2>
+              <p>How often the server pulls the latest scripts from the repository. Default: 5 minutes.</p>
+            </div>
+            <div class="setup-form">
+              <div class="form-row">
+                <label class="form-label" for="sync-interval-input">Sync interval (seconds)</label>
+                <input id="sync-interval-input" class="form-input" type="number" min="60" max="86400" placeholder="300" style="width:120px;" />
+                <span class="form-hint" style="margin-left:.5rem;">Min 60 · Max 86400 (24 hr)</span>
+              </div>
+              <div id="sync-interval-msg" class="settings-message hidden" role="alert"></div>
+            </div>
+          </div>
+
+      <div class="setup-card setup-section-gap">
+            <div class="setup-card-header">
+              <h2>WebUI Version</h2>
+              <p>The WebUI checks for a new installer version every 24 hours and updates automatically. Use the button below to check and apply immediately.</p>
+            </div>
+            <div class="setup-status-grid">
+              <div class="setup-status-item">
+                <span class="setup-status-label">Installed version</span>
+                <span id="version-current" class="setup-status-value">—</span>
+              </div>
+              <div class="setup-status-item">
+                <span class="setup-status-label">Available version</span>
+                <span id="version-available" class="setup-status-value">—</span>
+              </div>
+              <div class="setup-status-item">
+                <span class="setup-status-label">Last checked</span>
+                <span id="version-last-checked" class="setup-status-value muted">—</span>
+              </div>
+            </div>
+            <div class="setup-form">
+              <div class="form-actions" style="display:flex;justify-content:flex-end">
+                <button id="check-update-btn" class="btn btn-primary" type="button">🔄 Check &amp; Update Now</button>
+              </div>
+              <div id="update-message" class="settings-message hidden" role="alert"></div>
+              <details id="update-log-details" class="hidden" style="margin-top:10px;">
+                <summary style="cursor:pointer;font-size:0.82rem;color:rgba(255,255,255,0.6);">Show install output</summary>
+                <pre id="update-log-output" class="update-log-pre"></pre>
+              </details>
+            </div>
+          </div>
+    </div>
+
+        <div id="setup-simulation" class="setup-subpanel hidden">
+      <div id="setup-simulation-panel"></div>
+    </div>
+
+    <div id="setup-proxmox" class="setup-subpanel hidden">
+      <!-- USB Auto-Provisioning card -->
+      <div class="setup-card setup-section-gap">
+        <div class="setup-card-header">
+          <h2>USB Auto-Provisioning</h2>
+          <p>Configure certified USB dongles, provisioning behavior, and VM template assignments.</p>
+        </div>
+        <div class="setup-form">
+
+          <!-- Provisioning toggles -->
+          <div class="settings-section">
+            <div class="settings-section-title">Provisioning Behavior</div>
+            <div class="toggle-grid">
+              <label class="toggle-label">
+                <input type="checkbox" id="usb-auto-provision">
+                <span>Auto-Provision VMs</span>
+              </label>
+              <label class="toggle-label">
+                <input type="checkbox" id="use-all-dongles">
+                <span>Use All Available Dongles</span>
+              </label>
+            </div>
+            <span class="form-hint">When enabled, if the preferred dongle type runs out, remaining certified dongles of the other type will be provisioned automatically using their own sim profile.</span>
+            <div class="form-row" style="margin-top:12px;">
+              <div class="form-group">
+                <label class="form-label" for="usb-sim-phy">Preferred Dongle Type</label>
+                <select id="usb-sim-phy" class="form-input">
+                  <option value="wireless">Wireless</option>
+                  <option value="ethernet">Ethernet</option>
+                  <option value="any">Any</option>
+                </select>
+                <span class="form-hint">Preferred dongle type for auto-provisioning. Choose Any to allow either certified type.</span>
+              </div>
+              <div class="form-group">
+                <label class="form-label" for="usb-missing-timeout">Destroy after missing (minutes)</label>
+                <input id="usb-missing-timeout" class="form-input" type="number" value="60" min="1"
+                       placeholder="60">
+                <span class="form-hint">How long a dongle can be absent before its VM is destroyed.</span>
+              </div>
+            </div>
+          </div>
+
+          <!-- VM templates -->
+          <div class="settings-section">
+            <div class="settings-section-title">Parallel Provisioning</div>
+            <div class="form-row">
+              <div class="form-group">
+                <label class="form-label" for="reclone-concurrency">Max parallel operations</label>
+                <input id="reclone-concurrency" class="form-input" type="number" value="1" min="1" max="20"
+                       placeholder="1">
+                <span class="form-hint">Number of VMs to reclone or provision simultaneously. 1 = sequential (safe). Increase for faster fleet operations.</span>
+              </div>
+            </div>
+          </div>
+
+          <div class="settings-section">
+            <div class="settings-section-title">VM Templates</div>
+            <div class="form-row">
+              <div class="form-group">
+                <label class="form-label" for="vm-image-1-template-id">VM Image 1 Template VMIDs</label>
+                <input id="vm-image-1-template-id" class="form-input" type="text" value="100" placeholder="e.g. 9000 or 9000, 9005-9010">
+                <span class="form-hint">Individual VMIDs or ranges. The lowest valid template match is used first.</span>
+              </div>
+              <div class="form-group">
+                <label class="form-label" for="vm-image-2-template-id">VM Image 2 Template VMIDs <span class="form-hint" style="font-weight:400;">(optional)</span></label>
+                <input id="vm-image-2-template-id" class="form-input" type="text" value="200" placeholder="e.g. 9100-9200">
+                <span class="form-hint">Must not overlap with VM Image 1.</span>
+              </div>
+              <div class="form-group">
+                <label class="form-label" for="vm-image-1-pct">VM Image 1 % target</label>
+                <input id="vm-image-1-pct" class="form-input" type="number" value="50" min="0" max="100">
+                <span class="form-hint">Image 2 gets the remainder.</span>
+              </div>
+            </div>
+            <div id="template-vmid-spec-error" class="settings-message hidden" role="alert"></div>
+          </div>
+
+          <!-- Certified devices table -->
+          <div class="settings-section">
+            <div class="settings-section-title">Certified Devices</div>
+            <!-- Hub-managed notice: shown when this spoke is under hub control — hide locally to avoid confusion -->
+            <div id="usb-hub-managed-notice" style="display:none;margin-bottom:8px;padding:6px 10px;background:var(--bg-secondary);border-left:3px solid var(--accent-blue);border-radius:4px;font-size:0.82rem;color:var(--text-secondary);">
+              🔒 USB allowlist is managed by the Hub. To make changes, edit the device list from the Hub UI.
+            </div>
+            <div class="table-scroll">
+              <table class="data-table" id="usb-vidpid-table">
+                <thead>
+                  <tr><th>VID:PID</th><th>Type</th><th>Label</th><th></th></tr>
+                </thead>
+                <tbody id="usb-vidpid-tbody"></tbody>
+              </table>
+            </div>
+            <!-- Add Device form: hidden by JS when hub-managed so users aren't tempted to add locally -->
+            <div id="usb-add-device-form" class="form-row" style="margin-top:8px;align-items:flex-end;">
+              <div class="form-group" style="flex:1;">
+                <label class="form-label" for="new-vidpid">VID:PID</label>
+                <input id="new-vidpid" class="form-input" type="text" placeholder="e.g. 2357:012d"
+                       autocomplete="off" spellcheck="false">
+              </div>
+              <div class="form-group">
+                <label class="form-label" for="new-vidpid-type">Type</label>
+                <select id="new-vidpid-type" class="form-input">
+                  <option value="wireless">Wireless</option>
+                  <option value="wired">Wired</option>
+                </select>
+              </div>
+              <div class="form-group" style="flex:2;">
+                <label class="form-label" for="new-vidpid-label">Label</label>
+                <input id="new-vidpid-label" class="form-input" type="text" placeholder="Friendly name">
+              </div>
+              <div class="form-group" style="padding-top:4px;">
+                <button type="button" class="btn btn-secondary" id="add-vidpid-btn">+ Add Device</button>
+              </div>
+            </div>
+          </div>
+
+          <!-- Ignored devices -->
+          <div class="settings-section">
+            <div class="settings-section-title">Ignored Devices</div>
+            <div id="usb-ignored-list" class="badge-list"></div>
+          </div>
+
+          <div id="usb-settings-message" class="settings-message hidden" role="alert"></div>
+
+        </div>
+      </div>
+
+      <!-- Layer 1 VLAN Range card -->
+      <div class="setup-card setup-section-gap">
+        <div class="setup-card-header">
+          <h2>Layer 1 VLAN Range</h2>
+          <p>When a bucket has <code>l1=yes</code>, the provisioned VM gets a second NIC on <strong>vmbr254</strong> tagged with a VLAN from this range. VLAN ID is assigned sequentially starting from the Start value.</p>
+        </div>
+        <div class="setup-form">
+          <div class="settings-section">
+            <div class="form-row">
+              <div class="form-group">
+                <label class="form-label" for="l1-vlan-start">VLAN Start</label>
+                <input id="l1-vlan-start" class="form-input" type="number" value="100" min="1" max="4094"
+                       style="width:120px;" spellcheck="false">
+              </div>
+              <div class="form-group">
+                <label class="form-label" for="l1-vlan-end">VLAN End</label>
+                <input id="l1-vlan-end" class="form-input" type="number" value="199" min="1" max="4094"
+                       style="width:120px;" spellcheck="false">
+              </div>
+            </div>
+          </div>
+          <div id="l1-vlan-message" class="settings-message hidden" role="alert"></div>
+        </div>
+      </div>
+
+      <!-- Ignored Clients card -->
+      <div class="setup-card setup-section-gap">
+        <div class="setup-card-header">
+          <h2>Ignored Clients</h2>
+          <p>Clients with these hostnames are silently ignored — no telemetry processed, not shown in the dashboard. Useful for template VMs that have not yet been renamed.</p>
+        </div>
+        <div class="setup-form">
+          <div class="settings-section">
+            <div id="ignored-hostnames-list" class="badge-list"></div>
+            <div class="form-row" style="margin-top:10px;">
+              <div class="form-group">
+                <input id="new-ignored-hostname" class="form-input" type="text"
+                       placeholder="e.g. sim-rpi-0000" spellcheck="false">
+              </div>
+              <div class="form-group" style="padding-top:4px;">
+                <button type="button" class="btn btn-secondary" id="add-ignored-hostname-btn">+ Ignore</button>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- VM Maintenance card -->
+      <div class="setup-card setup-section-gap">
+        <div class="setup-card-header">
+          <h2>VM Maintenance</h2>
+          <p>Configure auto-recovery and scheduled fleet reclones.</p>
+        </div>
+        <div class="setup-form">
+
+          <div class="settings-section">
+            <div class="settings-section-title">Auto-Recovery</div>
+            <div class="form-row">
+              <div class="form-group">
+                <label class="form-label" for="vm-silent-timeout">Reclone if silent for (hours)</label>
+                <input id="vm-silent-timeout" class="form-input" type="number" value="24" min="1"
+                       placeholder="24">
+                <span class="form-hint">VMs not reporting telemetry for this long are automatically recloned.</span>
+              </div>
+            </div>
+          </div>
+
+          <div class="settings-section">
+            <div class="settings-section-title">Scheduled Reclone</div>
+            <div class="toggle-grid">
+              <label class="toggle-label">
+                <input type="checkbox" id="reclone-schedule-enabled">
+                <span>Enable Scheduled Reclone</span>
+              </label>
+            </div>
+            <div id="reclone-schedule-fields" class="form-row" style="margin-top:12px;">
+              <div class="form-group">
+                <label class="form-label" for="reclone-schedule-day">Day of week</label>
+                <select id="reclone-schedule-day" class="form-input">
+                  <option>sunday</option><option>monday</option><option>tuesday</option>
+                  <option>wednesday</option><option>thursday</option><option>friday</option>
+                  <option>saturday</option>
+                </select>
+              </div>
+              <div class="form-group">
+                <label class="form-label" for="reclone-schedule-time">Time (UTC)</label>
+                <input type="time" id="reclone-schedule-time" class="form-input" value="02:00">
+              </div>
+            </div>
+          </div>
+
+          <div id="vm-maintenance-message" class="settings-message hidden" role="alert"></div>
+
+        </div>
+      </div>
+    </div>
+
+    <div id="setup-relay" class="setup-subpanel hidden">
+      <div class="setup-card setup-section-gap">
+            <div class="setup-card-header">
+              <h2>Hub</h2>
+              <p>Configure optional Hub sync between this WebUI and a central management server.</p>
+            </div>
+
+            <div class="setup-form">
+              <div class="settings-section">
+                <div class="form-row">
+                  <div class="form-group">
+                    <label>Hub Enabled</label>
+                    <select id="relay-enabled-select" data-key="relay_enabled">
+                      <option value="off">Off</option>
+                      <option value="on">On</option>
+                    </select>
+                  </div>
+                  <div class="form-group" style="flex:2;">
+                    <label>Spoke Name</label>
+                    <input id="relay-spoke-name-input" type="text" data-key="relay_spoke_name" placeholder="e.g. Lab-01-Proxmox">
+                  </div>
+                </div>
+                <div class="form-row">
+                  <div class="form-group" style="flex:2;">
+                    <label>Server URL</label>
+                    <input id="relay-server-url-input" type="text" data-key="relay_server_url" placeholder="https://hub.example.com">
+                  </div>
+                </div>
+                <div class="form-row">
+                  <div class="form-group" style="flex:2;">
+                    <label>Tenant ID <span class="form-hint-inline">(optional — pre-register with a specific tenant)</span></label>
+                    <input id="relay-tenant-hint-input" type="text" data-key="relay_tenant_hint" placeholder="e.g. abc123-tenant-id">
+                  </div>
+                </div>
+                <!-- Adds the isolation timeout control so operators can tune when missing hub contact pauses future config pushes. --><div class="form-row"><div class="form-group"><label>Hub Isolation Timeout (min) <span class="form-hint-inline">(pause hub config pushes if unreachable longer than this)</span></label><input id="hub-isolation-timeout-input" type="number" min="5" max="1440" data-key="hub_isolation_timeout_min" placeholder="60"></div></div>
+                <div class="form-row">
+                  <div class="form-group" style="flex:2;">
+                    <label>Onboarding PSK <span class="form-hint-inline">(optional — enables auto-approval without superadmin review)</span></label>
+                    <input id="relay-psk-input" type="password" data-key="relay_onboarding_psk" placeholder="Leave blank to keep existing" autocomplete="new-password">
+                  </div>
+                </div>
+              </div>
+
+              <div id="relay-message" class="settings-message hidden" role="alert"></div>
+
+              <div class="setup-status-grid" style="margin-top: 1rem;">
+                <div class="setup-status-item">
+                  <span class="setup-status-label">Status</span>
+                  <span id="relay-state-text" class="setup-status-value">—</span>
+                </div>
+                <div class="setup-status-item">
+                  <span class="setup-status-label">Spoke ID</span>
+                  <span id="relay-spoke-id-display" class="setup-status-value muted">—</span>
+                </div>
+                <div class="setup-status-item">
+                  <span class="setup-status-label">API Key</span>
+                  <span id="relay-apikey-status" class="setup-status-value muted">—</span>
+                </div>
+                <div class="setup-status-item">
+                  <span class="setup-status-label">Last Sync</span>
+                  <span id="relay-last-time" class="setup-status-value">—</span>
+                </div>
+                <!-- Shows whether the spoke is currently isolating hub pushes so the setup status grid explains paused config updates. --><div class="setup-status-item"><span class="setup-status-label">Isolation</span><span id="relay-isolation-status" class="setup-status-value">—</span></div>
+                <div class="setup-status-item">
+                  <span class="setup-status-label">Last Error</span>
+                  <span id="relay-last-error" class="setup-status-value muted">—</span>
+                </div>
+              </div>
+            </div>
+            <!-- Registration Diagnostics -->
+            <div style="margin-top:14px;">
+              <button id="relay-diag-btn" class="btn btn-secondary btn-small" type="button">🔍 Run Registration Diagnostics</button>
+            </div>
+            <div id="relay-diag-panel" class="hidden" style="margin-top:12px;">
+              <div class="setup-status-grid" style="background:var(--bg-secondary);border-radius:6px;padding:12px;font-size:0.8rem;">
+                <div style="font-weight:600;margin-bottom:8px;color:var(--text-primary);">Hub Reachability</div>
+                <div id="relay-diag-reach" style="margin-bottom:12px;font-family:monospace;white-space:pre-wrap;color:var(--text-secondary);"></div>
+                <div style="font-weight:600;margin-bottom:8px;color:var(--text-primary);">Config Check</div>
+                <div id="relay-diag-config" style="margin-bottom:12px;font-family:monospace;white-space:pre-wrap;color:var(--text-secondary);"></div>
+                <div style="font-weight:600;margin-bottom:8px;color:var(--text-primary);">Registration Log <span id="relay-diag-log-count" class="badge-count">0</span></div>
+                <div id="relay-diag-log" style="font-family:monospace;font-size:0.75rem;white-space:pre-wrap;max-height:220px;overflow-y:auto;color:var(--text-secondary);"></div>
+              </div>
+            </div>
+          </div>
+        </div>
+    </div>
+
+    <div id="setup-central" class="setup-subpanel hidden">
+      <div class="setup-card setup-section-gap">
+            <div class="setup-card-header">
+              <h2>Central API</h2>
+              <p>Configure the active Central API connection mode for this spoke.</p>
+            </div>
+
+            <div class="setup-form">
+              <div class="form-group">
+                <label class="form-label">Mode</label>
+                <div class="segmented-control central-mode-toggle" id="central-api-mode-toggle">
+                  <button type="button" class="active" data-mode="classic" id="central-api-classic">Classic</button>
+                  <button type="button" data-mode="central" id="central-api-central">Central</button>
+                </div>
+              </div>
+
+              <div id="central-classic-fields">
+                <div class="form-group">
+                  <label class="form-label" for="central-classic-url">URL</label>
+                  <input id="central-classic-url" class="form-input" type="text"
+                         placeholder="https://classic-central.example.com" autocomplete="off" spellcheck="false">
+                </div>
+
+                <div class="form-group">
+                  <label class="form-label" for="central-classic-username">Username</label>
+                  <input id="central-classic-username" class="form-input" type="text" autocomplete="off" spellcheck="false">
+                </div>
+
+                <div class="form-group">
+                  <label class="form-label" for="central-classic-password">Password</label>
+                  <input id="central-classic-password" class="form-input" type="password"
+                         placeholder="Leave blank to keep current" autocomplete="new-password">
+                  <span class="form-hint" id="central-classic-password-status"></span>
+                </div>
+              </div>
+
+              <div id="central-new-fields" class="hidden">
+                <p class="form-hint" style="margin:0 0 12px">
+                  Central uses HPE GreenLake client credentials. Go to <strong>Manage Workspace → Personal API clients</strong>
+                  and create a credential scoped to your Central instance.
+                </p>
+
+                <div class="form-group">
+                  <label class="form-label" for="central-central-url">URL</label>
+                  <input id="central-central-url" class="form-input" type="text"
+                         placeholder="https://apigw-prod2.central.arubanetworks.com" autocomplete="off" spellcheck="false">
+                </div>
+
+                <div class="form-group">
+                  <label class="form-label" for="central-client-id">Client ID</label>
+                  <input id="central-client-id" class="form-input" type="text" autocomplete="off" spellcheck="false">
+                </div>
+
+                <div class="form-group">
+                  <label class="form-label" for="central-client-secret">Client Secret</label>
+                  <input id="central-client-secret" class="form-input" type="password"
+                         placeholder="Leave blank to keep current" autocomplete="new-password">
+                  <span class="form-hint" id="central-client-secret-status"></span>
+                </div>
+
+                <div class="form-group">
+                  <label class="form-label" for="central-customer-id">Customer ID <span class="token-optional-badge">optional</span></label>
+                  <input id="central-customer-id" class="form-input" type="text" autocomplete="off" spellcheck="false">
+                  <span class="form-hint">Only needed when your Central API client requires a customer identifier.</span>
+                </div>
+              </div>
+
+              <div class="form-actions central-config-actions">
+                <button id="central-test-btn" class="btn btn-secondary" type="button">Test Connection</button>
+                <button id="central-save-btn" class="btn btn-primary" type="button">Save</button>
+                <button id="central-clear-btn" class="btn btn-danger" type="button">Clear Config</button>
+              </div>
+
+              <div id="central-config-msg" class="settings-message hidden" role="alert"></div>
+            </div>
+          </div>
+
+      <div class="setup-card setup-section-gap">
+            <div class="setup-card-header">
+              <h2>Site Mappings</h2>
+              <p>Match your simulation.conf wsite values to Aruba Central site names. Click <strong>Load Sites</strong> to populate dropdowns from both sources.</p>
+            </div>
+
+            <div class="setup-form">
+              <div class="form-actions" style="margin-bottom:0.75rem;">
+                <button id="load-sites-btn" class="btn btn-secondary" type="button">🔄 Load Sites</button>
+                <span id="sites-load-status" class="form-hint" style="margin-left:0.75rem;"></span>
+              </div>
+
+              <table class="mapping-table">
+                <thead>
+                  <tr>
+                    <th>simulation.conf wsite</th>
+                    <th>Aruba Central Site</th>
+                    <th></th>
+                  </tr>
+                </thead>
+                <tbody id="site-mappings-body"></tbody>
+              </table>
+
+              <div class="form-actions">
+                <button id="add-mapping-btn" class="btn btn-secondary" type="button">+ Add Row</button>
+              </div>
+
+              <div id="central-mappings-msg" class="settings-message hidden" role="alert"></div>
+            </div>
+          </div>
+
+      <div class="setup-card setup-section-gap">
+            <div class="setup-card-header">
+              <h2>Monitored Checks</h2>
+              <p>Select which Aruba Central alerts and AI Insights to monitor. OK = present during polling. ERROR = missing.</p>
+            </div>
+
+            <div class="setup-form">
+              <div id="selected-checks-preview" class="form-hint">No checks selected yet.</div>
+              <div class="form-actions">
+                <button id="central-load-checks-btn" class="btn btn-secondary" type="button">Load Available Checks</button>
+              </div>
+
+              <div id="available-checks-container"></div>
+              <div id="central-checks-msg" class="settings-message hidden" role="alert"></div>
+            </div>
+          </div>
+
+      <div class="setup-card setup-section-gap">
+            <div class="setup-card-header">
+              <h2>Hardware Alerts</h2>
+              <p>Select which Aruba Central alert types to monitor as hardware health checks (e.g. AP Down, Switch Down).</p>
+            </div>
+            <div class="setup-form">
+              <div id="hw-checks-preview" class="form-hint">No hardware checks selected yet.</div>
+              <div class="form-actions">
+                <button id="hw-load-alerts-btn" class="btn btn-secondary" type="button">Load Available Alert Types</button>
+              </div>
+              <div id="hw-checks-container"></div>
+              <div id="hw-checks-msg" class="settings-message hidden" role="alert"></div>
+            </div>
+          </div>
+    </div>
+
+    <div id="setup-notifications" class="setup-subpanel hidden">
+      <div class="setup-card setup-section-gap">
+            <div class="setup-card-header">
+              <h2>Email Notifications</h2>
+              <p>Send an email when a simulation check transitions from OK to failing.</p>
+            </div>
+            <div class="setup-form">
+              <div class="form-row">
+                <label class="form-label">Enable</label>
+                <label class="toggle-switch">
+                  <input id="email-enabled-toggle" type="checkbox" />
+                  <span class="toggle-slider"></span>
+                </label>
+              </div>
+              <div class="form-row">
+                <label class="form-label" for="smtp-host">SMTP Host</label>
+                <input id="smtp-host" class="form-input" type="text" placeholder="smtp.example.com" />
+              </div>
+              <div class="form-row">
+                <label class="form-label" for="smtp-port">SMTP Port</label>
+                <input id="smtp-port" class="form-input" type="number" placeholder="587" style="width:100px;" />
+              </div>
+              <div class="form-row">
+                <label class="form-label" for="smtp-user">Username</label>
+                <input id="smtp-user" class="form-input" type="text" placeholder="user@example.com" />
+              </div>
+              <div class="form-row">
+                <label class="form-label" for="smtp-password">Password</label>
+                <input id="smtp-password" class="form-input" type="password" placeholder="••••••••" autocomplete="new-password" />
+              </div>
+              <div class="form-row">
+                <label class="form-label" for="smtp-from">From address</label>
+                <input id="smtp-from" class="form-input" type="email" placeholder="client-sim@example.com" />
+              </div>
+              <div class="form-row">
+                <label class="form-label" for="smtp-to">To (comma-separated)</label>
+                <input id="smtp-to" class="form-input" type="text" placeholder="ops@example.com, noc@example.com" />
+              </div>
+              <button id="test-email-btn" class="btn btn-secondary" type="button">Send Test</button>
+              <div id="email-notif-msg" class="settings-message hidden" role="alert"></div>
+            </div>
+          </div>
+
+      <div class="setup-card setup-section-gap">
+            <div class="setup-card-header">
+              <h2>Teams Webhook</h2>
+              <p>Post an Adaptive Card to a Microsoft Teams channel when a check fails.</p>
+            </div>
+            <div class="setup-form">
+              <div class="form-row">
+                <label class="form-label">Enable</label>
+                <label class="toggle-switch">
+                  <input id="teams-enabled-toggle" type="checkbox" />
+                  <span class="toggle-slider"></span>
+                </label>
+              </div>
+              <div class="form-row">
+                <label class="form-label" for="teams-webhook-url">Webhook URL</label>
+                <input id="teams-webhook-url" class="form-input" type="url" placeholder="https://outlook.office.com/webhook/..." />
+              </div>
+              <button id="test-teams-btn" class="btn btn-secondary" type="button">Send Test</button>
+              <div id="teams-notif-msg" class="settings-message hidden" role="alert"></div>
+            </div>
+          </div>
+    </div>
+
+    <!-- ── Troubleshooting sub-tab ── -->
+
+
+    <div id="setup-tls" class="setup-subpanel hidden">
+      <div class="setup-card setup-section-gap" style="max-width:760px;">
+        <div class="setup-card-header">
+          <h2>TLS Certificate</h2>
+          <p>Configure automatic certificate management via ACME (Let's Encrypt / ZeroSSL). Enabling ACME will switch the spoke to HTTPS. Ensure port 80 and 443 (or your spoke port) are accessible.</p>
+        </div>
+        <div id="spoke-acme-cert-status" class="setup-status-grid"></div>
+        <div class="setup-form" style="margin-top:16px;">
+          <div class="form-group">
+            <label class="form-label">Domain</label>
+            <input id="spoke-acme-domain" type="text" class="form-input" placeholder="spoke.example.com">
+          </div>
+          <div class="form-group">
+            <label class="form-label">Contact Email</label>
+            <input id="spoke-acme-email" type="email" class="form-input" placeholder="admin@example.com">
+          </div>
+          <div class="form-group">
+            <label class="form-label">Certificate Authority</label>
+            <select id="spoke-acme-ca" class="form-input">
+              <option value="letsencrypt">Let's Encrypt (Production)</option>
+              <option value="letsencrypt_staging">Let's Encrypt (Staging)</option>
+              <option value="zerossl">ZeroSSL</option>
+            </select>
+          </div>
+          <div class="form-group">
+            <label class="form-label">Challenge Type</label>
+            <select id="spoke-acme-challenge" class="form-input">
+              <option value="http-01">HTTP-01 (port 80 must be open)</option>
+              <option value="dns-01">DNS-01 (requires DNS provider)</option>
+            </select>
+          </div>
+          <div id="spoke-acme-dns-section" class="hidden">
+            <div class="form-group">
+              <label class="form-label">DNS Provider</label>
+              <select id="spoke-acme-dns-provider" class="form-input">
+                <option value="cloudflare">Cloudflare</option>
+                <option value="hurricane_electric">Hurricane Electric DNS</option>
+                <option value="azure_dns">Azure DNS (coming soon)</option>
+                <option value="route53">AWS Route53 (coming soon)</option>
+              </select>
+            </div>
+            <div id="spoke-acme-cloudflare-fields" class="form-group">
+              <label class="form-label">Cloudflare API Token</label>
+              <input id="spoke-acme-cf-token" type="password" class="form-input" placeholder="Leave blank to keep existing">
+            </div>
+            <div id="spoke-acme-he-fields" class="hidden">
+              <div class="form-group">
+                <label class="form-label">HE DDNS Key</label>
+                <input id="spoke-acme-he-ddns-key" type="password" class="form-input" placeholder="Leave blank to keep existing">
+                <p class="form-hint">In dns.he.net: create a TXT record for <code>_acme-challenge.yourdomain</code>, enable DDNS on it, then paste the generated key here.</p>
+              </div>
+            </div>
+          </div>
+          <div class="form-group">
+            <label class="checkbox-label"><input id="spoke-acme-enabled" type="checkbox"> Enable automatic renewal</label>
+          </div>
+          <div class="form-group">
+            <label class="checkbox-label"><input id="spoke-tls-enabled" type="checkbox"> Enable HTTPS (SPOKE_TLS) on next restart</label>
+          </div>
+          <div style="display:flex;gap:8px;margin-top:12px;">
+            <button class="btn btn-primary" type="button" onclick="saveSpokeAcmeConfig()">Save</button>
+            <button class="btn btn-secondary" type="button" onclick="requestSpokeAcmeCert()" id="spoke-acme-request-btn">Request Certificate Now</button>
+          </div>
+          <p id="spoke-acme-msg" class="form-msg"></p>
+        </div>
+      </div>
+    </div>
+
+    <div id="setup-account" class="setup-subpanel hidden">
+      <div class="setup-card" style="max-width:480px;">
+        <div class="setup-card-header"><h2>Change Password</h2></div>
+        <div class="setup-form">
+          <div class="form-group">
+            <label class="form-label" for="sp-pw-current">Current Password <span class="form-hint">(leave blank if not set)</span></label>
+            <input id="sp-pw-current" type="password" class="form-input" placeholder="Leave blank if no password is set">
+          </div>
+          <div class="form-group">
+            <label class="form-label" for="sp-pw-new">New Password</label>
+            <input id="sp-pw-new" type="password" class="form-input">
+          </div>
+          <div class="form-group">
+            <label class="form-label" for="sp-pw-confirm">Confirm New Password</label>
+            <input id="sp-pw-confirm" type="password" class="form-input">
+          </div>
+          <div class="form-actions">
+            <button id="sp-pw-save-btn" class="btn btn-primary" type="button">Save Password</button>
+            <span id="sp-pw-msg" class="form-msg"></span>
+          </div>
+        </div>
+      </div>
+
+      <div class="setup-card" style="max-width:600px;margin-top:16px;">
+        <div class="setup-card-header"><h2>Local Users</h2></div>
+        <p class="setup-card-desc">Manage local accounts for spoke WebUI access. The primary <code>admin</code> account cannot be removed.</p>
+        <table class="data-table" id="sp-local-users-table">
+          <thead><tr><th>Username</th><th>Role</th><th></th></tr></thead>
+          <tbody id="sp-local-users-body"><tr><td colspan="3" class="muted">Loading…</td></tr></tbody>
+        </table>
+        <div class="setup-form" style="margin-top:12px;display:flex;gap:8px;align-items:flex-end;flex-wrap:wrap;">
+          <div class="form-group" style="margin:0;flex:1;min-width:140px;">
+            <label class="form-label" for="sp-new-username">Username</label>
+            <input id="sp-new-username" type="text" class="form-input" placeholder="username">
+          </div>
+          <div class="form-group" style="margin:0;flex:1;min-width:140px;">
+            <label class="form-label" for="sp-new-password">Password</label>
+            <input id="sp-new-password" type="password" class="form-input">
+          </div>
+          <div class="form-group" style="margin:0;">
+            <label class="form-label" for="sp-new-role">Role</label>
+            <select id="sp-new-role" class="form-input">
+              <option value="admin">Admin</option>
+              <option value="viewer">Viewer</option>
+            </select>
+          </div>
+          <button id="sp-add-user-btn" class="btn btn-primary" type="button" style="align-self:flex-end;">Add User</button>
+        </div>
+        <span id="sp-user-msg" class="form-msg"></span>
+      </div>
+    </div>
+
+    <div id="setup-troubleshoot" class="setup-subpanel hidden">
+      <div class="setup-card">
+        <div class="setup-card-header">
+          <h2>Troubleshooting</h2>
+          <p>Operational tools — use when something is stuck, corrupted, or when setting up a new Proxmox server.</p>
+        </div>
+      </div>
+
+      <!-- System Health -->
+      <div class="setup-card setup-section-gap">
+        <div class="setup-card-header" style="display:flex;justify-content:space-between;align-items:center;">
+          <h2>System Health</h2>
+          <button id="syshealth-refresh-btn" class="btn btn-secondary" style="font-size:12px;padding:4px 10px;">↺ Refresh</button>
+        </div>
+        <div id="syshealth-body" style="display:grid;grid-template-columns:1fr 1fr;gap:16px 24px;padding:4px 0 8px;">
+          <!-- Service Status -->
+          <div>
+            <div style="font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:.05em;margin-bottom:6px;">Service</div>
+            <div style="display:flex;align-items:center;gap:8px;">
+              <span id="svc-status-dot" style="width:10px;height:10px;border-radius:50%;background:var(--muted);flex-shrink:0;"></span>
+              <span id="svc-status-label" style="font-size:13px;font-weight:600;">—</span>
+            </div>
+          </div>
+          <!-- Uptime -->
+          <div>
+            <div style="font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:.05em;margin-bottom:6px;">Uptime</div>
+            <span id="syshealth-uptime" style="font-size:13px;font-weight:600;">—</span>
+          </div>
+          <!-- Disk -->
+          <div style="grid-column:1/-1;">
+            <div style="font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:.05em;margin-bottom:6px;">Disk <span id="syshealth-disk-label" style="font-weight:400;text-transform:none;"></span></div>
+            <div style="background:rgba(255,255,255,.1);border-radius:4px;height:8px;overflow:hidden;">
+              <div id="syshealth-disk-bar" style="height:100%;background:#6fcf97;border-radius:4px;width:0%;transition:width .4s;"></div>
+            </div>
+          </div>
+          <!-- RAM -->
+          <div style="grid-column:1/-1;">
+            <div style="font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:.05em;margin-bottom:6px;">RAM <span id="syshealth-ram-label" style="font-weight:400;text-transform:none;"></span></div>
+            <div style="background:rgba(255,255,255,.1);border-radius:4px;height:8px;overflow:hidden;">
+              <div id="syshealth-ram-bar" style="height:100%;background:#56ccf2;border-radius:4px;width:0%;transition:width .4s;"></div>
+            </div>
+          </div>
+          <!-- Load -->
+          <div style="grid-column:1/-1;">
+            <div style="font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:.05em;margin-bottom:6px;">Load Average</div>
+            <span id="syshealth-load" style="font-size:13px;font-weight:600;">—</span>
+          </div>
+        </div>
+      </div>
+
+      <!-- Service Control -->
+      <div class="setup-card setup-section-gap">
+        <div class="setup-card-header"><h2>Service Control</h2></div>
+        <div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap;padding-bottom:8px;">
+          <button id="svc-restart-btn" class="btn btn-secondary">↺ Restart</button>
+          <button id="svc-start-btn" class="btn btn-secondary">▶ Start</button>
+          <button id="svc-stop-btn" class="btn btn-danger">⏹ Stop</button>
+          <span style="font-size:12px;color:var(--muted);">Stopping the service will take the WebUI offline until it is restarted from the Proxmox host console.</span>
+        </div>
+        <div id="svc-control-msg" class="settings-message hidden" role="alert"></div>
+      </div>
+
+      <!-- Proxmox Agent Setup -->
+      <div class="setup-card setup-section-gap">
+        <div class="setup-card-header">
+          <h2>Proxmox Agent Setup</h2>
+          <p>Run this command on each Proxmox host to install the agent. The host will appear in the Server tab pending approval.</p>
+        </div>
+        <div style="display:flex;gap:8px;align-items:stretch;margin-bottom:4px;">
+          <code id="proxmox-install-cmd" style="flex:1;background:rgba(0,0,0,.35);border-radius:6px;padding:10px 12px;font-size:12px;word-break:break-all;color:#a8d8a8;display:block;white-space:pre-wrap;"></code>
+          <button id="proxmox-install-copy-btn" class="btn btn-secondary" style="flex-shrink:0;align-self:center;">Copy</button>
+        </div>
+        <div id="proxmox-install-msg" class="settings-message hidden" role="alert"></div>
+      </div>
+
+      <!-- WiFi Auth Fix -->
+      <div class="setup-card setup-section-gap" style="padding:14px 16px;display:flex;justify-content:space-between;align-items:center;gap:12px;">
+        <div>
+          <div style="font-weight:600;font-size:13px;">📡 Push WiFi Auth Fix to All Clients</div>
+          <div style="font-size:12px;color:var(--muted);">Dispatches an <em>Update Now</em> command to every registered client. This re-deploys the polkit rule and kills nm-applet, fixing recurring WiFi authentication popups.</div>
+        </div>
+        <button id="wifi-fix-btn" class="btn btn-secondary" style="flex-shrink:0;">Push Fix</button>
+      </div>
+
+      <!-- Clear Cache -->
+      <div class="setup-card setup-section-gap" style="padding:14px 16px;display:flex;justify-content:space-between;align-items:center;gap:12px;">
+        <div>
+          <div style="font-weight:600;font-size:13px;">🗑 Clear All Cache &amp; Refresh GitHub Repo</div>
+          <div style="font-size:12px;color:var(--muted);">Removes git lock files, wipes and re-clones the repo from GitHub, clears all cached state files (client history, central history, state cache). <strong>The service will restart automatically.</strong></div>
+        </div>
+        <button id="setup-clear-cache-btn" class="btn btn-danger" style="flex-shrink:0;">Clear Cache</button>
+      </div>
+    </div>
+  </main>
+  <div id="spoke-user-override-modal-overlay" class="modal-overlay hidden" role="dialog" aria-modal="true" aria-labelledby="spoke-uom-title" style="display:none;">
+    <div class="modal-box" style="max-width:520px;">
+      <h2 id="spoke-uom-title" style="margin:0 0 16px;">User Override</h2>
+      <div id="spoke-uom-body"></div>
+      <div class="modal-actions" style="margin-top:20px;display:flex;gap:8px;justify-content:flex-end;">
+        <button id="spoke-uom-cancel" class="btn btn-secondary" type="button">Cancel</button>
+        <button id="spoke-uom-save" class="btn btn-primary" type="button">Save</button>
+      </div>
+    </div>
+  </div>
+  <div id="app-notification" class="app-notification settings-message hidden" aria-live="polite"></div>
+  <script src="/app.js" defer></script>
+
+  <footer class="page-footer">
+    <span>© Hewlett Packard Enterprise · Client Simulator</span>
+    <div class="page-footer-meta">
+      <span id="spoke-current-user-pill" class="page-footer-pill hidden" style="display:none;">👤 admin</span>
+      <span id="footer-version" class="page-footer-pill">v0.1</span>
+      <button id="spoke-logout-btn" class="page-footer-pill page-footer-pill-btn hidden" type="button" style="display:none;">Sign Out</button>
+    </div>
+  </footer>
+</body>
+</html>

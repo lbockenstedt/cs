@@ -1,0 +1,15 @@
+services:
+  client-sim-dashboard:
+    build: .
+    ports:
+      - "8000:8000"
+    environment:
+      - REPO_URL=https://github.com/solutions-hpe/client-sim.git
+      - REPO_BRANCH=main
+      - REPO_DIR=/app/client-sim
+      - OFFLINE_TIMEOUT=60
+    restart: unless-stopped
+    volumes:
+      - repo-cache:/app/client-sim
+volumes:
+  repo-cache:
