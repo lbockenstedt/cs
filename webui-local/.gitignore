@@ -1,0 +1,14 @@
+/data/
+.env
+*.pem
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+*.egg-info/
+dist/
+build/
+.DS_Store
+.deploy-secrets.env
+.deploy-secrets-prod.env

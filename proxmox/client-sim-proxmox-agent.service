@@ -1,0 +1,25 @@
+[Unit]
+Description=Client-Sim Proxmox Agent
+After=network-online.target
+Wants=network-online.target
+# Limit restart rate to prevent a crash-loop from consuming the host
+StartLimitBurst=10
+StartLimitIntervalSec=300
+
+[Service]
+Type=simple
+EnvironmentFile=-/etc/client-sim-proxmox-agent.env
+ExecStart=/usr/local/bin/client-sim-proxmox-agent
+Restart=always
+RestartSec=30
+# Protect the agent process from the OOM killer (scores range -1000 to 1000;
+# -500 strongly deprioritises killing this service relative to VM clones)
+OOMScoreAdjust=-500
+# Reasonable file-descriptor ceiling for a host running many VM clones
+LimitNOFILE=65536
+StandardOutput=append:/var/log/client-sim-proxmox-agent.log
+StandardError=append:/var/log/client-sim-proxmox-agent.log
+
+[Install]
+WantedBy=multi-user.target
+Alias=proxmox-agent.service

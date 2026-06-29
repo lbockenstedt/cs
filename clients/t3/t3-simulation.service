@@ -1,0 +1,28 @@
+[Unit]
+Description=T3 Wireless Device Simulation
+# Start after the system has basic networking (interfaces exist)
+# but do NOT wait for network-online — wireless.sh manages its own interfaces
+After=network.target
+Wants=network.target
+
+[Service]
+Type=simple
+ExecStart=/bin/bash /usr/scripts/wireless.sh
+WorkingDirectory=/usr/scripts
+
+# Restart automatically on failure or when exec bash hands off
+Restart=on-failure
+RestartSec=10
+
+# Run as root — required for ifconfig, dhcpcd, wpa_supplicant, ifmetric
+User=root
+
+# Log goes to wireless.log via the script; also capture stdout/stderr in journal
+StandardOutput=append:/usr/scripts/wireless.log
+StandardError=append:/usr/scripts/wireless.log
+
+# Give wpa_supplicant and DHCP time to settle before killing on stop
+TimeoutStopSec=30
+
+[Install]
+WantedBy=multi-user.target

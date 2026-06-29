@@ -1,0 +1,8 @@
+[Unit]
+Description=Client-Sim Proxmox Watchdog
+After=network-online.target client-sim-proxmox-agent.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/proxmox-watchdog

@@ -1,0 +1,5 @@
+[Desktop Entry]
+Type=Application
+Name=JournalView
+Comment=Launch journalctl viewer
+Exec=gnome-terminal --geometry=89x16+500+0 -- journalctl -f

@@ -1,0 +1,31 @@
+version: '3.9'
+
+services:
+  hub:
+    build: .
+    container_name: hub
+    restart: unless-stopped
+    ports:
+      - "${HUB_PORT:-8443}:8443"
+    environment:
+      # REQUIRED in production — generate with:
+      # python3 -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
+      WEBUI_SECRET_KEY: ${WEBUI_SECRET_KEY:-}
+      SECRET_KEY: ${SECRET_KEY:-change-me-in-production}
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD:-changeme}
+      DATA_DIR: /data
+    volumes:
+      - hubdata:/data
+      # Optional: mount your own TLS cert/key
+      # - ./certs/cert.pem:/data/tls/cert.pem:ro
+      # - ./certs/key.pem:/data/tls/key.pem:ro
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request, ssl; ctx=ssl.create_default_context(); ctx.check_hostname=False; ctx.verify_mode=ssl.CERT_NONE; urllib.request.urlopen('https://localhost:8443/api/health', context=ctx)"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 15s
+
+volumes:
+  hubdata:
+    driver: local

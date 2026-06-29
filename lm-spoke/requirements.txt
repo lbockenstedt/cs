@@ -1,0 +1,14 @@
+fastapi>=0.111.0
+uvicorn[standard]>=0.29.0
+httpx>=0.27.0
+websockets>=12.0
+psutil>=5.9.0
+python-dotenv>=1.0.0
+
+# Phase 1 — simulation primitives + models
+dnspython>=2.4          # dns_fail primitive (pure-Python DNS queries)
+icmplib>=1.3            # ping_test primitive (optional; falls back to `ping`)
+pydantic>=2             # data_models (already transitive via fastapi; pinned explicitly)
+
+# Phase 3 — Proxmox client deployment (not imported until Phase 3)
+# proxmoxer>=2.0

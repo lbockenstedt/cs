@@ -1,0 +1,13 @@
+---
+- hosts: production
+  become: true
+  tasks:
+  - name: 'Update KSM Threshold to 80%'
+    lineinfile:
+      dest: /etc/ksmtuned.conf
+      regexp: '^(.*)KSM_THRES_COEF(.*)$'
+      line: 'KSM_THRES_COEF=80'
+      backrefs: yes
+      
+  - name: Create Scripts folder on /etc/pve/scripts
+    ansible.builtin.shell: mkdir /etc/pve/scripts

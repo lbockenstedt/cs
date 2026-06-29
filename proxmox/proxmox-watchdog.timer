@@ -1,0 +1,12 @@
+[Unit]
+Description=Run Client-Sim Proxmox watchdog every 5 minutes
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=5min
+AccuracySec=1min
+Persistent=true
+Unit=proxmox-watchdog.service
+
+[Install]
+WantedBy=timers.target

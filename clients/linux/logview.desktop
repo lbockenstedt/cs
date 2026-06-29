@@ -1,0 +1,6 @@
+[Desktop Entry]
+Type=Application
+Name=Simulation Log Viewer
+Comment=Simulation Script Startup
+Exec=gnome-terminal --geometry=50x47+0+0 -- bash -c "/usr/local/scripts/dashboard.sh"
+

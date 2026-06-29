@@ -1,0 +1,5 @@
+[Desktop Entry]
+Type=Application
+Name=StartUp
+Comment=Simulation Script Startup
+Exec=gnome-terminal --geometry=89x20+500+400 -- bash -c "/usr/local/scripts/startup.sh ; systemctl reboot"
