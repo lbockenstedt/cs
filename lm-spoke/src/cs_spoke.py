@@ -84,10 +84,24 @@ class CSSpoke(BaseSpoke):
         }
 
     def get_version(self) -> str:
-        try:
-            return (Path(__file__).resolve().parent.parent / "VERSION").read_text().strip()
-        except Exception:  # noqa: BLE001
-            return "unknown"
+        # cs_spoke.py lives at <repo>/lm-spoke/src/cs_spoke.py; the tracked,
+        # autobumped VERSION file is at the REPO ROOT (<repo>/VERSION, deployed
+        # at /opt/lm/cs/VERSION per install_cs.sh), one dir above the legacy
+        # lm-spoke/VERSION path. Try repo-root first, then lm-spoke/ as a
+        # fallback for any layout that places VERSION beside the spoke.
+        here = Path(__file__).resolve().parent  # .../lm-spoke/src
+        for p in (
+            here.parent.parent / "VERSION",   # <repo>/VERSION  (dev + /opt/lm/cs/VERSION)
+            here.parent / "VERSION",          # <repo>/lm-spoke/VERSION (fallback)
+        ):
+            try:
+                if p.exists():
+                    v = p.read_text().strip()
+                    if v:
+                        return v
+            except Exception:  # noqa: BLE001
+                pass
+        return "unknown"
 
     # ── Phase F: sim-tag sync (driven off CS_INGEST_TELEMETRY / token store) ──
     async def _maybe_sync_sim_tags(self) -> None:
