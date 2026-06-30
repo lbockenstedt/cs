@@ -37,6 +37,8 @@ import sim_config
 from proxmox_deploy import ProxmoxDeploy
 from command_queue import CommandQueue, CSSettings
 from token_store import TokenStore, sync_all_sim_tags
+from client_registry import ClientRegistry
+import client_api  # for client_api.push_pending (live command delivery to WS agents)
 
 try:
     from core.src.base_spoke import BaseSpoke
@@ -52,14 +54,20 @@ class CSSpoke(BaseSpoke):
     def __init__(self, spoke_id: str, config: Dict[str, Any] | None = None):
         super().__init__(spoke_id, config or {})
         # Resolve repo-relative dirs from this file so cwd doesn't matter.
-        base = Path(__file__).resolve().parent.parent
-        config_dir = base / "configs"
+        # data/ stays under lm-spoke/ (runtime state, gitignored). configs/ lives
+        # at the REPO root (sibling of lm-spoke/, not a child) — install_cs.sh
+        # clones the whole repo to /opt/lm/cs, so <repo>/configs/simulation.conf
+        # is the canon the engine + /api/config serve (matches webui-spoke
+        # REPO_DIR/"configs").
+        base = Path(__file__).resolve().parent.parent  # lm-spoke/
+        config_dir = Path(__file__).resolve().parent.parent.parent / "configs"
         data_dir = base / "data"
         self.engine = SimulationEngine(spoke_id, config_dir=config_dir, data_dir=data_dir)
-        # Phase 2/3 modules land here (registry); the Proxmox deploy module
-        # (per-host state + telemetry ingest + relay payload) is wired (D1), and
-        # the persisted command queue + cs settings store are wired (D2).
-        self.registry = None
+        # The Proxmox deploy module (per-host state + telemetry ingest + relay
+        # payload) is wired (D1), and the persisted command queue + cs settings
+        # store are wired (D2). The client registry (Phase 2) backs the client
+        # API status/control surface.
+        self.registry = ClientRegistry(data_dir)
         self.settings = CSSettings(data_dir, config_dir)
         self.queue = CommandQueue(data_dir, self.settings)
         self.deploy = ProxmoxDeploy()
@@ -145,7 +153,7 @@ class CSSpoke(BaseSpoke):
 
         # ── config ─────────────────────────────────────────────────────────
         if cmd in ("CS_GET_CONFIG",):
-            base = Path(__file__).resolve().parent.parent / "configs"
+            base = Path(__file__).resolve().parent.parent.parent / "configs"
             return {"status": "SUCCESS", "mode": "local",
                     "simulation_conf": _read(base / "simulation.conf"),
                     "user_overrides": _read(base / "user-overrides.conf")}
@@ -158,7 +166,7 @@ class CSSpoke(BaseSpoke):
                 sim_config.validate_ini_text(content)
             except ValueError as exc:
                 return {"status": "ERROR", "message": str(exc)}
-            base = Path(__file__).resolve().parent.parent / "configs"
+            base = Path(__file__).resolve().parent.parent.parent / "configs"
             (base / "simulation.conf").write_text(content, encoding="utf-8")
             self.engine.reload_config()
             return {"status": "SUCCESS", "message": "simulation.conf updated"}
@@ -171,7 +179,7 @@ class CSSpoke(BaseSpoke):
                 sim_config.validate_ini_text(content)
             except ValueError as exc:
                 return {"status": "ERROR", "message": str(exc)}
-            base = Path(__file__).resolve().parent.parent / "configs"
+            base = Path(__file__).resolve().parent.parent.parent / "configs"
             (base / "user-overrides.conf").write_text(content, encoding="utf-8")
             self.engine.reload_config()
             return {"status": "SUCCESS", "message": "user-overrides.conf updated"}
@@ -266,6 +274,8 @@ class CSSpoke(BaseSpoke):
             except ValueError as exc:
                 # Safeguard refusal (protected vmid / below sim floor).
                 return {"status": "ERROR", "message": str(exc)}
+            # Live-deliver to a connected client WS agent (no waiting for sync).
+            await client_api.push_pending(self, target)
             return {"status": "SUCCESS", "command": res["command"],
                     "created": res["created"], "expired": res["expired"],
                     "purged": res["purged"]}

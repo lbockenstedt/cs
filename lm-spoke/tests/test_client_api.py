@@ -1,0 +1,239 @@
+"""Tests for the cs spoke client API surface (``lm-spoke/src/client_api.py``).
+
+Drives ``build_client_api_app`` with a real ``CSSpoke`` whose runtime state
+(registry / queue / settings) is isolated in a per-test tmp dir, while the
+engine keeps the real repo-root ``configs/`` so ``/api/config`` serves the
+canon. Uses FastAPI's ``TestClient`` for HTTP + the WebSocket flow.
+"""
+
+from pathlib import Path
+from typing import Any, Dict
+
+import pytest
+from fastapi.testclient import TestClient
+from starlette.websockets import WebSocketDisconnect
+
+import sim_config
+from client_api import build_client_api_app, resolve_script_path
+from client_registry import ClientRegistry
+from command_queue import CommandQueue, CSSettings
+from cs_spoke import CSSpoke
+
+CONFIGS = Path(__file__).resolve().parent.parent.parent / "configs"
+
+
+# ── fixtures ─────────────────────────────────────────────────────────────────
+@pytest.fixture
+def spoke(tmp_path) -> CSSpoke:
+    s = CSSpoke("test-cs", {})
+    data = tmp_path / "data"
+    data.mkdir()
+    # Isolate runtime state (registry/queue/settings) in tmp; keep the engine on
+    # the real repo-root configs so /api/config serves the canon simulation.conf.
+    s.settings = CSSettings(data, CONFIGS)
+    s.registry = ClientRegistry(data)
+    s.queue = CommandQueue(data, s.settings)
+    return s
+
+
+@pytest.fixture
+def client(spoke) -> TestClient:
+    return TestClient(build_client_api_app(spoke))
+
+
+# ── health / kill switch ─────────────────────────────────────────────────────
+def test_health(client, spoke):
+    r = client.get("/api/health")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["status"] == "ok"
+    assert body["version"] == spoke.get_version()
+    assert body["clients"] == 0
+
+
+def test_kill_switch_off_then_on(client, spoke, monkeypatch):
+    monkeypatch.setattr(spoke.engine, "kill_switch_active", lambda: False)
+    assert client.get("/api/kill-switch").text == "off"
+    monkeypatch.setattr(spoke.engine, "kill_switch_active", lambda: True)
+    assert client.get("/api/kill-switch").text == "on"
+
+
+# ── status beacon + registry ─────────────────────────────────────────────────
+def test_status_upserts_registry(client):
+    r = client.post("/api/status", json={
+        "hostname": "sim-1", "platform": "linux", "iteration": 3,
+        "connected_ssid": "corp", "gateway_reachable": True,
+        "active_simulations": ["www_traffic"], "errors": ["boom"],
+    })
+    assert r.status_code == 200
+    assert r.json()["client"] == "sim-1"
+
+    clients = client.get("/api/clients").json()
+    assert "sim-1" in clients
+    assert clients["sim-1"]["connected_ssid"] == "corp"
+    assert clients["sim-1"]["recent_errors"] == ["boom"]
+    assert clients["sim-1"]["active_simulations"] == ["www_traffic"]
+
+
+def test_client_key_default_empty(client):
+    r = client.get("/api/client/key")
+    assert r.status_code == 200
+    assert r.json() == {"client_api_key": ""}
+
+
+# ── config delivery ──────────────────────────────────────────────────────────
+def test_config_renders_host_bucket(client):
+    hostname = "sim-host-9"
+    r = client.get("/api/config", params={"hostname": hostname})
+    assert r.status_code == 200
+    text = r.text
+    assert "[simulation]" in text
+    bucket = sim_config.bucket_for(hostname)  # e.g. "s3"
+    assert f"[{bucket}]" in text
+
+
+def test_config_overrides_and_parsed(client):
+    assert client.get("/api/config/overrides").status_code == 200
+    parsed = client.get("/api/config/parsed").json()
+    assert "simulation" in parsed
+    assert "repo_location" in parsed["simulation"]
+
+
+# ── scripts ──────────────────────────────────────────────────────────────────
+def test_scripts_list_and_get(client):
+    r = client.get("/api/scripts/list", params={"platform": "linux"})
+    assert r.status_code == 200
+    assert "agent.sh" in r.json()["scripts"]
+
+    r = client.get("/api/scripts/linux/agent.sh")
+    assert r.status_code == 200
+    assert "hostname" in r.text  # agent.sh builds the WS url from hostname
+
+
+def test_resolve_script_path_traversal_guard():
+    # Happy path resolves to a real file inside the platform dir.
+    p = resolve_script_path("linux", "agent.sh")
+    assert p.is_file() and p.name == "agent.sh"
+
+    # Escape attempt + missing file both 404.
+    from fastapi import HTTPException
+    with pytest.raises(HTTPException) as exc:
+        resolve_script_path("linux", "../../configs/simulation.conf")
+    assert exc.value.status_code == 404
+    with pytest.raises(HTTPException) as exc:
+        resolve_script_path("linux", "does-not-exist.sh")
+    assert exc.value.status_code == 404
+    with pytest.raises(HTTPException) as exc:
+        resolve_script_path("plan9", "agent.sh")  # unknown platform
+    assert exc.value.status_code == 404
+
+
+# ── command queue (HTTP) ─────────────────────────────────────────────────────
+def test_commands_enqueue_and_list(client):
+    # Non-proxmox target, non-VM action → accepted (no safeguard).
+    r = client.post("/api/commands", json={
+        "target": "sim-host-1", "action": "reboot", "args": {}, "type": "client",
+    })
+    assert r.status_code == 200, r.text
+    assert r.json()["created"] is True
+
+    listed = client.get("/api/commands").json()["commands"]
+    assert any(c["action"] == "reboot" for c in listed)
+
+
+def test_commands_safeguard_refuse_low_vmid(client):
+    # proxmox VM action with vmid < SIM_VMIN (90000) → safeguard refuse → 400.
+    r = client.post("/api/commands", json={
+        "target": "proxmox", "action": "start_vm", "args": {"vmid": 100},
+    })
+    assert r.status_code == 400
+    assert "90000" in r.text or "Client-Simulation range" in r.text
+
+
+def test_commands_safeguard_accept_sim_vmid(client):
+    r = client.post("/api/commands", json={
+        "target": "proxmox", "action": "start_vm", "args": {"vmid": 91000},
+    })
+    assert r.status_code == 200, r.text
+
+
+# ── client control (overrides) ───────────────────────────────────────────────
+def test_client_control_overrides(client):
+    r = client.post("/api/clients/sim-1/control", json={"overrides": {"sim_load": "0"}})
+    assert r.status_code == 200
+    assert client.get("/api/clients").json()["sim-1"]["overrides"] == {"sim_load": "0"}
+
+    assert client.delete("/api/clients/sim-1/control").status_code == 200
+    assert "overrides" not in client.get("/api/clients").json().get("sim-1", {})
+
+
+# ── WebSocket ────────────────────────────────────────────────────────────────
+def test_ws_hello_status_ping(client):
+    with client.websocket_connect("/ws/client?hostname=ws-1&platform=linux") as ws:
+        assert ws.receive_json()["type"] == "hello"
+        ws.send_json({"type": "status", "payload": {"hostname": "ws-1", "iteration": 1}})
+        assert ws.receive_json()["type"] == "status_ack"
+        ws.send_json({"type": "ping"})
+        assert ws.receive_json()["type"] == "pong"
+
+
+def test_ws_pushes_pending_command_and_acks(client):
+    # Enqueue a command targeting the host BEFORE it connects, so the
+    # connect-time push delivers it immediately.
+    pr = client.post("/api/commands", json={
+        "target": "ws-2", "action": "reboot", "args": {}, "type": "client",
+    })
+    assert pr.status_code == 200 and pr.json()["created"] is True
+
+    with client.websocket_connect("/ws/client?hostname=ws-2") as ws:
+        assert ws.receive_json()["type"] == "hello"
+        frame = ws.receive_json()
+        assert frame["type"] == "commands"
+        assert len(frame["commands"]) == 1
+        cmd = frame["commands"][0]
+        assert cmd["action"] == "reboot"
+
+        # Ack it → ack_ok.
+        ws.send_json({"type": "ack", "payload": {
+            "id": cmd["id"], "status": "completed", "message": "ok"}})
+        ack = ws.receive_json()
+        assert ack["type"] == "ack_ok" and ack["ok"] is True
+
+        # A command queued WHILE connected is live-pushed (push_pending from the
+        # POST handler) without waiting for the agent's next sync.
+        client.post("/api/commands", json={
+            "target": "ws-2", "action": "snapshot_vm", "args": {}, "type": "client",
+        })
+        frame2 = ws.receive_json()
+        assert frame2["type"] == "commands"
+        assert len(frame2["commands"]) == 1
+        assert frame2["commands"][0]["action"] == "snapshot_vm"
+
+        # sync is fire-and-forget (no frame when nothing pending) — verify the
+        # loop is still alive afterwards with a ping/pong round-trip.
+        ws.send_json({"type": "sync"})
+        ws.send_json({"type": "ping"})
+        assert ws.receive_json()["type"] == "pong"
+
+
+def test_ws_rejects_bad_key(client, spoke):
+    spoke.settings.update({"client_api_key": "secret"})
+    with pytest.raises(Exception):  # WebSocketDisconnect / close 4403
+        with client.websocket_connect("/ws/client?hostname=nope") as ws:
+            ws.receive_json()
+
+
+# ── shared-key gating on HTTP ────────────────────────────────────────────────
+def test_http_key_gating(client, spoke):
+    spoke.settings.update({"client_api_key": "secret"})
+
+    # Public routes still work without a key.
+    assert client.get("/api/health").status_code == 200
+    assert client.get("/api/client/key").json()["client_api_key"] == "secret"
+
+    # Gated route without a key → 401.
+    assert client.get("/api/commands").status_code == 401
+
+    # Gated route with the right header → 200.
+    r = client.get("/api/commands", headers={"X-Client-Key": "secret"})
+    assert r.status_code == 200

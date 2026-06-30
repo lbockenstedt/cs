@@ -78,16 +78,45 @@ Dispatched in `CSSpoke.handle_command`. `*_GET_STATUS` falls back to
 | `CS_UPDATE_AGENT` | qm guest exec install/update |
 | `CS_SELF_UPDATE` | `perform_self_update_check()` |
 
-## Standalone HTTP (Phase 1, port 8000 when run without `--hub`)
-- `GET /status` — engine current state
-- `POST /simulate/trigger` — one iteration
-- `GET|POST /config` — view / patch profile
-- `GET /version` — spoke version
+## Client API (port 8000, both hub and standalone mode)
 
-(Phase 2 expands this to the full client-facing `/api/*` surface from the
-original `webui-spoke`: `/api/health`, `/api/kill-switch`, `POST /api/status`,
-`GET /api/config`, `/api/scripts/*`, `/api/clients/*/control`, `/api/commands`,
-config editors, and `WS /ws`.)
+The spoke that owns the isolated sim-client DHCP scope (`169.253.1.1/24` on the
+2nd NIC) is also the client API gateway on `169.253.1.1:8000`. The full
+client-facing surface is implemented (`lm-spoke/src/client_api.py`,
+`build_client_api_app`) and served on `0.0.0.0:8000` — configurable via
+`CS_API_PORT` / `CS_API_HOST` (env or `--port` / `--host`). The same app runs in
+hub mode (a `uvicorn.Server.serve()` task started in `CSControlPlane.run()`,
+surviving hub reconnects) and standalone mode (`run_standalone_mode()`), so both
+serve identical routes. Auth is a shared `client_api_key` (`CSSettings`, default
+empty = open); when set, `/ws/client` and the mutating/inbox HTTP routes require
+it (`X-Client-Key` header or `?api_key=`, `secrets.compare_digest`).
+
+| Route | Purpose |
+|---|---|
+| `GET /api/health` | `{status, version, clients, repo_synced, repo_error}` (public) |
+| `GET /api/kill-switch` | `on`/`off` plaintext (`engine.kill_switch_active()`) |
+| `POST /api/status` | client → spoke status beacon → `ClientRegistry.apply_status` (public) |
+| `GET /api/client/key` | `{"client_api_key": ...}` — agents fetch the PSK first (public) |
+| `GET /api/config?hostname=` | rendered `simulation.conf` (host bucket + registry overrides baked in) |
+| `GET /api/config/overrides` | `user-overrides.conf` plaintext |
+| `GET /api/config/parsed` | `{section: {key: value}}` |
+| `GET /api/scripts/list?platform=linux\|windows\|t3` | filenames in `clients/{platform}/` |
+| `GET /api/scripts/{platform}/{filename}` | `FileResponse` (path-traversal guarded) |
+| `GET /api/clients` | registry snapshot |
+| `POST /api/clients/{hostname}/control` | `{overrides}` → `registry.set_overrides` (key-gated) |
+| `DELETE /api/clients/{hostname}/control` | clear overrides (key-gated) |
+| `POST /api/commands` | `{target, action, args, type}` → `queue.enqueue` (key-gated; safeguard refuse → 400) |
+| `GET /api/commands` | `queue.list_commands()` (key-gated) |
+| `GET /api/inbox?hostname=` | `queue.poll_agent_inbox()` (key-gated) |
+| `POST /api/inbox/ack` | `{id, status, message, result}` → `queue.ack_command` (key-gated) |
+| `WS /ws/client?hostname=&platform=&api_key=` | primary agent channel (see below) |
+| `GET /status` · `POST /simulate/trigger` · `GET\|POST /config` · `GET /version` | mgmt (same as the old standalone surface) |
+
+### `/ws/client` protocol
+- Auth: empty key = open; else `secrets.compare_digest(api_key, key)`, close `4403` on mismatch. The t3 agent sends no key (connects open); the linux agent fetches `/api/client/key` first when a key is set.
+- On accept: server sends `{type:"hello"}`, then pushes pending commands (`{type:"commands", commands:[{id,action,args,type}]}`, marks them `delivered`).
+- Client → server: `{type:"status", payload}` → `{type:"status_ack"}`; `{type:"ack", payload:{id,status,message,...}}` → `queue.ack_command` → `{type:"ack_ok"}`; `{type:"sync"}` → re-push pending; `{type:"ping"}` → `{type:"pong"}`.
+- Live push: `CS_QUEUE_COMMAND` (hub) calls `client_api.push_pending(spoke, target)` so a queued command reaches a connected agent immediately, without waiting for its next `sync`.
 
 ## Architecture
 - **Bucket assignment** — deterministic `s0`–`s9` via CRC32 of the hostname.

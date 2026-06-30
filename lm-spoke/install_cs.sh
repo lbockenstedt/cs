@@ -31,6 +31,13 @@ HUB_SECRET=""
 ADMIN_TOKEN=""
 SVC_USER="svc_lm"
 LM_DIR="/opt/lm"
+# Client API listener. The spoke owns the isolated sim-client DHCP scope
+# (169.253.1.1/24 on the 2nd NIC) and is also the client API gateway on
+# 169.253.1.1:8000. Binding 0.0.0.0 puts the listener on the DHCP NIC too;
+# dnsmasq serves 169.253.1.0/24 with no router option, so clients reach it
+# directly. Override either before running.
+CS_API_PORT="${CS_API_PORT:-8000}"
+CS_API_HOST="${CS_API_HOST:-0.0.0.0}"
 
 # ── DHCP (sim-client isolated network) — port of install-lxc.sh STEP 3 ─────────
 # A second NIC runs dnsmasq DHCP for the isolated simulation-client network.
@@ -260,6 +267,8 @@ HUB_URL=$HUB_URL
 SPOKE_ID=$SPOKE_ID
 SPOKE_SECRET=$SPOKE_SECRET
 HUB_SECRET=${HUB_SECRET:-}
+CS_API_PORT=$CS_API_PORT
+CS_API_HOST=$CS_API_HOST
 DOTENV
 chmod 600 "$LM_DIR/cs/.env"
 
@@ -286,7 +295,9 @@ User=$SVC_USER
 WorkingDirectory=$LM_DIR/cs
 EnvironmentFile=$LM_DIR/cs/.env
 Environment="PYTHONPATH=$LM_DIR:$LM_DIR/core/src:$LM_DIR/cs/lm-spoke:$LM_DIR/cs/lm-spoke/src"
-ExecStart=$LM_DIR/cs/venv/bin/python3 -m src.control_plane --id $SPOKE_ID --hub $HUB_URL $SECRET_ARG $HUB_SECRET_ARG
+Environment="CS_API_PORT=$CS_API_PORT"
+Environment="CS_API_HOST=$CS_API_HOST"
+ExecStart=$LM_DIR/cs/venv/bin/python3 -m src.control_plane --id $SPOKE_ID --hub $HUB_URL $SECRET_ARG $HUB_SECRET_ARG --port $CS_API_PORT --host $CS_API_HOST
 
 StandardOutput=append:/var/log/lm/lm-cs.log
 StandardError=append:/var/log/lm/lm-cs.log

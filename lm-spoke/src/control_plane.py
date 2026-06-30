@@ -11,7 +11,6 @@ import sys
 import os
 from pathlib import Path
 from typing import Dict, Any
-from fastapi import FastAPI, HTTPException
 import uvicorn
 
 # Sibling modules (simulation_engine, cs_spoke, sim_config, sim_primitives,
@@ -25,6 +24,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from simulation_engine import SimulationEngine
 from cs_spoke import CSSpoke
+from client_api import build_client_api_app
 try:
     from core.src.messaging.control_plane import BaseControlPlane
 except ImportError:
@@ -43,17 +43,45 @@ class CSControlPlane(BaseControlPlane):
 
     def __init__(self, spoke_id: str, secret: str, hub_secret: str = None,
                  hub_url: str = None, config: Dict[str, Any] = None,
-                 onboarding_psk: str = None, tenant_id_hint: str = None):
+                 onboarding_psk: str = None, tenant_id_hint: str = None,
+                 api_host: str = None, api_port: int = None):
         super().__init__(spoke_id, secret, hub_secret, hub_url,
                          onboarding_psk=onboarding_psk, tenant_id_hint=tenant_id_hint)
         self.module_type = "simulation"
         self.startup_config = config or {}
+        # Client API listener (the spoke that owns the DHCP scope 169.253.1.1/24
+        # is also the client API gateway on 169.253.1.1:8000). Bound 0.0.0.0 so
+        # the listener lands on the DHCP NIC; configurable via CS_API_PORT/HOST.
+        self.api_host = api_host or os.getenv("CS_API_HOST", "0.0.0.0")
+        try:
+            self.api_port = int(api_port if api_port is not None
+                                else os.getenv("CS_API_PORT", "8000"))
+        except (TypeError, ValueError):
+            self.api_port = 8000
 
     async def run(self):
         logger.info(f"Starting CS (Client Simulator) -> {self.hub_url}")
         cs_spoke = CSSpoke(self.spoke_id, self.startup_config)
         self.register_module("cs", cs_spoke)
-        await super().run()
+        # Start the client API server as a long-lived task that SURVIVES hub
+        # reconnects (NOT via _create_spoke_tasks, which the base class tears
+        # down per-connection). Server.serve() is awaitable (vs blocking
+        # uvicorn.run), so it shares super().run()'s event loop — same pattern
+        # as webui-spoke running the LM relay as a background task.
+        app = build_client_api_app(cs_spoke)
+        self._api_server = uvicorn.Server(
+            uvicorn.Config(app, host=self.api_host, port=self.api_port,
+                           log_config=None))
+        self._api_task = asyncio.create_task(self._api_server.serve())
+        logger.info("CS client API on %s:%s", self.api_host, self.api_port)
+        try:
+            await super().run()
+        finally:
+            self._api_server.should_exit = True
+            try:
+                await self._api_task
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("CS API server shutdown: %s", exc)
 
     def _create_spoke_tasks(self, websocket):
         """Attach the CS telemetry relay loop.
@@ -101,38 +129,19 @@ class CSControlPlane(BaseControlPlane):
             await asyncio.sleep(interval)
 
     def run_standalone_mode(self):
-        """Standalone FastAPI server for local management / testing.
+        """Standalone FastAPI server: the full client API surface on
+        0.0.0.0:8000, driven by the same CSSpoke hub mode uses.
 
-        Phase 1: minimal surface (status / trigger / config / version) driven by
-        the same CSSpoke the hub mode uses. Phase 2 will mount the full
-        webui_spoke_api router here.
+        ``build_client_api_app`` is the single source for the route layer, so
+        standalone and hub mode serve identical surfaces (health / kill-switch /
+        status / config / scripts / clients / commands / inbox / ``/ws/client``
+        + the mgmt routes). Run without ``--hub`` to use it.
         """
-        logger.info("Starting CS Module in STANDALONE MODE on port 8000")
+        logger.info("Starting CS Module in STANDALONE MODE on %s:%s",
+                    self.api_host, self.api_port)
         spoke = CSSpoke(self.spoke_id, self.startup_config)
-        app = FastAPI(title="LM CS Spoke (standalone)")
-
-        @app.get("/status")
-        async def get_status():
-            return spoke.engine.get_current_state()
-
-        @app.post("/simulate/trigger")
-        async def trigger_sim():
-            return await spoke.engine.run_iteration()
-
-        @app.post("/config")
-        async def update_config(config: Dict[str, Any]):
-            spoke.engine.update_config(config or {})
-            return {"status": "success"}
-
-        @app.get("/config")
-        async def get_config():
-            return {"status": "success", "state": spoke.engine.get_current_state()}
-
-        @app.get("/version")
-        async def get_version():
-            return {"version": spoke.get_version()}
-
-        uvicorn.run(app, host="0.0.0.0", port=8000)
+        app = build_client_api_app(spoke)
+        uvicorn.run(app, host=self.api_host, port=self.api_port)
 
 if __name__ == "__main__":
     import os
@@ -144,6 +153,11 @@ if __name__ == "__main__":
     parser.add_argument("--secret",     default=os.getenv("SPOKE_SECRET", ""))
     parser.add_argument("--hub-secret", nargs='?', default=os.getenv("HUB_SECRET", ""), const="")
     parser.add_argument("--hub",        default=os.getenv("HUB_URL", "ws://localhost:8765"))
+    # Client API listener (169.253.1.1:8000 on the DHCP NIC). 0.0.0.0 binds it
+    # onto every interface, including the sim-client DHCP NIC, so clients on
+    # 169.253.1.0/24 reach it directly (dnsmasq serves no router option).
+    parser.add_argument("--port",       type=int, default=os.getenv("CS_API_PORT", "8000"))
+    parser.add_argument("--host",       default=os.getenv("CS_API_HOST", "0.0.0.0"))
     # PSK self-provisioning (optional). Falls back to env LM_ONBOARDING_PSK /
     # LM_TENANT_ID_HINT when the flags are absent; a spoke without either
     # connects as before (pending admin approval).
@@ -152,7 +166,8 @@ if __name__ == "__main__":
     args = parser.parse_args()
     cp = CSControlPlane(args.id, args.secret, args.hub_secret, args.hub,
                         onboarding_psk=args.onboarding_psk,
-                        tenant_id_hint=args.tenant_id_hint)
+                        tenant_id_hint=args.tenant_id_hint,
+                        api_host=args.host, api_port=args.port)
     if args.hub:
         asyncio.run(cp.run())
     else:

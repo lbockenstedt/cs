@@ -172,6 +172,10 @@ class CSSettings:
         "mem_provision_threshold": 80,
         # protected-vmid list (comma-separated ints/ranges) — drives the queue guard
         "protected_vmids": "",
+        # shared PSK for the client API (/ws/client + mutating HTTP routes).
+        # Empty = open (the t3 agent sends no key; linux agent fetches it first).
+        # Set via CS_UPDATE_SETTINGS at runtime → data/cs_settings.json (never committed).
+        "client_api_key": "",
     }
 
     def __init__(self, data_dir: Path, config_dir: Path) -> None:
