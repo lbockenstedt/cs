@@ -406,7 +406,7 @@ Tenant admins can generate a per-tenant onboarding PSK in **Setup → Onboarding
 Current spoke install command:
 
 ```bash
-sudo bash <(curl -fsSL https://raw.githubusercontent.com/solutions-hpe/client-sim/main/install-lxc.sh) \
+sudo bash <(curl -fsSL https://raw.githubusercontent.com/lbockenstedt/cs/main/installers/install-lxc.sh) \
   --hub-url https://hub.example.com:8443 \
   --hub-tenant <tenant-id> \
   --hub-psk <psk>

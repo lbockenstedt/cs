@@ -60,34 +60,34 @@ Before you run it, have:
 
 #### Install commands
 
-The production installer now lives at the repo root and should be fetched from:
+The production installer lives at `installers/install-lxc.sh` and should be fetched from:
 
 ```text
-https://raw.githubusercontent.com/solutions-hpe/client-sim/main/install-lxc.sh
+https://raw.githubusercontent.com/lbockenstedt/cs/main/installers/install-lxc.sh
 ```
 
 Standard install/update:
 
 ```bash
-sudo bash <(curl -fsSL https://raw.githubusercontent.com/solutions-hpe/client-sim/main/install-lxc.sh) --branch main
+sudo bash <(curl -fsSL https://raw.githubusercontent.com/lbockenstedt/cs/main/installers/install-lxc.sh) --branch main
 ```
 
 Full wipe/reinstall:
 
 ```bash
-sudo bash <(curl -fsSL https://raw.githubusercontent.com/solutions-hpe/client-sim/main/install-lxc.sh) --reinstall --branch main
+sudo bash <(curl -fsSL https://raw.githubusercontent.com/lbockenstedt/cs/main/installers/install-lxc.sh) --reinstall --branch main
 ```
 
 Custom port example:
 
 ```bash
-sudo bash <(curl -fsSL https://raw.githubusercontent.com/solutions-hpe/client-sim/main/install-lxc.sh) --branch main --port 9000
+sudo bash <(curl -fsSL https://raw.githubusercontent.com/lbockenstedt/cs/main/installers/install-lxc.sh) --branch main --port 9000
 ```
 
 Hub onboarding with tenant PSK auto-approval:
 
 ```bash
-sudo bash <(curl -fsSL https://raw.githubusercontent.com/solutions-hpe/client-sim/main/install-lxc.sh) \
+sudo bash <(curl -fsSL https://raw.githubusercontent.com/lbockenstedt/cs/main/installers/install-lxc.sh) \
   --hub-url https://hub.example.com:8443 \
   --hub-tenant <tenant-id> \
   --hub-psk <psk>
@@ -129,7 +129,7 @@ Run this on the **Proxmox host**, not inside the LXC.
 1. Install from GitHub (recommended for production `main`) or from a local checkout.
 
 ```bash
-curl -sSL https://raw.githubusercontent.com/solutions-hpe/client-sim/main/proxmox/install-proxmox-agent.sh | sudo bash -s -- \
+curl -sSL https://raw.githubusercontent.com/lbockenstedt/cs/main/proxmox/install-proxmox-agent.sh | sudo bash -s -- \
   --server http://169.253.1.1:8000 \
   --branch main \
   --hub-url https://<hub-host>:8443 \
@@ -285,7 +285,7 @@ Resolution order on a client VM is:
 | `[simulation]` | `rapid_update` | `on` | Run `update.sh` every loop instead of only at exec-restart checkpoints |
 | `[simulation]` | `sim_load` | `100` | Probability/CPU-style load gate for enabled simulations |
 | `[simulation]` | `github_repo` | `on` | Allow GitHub as an update source |
-| `[simulation]` | `repo_location` | `https://github.com/solutions-hpe/client-sim/` | Git repo used by update logic |
+| `[simulation]` | `repo_location` | `https://github.com/lbockenstedt/cs/` | Git repo used by update logic |
 | `[simulation]` | `repo_branch` | `main` | Branch used by client update logic |
 | `[simulation]` | `smb_repo` | `off` | Enable SMB as a fallback update source |
 | `[simulation]` | `vh_server` | `off` | Start/use VirtualHere workflow |

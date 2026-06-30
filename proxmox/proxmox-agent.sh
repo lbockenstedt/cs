@@ -499,7 +499,7 @@ clear_spoke_failure() {
 
 trigger_spoke_reinstall() {
     local state_dir="/var/lib/client-sim"
-    local installer_url="https://raw.githubusercontent.com/solutions-hpe/client-sim/main/proxmox/install-proxmox-agent.sh"
+    local installer_url="https://raw.githubusercontent.com/lbockenstedt/cs/main/proxmox/install-proxmox-agent.sh"
     local installer_file="${state_dir}/install-proxmox-agent-repair.sh"
     mkdir -p "$state_dir"
 
@@ -3477,8 +3477,8 @@ self_update_agent() {
         "$requested_repo_raw" \
         "${CLIENT_SIM_REPO_RAW:-}" \
         "$configured_repo_raw" \
-        "https://raw.githubusercontent.com/solutions-hpe/client-sim" \
-        "https://github.com/solutions-hpe/client-sim/raw"
+        "https://raw.githubusercontent.com/lbockenstedt/cs" \
+        "https://github.com/lbockenstedt/cs/raw"
     do
         [[ -n "$candidate" ]] || continue
         normalized=$(normalize_repo_raw_for_branch "$candidate" "$branch") || continue
@@ -3565,7 +3565,7 @@ sync_pve_scripts() {
     # Fall back to the canonical raw URL if not supplied
     if [[ -z "$repo_raw" ]]; then
         repo_raw=$(grep -oP '(?<=CLIENT_SIM_REPO_RAW=).*' "$ENV_FILE" 2>/dev/null | tr -d '[:space:]')
-        repo_raw="${repo_raw:-https://raw.githubusercontent.com/solutions-hpe/client-sim}"
+        repo_raw="${repo_raw:-https://raw.githubusercontent.com/lbockenstedt/cs}"
         repo_raw=$(normalize_repo_raw_for_branch "$repo_raw" "$branch" 2>/dev/null || echo "${repo_raw}/${branch}")
     fi
 

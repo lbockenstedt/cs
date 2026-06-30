@@ -279,7 +279,7 @@ sim_load=50                     # Reasonable load
 
 # Use known-good repositories
 github_repo=on
-repo_location=https://github.com/solutions-hpe/client-sim.git
+repo_location=https://github.com/lbockenstedt/cs.git
 repo_branch=main
 
 [address]

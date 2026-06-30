@@ -453,10 +453,10 @@ end_phase
 ###############################################################################
 begin_phase
 
-CLIENT_SIM_REPO="https://github.com/solutions-hpe/client-sim.git"
+CLIENT_SIM_REPO="https://github.com/lbockenstedt/cs.git"
 CLIENT_SIM_DIR="$HOME/client-sim"
 
-info "Cloning solutions-hpe/client-sim"
+info "Cloning lbockenstedt/cs"
 rm -rf "$CLIENT_SIM_DIR"
 if retry git clone --depth=1 "$CLIENT_SIM_REPO" "$CLIENT_SIM_DIR" >>"$LOG" 2>&1; then
   ok "client-sim repo cloned"

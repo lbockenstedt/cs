@@ -55,7 +55,7 @@ rapid_update=off         # on  = run update.sh every iteration (dev/testing mode
                          #       hammering update services in production deployments.
 sim_load=100             # CPU throttle target for cpulimit (percentage)
 github_repo=on           # on = repo cloned without auth
-repo_location=https://github.com/solutions-hpe/client-sim/
+repo_location=https://github.com/lbockenstedt/cs/
 server_url=http://169.253.1.1:8000   # webUI heartbeat endpoint (set in [server] section)
 repo_branch=main          # which branch clients pull from
 smb_repo=off             # on = enable Tier 2 SMB share as an update source (see [address] smb_address)

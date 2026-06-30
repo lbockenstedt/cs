@@ -5,7 +5,7 @@
 
 LOGFILE="/usr/scripts/wireless.log"
 SCRIPT_DIR="/usr/scripts"
-GITHUB_BASE="https://raw.githubusercontent.com/solutions-hpe/client-sim/main/T3"
+GITHUB_BASE="https://raw.githubusercontent.com/lbockenstedt/cs/main/clients/t3"
 
 log() { echo "$1" | tee -a "$LOGFILE"; }
 

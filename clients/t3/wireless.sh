@@ -29,11 +29,11 @@ github=raw.githubusercontent.com
 ping -c1 $github
   if [ $? -eq 0 ]; then
    echo Successful network connection to Github - updating scripts
-   sudo wget --waitretry=10 --read-timeout=20 --timeout=15 https://raw.githubusercontent.com/solutions-hpe/client-sim/main/T3/wireless.sh -O /usr/local/scripts/wireless.sh
+   sudo wget --waitretry=10 --read-timeout=20 --timeout=15 https://raw.githubusercontent.com/lbockenstedt/cs/main/clients/t3/wireless.sh -O /usr/local/scripts/wireless.sh
    sleep 1
-   sudo wget --waitretry=10 --read-timeout=20 --timeout=15 https://raw.githubusercontent.com/solutions-hpe/client-sim/main/T3/update_script.sh -O /usr/local/scripts/update_script.sh
+   sudo wget --waitretry=10 --read-timeout=20 --timeout=15 https://raw.githubusercontent.com/lbockenstedt/cs/main/clients/t3/update_script.sh -O /usr/local/scripts/update_script.sh
    sleep 1
-   sudo wget --waitretry=10 --read-timeout=20 --timeout=15 https://raw.githubusercontent.com/solutions-hpe/client-sim/main/t3/agent.sh -O /usr/local/scripts/agent.sh
+   sudo wget --waitretry=10 --read-timeout=20 --timeout=15 https://raw.githubusercontent.com/lbockenstedt/cs/main/clients/t3/agent.sh -O /usr/local/scripts/agent.sh
    sleep 1
 fi
 sudo chmod 777 /usr/scripts/wireless.sh

@@ -78,8 +78,8 @@ CLIENT_COUNT_7DAY_WINDOW = 7 * 24 * 3600   # 7 days of hourly history
 CLIENT_HISTORY_DAYS = 7          # remove clients not seen within this many days
 CLIENT_SAVE_INTERVAL = 60        # seconds between periodic disk saves
 REPO_DIR = Path(os.getenv("REPO_DIR", "/app/client-sim")).resolve()
-REPO_URL = os.getenv("REPO_URL", "https://github.com/solutions-hpe/client-sim.git")
-CLIENT_SIM_REPO_RAW = os.getenv("CLIENT_SIM_REPO_RAW", "https://raw.githubusercontent.com/solutions-hpe/client-sim")
+REPO_URL = os.getenv("REPO_URL", "https://github.com/lbockenstedt/cs.git")
+CLIENT_SIM_REPO_RAW = os.getenv("CLIENT_SIM_REPO_RAW", "https://raw.githubusercontent.com/lbockenstedt/cs")
 CS_WEBUI_REPO_RAW = os.getenv("CS_WEBUI_REPO_RAW", "https://raw.githubusercontent.com/solutions-hpe/cs-webui")
 
 
@@ -3536,7 +3536,7 @@ def _trace(event: str, **kwargs: Any) -> None:
         del _command_trace[: len(_command_trace) - _COMMAND_TRACE_MAX]
 # Queues for proxmox token provision responses relayed from agent → spoke → hub
 _proxmox_token_provision_queues: dict[str, asyncio.Queue] = {}
-GKILL_SWITCH_URL = "https://raw.githubusercontent.com/solutions-hpe/client-sim/main/kill_switch.txt"
+GKILL_SWITCH_URL = "https://raw.githubusercontent.com/lbockenstedt/cs/main/configs/kill_switch.txt"
 relay_state: dict[str, Any] = {
     "enabled": settings.get("relay_enabled") == "on" and bool(settings.get("relay_server_url")),
     "connected": False,

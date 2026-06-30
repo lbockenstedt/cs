@@ -16,7 +16,7 @@
 #   0 2 * * * root bash /etc/pve/scripts/sync-scripts.sh >> /var/log/client-sim-sync.log 2>&1
 #
 # Configuration — edit these to match your environment
-REPO_URL="https://github.com/solutions-hpe/client-sim.git"
+REPO_URL="https://github.com/lbockenstedt/cs.git"
 # Default branch is main — override with REPO_BRANCH env var
 REPO_BRANCH="${REPO_BRANCH:-main}"
 REPO_CACHE="/opt/client-sim-repo"

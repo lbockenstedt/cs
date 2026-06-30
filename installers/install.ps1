@@ -754,12 +754,12 @@ try {
     ###############################################################################
     Begin-Phase
 
-    $clientSimRepo = 'https://github.com/solutions-hpe/client-sim.git'
+    $clientSimRepo = 'https://github.com/lbockenstedt/cs.git'
     $clientSimDir = Join-Path $HOME 'client-sim'
     $windowsDir = Join-Path $clientSimDir 'windows'
     $configsDir = Join-Path $clientSimDir 'configs'
 
-    Start-Spinner 'Cloning solutions-hpe/client-sim'
+    Start-Spinner 'Cloning lbockenstedt/cs'
     try {
         if (Test-Path $clientSimDir) {
             Remove-Item -Path $clientSimDir -Recurse -Force

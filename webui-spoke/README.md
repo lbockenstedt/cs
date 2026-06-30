@@ -57,20 +57,20 @@ Aruba Central (AP/switch telemetry)
 2. **Enter the container and run the installer**:
 
    ```bash
-   sudo bash <(curl -fsSL https://raw.githubusercontent.com/solutions-hpe/client-sim/main/install-lxc.sh) --branch main --port 8000
+   sudo bash <(curl -fsSL https://raw.githubusercontent.com/lbockenstedt/cs/main/installers/install-lxc.sh) --branch main --port 8000
    ```
 
    Common alternatives:
 
    ```bash
-   sudo bash <(curl -fsSL https://raw.githubusercontent.com/solutions-hpe/client-sim/main/install-lxc.sh) --branch main --port 9000
-   sudo bash <(curl -fsSL https://raw.githubusercontent.com/solutions-hpe/client-sim/main/install-lxc.sh) --reinstall
+   sudo bash <(curl -fsSL https://raw.githubusercontent.com/lbockenstedt/cs/main/installers/install-lxc.sh) --branch main --port 9000
+   sudo bash <(curl -fsSL https://raw.githubusercontent.com/lbockenstedt/cs/main/installers/install-lxc.sh) --reinstall
    ```
 
-   The production installer moved from `webui-spoke/install-lxc.sh` to the repo root. The current raw URL is:
+   The production installer moved from `webui-spoke/install-lxc.sh` to `installers/install-lxc.sh`. The current raw URL is:
 
    ```text
-   https://raw.githubusercontent.com/solutions-hpe/client-sim/main/install-lxc.sh
+   https://raw.githubusercontent.com/lbockenstedt/cs/main/installers/install-lxc.sh
    ```
 
 3. **Attach client VMs to the isolated bridge** used by the spoke.
@@ -197,7 +197,7 @@ Tenant admins can generate an onboarding PSK in **Hub → Setup → Onboarding**
 Recommended install command:
 
 ```bash
-sudo bash <(curl -fsSL https://raw.githubusercontent.com/solutions-hpe/client-sim/main/install-lxc.sh) \
+sudo bash <(curl -fsSL https://raw.githubusercontent.com/lbockenstedt/cs/main/installers/install-lxc.sh) \
   --hub-url https://hub.example.com:8443 \
   --hub-tenant <tenant-id> \
   --hub-psk <psk>
@@ -337,7 +337,7 @@ Spoke-local auth is managed in **Setup → Account**.
 
 | Variable | Default | Description |
 |---|---|---|
-| `REPO_URL` | `https://github.com/solutions-hpe/client-sim.git` | Git repo to sync |
+| `REPO_URL` | `https://github.com/lbockenstedt/cs.git` | Git repo to sync |
 | `REPO_BRANCH` | `main` | Branch to sync |
 | `INSTALL_DIR` | `/opt/client-sim-dashboard` | App install directory |
 | `REPO_CACHE` | `/opt/client-sim-repo` | Local git checkout |
@@ -355,7 +355,7 @@ Spoke-local auth is managed in **Setup → Account**.
 If another device provides DHCP, install without local DHCP:
 
 ```bash
-DHCP_IFACE="" sudo bash <(curl -fsSL https://raw.githubusercontent.com/solutions-hpe/client-sim/main/install-lxc.sh)
+DHCP_IFACE="" sudo bash <(curl -fsSL https://raw.githubusercontent.com/lbockenstedt/cs/main/installers/install-lxc.sh)
 ```
 
 ---
@@ -424,10 +424,10 @@ This is the intended production deployment model.
 #### Common installer commands
 
 ```bash
-sudo bash <(curl -fsSL https://raw.githubusercontent.com/solutions-hpe/client-sim/main/install-lxc.sh)
-sudo bash <(curl -fsSL https://raw.githubusercontent.com/solutions-hpe/client-sim/main/install-lxc.sh) --branch main --port 8000
-sudo bash <(curl -fsSL https://raw.githubusercontent.com/solutions-hpe/client-sim/main/install-lxc.sh) --branch main --port 9000
-sudo bash <(curl -fsSL https://raw.githubusercontent.com/solutions-hpe/client-sim/main/install-lxc.sh) --reinstall
+sudo bash <(curl -fsSL https://raw.githubusercontent.com/lbockenstedt/cs/main/installers/install-lxc.sh)
+sudo bash <(curl -fsSL https://raw.githubusercontent.com/lbockenstedt/cs/main/installers/install-lxc.sh) --branch main --port 8000
+sudo bash <(curl -fsSL https://raw.githubusercontent.com/lbockenstedt/cs/main/installers/install-lxc.sh) --branch main --port 9000
+sudo bash <(curl -fsSL https://raw.githubusercontent.com/lbockenstedt/cs/main/installers/install-lxc.sh) --reinstall
 ```
 
 #### CLI flags

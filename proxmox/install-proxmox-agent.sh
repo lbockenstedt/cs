@@ -38,7 +38,7 @@ KEY_SET=0
 INTERVAL_SET=0
 BRANCH_SET=0
 
-OVERRIDE_CONFIG_URL="https://raw.githubusercontent.com/solutions-hpe/client-sim/${REPO_BRANCH}/proxmox/installer-override.conf"
+OVERRIDE_CONFIG_URL="https://raw.githubusercontent.com/lbockenstedt/cs/${REPO_BRANCH}/proxmox/installer-override.conf"
 if _override_content=$(curl -sf "$OVERRIDE_CONFIG_URL"); then
     source <(echo "$_override_content")
     echo "[override] Branch config applied from ${REPO_BRANCH}/proxmox/installer-override.conf"
@@ -474,7 +474,7 @@ fi
 [[ "$TENANT_SET" -eq 0 && -n "${OVERRIDE_TENANT_ID:-}" ]] && TENANT_ID="$OVERRIDE_TENANT_ID"
 [[ "$SERVER_SET" -eq 0 && -n "${OVERRIDE_SERVER_URL:-}" ]] && SERVER_URL="$OVERRIDE_SERVER_URL"
 
-REPO_RAW="https://raw.githubusercontent.com/solutions-hpe/client-sim/${REPO_BRANCH}"
+REPO_RAW="https://raw.githubusercontent.com/lbockenstedt/cs/${REPO_BRANCH}"
 
 if [[ -z "$SERVER_URL" ]]; then
     # No --server given — auto-detect spoke IP from LXC 1001

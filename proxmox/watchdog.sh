@@ -411,7 +411,7 @@ PY
 reinstall_agent() {
     local latest_installer_url installer_to_run installer_label
 
-    latest_installer_url="https://raw.githubusercontent.com/solutions-hpe/client-sim/${REPO_BRANCH}/proxmox/install-proxmox-agent.sh"
+    latest_installer_url="https://raw.githubusercontent.com/lbockenstedt/cs/${REPO_BRANCH}/proxmox/install-proxmox-agent.sh"
     installer_to_run="$INSTALLER_PATH"
     installer_label="$INSTALLER_PATH"
 

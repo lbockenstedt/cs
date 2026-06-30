@@ -171,7 +171,7 @@ fi
 ###############################################################################
 # Config — override via environment variables before running
 ###############################################################################
-REPO_URL="${REPO_URL:-https://github.com/solutions-hpe/client-sim.git}"
+REPO_URL="${REPO_URL:-https://github.com/lbockenstedt/cs.git}"
 REPO_BRANCH="${REPO_BRANCH:-main}"
 HUB_REPO_RAW="${HUB_REPO_RAW:-https://raw.githubusercontent.com/solutions-hpe/webui-hub}"
 CS_WEBUI_REPO_RAW="${CS_WEBUI_REPO_RAW:-https://raw.githubusercontent.com/solutions-hpe/cs-webui}"
@@ -232,7 +232,7 @@ if [[ -z "${_CLIENT_SIM_BOOTSTRAPPED:-}" ]]; then
     _env_br=$(grep '^REPO_BRANCH=' "${INSTALL_DIR}/.env" 2>/dev/null | head -1 | cut -d= -f2 | tr -d '"'"'"' ')
     [[ -n "${_env_br}" && "${_env_br}" != "lrb" ]] && REPO_BRANCH="${_env_br}"
   fi
-  _bs_url="https://raw.githubusercontent.com/solutions-hpe/client-sim/${REPO_BRANCH}/install-lxc.sh"
+  _bs_url="https://raw.githubusercontent.com/lbockenstedt/cs/${REPO_BRANCH}/installers/install-lxc.sh"
   _local_ver=$(grep '^VERSION=' "$0" 2>/dev/null | head -1 | tr -d '"' | cut -d= -f2)
   echo "[bootstrap] Local installer version : ${_local_ver:-unknown}"
   echo "[bootstrap] Fetching latest installer from ${_bs_url} ..."

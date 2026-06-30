@@ -66,7 +66,7 @@ save_failure_count() {
 rerun_installer() {
   local latest_installer_url installer_to_run installer_label
 
-  latest_installer_url="https://raw.githubusercontent.com/solutions-hpe/client-sim/${REPO_BRANCH}/webui-spoke/install-lxc.sh"
+  latest_installer_url="https://raw.githubusercontent.com/lbockenstedt/cs/${REPO_BRANCH}/installers/install-lxc.sh"
   installer_to_run="$INSTALLER_PATH"
   installer_label="$INSTALLER_PATH"
 
@@ -114,7 +114,7 @@ main() {
 
     # Proactive update check: fetch the remote INSTALLER_VERSION and reinstall if newer.
     remote_ver=$(curl -sSf --max-time 10 \
-      "https://raw.githubusercontent.com/solutions-hpe/client-sim/${REPO_BRANCH}/webui-spoke/INSTALLER_VERSION" \
+      "https://raw.githubusercontent.com/lbockenstedt/cs/${REPO_BRANCH}/webui-spoke/INSTALLER_VERSION" \
       2>/dev/null | tr -d '[:space:]')
     if [[ -n "$remote_ver" && -n "$INSTALLED_VERSION" && "$remote_ver" != "$INSTALLED_VERSION" ]]; then
       log "update_available installed=${INSTALLED_VERSION} remote=${remote_ver} — running installer"
