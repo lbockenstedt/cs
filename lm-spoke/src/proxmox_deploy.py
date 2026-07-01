@@ -26,7 +26,7 @@ from __future__ import annotations
 
 import logging
 import time
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 try:
     from dhcp_status import collect_dhcp_status
@@ -34,6 +34,14 @@ except ImportError:  # package-context import (core.src.base_spoke-style dual pa
     from .dhcp_status import collect_dhcp_status
 
 logger = logging.getLogger("ProxmoxDeploy")
+
+# Rolling resource-sample window for the per-host cpu_1h_avg / mem_1h_avg the
+# VM Server Details header reads. Mirrors the legacy webui-spoke
+# _RESOURCE_SAMPLE_WINDOW (server.py:3940). Samples are pruned to this window
+# on every ingest, so the average always reflects the last hour (no warm-up
+# delay — the mean of whatever samples exist is returned as soon as the first
+# frame arrives).
+_RESOURCE_SAMPLE_WINDOW = 3600.0
 
 
 def _s(v: Any) -> Optional[str]:
@@ -81,6 +89,11 @@ class ProxmoxDeploy:
         "usb_state", "present_usb", "unknown_usb", "usb_count", "agent_version",
         "pve_version", "provision_halt", "template_lock", "vmid_range",
         "vm_set_override", "effective_vm_set", "provision",
+        # Rolling 1h averages (computed from per-host sample rings); the VM
+        # Server Details header renders px.cpu_1h_avg / px.mem_1h_avg, falling
+        # back to "—" when None. Projected via _SUMMARY_KEYS so they relay to
+        # the hub cache alongside the rest of the per-host ``proxmox`` block.
+        "cpu_1h_avg", "mem_1h_avg",
     )
 
     def __init__(self) -> None:
@@ -88,6 +101,13 @@ class ProxmoxDeploy:
         self.proxmox_states: Dict[str, Dict[str, Any]] = {}
         # Rolling event buffers per host (Phase E fills these; D1 keeps empty).
         self.events: Dict[str, List[Dict[str, Any]]] = {}
+        # Per-host resource-sample rings → cpu_1h_avg / mem_1h_avg. Each sample
+        # is (timestamp, value); pruned to _RESOURCE_SAMPLE_WINDOW on every
+        # ingest so the mean always reflects the last hour. In-memory (matches
+        # proxmox_states); a spoke restart resets the window, which is fine —
+        # the averages repopulate from the next telemetry frame within ~10s.
+        self.cpu_samples: Dict[str, List[Tuple[float, float]]] = {}
+        self.mem_samples: Dict[str, List[Tuple[float, float]]] = {}
 
     # ── ingest ───────────────────────────────────────────────────────────────
 
@@ -162,11 +182,71 @@ class ProxmoxDeploy:
             # Auto-Provisioning card can show WHY nothing provisions.
             "provision":        body.get("provision") or {},
         }
+        # Roll a CPU + mem sample from this frame's node block, then read the
+        # 1h averages back into the entry so they ride the relay payload's
+        # per-host ``proxmox`` summary (Details header CPU 1h / Mem 1h).
+        self._record_resource_samples(hostname, node, now)
+        entry["cpu_1h_avg"] = self._resource_1h_average(self.cpu_samples.get(hostname, []))
+        entry["mem_1h_avg"] = self._resource_1h_average(self.mem_samples.get(hostname, []))
         self.proxmox_states[hostname] = entry
         logger.debug("CS_INGEST_TELEMETRY: %s — %d VMs (%d running, %d templates), %d USB",
                      hostname, len(enriched_vms), len(running),
                      len(enriched_vms) - len(non_template), len(usb_state))
         return entry
+
+    # ── resource samples (cpu_1h_avg / mem_1h_avg) ───────────────────────────
+
+    def _record_resource_samples(self, hostname: str, node: Dict[str, Any],
+                                 now: float) -> None:
+        """Append a CPU and a memory sample from this frame's ``node`` block.
+
+        Ports ``_record_resource_samples`` (legacy server.py:3966). CPU is
+        ``node.cpu_percent`` directly; mem is ``mem_used_kb / mem_total_kb * 100``
+        (a percentage, so hosts with different RAM compare on the same axis).
+        Each ring is pruned to ``_RESOURCE_SAMPLE_WINDOW`` on every append so
+        the mean always reflects the last hour. Best-effort: a missing/zero
+        field just skips that sample rather than raising.
+        """
+        if not hostname or not isinstance(node, dict):
+            return
+        cutoff = now - _RESOURCE_SAMPLE_WINDOW
+        cpu_pct = node.get("cpu_percent")
+        if cpu_pct is not None:
+            try:
+                ring = self.cpu_samples.setdefault(hostname, [])
+                ring.append((now, float(cpu_pct)))
+                ring[:] = [(ts, v) for ts, v in ring if ts >= cutoff]
+            except (TypeError, ValueError):
+                pass
+        mem_used = node.get("mem_used_kb")
+        mem_total = node.get("mem_total_kb")
+        try:
+            if mem_used is not None and mem_total:
+                mem_total_f = float(mem_total)
+                if mem_total_f > 0:
+                    mem_pct = (float(mem_used) / mem_total_f) * 100.0
+                    ring = self.mem_samples.setdefault(hostname, [])
+                    ring.append((now, mem_pct))
+                    ring[:] = [(ts, v) for ts, v in ring if ts >= cutoff]
+            else:
+                self.mem_samples.setdefault(hostname, [])
+        except (TypeError, ValueError, ZeroDivisionError):
+            pass
+
+    @staticmethod
+    def _resource_1h_average(samples: List[Tuple[float, float]]) -> Optional[float]:
+        """Rolling mean of all samples within the last hour, or None if none.
+
+        Ports ``_resource_1h_average`` (legacy server.py:3940). Returns the
+        average of whatever samples exist as soon as the first arrives — no
+        warm-up delay; None only when no sample has been recorded yet (which
+        is what the UI renders as "—").
+        """
+        if not samples:
+            return None
+        cutoff = time.time() - _RESOURCE_SAMPLE_WINDOW
+        recent = [v for ts, v in samples if ts >= cutoff]
+        return (sum(recent) / len(recent)) if recent else None
 
     # ── relay payload ────────────────────────────────────────────────────────
 
