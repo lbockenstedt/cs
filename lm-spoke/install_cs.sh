@@ -75,6 +75,21 @@ done
 
 [ "$(id -u)" -eq 0 ] || { echo "❌ Must be run as root."; exit 1; }
 
+# ── Local logging ─────────────────────────────────────────────────────────────
+# The lm-cs service unit below logs to /var/log/lm/lm-cs.log, but systemd
+# ``append:`` does NOT create parent dirs — so on a fresh box the spoke ran with
+# its logs silently dropped and a failed/pending install left nothing to read.
+# Create the dir up front and mirror the entire install to an install log so a
+# silent or half-finished run is debuggable without re-running. (Mirrors
+# lm/install_all.sh + agent/install_agent.sh, which both do this.)
+mkdir -p /var/log/lm
+chmod 755 /var/log/lm
+INSTALL_LOG="/var/log/lm/lm-cs-install.log"
+exec > >(tee -a "$INSTALL_LOG") 2>&1
+echo "══ $(date -u '+%Y-%m-%dT%H:%M:%SZ') install_cs.sh start ══"
+echo "  args: $*"
+echo "  log:  $INSTALL_LOG"
+
 GRN='\033[0;32m'; YLW='\033[1;33m'; NC='\033[0m'
 ok()   { echo -e "${GRN}✅  $*${NC}"; }
 warn() { echo -e "${YLW}⚠️   $*${NC}"; }
@@ -331,6 +346,8 @@ echo "  LM Hub:       $HUB_URL"
 echo "  Spoke ID:     $SPOKE_ID"
 echo "  Version:      $(cat $LM_DIR/cs/VERSION 2>/dev/null || echo unknown)"
 echo "  Status:       sudo systemctl status lm-cs"
+echo "  Service log:  /var/log/lm/lm-cs.log  (sudo journalctl -u lm-cs -f)"
+echo "  Install log:  $INSTALL_LOG"
 if [[ -n "${DHCP_IFACE:-}" && "$DHCP_SKIP" != "1" ]]; then
     if systemctl is-active --quiet dnsmasq 2>/dev/null; then
         echo "  DHCP:          dnsmasq RUNNING on ${DHCP_IFACE} (${DHCP_RANGE_START}–${DHCP_RANGE_END})"
