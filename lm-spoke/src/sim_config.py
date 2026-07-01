@@ -66,15 +66,61 @@ def load_ini(path: os.PathLike | str) -> configparser.ConfigParser:
     return p
 
 
+def merge_override(parser: configparser.ConfigParser, path: os.PathLike | str) -> None:
+    """Merge a hub-managed override ``.conf`` on top of an already-parsed parser.
+
+    Ports the legacy webui-spoke ``_merge_ini_override`` (server.py:675).
+    Every key/section in the override file wins over the base file. Missing
+    file → no-op. Parse failures log a warning and skip (never raise) so a
+    malformed hub override can't take down the engine's per-iteration reload.
+
+    The override files (``hub-sim-overrides.conf`` / ``hub-user-overrides.conf``)
+    are written by the spoke's ``CS_CONFIG_UPDATE`` handler from the
+    ``sim_conf_override`` / ``user_conf_override`` INI text the LM hub pushes.
+    Without this merge they were dead files — only ``[simulation] sim_phy``
+    was ever read (command_queue.usb_config_payload). Merging here makes the
+    hub-managed override path effective in the engine resolver, the
+    ``/api/config`` client route, and ``CS_GET_CONFIG`` readback.
+    """
+    p = Path(path)
+    if not p.exists():
+        return
+    try:
+        ov = _new_parser()
+        ov.read_string(p.read_text(encoding="utf-8"))
+        for section in ov.sections():
+            if not parser.has_section(section):
+                parser.add_section(section)
+            for key, value in ov.items(section):
+                parser.set(section, key, value)
+    except Exception as exc:  # noqa: BLE001 — best-effort; never break reload
+        logger.warning("Could not apply hub override %s: %s", p, exc)
+
+
+def serialize_ini(parser: configparser.ConfigParser) -> str:
+    """Render a parser back to INI text (round-trips ``load_ini`` output)."""
+    buf = io.StringIO()
+    parser.write(buf)
+    return buf.getvalue()
+
+
 def load_configs(config_dir: os.PathLike | str) -> Tuple[configparser.ConfigParser, configparser.ConfigParser]:
     """Load ``(simulation.conf, user-overrides.conf)`` from *config_dir*.
 
     ``user-overrides.conf`` is optional — an empty parser is returned if absent.
+
+    Hub-managed overrides (``hub-sim-overrides.conf`` / ``hub-user-overrides.conf``,
+    written by ``CS_CONFIG_UPDATE``) are merged on top so the hub-pushed config
+    takes effect everywhere this loader is used: the engine's per-iteration
+    ``resolve_profile``, the ``/api/config`` client route, and ``CS_GET_CONFIG``.
+    Mirrors the legacy webui-spoke, which merged the override before serving.
     """
     d = Path(config_dir)
     sim_conf = load_ini(d / "simulation.conf")
     user_conf_path = d / "user-overrides.conf"
     user_conf = load_ini(user_conf_path) if user_conf_path.exists() else _new_parser()
+    merge_override(sim_conf, d / "hub-sim-overrides.conf")
+    merge_override(user_conf, d / "hub-user-overrides.conf")
     return sim_conf, user_conf
 
 

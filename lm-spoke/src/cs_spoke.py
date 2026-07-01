@@ -153,10 +153,16 @@ class CSSpoke(BaseSpoke):
 
         # ── config ─────────────────────────────────────────────────────────
         if cmd in ("CS_GET_CONFIG",):
+            # Return the MERGED config (base repo file + hub-managed override
+            # layered on top) so the hub's Sim Config editor reads back the
+            # effective config, not the raw base. Without the merge, edits saved
+            # via CS_CONFIG_UPDATE (which writes hub-*-overrides.conf) would be
+            # invisible on Refresh. Mirrors legacy GET /api/config + /api/config/overrides.
             base = Path(__file__).resolve().parent.parent.parent / "configs"
+            sim_conf, user_conf = sim_config.load_configs(base)
             return {"status": "SUCCESS", "mode": "local",
-                    "simulation_conf": _read(base / "simulation.conf"),
-                    "user_overrides": _read(base / "user-overrides.conf")}
+                    "simulation_conf": sim_config.serialize_ini(sim_conf),
+                    "user_overrides": sim_config.serialize_ini(user_conf)}
 
         if cmd in ("CS_UPDATE_CONFIG", "UPDATE_CONFIG"):
             content = d.get("content")
@@ -420,9 +426,3 @@ class CSSpoke(BaseSpoke):
                     ", ".join(applied) if applied else "no changes")
         return applied
 
-
-def _read(path: Path) -> str:
-    try:
-        return path.read_text(encoding="utf-8")
-    except FileNotFoundError:
-        return ""
