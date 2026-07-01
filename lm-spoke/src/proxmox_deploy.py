@@ -80,7 +80,7 @@ class ProxmoxDeploy:
         "connected", "last_seen", "node", "vm_count", "running_count", "vms",
         "usb_state", "present_usb", "unknown_usb", "usb_count", "agent_version",
         "pve_version", "provision_halt", "template_lock", "vmid_range",
-        "vm_set_override", "effective_vm_set",
+        "vm_set_override", "effective_vm_set", "provision",
     )
 
     def __init__(self) -> None:
@@ -155,6 +155,12 @@ class ProxmoxDeploy:
             "usb_state":        [_tag_usb(u, hostname) for u in usb_state],
             "present_usb":      [_tag_usb(u, hostname) for u in present_usb],
             "unknown_usb":      [_tag_usb(u, hostname) for u in unknown_usb],
+            # Auto-provision diagnostic from the pxmx agent (cs_enabled,
+            # loop_running heartbeat, auto_provision_on, reason, halt, config
+            # snapshot). Projected into the per-host ``proxmox`` block via
+            # _SUMMARY_KEYS so the hub cache → /usb-provisioning-status → WebUI
+            # Auto-Provisioning card can show WHY nothing provisions.
+            "provision":        body.get("provision") or {},
         }
         self.proxmox_states[hostname] = entry
         logger.debug("CS_INGEST_TELEMETRY: %s — %d VMs (%d running, %d templates), %d USB",
