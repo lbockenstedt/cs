@@ -311,6 +311,19 @@ class CSSpoke(BaseSpoke):
             return {"status": "SUCCESS",
                     "settings": self.settings.update(patch)}
 
+        if cmd == "CS_CONFIG_UPDATE":
+            # Hub pushes hub-owned provisioning config (usb_vidpids,
+            # usb_ignored_vidpids, usb_auto_provision, template ids, VLAN
+            # ranges, reclone concurrency, ... + optional sim/user-overrides
+            # INI text). The legacy cs webui-spoke applied these via
+            # _apply_hub_config; this spoke MUST do the same or certification
+            # pushes are silently dropped: usb_vidpids stays "[]" in settings,
+            # the cs_bridge pulls an empty ``vidpids`` via CS_GET_USB_CONFIG
+            # every 60s, the agent's _dongle_vidpids returns 0, and
+            # auto-provision never fires ("no dongle_vidpids configured").
+            applied = self._apply_hub_config(d if isinstance(d, dict) else {})
+            return {"status": "SUCCESS", "applied": applied}
+
         # Phase 2/3 commands (queue/proxmox/clients) return NotImplemented until
         # those modules land, so the LM hub sees a clear "not yet" rather than a
         # silent error.
@@ -326,6 +339,84 @@ class CSSpoke(BaseSpoke):
                     "message": f"{cmd} lands in a later phase", "command": cmd}
 
         return {"status": "ERROR", "message": f"Unknown command: {command_type}"}
+
+    # ── hub-pushed config (CS_CONFIG_UPDATE) ───────────────────────────────
+    # Keys the hub sends that map 1:1 to a CSSettings key (consumed by
+    # ``CSSettings.usb_config_payload`` → cs_bridge → agent usb_config).
+    _HUB_DIRECT_KEYS = (
+        "usb_vidpids", "usb_ignored_vidpids", "usb_auto_provision",
+        "usb_missing_timeout", "usb_max_slots", "vm_image_1_pct",
+        "reclone_concurrency", "l1_vlan_start", "l1_vlan_end",
+        "vmid_start", "vm_set_override", "use_all_dongles",
+        "guest_agent_watchdog_enabled", "guest_agent_grace_minutes",
+        "guest_agent_check_interval_minutes", "guest_agent_reboot_after_minutes",
+        "guest_agent_reclone_after_minutes", "watchdog_reboot_enabled",
+        "cpu_provision_threshold", "mem_provision_threshold",
+    )
+    # Hub keys that must be renamed to land in their CSSettings counterpart
+    # (the hub UI/label uses ``vm_image_*``; the settings store + agent read
+    # ``image*_template_*``). Without this remap the template IDs never reach
+    # the agent even after certification is unblocked.
+    _HUB_KEY_REMAP = {
+        "vm_image_1_template_id":  "image1_template_id",
+        "vm_image_2_template_id":  "image2_template_id",
+        "vm_image_1_template_spec": "image1_template_spec",
+        "vm_image_2_template_spec": "image2_template_spec",
+    }
+
+    def _apply_hub_config(self, patch: Dict[str, Any]) -> list:
+        """Apply a hub-pushed CS_CONFIG_UPDATE patch to the cs settings store.
+
+        Mirrors the legacy webui-spoke ``_apply_hub_config`` for the keys this
+        spoke consumes (the ``usb_config_payload`` knobs + the sim/user-override
+        INI files). Hub keys with no CSSettings equivalent (repo_branch,
+        reclone_schedule_*, vm_silent_timeout, ignored_hostnames) are ignored
+        here — they are legacy-only and this spoke has no consumer for them.
+        Returns the list of applied keys (for the hub log / reply).
+        """
+        if not isinstance(patch, dict) or not patch:
+            return []
+        update: Dict[str, Any] = {"hub_managed": True}
+        applied: list = []
+        for key in self._HUB_DIRECT_KEYS:
+            if key in patch:
+                update[key] = patch[key]
+                applied.append(key)
+        for hub_key, settings_key in self._HUB_KEY_REMAP.items():
+            if hub_key in patch:
+                update[settings_key] = patch[hub_key]
+                applied.append(f"{hub_key}->{settings_key}")
+        # Optional simulation.conf / user-overrides.conf INI text overrides.
+        # None = clear the local override file so the GitHub-pulled file applies;
+        # a string = write it to configs/hub-*-overrides.conf (merged on top of
+        # simulation.conf by usb_config_payload's sim_phy read).
+        for override_key, filename in (
+            ("sim_conf_override", "hub-sim-overrides.conf"),
+            ("user_conf_override", "hub-user-overrides.conf"),
+        ):
+            if override_key not in patch:
+                continue
+            text = patch[override_key]
+            override_path = self.settings.config_dir / filename
+            try:
+                if text is None:
+                    if override_path.exists():
+                        override_path.unlink()
+                    applied.append(f"{override_key}:cleared")
+                else:
+                    override_path.parent.mkdir(parents=True, exist_ok=True)
+                    tmp = override_path.with_suffix(".tmp")
+                    tmp.write_text(str(text), encoding="utf-8")
+                    tmp.replace(override_path)
+                    applied.append(f"{override_key}:updated")
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("CS_CONFIG_UPDATE: %s write failed: %s",
+                               override_path, exc)
+        if applied:
+            self.settings.update(update)
+        logger.info("CS_CONFIG_UPDATE: applied %s",
+                    ", ".join(applied) if applied else "no changes")
+        return applied
 
 
 def _read(path: Path) -> str:
