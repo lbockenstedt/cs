@@ -262,46 +262,58 @@ fi
 step "Installing Generic Agent"
 mkdir -p "$LM_DIR"
 
-# LM core (base_spoke + shared base classes). CSSpoke subclasses BaseSpoke, which
-# lives in the lm hub repo (lm/core/src/base_spoke.py) — NOT in the cs repo. The
-# service unit's PYTHONPATH below includes $LM_DIR/core/src, but on a FRESH box
-# with no prior LM hub install /opt/lm/core does not exist, so the spoke
-# crash-loops with "ModuleNotFoundError: No module named 'base_spoke'"
-# (the prior install only worked because /opt/lm/core was already there). Clone
-# (or update) lm here so base_spoke is always present.
+# LM core (base_spoke + shared base classes). CSSpoke subclasses BaseSpoke and
+# control_plane subclasses BaseControlPlane, both of which live ONLY in the lm
+# hub repo's core/ subdir (lm/core/src/base_spoke.py, lm/core/src/messaging/).
+# The service unit's PYTHONPATH below includes $LM_DIR/core/src so
+# `from base_spoke` / `from core.src.base_spoke` resolve there. On a FRESH
+# cs-only box /opt/lm/core does not exist, so the spoke crash-loops with
+# "ModuleNotFoundError: No module named 'base_spoke'" (a prior install only
+# worked because a hub install had already laid /opt/lm/core).
+#
+# Mirror install_all.sh: clone lm to a temp dir and extract ONLY its core/
+# subdir to $LM_DIR/core. Cloning the WHOLE lm repo to $LM_DIR/core nests it one
+# level deep — base_spoke lands at $LM_DIR/core/core/src/base_spoke.py and the
+# PYTHONPATH path ($LM_DIR/core/src) misses it, so the spoke still crash-loops.
+# Extracting just core/ puts base_spoke at $LM_DIR/core/src/base_spoke.py.
 LM_CORE_URL="https://github.com/lbockenstedt/lm.git"
-_lm_core_ensure() {
-    # Re-clone from scratch (used when a prior checkout is broken or a pull
-    # fails). With set -e, a bare failed pull aborts the whole install leaving
-    # /opt/lm/core half-updated and the spoke crash-looping on base_spoke; this
-    # recovers instead. $1 = reason for the re-clone.
-    warn "LM core re-clone ($1)"
-    rm -rf "$LM_DIR/core"
-    git clone -q "$LM_CORE_URL" "$LM_DIR/core"
+_lm_core_refresh() {
+    # $1 = reason. Fresh clone to a temp dir, then swap only the core/ subdir in
+    # place. rm -rf the existing /opt/lm/core first so updates — and recovery
+    # from a half-written or wrong-layout prior run (e.g. an older installer that
+    # cloned the whole lm repo here) — are clean and idempotent.
+    warn "LM core refresh ($1)"
+    local tmp="$LM_DIR/.lm-core-tmp"
+    rm -rf "$tmp" "$LM_DIR/core"
+    if ! git clone -q "$LM_CORE_URL" "$tmp"; then
+        rm -rf "$tmp"
+        return 1
+    fi
+    if [ ! -d "$tmp/core" ]; then
+        warn "LM core clone has no core/ subdir — unexpected lm repo layout"
+        rm -rf "$tmp"
+        return 1
+    fi
+    mv "$tmp/core" "$LM_DIR/core"
+    rm -rf "$tmp"
 }
-if [ -d "$LM_DIR/core/.git" ]; then
+if [ -f "$LM_DIR/core/src/base_spoke.py" ]; then
     echo "   Updating LM core (base_spoke)"
-    git -C "$LM_DIR/core" pull --rebase --autostash origin main -q \
-        || _lm_core_ensure "pull --rebase failed"
+    _lm_core_refresh "update" || { echo "❌ LM core update failed (network access to $LM_CORE_URL?)"; exit 1; }
 else
-    # A stale non-git dir from a botched prior install blocks `git clone` (it
-    # refuses a non-empty target) — remove it first.
-    [ -d "$LM_DIR/core" ] && rm -rf "$LM_DIR/core"
+    # A stale dir from a botched prior install (or an older installer that cloned
+    # the whole lm repo here) is removed by _lm_core_refresh before the swap.
     echo "   Cloning LM core (base_spoke)"
-    git clone -q "$LM_CORE_URL" "$LM_DIR/core"
+    _lm_core_refresh "install" || { echo "❌ LM core clone failed (network access to $LM_CORE_URL?)"; exit 1; }
 fi
 # Verify base_spoke actually landed — a wrong-repo clone, a partial clone, or a
 # future lm layout change would otherwise leave the spoke crash-looping with a
 # confusing import error. Fail loudly with the exact missing path instead.
 if [ ! -f "$LM_DIR/core/src/base_spoke.py" ]; then
-    warn "LM core present but $LM_DIR/core/src/base_spoke.py missing — re-cloning once"
-    _lm_core_ensure "base_spoke.py absent after clone"
-    if [ ! -f "$LM_DIR/core/src/base_spoke.py" ]; then
-        echo "❌ FATAL: base_spoke.py not found at $LM_DIR/core/src/base_spoke.py after clone."
-        echo "   CS spoke subclasses BaseSpoke from the lm hub repo; the spoke cannot start without it."
-        echo "   Check network access to $LM_CORE_URL and that lm main carries core/src/base_spoke.py."
-        exit 1
-    fi
+    echo "❌ FATAL: base_spoke.py not found at $LM_DIR/core/src/base_spoke.py after clone."
+    echo "   CS spoke subclasses BaseSpoke from the lm hub repo; the spoke cannot start without it."
+    echo "   Check network access to $LM_CORE_URL and that lm main carries core/src/base_spoke.py."
+    exit 1
 fi
 ok "LM core (base_spoke) ready"
 
