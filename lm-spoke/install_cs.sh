@@ -261,6 +261,22 @@ fi
 # ── Clone / update ────────────────────────────────────────────────────────────
 step "Installing Generic Agent"
 mkdir -p "$LM_DIR"
+
+# LM core (base_spoke + shared base classes). CSSpoke subclasses BaseSpoke, which
+# lives in the lm hub repo (lm/core/src/base_spoke.py) — NOT in the cs repo. The
+# service unit's PYTHONPATH below includes $LM_DIR/core/src, but on a FRESH box
+# with no prior LM hub install /opt/lm/core does not exist, so the spoke
+# crash-loops with "ModuleNotFoundError: No module named 'base_spoke'"
+# (the prior install only worked because /opt/lm/core was already there). Clone
+# (or update) lm here so base_spoke is always present.
+if [ -d "$LM_DIR/core/.git" ]; then
+    echo "   Updating LM core (base_spoke)"
+    git -C "$LM_DIR/core" pull --rebase --autostash origin main -q
+else
+    echo "   Cloning LM core (base_spoke)"
+    git clone -q https://github.com/lbockenstedt/lm.git "$LM_DIR/core"
+fi
+
 if [ -d "$LM_DIR/cs/.git" ]; then
     echo "   Updating existing install"
     git -C "$LM_DIR/cs" pull --rebase --autostash origin main -q
