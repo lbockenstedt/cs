@@ -56,6 +56,17 @@ def test_1h_avg_is_rolling_mean_of_multiple_samples():
     assert entry["cpu_1h_avg"] == 50.0
 
 
+def test_1h_avg_rounded_to_2_decimal_places():
+    d = proxmox_deploy.ProxmoxDeploy()
+    # mean of [10, 10, 11] == 10.333… → rounds to 10.33, not 10.333333333333334.
+    d.ingest_telemetry("h1", _body(cpu_percent=10.0))
+    d.ingest_telemetry("h1", _body(cpu_percent=10.0))
+    entry = d.ingest_telemetry("h1", _body(cpu_percent=11.0))
+    assert entry["cpu_1h_avg"] == 10.33
+    # And the relay payload carries the rounded value too.
+    assert d.relay_payload("cs-spoke-1")["proxmox"]["cpu_1h_avg"] == 10.33
+
+
 def test_missing_resource_fields_yield_none_rendered_as_dash():
     d = proxmox_deploy.ProxmoxDeploy()
     # Agent reports a node block with NO resource fields — no sample recorded,

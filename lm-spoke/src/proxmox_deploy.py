@@ -240,13 +240,17 @@ class ProxmoxDeploy:
         Ports ``_resource_1h_average`` (legacy server.py:3940). Returns the
         average of whatever samples exist as soon as the first arrives — no
         warm-up delay; None only when no sample has been recorded yet (which
-        is what the UI renders as "—").
+        is what the UI renders as "—"). Rounded to 2 decimal places so the
+        Details header (CPU 1h / Mem 1h) shows e.g. ``42.17`` not
+        ``42.173333333333334``.
         """
         if not samples:
             return None
         cutoff = time.time() - _RESOURCE_SAMPLE_WINDOW
         recent = [v for ts, v in samples if ts >= cutoff]
-        return (sum(recent) / len(recent)) if recent else None
+        if not recent:
+            return None
+        return round(sum(recent) / len(recent), 2)
 
     # ── relay payload ────────────────────────────────────────────────────────
 
