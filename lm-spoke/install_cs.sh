@@ -33,11 +33,18 @@ SVC_USER="svc_lm"
 LM_DIR="/opt/lm"
 # Client API listener. The spoke owns the isolated sim-client DHCP scope
 # (169.253.1.1/24 on the 2nd NIC) and is also the client API gateway on
-# 169.253.1.1:8000. Binding 0.0.0.0 puts the listener on the DHCP NIC too;
+# 169.253.1.1:8080. Binding 0.0.0.0 puts the listener on the DHCP NIC too;
 # dnsmasq serves 169.253.1.0/24 with no router option, so clients reach it
 # directly. Override either before running.
-CS_API_PORT="${CS_API_PORT:-8000}"
+# 8080 (not 8000): the LM hub serves its admin WebUI/API on 0.0.0.0:8000, and
+# in hub mode the cs spoke runs on the SAME box — binding 8000 here collided
+# with the hub and took the WebUI down. The cs client API takes 8080.
+CS_API_PORT="${CS_API_PORT:-8080}"
 CS_API_HOST="${CS_API_HOST:-0.0.0.0}"
+# Migrate the pre-collision default: 8000 collides with the hub WebUI/API on
+# the same box, so a stale CS_API_PORT=8000 baked into an existing .env by a
+# prior install is bumped to 8080. Any other explicitly-chosen port is kept.
+[ "${CS_API_PORT:-}" = "8000" ] && CS_API_PORT="8080"
 
 # ── DHCP (sim-client isolated network) — port of install-lxc.sh STEP 3 ─────────
 # A second NIC runs dnsmasq DHCP for the isolated simulation-client network.

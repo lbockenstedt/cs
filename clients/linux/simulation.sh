@@ -91,7 +91,7 @@ ssidpw_fail=$(get_value 'simulation' 'ssidpw_fail')
 allow_offline=$(get_value 'simulation' 'allow_offline')
 web_server=$(get_value 'simulation' 'web_server')
 server_url=$(get_value 'server' 'server_url')
-server_url="${server_url:-http://169.253.1.1:8000}"
+server_url="${server_url:-http://169.253.1.1:8080}"
 #------------------------------------------------------------
 #Device Specific Simulation settings
 #------------------------------------------------------------

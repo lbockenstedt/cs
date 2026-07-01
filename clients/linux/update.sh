@@ -17,7 +17,7 @@ process_ini_file '/usr/local/scripts/simulation.conf'
 #------------------------------------------------------------
 web_server=$(get_value 'simulation' 'web_server')
 server_url=$(get_value 'server' 'server_url')
-server_url="${server_url:-http://169.253.1.1:8000}"
+server_url="${server_url:-http://169.253.1.1:8080}"
 smb_repo=$(get_value 'simulation' 'smb_repo')
 smb_address=$(get_value 'address' 'smb_address')
 github_repo=$(get_value 'simulation' 'github_repo')

@@ -50,14 +50,18 @@ class CSControlPlane(BaseControlPlane):
         self.module_type = "simulation"
         self.startup_config = config or {}
         # Client API listener (the spoke that owns the DHCP scope 169.253.1.1/24
-        # is also the client API gateway on 169.253.1.1:8000). Bound 0.0.0.0 so
+        # is also the client API gateway on 169.253.1.1:8080). Bound 0.0.0.0 so
         # the listener lands on the DHCP NIC; configurable via CS_API_PORT/HOST.
+        # NOTE: 8080 (not 8000) — the LM hub serves its own admin WebUI/API on
+        # 0.0.0.0:8000, and in hub mode the cs spoke runs on the SAME box, so
+        # binding 8000 here collided with the hub and broke the WebUI. The cs
+        # client API takes 8080; sim clients reach it at 169.253.1.1:8080.
         self.api_host = api_host or os.getenv("CS_API_HOST", "0.0.0.0")
         try:
             self.api_port = int(api_port if api_port is not None
-                                else os.getenv("CS_API_PORT", "8000"))
+                                else os.getenv("CS_API_PORT", "8080"))
         except (TypeError, ValueError):
-            self.api_port = 8000
+            self.api_port = 8080
 
     async def run(self):
         logger.info(f"Starting CS (Client Simulator) -> {self.hub_url}")
@@ -130,7 +134,7 @@ class CSControlPlane(BaseControlPlane):
 
     def run_standalone_mode(self):
         """Standalone FastAPI server: the full client API surface on
-        0.0.0.0:8000, driven by the same CSSpoke hub mode uses.
+        0.0.0.0:8080, driven by the same CSSpoke hub mode uses.
 
         ``build_client_api_app`` is the single source for the route layer, so
         standalone and hub mode serve identical surfaces (health / kill-switch /
@@ -153,10 +157,12 @@ if __name__ == "__main__":
     parser.add_argument("--secret",     default=os.getenv("SPOKE_SECRET", ""))
     parser.add_argument("--hub-secret", nargs='?', default=os.getenv("HUB_SECRET", ""), const="")
     parser.add_argument("--hub",        default=os.getenv("HUB_URL", "ws://localhost:8765"))
-    # Client API listener (169.253.1.1:8000 on the DHCP NIC). 0.0.0.0 binds it
+    # Client API listener (169.253.1.1:8080 on the DHCP NIC). 0.0.0.0 binds it
     # onto every interface, including the sim-client DHCP NIC, so clients on
     # 169.253.1.0/24 reach it directly (dnsmasq serves no router option).
-    parser.add_argument("--port",       type=int, default=os.getenv("CS_API_PORT", "8000"))
+    # 8080, not 8000: the LM hub owns 0.0.0.0:8000 (admin WebUI/API) and in hub
+    # mode this spoke shares that box — 8000 here collided with the hub.
+    parser.add_argument("--port",       type=int, default=os.getenv("CS_API_PORT", "8080"))
     parser.add_argument("--host",       default=os.getenv("CS_API_HOST", "0.0.0.0"))
     # PSK self-provisioning (optional). Falls back to env LM_ONBOARDING_PSK /
     # LM_TENANT_ID_HINT when the flags are absent; a spoke without either

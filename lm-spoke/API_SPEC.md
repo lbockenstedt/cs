@@ -78,12 +78,12 @@ Dispatched in `CSSpoke.handle_command`. `*_GET_STATUS` falls back to
 | `CS_UPDATE_AGENT` | qm guest exec install/update |
 | `CS_SELF_UPDATE` | `perform_self_update_check()` |
 
-## Client API (port 8000, both hub and standalone mode)
+## Client API (port 8080, both hub and standalone mode)
 
 The spoke that owns the isolated sim-client DHCP scope (`169.253.1.1/24` on the
-2nd NIC) is also the client API gateway on `169.253.1.1:8000`. The full
+2nd NIC) is also the client API gateway on `169.253.1.1:8080`. The full
 client-facing surface is implemented (`lm-spoke/src/client_api.py`,
-`build_client_api_app`) and served on `0.0.0.0:8000` — configurable via
+`build_client_api_app`) and served on `0.0.0.0:8080` — configurable via
 `CS_API_PORT` / `CS_API_HOST` (env or `--port` / `--host`). The same app runs in
 hub mode (a `uvicorn.Server.serve()` task started in `CSControlPlane.run()`,
 surviving hub reconnects) and standalone mode (`run_standalone_mode()`), so both

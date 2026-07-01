@@ -104,7 +104,7 @@ sudo bash install-lxc.sh --branch main
 
 ```bash
 systemctl status client-sim-dashboard
-curl http://localhost:8000/api/health
+curl http://localhost:8080/api/health
 cat /var/log/client-sim-dashboard-install.log
 ```
 
@@ -130,7 +130,7 @@ Run this on the **Proxmox host**, not inside the LXC.
 
 ```bash
 curl -sSL https://raw.githubusercontent.com/lbockenstedt/cs/main/proxmox/install-proxmox-agent.sh | sudo bash -s -- \
-  --server http://169.253.1.1:8000 \
+  --server http://169.253.1.1:8080 \
   --branch main \
   --hub-url https://<hub-host>:8443 \
   --tenant-id <tenant-id> \
@@ -140,7 +140,7 @@ curl -sSL https://raw.githubusercontent.com/lbockenstedt/cs/main/proxmox/install
 ```bash
 cd /opt/client-sim-repo/proxmox
 sudo bash install-proxmox-agent.sh \
-  --server http://169.253.1.1:8000 \
+  --server http://169.253.1.1:8080 \
   --branch main \
   --hub-url https://<hub-host>:8443 \
   --tenant-id <tenant-id> \
@@ -160,14 +160,14 @@ journalctl -u client-sim-proxmox-agent -f
 3. Approve the agent from the spoke UI, or by API:
 
 ```bash
-curl -X POST http://169.253.1.1:8000/api/proxmox/approve/<hostname>
+curl -X POST http://169.253.1.1:8080/api/proxmox/approve/<hostname>
 ```
 
 4. Confirm the agent received a key and is posting telemetry.
 
 ```bash
 cat /etc/client-sim-proxmox-agent.env
-curl http://169.253.1.1:8000/api/proxmox/status
+curl http://169.253.1.1:8080/api/proxmox/status
 ```
 
 #### Common installer flags
@@ -304,7 +304,7 @@ Resolution order on a client VM is:
 
 | Section | Key | Default in repo | Description |
 |---|---|---:|---|
-| `[server]` | `server_url` | `http://169.253.1.1:8000` | Spoke URL used by clients for health/config/scripts/status/inbox |
+| `[server]` | `server_url` | `http://169.253.1.1:8080` | Spoke URL used by clients for health/config/scripts/status/inbox |
 | `[address]` | `smb_address` | `//nas/scripts` | SMB fallback path for updates |
 | `[address]` | `ping_address` | `172.31.201.3` | Ping target for traffic testing |
 | `[address]` | `dns_latency_1` | `13.239.88.95` | DNS latency target 1 |
@@ -446,31 +446,31 @@ The VirtualHere restart path is separate from the Proxmox agent failure counter.
 #### Health and status
 
 ```bash
-curl http://localhost:8000/api/health
-curl http://localhost:8000/api/services/status
-curl http://localhost:8000/api/system/health
-curl http://localhost:8000/api/version
+curl http://localhost:8080/api/health
+curl http://localhost:8080/api/services/status
+curl http://localhost:8080/api/system/health
+curl http://localhost:8080/api/version
 ```
 
 #### Client and config views
 
 ```bash
-curl http://localhost:8000/api/clients
-curl "http://localhost:8000/api/config?hostname=<client-hostname>"
-curl http://localhost:8000/api/config/overrides
-curl http://localhost:8000/api/config/parsed
-curl "http://localhost:8000/api/scripts/list?platform=linux"
+curl http://localhost:8080/api/clients
+curl "http://localhost:8080/api/config?hostname=<client-hostname>"
+curl http://localhost:8080/api/config/overrides
+curl http://localhost:8080/api/config/parsed
+curl "http://localhost:8080/api/scripts/list?platform=linux"
 ```
 
 #### Proxmox views
 
 ```bash
-curl http://localhost:8000/api/proxmox/status
-curl http://localhost:8000/api/proxmox/pending
-curl http://localhost:8000/api/proxmox/approved
-curl http://localhost:8000/api/proxmox/reclone-status
-curl http://localhost:8000/api/proxmox/usb-config
-curl -X POST http://localhost:8000/api/proxmox/console/<vmid>
+curl http://localhost:8080/api/proxmox/status
+curl http://localhost:8080/api/proxmox/pending
+curl http://localhost:8080/api/proxmox/approved
+curl http://localhost:8080/api/proxmox/reclone-status
+curl http://localhost:8080/api/proxmox/usb-config
+curl -X POST http://localhost:8080/api/proxmox/console/<vmid>
 ```
 
 `POST /api/proxmox/console/{vmid}` creates a direct Proxmox VNC console session for the spoke VM Server view; the browser then opens `/console?session_id=<id>` and bridges over `WS /ws/console/{session_id}`.
@@ -478,18 +478,18 @@ curl -X POST http://localhost:8000/api/proxmox/console/<vmid>
 #### Relay and repo views
 
 ```bash
-curl http://localhost:8000/api/repo/status
-curl http://localhost:8000/api/relay/status
-curl http://localhost:8000/api/relay/diag
+curl http://localhost:8080/api/repo/status
+curl http://localhost:8080/api/relay/status
+curl http://localhost:8080/api/relay/diag
 ```
 
 #### Logs and maintenance
 
 ```bash
-curl "http://localhost:8000/api/logs/history?lines=200&source=service"
-curl -X POST http://localhost:8000/api/sync-now
-curl -X POST http://localhost:8000/api/self-update
-curl -X POST http://localhost:8000/api/update-all
+curl "http://localhost:8080/api/logs/history?lines=200&source=service"
+curl -X POST http://localhost:8080/api/sync-now
+curl -X POST http://localhost:8080/api/self-update
+curl -X POST http://localhost:8080/api/update-all
 ```
 
 ### Troubleshooting
@@ -497,7 +497,7 @@ curl -X POST http://localhost:8000/api/update-all
 | Problem | What to check | Typical fix |
 |---|---|---|
 | Spoke UI is down | `systemctl status client-sim-dashboard` and `/api/health` | rerun `install-lxc.sh`, inspect `/var/log/client-sim-dashboard-install.log`, check watchdog log |
-| Clients are not appearing | `curl /api/health`, `curl /api/clients`, client `server_url` | verify `server_url`, `web_server=on`, and client reachability to `169.253.1.1:8000` |
+| Clients are not appearing | `curl /api/health`, `curl /api/clients`, client `server_url` | verify `server_url`, `web_server=on`, and client reachability to `169.253.1.1:8080` |
 | Proxmox agent never connects | `systemctl status client-sim-proxmox-agent`, `curl /api/proxmox/pending` | approve the pending host, verify `/etc/client-sim-proxmox-agent.env`, then restart the agent |
 | VM Server tab is empty | `curl /api/proxmox/status` | make sure the Proxmox agent is approved and posting telemetry |
 | Commands stay queued | `curl /api/commands`, agent/client logs | confirm agent or client can poll `/api/inbox` and POST `/api/inbox/ack` |

@@ -1,4 +1,4 @@
-"""client_api — the cs spoke's client-facing FastAPI surface (port 8000).
+"""client_api — the cs spoke's client-facing FastAPI surface (port 8080).
 
 The spoke that owns the DHCP scope (``169.253.1.1/24``) is also the client API
 gateway. This module builds the FastAPI app that simulation clients call:
