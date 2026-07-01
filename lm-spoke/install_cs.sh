@@ -269,13 +269,41 @@ mkdir -p "$LM_DIR"
 # crash-loops with "ModuleNotFoundError: No module named 'base_spoke'"
 # (the prior install only worked because /opt/lm/core was already there). Clone
 # (or update) lm here so base_spoke is always present.
+LM_CORE_URL="https://github.com/lbockenstedt/lm.git"
+_lm_core_ensure() {
+    # Re-clone from scratch (used when a prior checkout is broken or a pull
+    # fails). With set -e, a bare failed pull aborts the whole install leaving
+    # /opt/lm/core half-updated and the spoke crash-looping on base_spoke; this
+    # recovers instead. $1 = reason for the re-clone.
+    warn "LM core re-clone ($1)"
+    rm -rf "$LM_DIR/core"
+    git clone -q "$LM_CORE_URL" "$LM_DIR/core"
+}
 if [ -d "$LM_DIR/core/.git" ]; then
     echo "   Updating LM core (base_spoke)"
-    git -C "$LM_DIR/core" pull --rebase --autostash origin main -q
+    git -C "$LM_DIR/core" pull --rebase --autostash origin main -q \
+        || _lm_core_ensure "pull --rebase failed"
 else
+    # A stale non-git dir from a botched prior install blocks `git clone` (it
+    # refuses a non-empty target) — remove it first.
+    [ -d "$LM_DIR/core" ] && rm -rf "$LM_DIR/core"
     echo "   Cloning LM core (base_spoke)"
-    git clone -q https://github.com/lbockenstedt/lm.git "$LM_DIR/core"
+    git clone -q "$LM_CORE_URL" "$LM_DIR/core"
 fi
+# Verify base_spoke actually landed — a wrong-repo clone, a partial clone, or a
+# future lm layout change would otherwise leave the spoke crash-looping with a
+# confusing import error. Fail loudly with the exact missing path instead.
+if [ ! -f "$LM_DIR/core/src/base_spoke.py" ]; then
+    warn "LM core present but $LM_DIR/core/src/base_spoke.py missing — re-cloning once"
+    _lm_core_ensure "base_spoke.py absent after clone"
+    if [ ! -f "$LM_DIR/core/src/base_spoke.py" ]; then
+        echo "❌ FATAL: base_spoke.py not found at $LM_DIR/core/src/base_spoke.py after clone."
+        echo "   CS spoke subclasses BaseSpoke from the lm hub repo; the spoke cannot start without it."
+        echo "   Check network access to $LM_CORE_URL and that lm main carries core/src/base_spoke.py."
+        exit 1
+    fi
+fi
+ok "LM core (base_spoke) ready"
 
 if [ -d "$LM_DIR/cs/.git" ]; then
     echo "   Updating existing install"
