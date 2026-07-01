@@ -152,7 +152,12 @@ class CSSettings:
         "usb_auto_provision": "off",
         "use_all_dongles": False,
         "usb_max_slots": 24,
-        "vmid_start": 0,
+        # VMID allocation range for new sim VMs. Defaults 90000-99999 match the
+        # pxmx agent's historical default so an unset hub value preserves behavior;
+        # the clone-source templates (image1/2_template_id) are OUTSIDE this range
+        # (the agent excludes them from the allocator) and are cluster-consistent.
+        "vmid_start": 90000,
+        "vmid_end": 99999,
         "vm_set_override": 0,
         "vm_image_1_pct": 50,
         "image1_template_id": 100,
@@ -253,7 +258,8 @@ class CSSettings:
             "auto_provision": _normalize_toggle(self.get("usb_auto_provision", "off")),
             "use_all_dongles": _setting_bool(self.get("use_all_dongles", False)),
             "max_slots": max(1, min(256, int(self.get("usb_max_slots", 24) or 24))),
-            "vmid_start": int(self.get("vmid_start", 0) or 0),
+            "vmid_start": int(self.get("vmid_start", 90000) or 90000),
+            "vmid_end": int(self.get("vmid_end", 99999) or 99999),
             "vm_set_override": vm_set_override,
             "ignored_vidpids": _parse_json_list(self.get("usb_ignored_vidpids", "[]")),
             "sim_phy": sim_phy,

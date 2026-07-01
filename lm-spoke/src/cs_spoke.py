@@ -347,7 +347,7 @@ class CSSpoke(BaseSpoke):
         "usb_vidpids", "usb_ignored_vidpids", "usb_auto_provision",
         "usb_missing_timeout", "usb_max_slots", "vm_image_1_pct",
         "reclone_concurrency", "l1_vlan_start", "l1_vlan_end",
-        "vmid_start", "vm_set_override", "use_all_dongles",
+        "vmid_start", "vmid_end", "vm_set_override", "use_all_dongles",
         "guest_agent_watchdog_enabled", "guest_agent_grace_minutes",
         "guest_agent_check_interval_minutes", "guest_agent_reboot_after_minutes",
         "guest_agent_reclone_after_minutes", "watchdog_reboot_enabled",
