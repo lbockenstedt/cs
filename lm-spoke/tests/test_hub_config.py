@@ -141,3 +141,51 @@ def test_config_update_empty_patch_is_noop(spoke_loop):
     resp = _run(loop, spoke.handle_command("CS_CONFIG_UPDATE", {}))
     assert resp["status"] == "SUCCESS"
     assert resp["applied"] == []
+
+
+def test_usb_config_payload_emits_thresholds_protected_vmids_and_missing_timeout_seconds(spoke_loop):
+    """The Setup/Proxmox 'VM Auto-Provisioning' card owns resource thresholds
+    (cpu/mem provision + delete), protected_vmids, and the missing-dongle
+    teardown timeout. The cs speak must accept+persist+emit all of them in
+    usb_config (the agent reads them there), and:
+
+    * missing_timeout is stored in MINUTES (UI label "Destroy after missing
+      (minutes)") but the agent compares in SECONDS → emit minutes × 60.
+    * VM 1001 is always protected (UI help) → merge it into the emitted list.
+    * protected_vmids accepts comma-separated ints AND ranges.
+    """
+    spoke, loop = spoke_loop
+    resp = _run(loop, spoke.handle_command("CS_CONFIG_UPDATE", {
+        "cpu_provision_threshold": "75",
+        "cpu_delete_threshold": "85",
+        "mem_provision_threshold": "70",
+        "mem_delete_threshold": "80",
+        "usb_missing_timeout": "5",          # minutes
+        "protected_vmids": "9000, 9005-9007",  # int + range, no 1001
+    }))
+    assert resp["status"] == "SUCCESS"
+    for k in ("cpu_provision_threshold", "cpu_delete_threshold",
+              "mem_provision_threshold", "mem_delete_threshold",
+              "usb_missing_timeout", "protected_vmids"):
+        assert k in resp["applied"], f"{k} not applied"
+
+    cfg = spoke.settings.usb_config_payload()
+    # Thresholds clamped + threaded through.
+    assert cfg["cpu_provision_threshold"] == 75
+    assert cfg["cpu_delete_threshold"] == 85
+    assert cfg["mem_provision_threshold"] == 70
+    assert cfg["mem_delete_threshold"] == 80
+    # missing_timeout: 5 minutes → 300 seconds (agent compares in seconds).
+    assert cfg["missing_timeout"] == 300
+    # protected_vmids: 9000 + 9005-9007 range, AND 1001 always merged.
+    assert set(cfg["protected_vmids"]) == {1001, 9000, 9005, 9006, 9007}
+    assert cfg["protected_vmids"] == sorted(cfg["protected_vmids"])  # JSON-safe sorted list
+
+
+def test_usb_config_payload_missing_timeout_zero_disables_teardown(spoke_loop):
+    """usb_missing_timeout=0 must emit missing_timeout=0 so the agent's
+    ``if missing_timeout > 0`` gate skips teardown entirely (disable-by-zero
+    preserved across the minutes→seconds conversion)."""
+    spoke, loop = spoke_loop
+    _run(loop, spoke.handle_command("CS_CONFIG_UPDATE", {"usb_missing_timeout": "0"}))
+    assert spoke.settings.usb_config_payload()["missing_timeout"] == 0

@@ -351,7 +351,9 @@ class CSSpoke(BaseSpoke):
         "guest_agent_watchdog_enabled", "guest_agent_grace_minutes",
         "guest_agent_check_interval_minutes", "guest_agent_reboot_after_minutes",
         "guest_agent_reclone_after_minutes", "watchdog_reboot_enabled",
-        "cpu_provision_threshold", "mem_provision_threshold",
+        "cpu_provision_threshold", "cpu_delete_threshold",
+        "mem_provision_threshold", "mem_delete_threshold",
+        "protected_vmids",
     )
     # Hub keys that must be renamed to land in their CSSettings counterpart
     # (the hub UI/label uses ``vm_image_*``; the settings store + agent read

@@ -174,7 +174,9 @@ class CSSettings:
         "guest_agent_reclone_after_minutes": 30,
         "watchdog_reboot_enabled": "on",
         "cpu_provision_threshold": 80,
+        "cpu_delete_threshold": 90,
         "mem_provision_threshold": 80,
+        "mem_delete_threshold": 90,
         # protected-vmid list (comma-separated ints/ranges) — drives the queue guard
         "protected_vmids": "",
         # shared PSK for the client API (/ws/client + mutating HTTP routes).
@@ -246,9 +248,19 @@ class CSSettings:
         img1_id = int(self.get("image1_template_id", 100) or 100)
         img2_id = int(self.get("image2_template_id", 200) or 200)
 
+        # missing_timeout is stored in MINUTES (the UI label is "Destroy after
+        # missing (minutes)"); the pxmx agent compares ``now - missing_since`` in
+        # SECONDS, so emit seconds here (minutes × 60). 0 = teardown disabled
+        # (preserved — the agent gates on ``missing_timeout > 0``).
+        _missing_min = int(self.get("usb_missing_timeout", 60) or 0)
+        # protected_vmids: the hub container (VMID 1001) is ALWAYS protected
+        # (matches the UI help "VM 1001 is always protected") — merge it into the
+        # emitted list so the agent's as-is resolution always includes it.
+        _protected = set(_parse_int_ranges(self.get("protected_vmids", ""))) | {1001}
+
         return {
             "vidpids": _parse_json_list(self.get("usb_vidpids", "[]")),
-            "missing_timeout": _setting_int(self.get("usb_missing_timeout", 60), 1),
+            "missing_timeout": _missing_min * 60 if _missing_min > 0 else 0,
             "image1_template_id": img1_id,
             "image1_template_spec": img1_spec,
             "image2_template_id": img2_id,
@@ -273,7 +285,10 @@ class CSSettings:
             "guest_agent_reclone_after_minutes": max(1, int(self.get("guest_agent_reclone_after_minutes", 30) or 30)),
             "watchdog_reboot_enabled": _normalize_toggle(self.get("watchdog_reboot_enabled", "on")),
             "cpu_provision_threshold": max(0, min(100, int(self.get("cpu_provision_threshold", 80) or 80))),
+            "cpu_delete_threshold": max(0, min(100, int(self.get("cpu_delete_threshold", 90) or 90))),
             "mem_provision_threshold": max(0, min(100, int(self.get("mem_provision_threshold", 80) or 80))),
+            "mem_delete_threshold": max(0, min(100, int(self.get("mem_delete_threshold", 90) or 90))),
+            "protected_vmids": sorted(_protected),
         }
 
     @staticmethod
