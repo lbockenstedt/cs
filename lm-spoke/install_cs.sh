@@ -358,9 +358,9 @@ chmod 600 "$LM_DIR/cs/.env"
 # empty case (control_plane.py falls back to SPOKE_SECRET from the .env, then
 # awaits admin approval in the WebUI).
 SECRET_ARG=""
-[ -n "$SPOKE_SECRET" ] && SECRET_ARG="--secret $SPOKE_SECRET"
+[ -n "$SPOKE_SECRET" ] && SECRET_ARG="--secret=$SPOKE_SECRET"
 HUB_SECRET_ARG=""
-[ -n "${HUB_SECRET:-}" ] && HUB_SECRET_ARG="--hub-secret $HUB_SECRET"
+[ -n "${HUB_SECRET:-}" ] && HUB_SECRET_ARG="--hub-secret=$HUB_SECRET"
 
 cat > /etc/systemd/system/lm-cs.service <<SYSD
 [Unit]
