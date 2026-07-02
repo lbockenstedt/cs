@@ -43,7 +43,8 @@ PURGE_LOGS=0
 REMOVE_DHCP=0
 PURGE_DNSMASQ=0
 HUB_API=""
-SPOKE_ID="cs-spoke-1"
+SPOKE_ID=""
+SPOKE_ID_SET=0
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -52,12 +53,25 @@ while [[ $# -gt 0 ]]; do
         --remove-dhcp)     REMOVE_DHCP=1; shift ;;
         --purge-dnsmasq)   PURGE_DNSMASQ=1; REMOVE_DHCP=1; shift ;;
         --hub-api)         HUB_API="$2"; shift 2 ;;
-        --spoke-id)        SPOKE_ID="$2"; shift 2 ;;
+        --spoke-id)        SPOKE_ID="$2"; SPOKE_ID_SET=1; shift 2 ;;
         *) echo "Unknown argument: $1"; exit 1 ;;
     esac
 done
 
 [[ "$(id -u)" -eq 0 ]] || { echo "❌ Run as root (sudo)."; exit 1; }
+
+# Auto-detect the installed spoke id from the cs .env so the uninstall targets
+# the RIGHT spoke for the pkill + hub deregister — the installer defaults the
+# id to `cs-$(hostname -s)` when no --id is supplied (curl one-liner installs),
+# while install_all.sh pins it to cs-spoke-1. Only fall back to cs-spoke-1 if
+# the .env is gone and --spoke-id wasn't passed.
+if [[ $SPOKE_ID_SET -eq 0 ]]; then
+    _ENV="$CS_DIR/.env"
+    if [[ -f "$_ENV" ]]; then
+        SPOKE_ID=$(grep '^SPOKE_ID=' "$_ENV" 2>/dev/null | head -1 | cut -d= -f2- | tr -d '"' || true)
+    fi
+    [[ -z "$SPOKE_ID" ]] && SPOKE_ID="cs-spoke-1"
+fi
 
 echo "=== Client-Sim (cs) Spoke Uninstaller ==="
 echo "  Service      : $SERVICE ($UNIT_FILE)"
