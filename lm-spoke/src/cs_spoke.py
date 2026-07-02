@@ -196,6 +196,13 @@ class CSSpoke(BaseSpoke):
             self.engine.set_kill_switch(on)
             return {"status": "SUCCESS", "kill_switch": on}
 
+        if cmd in ("CS_GET_KILL_SWITCH",):
+            # Read for the hub's kill-switch banner. Sits BEFORE the
+            # NOT_IMPLEMENTED matcher (whose set includes "GET") so the hub's
+            # GET /kill-switch doesn't hit a dead command.
+            return {"status": "SUCCESS",
+                    "kill_switch": self.engine.kill_switch_active()}
+
         # ── Client-Simulation ingest (unified pxmx agent → hub → here) ───────
         # The hub's AGENT_RELAY_UP CS_* dispatcher forwards each CS_* agent event
         # here as a CS_INGEST_* (or CS_STORE_PROXMOX_TOKEN) command carrying the
