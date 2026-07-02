@@ -161,11 +161,17 @@ class CSControlPlane(BaseControlPlane):
 
 if __name__ == "__main__":
     import os
+    import socket
     from dotenv import load_dotenv
     load_dotenv()
 
     parser = argparse.ArgumentParser(description="Lab Manager Generic Agent")
-    parser.add_argument("--id",         default=os.getenv("SPOKE_ID", "cs-spoke-1"))
+    # --id is OPTIONAL: when neither --id nor the SPOKE_ID env is supplied the
+    # spoke derives its id from the current OS hostname at startup, so a
+    # cloned+renamed container reconnects under a new id (correlated to the old
+    # one via the install UUID by the hub) instead of being frozen to the
+    # hostname captured at install time. A pinned --id (install_all.sh) wins.
+    parser.add_argument("--id",         default=os.getenv("SPOKE_ID") or None)
     parser.add_argument("--secret",     default=os.getenv("SPOKE_SECRET", ""))
     parser.add_argument("--hub-secret", nargs='?', default=os.getenv("HUB_SECRET", ""), const="")
     parser.add_argument("--hub",        default=os.getenv("HUB_URL", "ws://localhost:8765"))
@@ -182,6 +188,8 @@ if __name__ == "__main__":
     parser.add_argument("--onboarding-psk",  default=os.getenv("LM_ONBOARDING_PSK", ""))
     parser.add_argument("--tenant-id-hint",  default=os.getenv("LM_TENANT_ID_HINT", ""))
     args = parser.parse_args()
+    if not args.id:
+        args.id = f"{socket.gethostname()}-spoke"
     cp = CSControlPlane(args.id, args.secret, args.hub_secret, args.hub,
                         onboarding_psk=args.onboarding_psk,
                         tenant_id_hint=args.tenant_id_hint,

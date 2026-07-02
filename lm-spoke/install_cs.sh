@@ -25,7 +25,15 @@ export DEBIAN_FRONTEND=noninteractive
 # ============================================================
 
 HUB_URL="ws://localhost:8765"
-SPOKE_ID="${SPOKE_ID:-$(hostname -s)-spoke}"
+# SPOKE_ID is OPTIONAL. When neither the SPOKE_ID env var nor --id is supplied
+# the spoke derives its id from the current OS hostname at startup (see
+# control_plane __main__), so a cloned+renamed container reconnects under a new
+# id instead of being frozen to the hostname captured at install. A pinned --id
+# (install_all.sh / explicit --id) is honored as-is. We only bake SPOKE_ID into
+# .env + the unit when it was explicitly pinned; otherwise Python owns the id.
+SPOKE_ID="${SPOKE_ID:-}"
+SPOKE_ID_PINNED=0
+[ -n "$SPOKE_ID" ] && SPOKE_ID_PINNED=1
 SPOKE_SECRET=""
 HUB_SECRET=""
 ADMIN_TOKEN=""
@@ -61,7 +69,7 @@ DHCP_LEASE_TIME="${DHCP_LEASE_TIME:-1h}"
 while [[ "$#" -gt 0 ]]; do
     case $1 in
         --hub)         HUB_URL="$2";      shift ;;
-        --id|--name)   SPOKE_ID="$2";     shift ;;
+        --id|--name)   SPOKE_ID="$2"; SPOKE_ID_PINNED=1; shift ;;
         --secret)      SPOKE_SECRET="$2"; shift ;;
         --hub-secret)  HUB_SECRET="$2";   shift ;;
         --dhcp-iface)  DHCP_IFACE="$2";   shift ;;
@@ -339,10 +347,23 @@ CS_REQ="$LM_DIR/cs/lm-spoke/requirements.txt"
 "$LM_DIR/cs/venv/bin/pip" install -r "$CS_REQ" -q
 ok "Dependencies installed"
 
+# Bake SPOKE_ID into .env + the unit ONLY when it was explicitly pinned. In the
+# derived case Python computes `<hostname>-spoke` at startup, so a clone that was
+# renamed reconnects under a new id (correlated to the old one via the install
+# UUID). INSTALL_UUID is deliberately NOT written here — the spoke mints it at
+# first start (BaseControlPlane._ensure_install_uuid), and prep-for-imaging
+# strips it so a cloned image gets a fresh one.
+SPOKE_ID_LINE=""
+ID_ARG=""
+if [ "$SPOKE_ID_PINNED" = "1" ]; then
+    SPOKE_ID_LINE="SPOKE_ID=$SPOKE_ID"
+    ID_ARG="--id $SPOKE_ID"
+fi
+
 # ── .env ──────────────────────────────────────────────────────────────────────
 cat > "$LM_DIR/cs/.env" <<DOTENV
 HUB_URL=$HUB_URL
-SPOKE_ID=$SPOKE_ID
+${SPOKE_ID_LINE}
 SPOKE_SECRET=$SPOKE_SECRET
 HUB_SECRET=${HUB_SECRET:-}
 CS_API_PORT=$CS_API_PORT
@@ -375,7 +396,7 @@ EnvironmentFile=$LM_DIR/cs/.env
 Environment="PYTHONPATH=$LM_DIR:$LM_DIR/core/src:$LM_DIR/cs/lm-spoke:$LM_DIR/cs/lm-spoke/src"
 Environment="CS_API_PORT=$CS_API_PORT"
 Environment="CS_API_HOST=$CS_API_HOST"
-ExecStart=$LM_DIR/cs/venv/bin/python3 -m src.control_plane --id $SPOKE_ID --hub $HUB_URL $SECRET_ARG $HUB_SECRET_ARG --port $CS_API_PORT --host $CS_API_HOST
+ExecStart=$LM_DIR/cs/venv/bin/python3 -m src.control_plane $ID_ARG --hub $HUB_URL $SECRET_ARG $HUB_SECRET_ARG --port $CS_API_PORT --host $CS_API_HOST
 
 StandardOutput=append:/var/log/lm/lm-cs.log
 StandardError=append:/var/log/lm/lm-cs.log
@@ -399,7 +420,11 @@ echo "════════════════════════�
 ok "Generic Agent installation complete!"
 echo "════════════════════════════════════════════"
 echo "  LM Hub:       $HUB_URL"
-echo "  Spoke ID:     $SPOKE_ID"
+if [ "$SPOKE_ID_PINNED" = "1" ]; then
+    echo "  Spoke ID:     $SPOKE_ID  (pinned)"
+else
+    echo "  Spoke ID:     $(hostname -s)-spoke  (derived from hostname at startup)"
+fi
 echo "  Version:      $(cat $LM_DIR/cs/VERSION 2>/dev/null || echo unknown)"
 echo "  Status:       sudo systemctl status lm-cs"
 echo "  Service log:  /var/log/lm/lm-cs.log  (sudo journalctl -u lm-cs -f)"
