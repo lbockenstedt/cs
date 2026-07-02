@@ -25,7 +25,7 @@ export DEBIAN_FRONTEND=noninteractive
 # ============================================================
 
 HUB_URL="ws://localhost:8765"
-SPOKE_ID="${SPOKE_ID:-cs-$(hostname -s)}"
+SPOKE_ID="${SPOKE_ID:-$(hostname -s)-spoke}"
 SPOKE_SECRET=""
 HUB_SECRET=""
 ADMIN_TOKEN=""
