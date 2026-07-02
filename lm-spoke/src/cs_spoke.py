@@ -38,6 +38,7 @@ from proxmox_deploy import ProxmoxDeploy
 from command_queue import CommandQueue, CSSettings
 from token_store import TokenStore, sync_all_sim_tags
 from client_registry import ClientRegistry
+from demo_scenarios import DemoManager, DEMO_SCENARIOS
 import client_api  # for client_api.push_pending (live command delivery to WS agents)
 
 try:
@@ -74,6 +75,11 @@ class CSSpoke(BaseSpoke):
         # Phase F: per-host Proxmox token store + sim-tag sync (registry=None in
         # Phase 2/3, so sim-tag sync is a no-op until the client registry lands).
         self.tokens = TokenStore(data_dir)
+        # In-memory per-client demo-scenario overrides (TTL + auto-expiry). The
+        # live flags are layered on top of the registry's persisted overrides at
+        # config delivery time (client_api /api/config); demos never touch the
+        # persisted store. Expiry sweep is started by control_plane.run().
+        self.demo = DemoManager()
         self._sim_tag_cache: Dict[tuple, set] = {}
         self._sim_tag_sync_lock = asyncio.Lock()
 
@@ -202,6 +208,36 @@ class CSSpoke(BaseSpoke):
             # GET /kill-switch doesn't hit a dead command.
             return {"status": "SUCCESS",
                     "kill_switch": self.engine.kill_switch_active()}
+
+        # ── demo scenarios (named per-client failure presets, TTL + auto-expiry)
+        # None of CS_DEMO_* / CS_GET_DEMO_* match the NOT_IMPLEMENTED matcher's
+        # second-segment set {QUEUE,GET,CLEAR,...} except the GET pair ("GET" is
+        # in the set), so all four sit here before the matcher.
+        if cmd in ("CS_DEMO_SCENARIO",):
+            hostname = str(d.get("hostname") or "").strip()
+            scenario = str(d.get("scenario") or "").strip()
+            if not hostname or not scenario:
+                return {"status": "ERROR", "message": "missing 'hostname' or 'scenario'"}
+            try:
+                summ = await self.demo.apply(hostname, scenario,
+                                             str(d.get("triggered_by") or ""))
+            except ValueError as exc:
+                return {"status": "ERROR", "message": str(exc)}
+            return {"status": "SUCCESS", **summ}
+
+        if cmd in ("CS_DEMO_CLEAR",):
+            hostname = str(d.get("hostname") or "").strip()
+            if not hostname:
+                return {"status": "ERROR", "message": "missing 'hostname'"}
+            cleared = await self.demo.clear(hostname)
+            return {"status": "SUCCESS", "hostname": hostname, "cleared": cleared}
+
+        if cmd in ("CS_GET_DEMO_ACTIVE",):
+            return {"status": "SUCCESS",
+                    "active": await self.demo.active_summary()}
+
+        if cmd in ("CS_GET_DEMO_SCENARIOS",):
+            return {"status": "SUCCESS", "scenarios": DEMO_SCENARIOS}
 
         # ── Client-Simulation ingest (unified pxmx agent → hub → here) ───────
         # The hub's AGENT_RELAY_UP CS_* dispatcher forwards each CS_* agent event

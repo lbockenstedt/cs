@@ -67,6 +67,8 @@ class CSControlPlane(BaseControlPlane):
         logger.info(f"Starting CS (Client Simulator) -> {self.hub_url}")
         cs_spoke = CSSpoke(self.spoke_id, self.startup_config)
         self.register_module("cs", cs_spoke)
+        # Start the demo-scenario TTL expiry sweep (no-op without a loop).
+        cs_spoke.demo.start()
         # Start the client API server as a long-lived task that SURVIVES hub
         # reconnects (NOT via _create_spoke_tasks, which the base class tears
         # down per-connection). Server.serve() is awaitable (vs blocking

@@ -172,6 +172,12 @@ def build_client_api_app(spoke) -> FastAPI:
             entry = spoke.registry.get(hostname)
             if entry and isinstance(entry.get("overrides"), dict):
                 overrides = {str(k): str(v) for k, v in entry["overrides"].items()}
+        # Layer any active demo-scenario flags on top (ephemeral, demo wins).
+        # Demos live in-memory on the spoke's DemoManager; they never mutate the
+        # persisted registry overrides.
+        demo = getattr(spoke, "demo", None)
+        if demo is not None and hostname:
+            overrides.update(demo.effective_flags(hostname))
         text = sim_config.render_ini_for_client(sim_conf, hostname, overrides or None)
         return PlainTextResponse(text)
 
