@@ -220,6 +220,57 @@ class CSSettings:
     def protected_vmids(self) -> Set[int]:
         return _parse_int_ranges(self.settings.get("protected_vmids", ""))
 
+    # ── Per-host USB VMID overrides ─────────────────────────────────────────
+    # Optional per-host knobs (vmid_start / vmid_end / vm_set_override) that
+    # override the global range for one proxmox host, so the cs speak can pin a
+    # specific host's batch without changing the global default. Persisted as a
+    # ``host_usb_overrides`` map inside cs_settings.json. The pxmx agent honors
+    # a non-default vmid_start/vmid_end over its own hostname-suffix derivation.
+
+    _HOST_USB_OVERRIDE_KEYS = ("vmid_start", "vmid_end", "vm_set_override")
+
+    def _host_usb_store(self) -> Dict[str, Dict[str, Any]]:
+        return self.settings.setdefault("host_usb_overrides", {})  # type: ignore[return-value]
+
+    def host_usb_override(self, hostname: str) -> Dict[str, Any]:
+        """Per-host USB VMID override for one hostname (empty dict if none)."""
+        if not hostname:
+            return {}
+        return dict(self._host_usb_store().get(hostname, {}) or {})
+
+    def all_host_usb_overrides(self) -> Dict[str, Dict[str, Any]]:
+        return {h: dict(v) for h, v in self._host_usb_store().items()}
+
+    def set_host_usb_override(self, hostname: str,
+                              knobs: Dict[str, Any]) -> Dict[str, Any]:
+        if not hostname:
+            return {}
+        store = self._host_usb_store()
+        cur = dict(store.get(hostname, {}) or {})
+        if "vmid_start" in knobs and knobs["vmid_start"] is not None:
+            try:
+                cur["vmid_start"] = int(knobs["vmid_start"])
+            except (TypeError, ValueError):
+                pass
+        if "vmid_end" in knobs and knobs["vmid_end"] is not None:
+            try:
+                cur["vmid_end"] = int(knobs["vmid_end"])
+            except (TypeError, ValueError):
+                pass
+        if "vm_set_override" in knobs and knobs["vm_set_override"] is not None:
+            cur["vm_set_override"] = _sanitize_vm_set_override(knobs["vm_set_override"])
+        store[hostname] = cur
+        self._save()
+        return dict(cur)
+
+    def clear_host_usb_override(self, hostname: str) -> bool:
+        store = self.settings.get("host_usb_overrides", {}) or {}
+        if hostname in store:
+            store.pop(hostname)
+            self._save()
+            return True
+        return False
+
     # ── USB config payload (port of _proxmox_usb_config_payload) ───────────
 
     def usb_config_payload(self, hostname: Optional[str] = None) -> Dict[str, Any]:
@@ -258,7 +309,7 @@ class CSSettings:
         # emitted list so the agent's as-is resolution always includes it.
         _protected = set(_parse_int_ranges(self.get("protected_vmids", ""))) | {1001}
 
-        return {
+        payload = {
             "vidpids": _parse_json_list(self.get("usb_vidpids", "[]")),
             "missing_timeout": _missing_min * 60 if _missing_min > 0 else 0,
             "image1_template_id": img1_id,
@@ -290,6 +341,20 @@ class CSSettings:
             "mem_delete_threshold": max(0, min(100, int(self.get("mem_delete_threshold", 90) or 90))),
             "protected_vmids": sorted(_protected),
         }
+
+        # Per-host override: a non-default vmid_start/vmid_end (or vm_set_override)
+        # pinned for this hostname overrides the global values, so the pxmx agent
+        # honors it over its own hostname-suffix derivation. (vm_set_override is
+        # only meaningful to the agent when vmid_start/vmid_end are at the default.)
+        if hostname:
+            ov = self.host_usb_override(hostname)
+            if "vmid_start" in ov:
+                payload["vmid_start"] = int(ov["vmid_start"])
+            if "vmid_end" in ov:
+                payload["vmid_end"] = int(ov["vmid_end"])
+            if "vm_set_override" in ov:
+                payload["vm_set_override"] = _sanitize_vm_set_override(ov["vm_set_override"])
+        return payload
 
     @staticmethod
     def _merge_ini_override(parser: configparser.ConfigParser, override_path: Path) -> None:

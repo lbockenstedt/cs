@@ -287,6 +287,32 @@ class CSSpoke(BaseSpoke):
             return {"status": "SUCCESS", "applied": applied,
                     "overrides": dict(overrides)}
 
+        # ── Per-host USB VMID overrides ──────────────────────────────────────
+        # Optional per-host vmid_start/vmid_end/vm_set_override that override the
+        # global range for one proxmox host (the pxmx agent honors a non-default
+        # range over its own hostname-suffix batch derivation). Persisted by
+        # CSSettings in cs_settings.json under ``host_usb_overrides``.
+        if cmd == "CS_GET_HOST_USB_OVERRIDES":
+            return {"status": "SUCCESS",
+                    "overrides": self.settings.all_host_usb_overrides()}
+
+        if cmd == "CS_SET_HOST_USB_OVERRIDE":
+            hostname = str(d.get("hostname") or "").strip()
+            if not hostname:
+                return {"status": "ERROR", "message": "missing 'hostname'"}
+            knobs = d.get("knobs") or d.get("overrides") or {}
+            if not isinstance(knobs, dict):
+                return {"status": "ERROR", "message": "'knobs' must be an object"}
+            merged = self.settings.set_host_usb_override(hostname, knobs)
+            return {"status": "SUCCESS", "hostname": hostname, "knobs": merged}
+
+        if cmd == "CS_CLEAR_HOST_USB_OVERRIDE":
+            hostname = str(d.get("hostname") or "").strip()
+            if not hostname:
+                return {"status": "ERROR", "message": "missing 'hostname'"}
+            cleared = self.settings.clear_host_usb_override(hostname)
+            return {"status": "SUCCESS", "hostname": hostname, "cleared": cleared}
+
         # ── Client-Simulation ingest (unified pxmx agent → hub → here) ───────
         # The hub's AGENT_RELAY_UP CS_* dispatcher forwards each CS_* agent event
         # here as a CS_INGEST_* (or CS_STORE_PROXMOX_TOKEN) command carrying the
