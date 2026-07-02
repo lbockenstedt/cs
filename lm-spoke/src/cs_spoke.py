@@ -239,6 +239,54 @@ class CSSpoke(BaseSpoke):
         if cmd in ("CS_GET_DEMO_SCENARIOS",):
             return {"status": "SUCCESS", "scenarios": DEMO_SCENARIOS}
 
+        # ── per-client override control panel (hub/UI → registry overrides) ──
+        # The legacy cs webui-spoke exposed a per-client "Control Panel" with
+        # live sim-flag toggles (kill_switch/dns_fail/iperf/download/www_traffic/
+        # ping_test/ssidpw_fail/auth_fail/dhcp_fail/port_flap/assoc_fail) +
+        # Apply / Clear / Apply-to-ALL. The hub forwards each action here as a
+        # CS_* command; these handlers wrap ClientRegistry.set_overrides /
+        # clear_overrides (the SAME persisted store the /api/config delivery
+        # reads, unlike the ephemeral demo flags). GET + CLEAR sit before the
+        # NOT_IMPLEMENTED matcher (both second-segments are in its set); SET is
+        # not in the set but would fall through to "Unknown command", so it gets
+        # an explicit handler too.
+        if cmd in ("CS_GET_CLIENT_OVERRIDES",):
+            hostname = str(d.get("hostname") or "").strip()
+            if not hostname:
+                return {"status": "ERROR", "message": "missing 'hostname'"}
+            entry = self.registry.get(hostname) or {}
+            return {"status": "SUCCESS", "hostname": hostname,
+                    "overrides": entry.get("overrides", {})}
+
+        if cmd in ("CS_SET_CLIENT_OVERRIDES",):
+            hostname = str(d.get("hostname") or "").strip()
+            overrides = d.get("overrides") or {}
+            if not hostname:
+                return {"status": "ERROR", "message": "missing 'hostname'"}
+            if not isinstance(overrides, dict):
+                return {"status": "ERROR", "message": "'overrides' must be an object"}
+            entry = await self.registry.set_overrides(hostname, overrides)
+            return {"status": "SUCCESS", "hostname": hostname,
+                    "overrides": entry.get("overrides", {})}
+
+        if cmd in ("CS_CLEAR_CLIENT_OVERRIDES",):
+            hostname = str(d.get("hostname") or "").strip()
+            if not hostname:
+                return {"status": "ERROR", "message": "missing 'hostname'"}
+            await self.registry.clear_overrides(hostname)
+            return {"status": "SUCCESS", "hostname": hostname, "cleared": True}
+
+        if cmd in ("CS_SET_ALL_CLIENT_OVERRIDES",):
+            overrides = d.get("overrides") or {}
+            if not isinstance(overrides, dict):
+                return {"status": "ERROR", "message": "'overrides' must be an object"}
+            applied = 0
+            for hostname in list(self.registry.get_all().keys()):
+                await self.registry.set_overrides(hostname, dict(overrides))
+                applied += 1
+            return {"status": "SUCCESS", "applied": applied,
+                    "overrides": dict(overrides)}
+
         # ── Client-Simulation ingest (unified pxmx agent → hub → here) ───────
         # The hub's AGENT_RELAY_UP CS_* dispatcher forwards each CS_* agent event
         # here as a CS_INGEST_* (or CS_STORE_PROXMOX_TOKEN) command carrying the
