@@ -26,6 +26,13 @@ def _make_spoke(data_dir: Path, config_dir: Path):
     s.settings = CSSettings(data_dir, config_dir)
     s.registry = ClientRegistry(data_dir)
     s.queue = CommandQueue(data_dir, s.settings)
+    # CSSpoke hardcodes the engine's config_dir to the real repo configs/; redirect
+    # it to a tmp dir so set_kill_switch writes kill_switch.txt there instead of
+    # mutating the tracked repo file (the engine already loaded its sim_conf at
+    # construction; only kill_switch.txt reads/writes use config_dir after that).
+    cfg = data_dir / "cfg"
+    cfg.mkdir()
+    s.engine.config_dir = cfg
     return s, loop
 
 
