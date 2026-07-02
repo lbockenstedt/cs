@@ -24,7 +24,13 @@ export DEBIAN_FRONTEND=noninteractive
 #   DHCP_RANGE_END, DHCP_LEASE_TIME, DHCP_SKIP (1 to skip DHCP entirely)
 # ============================================================
 
-HUB_URL="ws://localhost:8765"
+HUB_URL="${HUB_URL:-}"
+# Track whether the hub URL was explicitly given (arg or env). When NOT pinned
+# the installer auto-discovers the hub via DNS (lm-hub.<dns-suffix>) then mDNS
+# (_lm-hub._tcp.local.) after the venv is ready; if nothing is found HUB_URL is
+# left empty and the spoke re-discovers at startup (BaseControlPlane.run).
+HUB_URL_PINNED=0
+[ -n "$HUB_URL" ] && HUB_URL_PINNED=1
 # SPOKE_ID is OPTIONAL. When neither the SPOKE_ID env var nor --id is supplied
 # the spoke derives its id from the current OS hostname at startup (see
 # control_plane __main__), so a cloned+renamed container reconnects under a new
@@ -68,7 +74,7 @@ DHCP_LEASE_TIME="${DHCP_LEASE_TIME:-1h}"
 
 while [[ "$#" -gt 0 ]]; do
     case $1 in
-        --hub)         HUB_URL="$2";      shift ;;
+        --hub)         HUB_URL="$2"; HUB_URL_PINNED=1; shift ;;
         --id|--name)   SPOKE_ID="$2"; SPOKE_ID_PINNED=1; shift ;;
         --secret)      SPOKE_SECRET="$2"; shift ;;
         --hub-secret)  HUB_SECRET="$2";   shift ;;
@@ -347,6 +353,28 @@ CS_REQ="$LM_DIR/cs/lm-spoke/requirements.txt"
 "$LM_DIR/cs/venv/bin/pip" install -r "$CS_REQ" -q
 ok "Dependencies installed"
 
+# ── Hub auto-discovery ──────────────────────────────────────────────────────
+# When --hub was not given (and no HUB_URL env), auto-locate the hub via DNS
+# (lm-hub.<dns-suffix>) then mDNS (_lm-hub._tcp.local.) using the just-installed
+# venv + lm core's messaging.hub_discovery. If nothing is found, leave HUB_URL
+# empty — the spoke re-discovers at startup (BaseControlPlane.run sentinel) once
+# the hub is up, so this never hard-fails a hub-box install where the hub isn't
+# running yet at cs-install time.
+CS_VENVPY="$LM_DIR/cs/venv/bin/python3"
+if [ "$HUB_URL_PINNED" != "1" ]; then
+    echo "🔎 No --hub given; auto-discovering the LM hub (DNS lm-hub.* / mDNS)…"
+    DISCOVERED=$(PYTHONPATH="$LM_DIR/core/src" "$CS_VENVPY" -m messaging.hub_discovery --timeout 5 2>/dev/null || echo NONE)
+    if [ -n "$DISCOVERED" ] && [ "$DISCOVERED" != "NONE" ]; then
+        HUB_URL="$DISCOVERED"
+        echo "✅ Discovered hub: $HUB_URL"
+    else
+        echo "⚠️  Hub not found via DNS/mDNS. Leaving HUB_URL empty — the spoke will"
+        echo "    retry auto-discovery at startup. To pin it now, re-run with"
+        echo "    --hub ws://HUB:8765 (or create an 'lm-hub' DNS record / enable mDNS on the hub)."
+        HUB_URL=""
+    fi
+fi
+
 # Bake SPOKE_ID into .env + the unit ONLY when it was explicitly pinned. In the
 # derived case Python computes `<hostname>-spoke` at startup, so a clone that was
 # renamed reconnects under a new id (correlated to the old one via the install
@@ -396,7 +424,7 @@ EnvironmentFile=$LM_DIR/cs/.env
 Environment="PYTHONPATH=$LM_DIR:$LM_DIR/core/src:$LM_DIR/cs/lm-spoke:$LM_DIR/cs/lm-spoke/src"
 Environment="CS_API_PORT=$CS_API_PORT"
 Environment="CS_API_HOST=$CS_API_HOST"
-ExecStart=$LM_DIR/cs/venv/bin/python3 -m src.control_plane $ID_ARG --hub $HUB_URL $SECRET_ARG $HUB_SECRET_ARG --port $CS_API_PORT --host $CS_API_HOST
+ExecStart=$LM_DIR/cs/venv/bin/python3 -m src.control_plane $ID_ARG --hub "\${HUB_URL}" $SECRET_ARG $HUB_SECRET_ARG --port $CS_API_PORT --host $CS_API_HOST
 
 StandardOutput=append:/var/log/lm/lm-cs.log
 StandardError=append:/var/log/lm/lm-cs.log
@@ -419,7 +447,11 @@ echo ""
 echo "════════════════════════════════════════════"
 ok "Generic Agent installation complete!"
 echo "════════════════════════════════════════════"
-echo "  LM Hub:       $HUB_URL"
+if [ -n "$HUB_URL" ]; then
+    echo "  LM Hub:       $HUB_URL"
+else
+    echo "  LM Hub:       (auto-discover at startup — no lm-hub DNS/mDNS found yet)"
+fi
 if [ "$SPOKE_ID_PINNED" = "1" ]; then
     echo "  Spoke ID:     $SPOKE_ID  (pinned)"
 else

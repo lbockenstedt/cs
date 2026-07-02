@@ -174,7 +174,15 @@ if __name__ == "__main__":
     parser.add_argument("--id",         default=os.getenv("SPOKE_ID") or None)
     parser.add_argument("--secret",     default=os.getenv("SPOKE_SECRET", ""))
     parser.add_argument("--hub-secret", nargs='?', default=os.getenv("HUB_SECRET", ""), const="")
-    parser.add_argument("--hub",        default=os.getenv("HUB_URL", "ws://localhost:8765"))
+    # --hub is OPTIONAL: when neither --hub nor HUB_URL is supplied the spoke
+    # auto-discovers the hub via DNS (lm-hub.<dns-suffix>) then mDNS
+    # (_lm-hub._tcp.local.) at startup (see BaseControlPlane.run). Pass an empty
+    # value to force discovery; --standalone opts out of hub mode entirely.
+    parser.add_argument("--hub",        default=os.getenv("HUB_URL") or None)
+    # Standalone (hub-less local) mode is now an explicit opt-in. Previously an
+    # empty --hub triggered it; with auto-discovery an empty --hub means "discover".
+    parser.add_argument("--standalone", action="store_true",
+                        help="run without a hub (local-only mode)")
     # Client API listener (169.253.1.1:8080 on the DHCP NIC). 0.0.0.0 binds it
     # onto every interface, including the sim-client DHCP NIC, so clients on
     # 169.253.1.0/24 reach it directly (dnsmasq serves no router option).
@@ -194,7 +202,7 @@ if __name__ == "__main__":
                         onboarding_psk=args.onboarding_psk,
                         tenant_id_hint=args.tenant_id_hint,
                         api_host=args.host, api_port=args.port)
-    if args.hub:
-        asyncio.run(cp.run())
-    else:
+    if args.standalone:
         cp.run_standalone_mode()
+    else:
+        asyncio.run(cp.run())
