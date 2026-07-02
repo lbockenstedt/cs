@@ -83,10 +83,13 @@ echo "  Hub deregister: $([[ -n $HUB_API ]] && echo "$HUB_API (spoke=$SPOKE_ID)"
 echo "  PRESERVED (shared): svc_lm user, $SHARED_CORE, /var/log/lm dir"
 echo
 
-if [[ $YES -eq 0 ]]; then
+if [[ $YES -eq 0 ]] && [ -t 0 ]; then
+    # Interactive TTY: confirm before destroying anything.
     read -rp "Proceed with uninstall? [y/N]: " _confirm
     [[ "$_confirm" =~ ^[Yy]$ ]] || { echo "Aborted."; exit 0; }
 fi
+# Non-TTY stdin (e.g. `curl ... | bash`) proceeds without a prompt — the pipe
+# is consent — so the documented one-liner works without an extra --yes.
 
 # ── [1] Stop + disable the cs spoke service ───────────────────────────────
 echo "[1/5] Stopping and disabling $SERVICE..."
