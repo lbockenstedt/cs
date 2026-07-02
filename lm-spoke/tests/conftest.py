@@ -9,8 +9,15 @@ that's the sibling ``lm`` repo (``vscode/lm/core``), in prod ``/opt/lm/core``
 run in both layouts.
 """
 
+import os
 import sys
 from pathlib import Path
+
+# dep_guard.ensure_requirements runs at control_plane.py import time (top of
+# module). A dev test box may be missing optional deps (e.g. icmplib) — never
+# attempt a real `pip install` into the test interpreter. Production never sets
+# this. (Mirrors the lm core conftest.)
+os.environ.setdefault("LM_DEP_GUARD_DISABLE", "1")
 
 HERE = Path(__file__).resolve().parent        # lm-spoke/tests
 LM_SPOKE = HERE.parent                         # lm-spoke
