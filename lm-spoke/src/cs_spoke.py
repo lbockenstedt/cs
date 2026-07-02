@@ -309,6 +309,23 @@ class CSSpoke(BaseSpoke):
             return {"status": "SUCCESS",
                     "commands": await self.queue.list_commands()}
 
+        if cmd == "CS_CLEAR_COMMANDS":
+            # Cancel all non-terminal commands (optionally scoped to a target).
+            # Sits BEFORE the NOT_IMPLEMENTED matcher below (whose set includes
+            # "CLEAR") so the hub's Clear-queue + pre-teardown-expire routes work.
+            target = str(d.get("target") or "").strip() or None
+            res = await self.queue.clear_commands(target)
+            return {"status": "SUCCESS", **res}
+
+        if cmd == "CS_DELETE_COMMAND":
+            # Per-row delete (any status). "DELETE" isn't in the matcher set, so
+            # without this handler it would fall through to "Unknown command".
+            res = await self.queue.delete_command(d.get("id"))
+            if not res.get("ok"):
+                return {"status": "ERROR",
+                        "message": res.get("message", "command not found")}
+            return {"status": "SUCCESS", **res}
+
         if cmd == "CS_UPDATE_SETTINGS":
             # cs UI edits a USB-provision / watchdog knob; persisted to data/cs_settings.json.
             patch = d.get("settings") or d.get("patch") or {}

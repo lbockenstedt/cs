@@ -547,6 +547,44 @@ class CommandQueue:
             # Hand back copies so callers can't mutate the live list.
             return [dict(c) for c in self.commands]
 
+    async def clear_commands(self, target: Optional[str] = None) -> Dict[str, Any]:
+        """Cancel (expire) all non-terminal commands, optionally scoped to a
+        target. Mirrors the legacy ``DELETE /api/commands`` (cancel-all) and
+        ``DELETE /api/commands/pending?target=`` (pre-teardown expiry so
+        in-flight commands don't fire against a gone VM). Terminal commands
+        (completed/failed/expired) are left for their retention window."""
+        async with self.lock:
+            now = time.time()
+            ntarget = _normalize_hostname(target) if target else None
+            cleared = 0
+            for cmd in self.commands:
+                if cmd.get("status") not in {"pending", "delivered"}:
+                    continue
+                if ntarget and not self._command_matches_agent(cmd, ntarget):
+                    continue
+                cmd["status"] = "expired"
+                cmd["message"] = "cleared by operator"
+                cmd["updated_at"] = now
+                cmd["purge_after"] = now + COMMAND_RESULT_RETENTION_SECS
+                cleared += 1
+            if cleared:
+                self._save()
+            return {"cleared": cleared, "remaining": len(self.commands)}
+
+    async def delete_command(self, cmd_id: str) -> Dict[str, Any]:
+        """Remove a single command (any status). Mirrors the legacy
+        ``DELETE /api/commands/{cmd_id}`` per-row delete."""
+        cmd_id = str(cmd_id or "").strip()
+        if not cmd_id:
+            return {"ok": False, "message": "missing 'id'"}
+        async with self.lock:
+            before = len(self.commands)
+            self.commands[:] = [c for c in self.commands if c.get("id") != cmd_id]
+            removed = before - len(self.commands)
+            if removed:
+                self._save()
+            return {"ok": bool(removed), "id": cmd_id, "removed": removed}
+
     async def get_usb_config(self, hostname: Optional[str] = None) -> Dict[str, Any]:
         return self.settings.usb_config_payload(hostname)
 
