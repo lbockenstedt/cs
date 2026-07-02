@@ -30,11 +30,8 @@ import sim_config
 from sim_config import flag_on
 from sim_primitives import PRIMITIVES, SimCtx
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S",
-)
+# Library module — do NOT call basicConfig here (the process entrypoint
+# cs/lm-spoke/src/control_plane.py owns logging config via configure_logging()).
 logger = logging.getLogger("SimulationEngine")
 
 # Subset of the profile emitted in the status beacon (CLIENT_API.md "config" obj).

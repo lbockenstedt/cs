@@ -55,7 +55,21 @@ from starlette.middleware.base import BaseHTTPMiddleware
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
-logging.basicConfig(level=logging.INFO)
+try:
+    from logging_setup import configure_logging
+except ImportError:
+    try:
+        from core.src.logging_setup import configure_logging
+    except ImportError:
+        import logging as _logging
+        _FMT = '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+        _DFMT = '%Y-%m-%d %H:%M:%S'
+        def configure_logging(default_level=_logging.INFO, *, log_file=None, **_):
+            handlers = ([_logging.FileHandler(log_file), _logging.StreamHandler()]
+                        if log_file else None)
+            _logging.basicConfig(level=default_level, force=True,
+                                 format=_FMT, datefmt=_DFMT, handlers=handlers)
+configure_logging()
 logger = logging.getLogger("client_sim_dashboard")
 if not _HTTPX_AVAILABLE:
     logger.warning("httpx not installed — network-backed features may be limited. Install with: pip install httpx")

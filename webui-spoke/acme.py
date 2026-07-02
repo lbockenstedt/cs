@@ -32,7 +32,7 @@ from cryptography.hazmat.primitives.asymmetric import rsa
 from cryptography.hazmat.primitives.serialization import load_pem_private_key
 from cryptography.x509.oid import NameOID
 
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("Acme")
 BASE_DIR = Path(__file__).resolve().parent
 _CFG_PATH = BASE_DIR / "acme.json"
 _CERT_PATH = BASE_DIR / "tls" / "cert.pem"
