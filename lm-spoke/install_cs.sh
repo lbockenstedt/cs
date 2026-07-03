@@ -145,7 +145,7 @@ step "Lab Manager — Generic Agent Installer"
 step "Installing system packages"
 apt-get update -qq
 DEBIAN_FRONTEND=noninteractive apt-get install -y -q \
-    python3 python3-venv python3-pip git curl jq
+    python3 python3-venv python3-pip git curl jq sudo
 ok "Packages ready"
 
 # ── DHCP on the second NIC (sim-client network) ───────────────────────────────
@@ -630,7 +630,10 @@ exit 1
 HELPER
 chmod 0755 /usr/local/bin/lm-component-update-restart
 # Grant svc_lm passwordless sudo ONLY for the watchdog path (mirrors the hub's
-# NOPASSWD: /usr/local/bin/lm-update-restart in install_all.sh).
+# NOPASSWD: /usr/local/bin/lm-update-restart in install_all.sh). /etc/sudoers.d
+# is created by the sudo package's postinst (installed above); mkdir here too
+# as a defensive belt-and-suspenders in case a minimal image ever lacks it.
+mkdir -p /etc/sudoers.d
 cat > /etc/sudoers.d/lm-component-update <<SUDOERS
 $SVC_USER ALL=(ALL) NOPASSWD: /usr/local/bin/lm-component-update-restart
 SUDOERS
