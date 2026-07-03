@@ -109,6 +109,16 @@ fi
 
 [ "$(id -u)" -eq 0 ] || { echo "❌ Must be run as root."; exit 1; }
 
+# A successful install chowns $LM_DIR/cs to $SVC_USER (see chown -R near the end
+# of this script), but every run — including re-runs/updates — executes entirely
+# as root. Root then running `git pull`/`git clone` against a directory owned by
+# a different user trips git's dubious-ownership safety check (CVE-2022-24765
+# mitigation): "fatal: detected dubious ownership in repository at ...". Whitelist
+# both git-managed paths for root's git config up front so clone/pull always
+# work regardless of who currently owns them.
+git config --global --add safe.directory "$LM_DIR/cs" 2>/dev/null || true
+git config --global --add safe.directory "$LM_DIR/core" 2>/dev/null || true
+
 # ── Local logging ─────────────────────────────────────────────────────────────
 # The lm-cs service unit below logs to /var/log/lm/lm-cs.log, but systemd
 # ``append:`` does NOT create parent dirs — so on a fresh box the spoke ran with
