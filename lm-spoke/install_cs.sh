@@ -72,6 +72,12 @@ DHCP_RANGE_START="${DHCP_RANGE_START:-169.253.1.11}"
 DHCP_RANGE_END="${DHCP_RANGE_END:-169.253.1.254}"
 DHCP_LEASE_TIME="${DHCP_LEASE_TIME:-1h}"
 
+# TLS cert verification is OFF by default (self-signed hub cert → encrypt
+# without auth). Pass --tls-verify --tls-ca-cert <path> to make this spoke
+# verify the hub cert. A standalone cs spoke is remote, so the hub CA cert
+# MUST be supplied (--tls-ca-cert) — there is no local hub cert to default to.
+TLS_VERIFY=false
+TLS_CA_CERT=""
 while [[ "$#" -gt 0 ]]; do
     case $1 in
         --hub)         HUB_URL="$2"; HUB_URL_PINNED=1; shift ;;
@@ -80,12 +86,26 @@ while [[ "$#" -gt 0 ]]; do
         --hub-secret)  HUB_SECRET="$2";   shift ;;
         --dhcp-iface)  DHCP_IFACE="$2";   shift ;;
         --no-dhcp)     DHCP_SKIP=1 ;;
+        --tls-verify)  TLS_VERIFY=true ;;
+        --tls-ca-cert) shift; TLS_CA_CERT="$1" ;;
         --admin-token) ;; # deprecated
         --all-prereqs) ;;
         *) echo "Unknown argument: $1"; exit 1 ;;
     esac
     shift
 done
+
+if $TLS_VERIFY && [ -z "$TLS_CA_CERT" ]; then
+    echo "❌ --tls-verify requires --tls-ca-cert <path> on a standalone spoke (the hub CA cert is not on this box)."
+    exit 1
+fi
+if $TLS_VERIFY; then
+    HUB_TLS_VERIFY_ENV=1
+    HUB_TLS_CA_ENV="$TLS_CA_CERT"
+else
+    HUB_TLS_VERIFY_ENV=0
+    HUB_TLS_CA_ENV=""
+fi
 
 [ "$(id -u)" -eq 0 ] || { echo "❌ Must be run as root."; exit 1; }
 
@@ -388,6 +408,11 @@ if [ "$SPOKE_ID_PINNED" = "1" ]; then
     ID_ARG="--id $SPOKE_ID"
 fi
 
+# TLS verify lines for the .env (empty unless --tls-verify was passed).
+TLS_VERIFY_LINE="LM_HUB_TLS_VERIFY=$HUB_TLS_VERIFY_ENV"
+TLS_CA_LINE=""
+[ -n "$HUB_TLS_CA_ENV" ] && TLS_CA_LINE="LM_HUB_CA_CERT=$HUB_TLS_CA_ENV"
+
 # ── .env ──────────────────────────────────────────────────────────────────────
 cat > "$LM_DIR/cs/.env" <<DOTENV
 HUB_URL=$HUB_URL
@@ -396,6 +421,8 @@ SPOKE_SECRET=$SPOKE_SECRET
 HUB_SECRET=${HUB_SECRET:-}
 CS_API_PORT=$CS_API_PORT
 CS_API_HOST=$CS_API_HOST
+${TLS_VERIFY_LINE}
+${TLS_CA_LINE}
 DOTENV
 chmod 600 "$LM_DIR/cs/.env"
 
