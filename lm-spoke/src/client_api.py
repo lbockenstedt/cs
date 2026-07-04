@@ -194,10 +194,7 @@ def build_client_api_app(spoke) -> FastAPI:
     @app.get("/api/config/parsed")
     async def api_config_parsed() -> JSONResponse:
         parser = sim_config.load_ini(CONFIGS_DIR / "simulation.conf")
-        out: Dict[str, Dict[str, str]] = {}
-        for section in parser.sections():
-            out[section] = {k: v for k, v in parser.items(section)}
-        return JSONResponse(out)
+        return JSONResponse(sim_config.sections_dict(parser))
 
     # ── scripts ────────────────────────────────────────────────────────────
     def _scripts_dir(platform: str) -> Path:

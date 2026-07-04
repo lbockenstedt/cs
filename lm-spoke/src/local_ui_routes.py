@@ -27,9 +27,17 @@ rather than fabricating data, which renders sim-views.js's existing
 from __future__ import annotations
 
 import time
+from pathlib import Path
 from typing import Any, Dict, Optional
 
 from fastapi import APIRouter, Request
+
+import sim_config
+
+# Matches client_api.py's CONFIGS_DIR / cs_spoke.py's inline equivalent — kept
+# as a separate constant (not imported from client_api.py) to avoid a circular
+# import, since client_api.py imports build_local_ui_router from this module.
+_CONFIGS_DIR = Path(__file__).resolve().parent.parent.parent / "configs"
 
 
 def build_local_ui_router(spoke) -> APIRouter:
@@ -132,5 +140,75 @@ def build_local_ui_router(spoke) -> APIRouter:
         body = await request.json()
         overrides = body.get("overrides") if isinstance(body.get("overrides"), dict) else body
         return await _cmd("CS_SET_ALL_CLIENT_OVERRIDES", {"overrides": overrides})
+
+    # ── API Server tab ───────────────────────────────────────────────────────
+
+    @router.get("/aggregate/api-server")
+    async def aggregate_api_server():
+        ks = await _cmd("CS_GET_KILL_SWITCH")
+        return {"spokes": [{
+            "spoke_id": spoke.spoke_id,
+            "spoke_name": spoke.spoke_id,
+            "spoke_hostname": spoke.spoke_id,
+            "spoke_online": True,
+            "api_server": {
+                "health": {
+                    "status": "ok",
+                    "clients": spoke.registry.count() if spoke.registry is not None else 0,
+                    "repo_synced": True,
+                    "repo_error": None,
+                    "version": spoke.get_version(),
+                },
+                "services": {
+                    "simulation_engine": "killed" if ks.get("kill_switch") else "running",
+                    "client_registry": "running",
+                },
+            },
+        }]}
+
+    # ── Config tab (simulation.conf + user-overrides.conf editors) ──────────
+    # Maps directly onto cs_spoke.py's existing CS_GET_CONFIG/CS_UPDATE_CONFIG/
+    # CS_UPDATE_USER_OVERRIDES commands — no new logic, just HTTP shape glue.
+    # Skips the hub's config-push / per-tenant hub-config cards entirely (both
+    # are multi-spoke/tenant hub-admin concepts that don't apply to a single
+    # standalone spoke).
+
+    @router.get("/{tenant}/config/simulation-conf-parsed")
+    async def config_sim_conf_parsed(tenant: str):
+        res = await _cmd("CS_GET_CONFIG")
+        if res.get("status") != "SUCCESS":
+            return res
+        raw = res.get("simulation_conf") or ""
+        # Re-parse the MERGED text CS_GET_CONFIG returned (base file + any
+        # hub-applied override) so edits already saved show up as sections.
+        # sim_config.sections_dict is the same helper client_api.py's
+        # /api/config/parsed uses (that route reads the base file only —
+        # this one needs the merged text CS_GET_CONFIG already computed).
+        parser = sim_config._new_parser()
+        parser.read_string(raw)
+        return {"fetched_at": time.time(), "source": "spoke",
+                "sections": sim_config.sections_dict(parser), "raw": raw}
+
+    @router.put("/{tenant}/config/simulation-conf")
+    async def config_sim_conf_put(tenant: str, request: Request):
+        body = await request.json()
+        res = await _cmd("CS_UPDATE_CONFIG", {"content": body.get("content") or ""})
+        return {**res, "synced_spokes": 1 if res.get("status") == "SUCCESS" else 0}
+
+    @router.get("/{tenant}/config/user-overrides-conf")
+    async def config_user_overrides_get(tenant: str):
+        # Reads the file directly — same approach as client_api.py's existing
+        # /api/config/overrides — rather than round-tripping through
+        # CS_GET_CONFIG's configparser serialize, which risks reformatting
+        # comments/whitespace on a file this editor is about to show verbatim.
+        path = _CONFIGS_DIR / "user-overrides.conf"
+        content = path.read_text(encoding="utf-8") if path.exists() else ""
+        return {"content": content, "fetched_at": time.time(), "source": "spoke"}
+
+    @router.put("/{tenant}/config/user-overrides-conf")
+    async def config_user_overrides_put(tenant: str, request: Request):
+        body = await request.json()
+        res = await _cmd("CS_UPDATE_USER_OVERRIDES", {"content": body.get("content") or ""})
+        return {**res, "synced_spokes": 1 if res.get("status") == "SUCCESS" else 0}
 
     return router

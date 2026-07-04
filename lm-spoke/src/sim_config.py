@@ -104,6 +104,15 @@ def serialize_ini(parser: configparser.ConfigParser) -> str:
     return buf.getvalue()
 
 
+def sections_dict(parser: configparser.ConfigParser) -> Dict[str, Dict[str, str]]:
+    """``{section: {key: value}}`` view of a parser. Shared by every consumer
+    that needs simulation.conf as nested JSON rather than a ConfigParser
+    object — client_api.py's ``/api/config/parsed`` and local_ui_routes.py's
+    ``/config/simulation-conf-parsed`` both call this instead of each
+    re-implementing the same three-line conversion."""
+    return {s: dict(parser.items(s)) for s in parser.sections()}
+
+
 def load_configs(config_dir: os.PathLike | str) -> Tuple[configparser.ConfigParser, configparser.ConfigParser]:
     """Load ``(simulation.conf, user-overrides.conf)`` from *config_dir*.
 

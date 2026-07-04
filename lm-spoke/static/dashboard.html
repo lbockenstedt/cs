@@ -58,13 +58,16 @@
         <p class="text-[11px] text-slate-400">Standalone local dashboard</p>
     </header>
 
-    <!-- Tab nav — Simulations + Clients (first slice; more tabs land as they're
-         ported: Central / VM Server / API Server / Config / Setup). -->
+    <!-- Tab nav — more tabs land as they're ported: Central / VM Server / Setup. -->
     <nav class="flex gap-1 px-6 pt-3 bg-white border-b border-slate-200 shrink-0" role="tablist">
         <button class="cs-tab-btn px-4 py-2 text-sm font-semibold rounded-t-lg border border-b-0 border-slate-200"
                 data-view="Dashboard" role="tab" aria-selected="true">Simulations</button>
         <button class="cs-tab-btn px-4 py-2 text-sm font-semibold rounded-t-lg border border-b-0 border-transparent text-slate-500"
                 data-view="Clients" role="tab" aria-selected="false">Clients</button>
+        <button class="cs-tab-btn px-4 py-2 text-sm font-semibold rounded-t-lg border border-b-0 border-transparent text-slate-500"
+                data-view="API Server" role="tab" aria-selected="false">API Server</button>
+        <button class="cs-tab-btn px-4 py-2 text-sm font-semibold rounded-t-lg border border-b-0 border-transparent text-slate-500"
+                data-view="Config" role="tab" aria-selected="false">Config</button>
     </nav>
 
     <!-- Content — sim-views.js renders into these two containers. -->
@@ -99,6 +102,15 @@
             setTimeout(() => location.reload(), 1000);
         }
 
+        // 'Config' bypasses loadCSData's default renderer (csRenderConfig —
+        // the hub's cross-spoke config-push admin tool, not applicable to a
+        // single standalone spoke) and calls the sim-conf/user-overrides
+        // editor directly instead — that's what "Config" means per the
+        // original webui-spoke's documented tab purpose.
+        const TAB_RENDERERS = {
+            'Config': () => csRenderConfigSimulation(),
+        };
+
         function activateTab(view) {
             currentSubView = view;
             currentSubChild = '';
@@ -109,7 +121,7 @@
                 btn.classList.toggle('border-transparent', !active);
                 btn.classList.toggle('text-slate-500', !active);
             });
-            loadCSData(view, '');
+            (TAB_RENDERERS[view] || (() => loadCSData(view, '')))();
         }
 
         document.querySelectorAll('.cs-tab-btn').forEach((btn) => {
