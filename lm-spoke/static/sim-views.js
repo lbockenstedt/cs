@@ -239,6 +239,23 @@ function csEmpty(msg, hint) {
     </div>`;
 }
 
+// Shared toast for every "Save & Push to Spokes"-style route (they all
+// return {pushed_to_spokes, queued}). The spoke may be approved+bound but
+// momentarily unreachable (self-update restart, brief reconnect blip) — in
+// that case push_or_queue_to_spoke (core/src/main.py) queues the change via
+// the Mailbox instead of dropping it, so it applies the moment the spoke
+// reconnects rather than being lost. Surface that as a distinct amber toast
+// instead of claiming the change already landed.
+function csPushToast(r, verb) {
+    verb = verb || 'Saved';
+    const n = (r && r.pushed_to_spokes != null) ? r.pushed_to_spokes : 0;
+    if (r && r.queued) {
+        showToast(`${verb} — spoke temporarily unreachable, queued for delivery on reconnect.`, 'info');
+    } else {
+        showToast(`${verb}. Pushed to ${n} spoke(s).`, 'success');
+    }
+}
+
 function csErrorBox(label, err) {
     const msg = (err && err.message) ? err.message : String(err);
     const stub = /404|Not implemented/i.test(msg);
@@ -1959,7 +1976,7 @@ window.csSaveHubConfig = async function () {
             hub_config: merged
         };
         const r = await csFetch('/tenant/' + csTenant() + '/hub-config', { method: 'PUT', body: JSON.stringify(body) });
-        showToast('Saved. Pushed to ' + ((r && r.pushed_to_spokes) != null ? r.pushed_to_spokes : 0) + ' spoke(s).', 'success');
+        csPushToast(r, 'Saved');
     } catch (e) {
         console.error('csSaveHubConfig: hub-config push failed', e);
         showToast(e.message, 'error');
@@ -2079,7 +2096,7 @@ window.csSaveAutoProvConfig = async function () {
             hub_config: merged
         };
         const r = await csFetch('/tenant/' + csTenant() + '/hub-config', { method: 'PUT', body: JSON.stringify(body) });
-        showToast('Saved. Pushed to ' + ((r && r.pushed_to_spokes) != null ? r.pushed_to_spokes : 0) + ' spoke(s).', 'success');
+        csPushToast(r, 'Saved');
         // Keep the Overview/USB auto-provision checkbox + status in sync with
         // this save (same underlying key) so the two controls never drift.
         try { if (typeof csRefreshAutoProvStatus === 'function') csRefreshAutoProvStatus(); } catch (_) {}
@@ -2355,7 +2372,7 @@ window.csSaveCentralConn = async function () {
     if (v('cs-csc-refreshtoken')) hub_central_config.refresh_token = v('cs-csc-refreshtoken');
     try {
         const r = await csFetch('/aggregate/central', { method: 'POST', body: JSON.stringify({ mode, hub_central_config }) });
-        showToast('Saved. Pushed to ' + ((r && r.pushed_to_spokes) != null ? r.pushed_to_spokes : 0) + ' spoke(s).', 'success');
+        csPushToast(r, 'Saved');
     } catch (e) { console.error('csSaveCentralConn: central connection save failed', e); showToast(e.message, 'error'); }
 };
 
@@ -2375,7 +2392,7 @@ window.csSaveCentralSites = async function () {
     const cfg = { site_mappings, monitored_checks: window._csCscMonitoredChecks || [], hardware_checks };
     try {
         const r = await csFetch(`/${csTenant()}/central-sites-config?tenant_id=${csTenant()}`, { method: 'POST', body: JSON.stringify(cfg) });
-        showToast('Saved. Pushed to ' + ((r && r.pushed_to_spokes) != null ? r.pushed_to_spokes : 0) + ' spoke(s).', 'success');
+        csPushToast(r, 'Saved');
     } catch (e) { console.error('csSaveCentralSites: central sites save failed', e); showToast(e.message, 'error'); }
 };
 
@@ -2422,8 +2439,7 @@ window.csResetHubConfig = async function () {
         // Re-render so both cards reflect the reset values (csSetupAutoProvConfigCard
         // + csHubConfigCard reload from /hub-config, which now returns the defaults).
         await csRenderSetupProxmox();
-        const n = (r && r.pushed_to_spokes != null) ? r.pushed_to_spokes : 0;
-        if (typeof showToast === 'function') showToast('Reset to defaults — pushed to ' + n + ' spoke(s).', 'success');
+        csPushToast(r, 'Reset to defaults');
     } catch (e) {
         console.error('csResetHubConfig: reset failed', e);
         if (typeof showToast === 'function') showToast('Reset failed: ' + (e.message || e), 'error');
@@ -2721,8 +2737,9 @@ window.csFleetReclone = async function () {
 
 window.csToggleAutoProvision = async function (enabled) {
     try {
-        await csFetch(`/${csTenant()}/toggle-auto-provision?tenant_id=${csTenant()}`, {
+        const r = await csFetch(`/${csTenant()}/toggle-auto-provision?tenant_id=${csTenant()}`, {
             method: 'POST', body: JSON.stringify({ enabled }) });
+        csPushToast(r, enabled ? 'Auto-provisioning enabled' : 'Auto-provisioning disabled');
         csRefreshAutoProvStatus();
     } catch (e) { console.error('csToggleAutoProvision: toggle failed', e); if (typeof showToast === 'function') showToast('Toggle failed: ' + (e.message || e), 'error'); }
 };
@@ -3441,7 +3458,7 @@ window.csSpokePatchConfig = async function (spokeId) {
     try { cfg = JSON.parse(raw); } catch (e) { console.error('csSpokePatchConfig: invalid JSON', e); if (typeof showToast === 'function') showToast('Invalid JSON: ' + e.message, 'error'); return; }
     try {
         const r = await csFetch(`/${csTenant()}/spokes/${encodeURIComponent(spokeId)}/config`, { method: 'PATCH', body: JSON.stringify({ config: cfg }) });
-        if (typeof showToast === 'function') showToast(`Config pushed to ${r.pushed_to_spokes || 0} spoke(s)`, 'success');
+        csPushToast(r, 'Config pushed');
     } catch (e) { console.error('csSpokePatchConfig: config push failed', e); if (typeof showToast === 'function') showToast(e.message, 'error'); }
 };
 
