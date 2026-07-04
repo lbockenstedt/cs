@@ -45,9 +45,9 @@ from simulation_engine import SimulationEngine
 from cs_spoke import CSSpoke
 from client_api import build_client_api_app
 try:
-    from core.src.messaging.control_plane import BaseControlPlane
+    from core.src.messaging.agent_hosting import AgentHostingControlPlane
 except ImportError:
-    from messaging.control_plane import BaseControlPlane
+    from messaging.agent_hosting import AgentHostingControlPlane
 
 try:
     from logging_setup import configure_logging
@@ -66,7 +66,30 @@ except ImportError:
 configure_logging()
 logger = logging.getLogger("CSControlPlane")
 
-class CSControlPlane(BaseControlPlane):
+class CSControlPlane(AgentHostingControlPlane):
+    """cs spoke control plane.
+
+    Subclasses ``AgentHostingControlPlane`` (shared with pxmx) so it can host
+    inbound pxmx agents directly in the split (per-module-LXC) topology — a
+    cs-dialed agent connects to this spoke's ``/ws/agent`` and is managed via
+    the cs WebUI. The agent listener is OPT-IN (``LM_CS_AGENT_LISTENER=1``, set
+    by ``install_cs.sh --agent-listener``): an all-in-one / relay-only cs spoke
+    never binds ``:443`` and co-located cs agents keep going through the hub
+    ``/ws/agent`` byte-proxy → pxmx → ``CSBridgePoller`` path.
+    """
+
+    # cs-specific tuning of the mixin's class attrs.
+    MODULE_TYPE = "simulation"
+    AGENT_PORT_ENV = "LM_CS_AGENT_PORT"
+    AGENT_LOOPBACK_ENV = "LM_CS_AGENT_LOOPBACK"
+    AGENT_LISTENER_ENV = "LM_CS_AGENT_LISTENER"
+    AGENT_CONFIG_PATH = "/etc/lm-cs-agent/config.json"
+    # cs agent listener is opt-in (env-gated) so all-in-one stays relay-only.
+    AGENT_LISTENER_OPT_IN = True
+    AGENT_LOOPBACK_PORT = 8443
+    AGENT_WSS_PORT = 443
+    AGENT_FALLBACK_PORT = 8767
+
     def get_service_name(self) -> str:
         return "lm-cs"
 
@@ -76,7 +99,6 @@ class CSControlPlane(BaseControlPlane):
                  api_host: str = None, api_port: int = None):
         super().__init__(spoke_id, secret, hub_secret, hub_url,
                          onboarding_psk=onboarding_psk, tenant_id_hint=tenant_id_hint)
-        self.module_type = "simulation"
         self.startup_config = config or {}
         # Client API listener (the spoke that owns the DHCP scope 169.253.1.1/24
         # is also the client API gateway on 169.253.1.1:8080). Bound 0.0.0.0 so
@@ -95,7 +117,19 @@ class CSControlPlane(BaseControlPlane):
     async def run(self):
         logger.info(f"Starting CS (Client Simulator) -> {self.hub_url}")
         cs_spoke = CSSpoke(self.spoke_id, self.startup_config)
+        # Wire the control-plane reference so CSSpoke's GET_AGENTS / SPOKE_RELAY
+        # handlers can reach connected_agents / approve_pending_agent / send_to_agent
+        # (mirrors ProxmoxSpoke(control_plane=self)).
+        cs_spoke.control_plane = self
         self.register_module("cs", cs_spoke)
+        # Start the agent listener ONLY when opted in (LM_CS_AGENT_LISTENER=1,
+        # set by install_cs.sh --agent-listener). An all-in-one / relay-only cs
+        # spoke skips this entirely so it never binds :443 on the hub box.
+        if self._agent_listener_enabled():
+            self._start_agent_server_task()
+            logger.info("CS agent listener enabled (cs-dialed agents accepted)")
+        else:
+            logger.info("CS agent listener disabled (relay-only; --agent-listener to enable)")
         # Start the demo-scenario TTL expiry sweep (no-op without a loop).
         cs_spoke.demo.start()
         # Start the client API server as a long-lived task that SURVIVES hub

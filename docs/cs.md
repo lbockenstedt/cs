@@ -27,7 +27,11 @@ The active LM spoke is `lm-spoke/` (`CSSpoke`), **relay-only** for Proxmox/USB a
 
 ## Install flags
 
-`lm-spoke/install_cs.sh`: `--hub`, `--id`/`--name`, `--secret`, `--hub-secret`, `--dhcp-iface`, `--no-dhcp`, `--tls-verify` (+ `--tls-ca-cert`, **required**), `--admin-token` (deprecated no-op), `--all-prereqs` (no-op). A stale `CS_API_PORT=8000` is auto-migrated to 8080. `control_plane.py` CLI also accepts `--port`, `--host`, `--standalone`, `--onboarding-psk`, `--tenant-id-hint`.
+`lm-spoke/install_cs.sh`: `--hub`, `--id`/`--name`, `--secret`, `--hub-secret`, `--dhcp-iface`, `--no-dhcp`, `--tls-verify` (+ `--tls-ca-cert`, **required**), `--agent-listener` (opt-in split-topology `/ws/agent` listener — see below), `--admin-token` (deprecated no-op), `--all-prereqs` (no-op). A stale `CS_API_PORT=8000` is auto-migrated to 8080. `control_plane.py` CLI also accepts `--port`, `--host`, `--standalone`, `--onboarding-psk`, `--tenant-id-hint`.
+
+### Agent listener (split topology, opt-in)
+
+`CSControlPlane` subclasses the shared `AgentHostingControlPlane` mixin (also used by pxmx), so a cs spoke can host inbound Proxmox host agents on `/ws/agent` directly — OFF by default (relay-only; an all-in-one cs spoke never binds `:443`). Pass `--agent-listener` to `install_cs.sh` to opt in: it generates a self-signed cert at `$LM_DIR/cs/certs/` (preserved on re-run), writes `LM_CS_AGENT_LISTENER=1` + `LM_TLS_CERT`/`LM_TLS_KEY` to `.env`, and grants the `lm-cs.service` unit `CAP_NET_BIND_SERVICE` so `svc_lm` can bind `:443`. Since a standalone cs spoke doesn't broadcast `_lm-hub` mDNS, the agent must be pinned: `agent/install_agent.sh --spoke-url wss://<cs-host>:443/ws/agent` (the installer prints this). `CSSpoke` answers `GET_AGENTS`/`SET_AGENT_CONFIG`/`SPOKE_RELAY` for cs-dialed agents, mirroring `ProxmoxSpoke`'s existing handlers.
 
 ## Key commands / handlers (`CSSpoke.handle_command`, `lm-spoke/src/cs_spoke.py`)
 

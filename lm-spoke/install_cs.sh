@@ -78,16 +78,25 @@ DHCP_LEASE_TIME="${DHCP_LEASE_TIME:-1h}"
 # MUST be supplied (--tls-ca-cert) — there is no local hub cert to default to.
 TLS_VERIFY=false
 TLS_CA_CERT=""
+# Agent listener (split topology): OFF by default — this cs spoke stays
+# relay-only and never binds :443. --agent-listener opts in so a pxmx host
+# agent can dial THIS spoke's /ws/agent directly (wss://<cs>:443/ws/agent)
+# instead of the pxmx spoke, for a deployment where cs owns the agent
+# relationship (see AgentHostingControlPlane / CSControlPlane). Requires its
+# own self-signed cert + CAP_NET_BIND_SERVICE, same pattern as install_pxmx.sh's
+# standalone mode.
+CS_AGENT_LISTENER=0
 while [[ "$#" -gt 0 ]]; do
     case $1 in
-        --hub)         HUB_URL="$2"; HUB_URL_PINNED=1; shift ;;
-        --id|--name)   SPOKE_ID="$2"; SPOKE_ID_PINNED=1; shift ;;
-        --secret)      SPOKE_SECRET="$2"; shift ;;
-        --hub-secret)  HUB_SECRET="$2";   shift ;;
-        --dhcp-iface)  DHCP_IFACE="$2";   shift ;;
-        --no-dhcp)     DHCP_SKIP=1 ;;
-        --tls-verify)  TLS_VERIFY=true ;;
-        --tls-ca-cert) shift; TLS_CA_CERT="$1" ;;
+        --hub)             HUB_URL="$2"; HUB_URL_PINNED=1; shift ;;
+        --id|--name)       SPOKE_ID="$2"; SPOKE_ID_PINNED=1; shift ;;
+        --secret)          SPOKE_SECRET="$2"; shift ;;
+        --hub-secret)      HUB_SECRET="$2";   shift ;;
+        --dhcp-iface)      DHCP_IFACE="$2";   shift ;;
+        --no-dhcp)         DHCP_SKIP=1 ;;
+        --tls-verify)      TLS_VERIFY=true ;;
+        --tls-ca-cert)     shift; TLS_CA_CERT="$1" ;;
+        --agent-listener)  CS_AGENT_LISTENER=1 ;;
         --admin-token) ;; # deprecated
         --all-prereqs) ;;
         *) echo "Unknown argument: $1"; exit 1 ;;
@@ -423,6 +432,41 @@ TLS_VERIFY_LINE="LM_HUB_TLS_VERIFY=$HUB_TLS_VERIFY_ENV"
 TLS_CA_LINE=""
 [ -n "$HUB_TLS_CA_ENV" ] && TLS_CA_LINE="LM_HUB_CA_CERT=$HUB_TLS_CA_ENV"
 
+# ── Agent listener (split topology, --agent-listener opt-in) ─────────────────
+# Mirrors install_pxmx.sh's standalone TLS-cert generation: a pxmx host agent
+# dialing THIS cs spoke's /ws/agent needs wss on :443, so a self-signed cert is
+# generated (once; preserved on re-run) and the systemd unit below gets
+# CAP_NET_BIND_SERVICE so svc_lm can bind :443. Skipped entirely when the
+# listener is off — a relay-only cs spoke never touches any of this.
+CS_AGENT_LISTENER_LINES=""
+if [ "$CS_AGENT_LISTENER" = "1" ]; then
+    CS_CERT_DIR="$LM_DIR/cs/certs"
+    CS_CERT="$CS_CERT_DIR/hub.crt"
+    CS_KEY="$CS_CERT_DIR/hub.key"
+    mkdir -p "$CS_CERT_DIR"
+    if ! command -v openssl >/dev/null 2>&1; then
+        warn "openssl not found — skipping cs agent-listener TLS cert (listener stays plaintext :8767)."
+    elif [ -f "$CS_CERT" ] && [ -f "$CS_KEY" ]; then
+        ok "cs agent-listener TLS cert already present at $CS_CERT — preserving."
+    else
+        echo "🔒 Generating self-signed cs agent-listener TLS cert at $CS_CERT…"
+        openssl req -x509 -newkey rsa:2048 -nodes \
+            -keyout "$CS_KEY" -out "$CS_CERT" -days 3650 \
+            -subj "/CN=lm-cs" -addext "subjectAltName=IP:127.0.0.1,DNS:lm-hub,DNS:lm-hub.local" \
+            >/dev/null 2>&1 || warn "openssl cert generation failed — agent listener stays plaintext."
+    fi
+    if [ -f "$CS_KEY" ]; then
+        chmod 600 "$CS_KEY"
+        chown "$SVC_USER:$SVC_USER" "$CS_KEY" "$CS_CERT" 2>/dev/null || true
+    fi
+    CS_AGENT_LISTENER_LINES="LM_CS_AGENT_LISTENER=1"
+    if [ -f "$CS_CERT" ] && [ -f "$CS_KEY" ]; then
+        CS_AGENT_LISTENER_LINES="$CS_AGENT_LISTENER_LINES
+LM_TLS_CERT=$CS_CERT
+LM_TLS_KEY=$CS_KEY"
+    fi
+fi
+
 # ── .env ──────────────────────────────────────────────────────────────────────
 cat > "$LM_DIR/cs/.env" <<DOTENV
 HUB_URL=$HUB_URL
@@ -433,6 +477,7 @@ CS_API_PORT=$CS_API_PORT
 CS_API_HOST=$CS_API_HOST
 ${TLS_VERIFY_LINE}
 ${TLS_CA_LINE}
+${CS_AGENT_LISTENER_LINES}
 DOTENV
 chmod 600 "$LM_DIR/cs/.env"
 
@@ -448,6 +493,15 @@ SECRET_ARG=""
 HUB_SECRET_ARG=""
 [ -n "${HUB_SECRET:-}" ] && HUB_SECRET_ARG="--hub-secret=$HUB_SECRET"
 
+# CAP_NET_BIND_SERVICE lets svc_lm (non-root) bind :443 for the agent listener.
+# Only granted when --agent-listener is on; a relay-only cs spoke needs no
+# extra capability.
+CAP_LINES=""
+if [ "$CS_AGENT_LISTENER" = "1" ]; then
+    CAP_LINES="AmbientCapabilities=CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE"
+fi
+
 cat > /etc/systemd/system/lm-cs.service <<SYSD
 [Unit]
 Description=Lab Manager Spoke - Generic Agent
@@ -462,6 +516,7 @@ Environment="PYTHONPATH=$LM_DIR:$LM_DIR/core/src:$LM_DIR/cs/lm-spoke:$LM_DIR/cs/
 Environment="CS_API_PORT=$CS_API_PORT"
 Environment="CS_API_HOST=$CS_API_HOST"
 ExecStart=$LM_DIR/cs/venv/bin/python3 -m src.control_plane $ID_ARG --hub "\${HUB_URL}" $SECRET_ARG $HUB_SECRET_ARG --port $CS_API_PORT --host $CS_API_HOST
+$CAP_LINES
 
 StandardOutput=append:/var/log/lm/lm-cs.log
 StandardError=append:/var/log/lm/lm-cs.log
@@ -672,5 +727,13 @@ if [[ -n "${DHCP_IFACE:-}" && "$DHCP_SKIP" != "1" ]]; then
     fi
 else
     echo "  DHCP:          skipped (single NIC or --no-dhcp)"
+fi
+if [ "$CS_AGENT_LISTENER" = "1" ]; then
+    echo "  Agent listener: ENABLED — a pxmx host agent can dial this cs spoke directly."
+    echo "                  Pin the agent install to THIS spoke (not the pxmx spoke):"
+    echo "                  agent/install_agent.sh --spoke-url wss://${LOCAL_IP}:443/ws/agent"
+    echo "                  (a cs spoke does not broadcast _lm-hub mDNS — the agent must be pinned)"
+else
+    echo "  Agent listener: disabled (relay-only; pass --agent-listener to accept cs-dialed agents)"
 fi
 echo ""

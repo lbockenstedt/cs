@@ -82,6 +82,11 @@ class CSSpoke(BaseSpoke):
         self.demo = DemoManager()
         self._sim_tag_cache: Dict[tuple, set] = {}
         self._sim_tag_sync_lock = asyncio.Lock()
+        # Control-plane back-reference, set by CSControlPlane.run() so the
+        # GET_AGENTS / SPOKE_RELAY / SET_AGENT_CONFIG handlers can reach
+        # connected_agents / approve_pending_agent / send_to_agent (mirrors
+        # ProxmoxSpoke(control_plane=...)). None when driven standalone.
+        self.control_plane = None
 
     # ── BaseSpoke: status (fallback for *_GET_STATUS) ───────────────────────
     async def get_status(self) -> Dict[str, Any]:
@@ -117,6 +122,32 @@ class CSSpoke(BaseSpoke):
                 pass
         return "unknown"
 
+    # ── agent registry (cs-dialed pxmx agents) ──────────────────────────────
+
+    def _get_agents(self) -> Dict[str, Any]:
+        """List connected + pending cs-dialed agents (mirrors ProxmoxSpoke).
+
+        cs-dialed agents are pxmx agents that dial this cs spoke's
+        ``/ws/agent`` instead of the pxmx spoke. The cs WebUI renders them; the
+        cs-relevant fields are hostname / version / last_seen (no Proxmox
+        nodes/vms — those live on the pxmx-dial path)."""
+        if not self.control_plane:
+            return {"status": "SUCCESS", "agents": [], "pending_agents": []}
+        agents = []
+        for aid, info in self.control_plane.connected_agents.items():
+            agents.append({
+                "agent_id":  aid,
+                "hostname":  info.get("hostname", aid),
+                "last_seen": info.get("last_seen", 0),
+                "version":   info.get("version", "unknown"),
+                "status":    "connected",
+            })
+        pending = [
+            {"agent_id": aid, "status": "pending"}
+            for aid in self.control_plane.pending_agents
+        ]
+        return {"status": "SUCCESS", "agents": agents, "pending_agents": pending}
+
     # ── Phase F: sim-tag sync (driven off CS_INGEST_TELEMETRY / token store) ──
     async def _maybe_sync_sim_tags(self) -> None:
         """Best-effort sim-tag sweep (legacy ``_sync_all_vm_sim_tags``).
@@ -143,6 +174,44 @@ class CSSpoke(BaseSpoke):
         # ── identity / status ──────────────────────────────────────────────
         if cmd in ("GET_VERSION", "CS_GET_VERSION"):
             return {"status": "SUCCESS", "version": self.get_version()}
+
+        # ── agent hosting (cs-dialed pxmx agents, split topology) ───────────
+        # These mirror ProxmoxSpoke so the LM hub can list/approve/relay-to a
+        # pxmx agent that dials THIS cs spoke (wss://<cs>:443/ws/agent) instead
+        # of the pxmx spoke. The cs WebUI's cs-agents panel + the hub's
+        # CSBridgePoller drive them. Only active when CSControlPlane has its
+        # agent listener enabled (LM_CS_AGENT_LISTENER=1); otherwise
+        # control_plane.connected_agents is empty and these return empty/error.
+        if cmd == "GET_AGENTS":
+            return self._get_agents()
+
+        if cmd == "SET_AGENT_CONFIG":
+            agent_id = d.get("agent_id")
+            cfg = d.get("config", {})
+            if not agent_id:
+                return {"status": "ERROR", "message": "Missing agent_id"}
+            if self.control_plane:
+                return await self.control_plane.send_to_agent(
+                    "UPDATE_CONFIG", cfg, agent_id=agent_id)
+            return {"status": "ERROR", "message": "Agent not connected"}
+
+        if cmd == "SPOKE_RELAY":
+            target = d.get("target_agent_id")
+            command = d.get("command")
+            if command == "APPROVAL_SUCCESS" and target and self.control_plane:
+                await self.control_plane.approve_pending_agent(target)
+                return {"status": "SUCCESS", "message": f"Agent {target} approved"}
+            if command == "REVOKE_AGENT" and target and self.control_plane:
+                await self.control_plane.revoke_agent(target)
+                return {"status": "SUCCESS", "message": f"Agent {target} disconnected"}
+            # Generic forward: relay an arbitrary command (e.g. CS_COMMAND from
+            # the hub's CSBridgePoller) to a specific cs-dialed agent. The
+            # agent's AGENT_RESPONSE data is returned to the hub. send_to_agent
+            # enforces the 15s sync window — only fast commands belong here.
+            if command and target and self.control_plane:
+                inner = d.get("data") or {}
+                return await self.control_plane.send_to_agent(command, inner, agent_id=target)
+            return {"status": "ERROR", "error": "Unknown relay command"}
 
         # ── simulation execution ────────────────────────────────────────────
         if cmd in ("CS_TRIGGER_ITERATION", "TRIGGER_ITERATION"):
