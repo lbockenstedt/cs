@@ -78,25 +78,27 @@ DHCP_LEASE_TIME="${DHCP_LEASE_TIME:-1h}"
 # MUST be supplied (--tls-ca-cert) — there is no local hub cert to default to.
 TLS_VERIFY=false
 TLS_CA_CERT=""
-# Agent listener (split topology): OFF by default — this cs spoke stays
-# relay-only and never binds :443. --agent-listener opts in so a pxmx host
-# agent can dial THIS spoke's /ws/agent directly (wss://<cs>:443/ws/agent)
-# instead of the pxmx spoke, for a deployment where cs owns the agent
-# relationship (see AgentHostingControlPlane / CSControlPlane). Requires its
-# own self-signed cert + CAP_NET_BIND_SERVICE, same pattern as install_pxmx.sh's
-# standalone mode.
-CS_AGENT_LISTENER=0
+# Agent listener (split topology): ON by default — a pxmx host agent dials
+# THIS cs spoke's /ws/agent directly (wss://<cs>:443/ws/agent) instead of the
+# pxmx spoke, since most deployments route the agent relationship through cs
+# (see AgentHostingControlPlane / CSControlPlane). Generates its own
+# self-signed cert + grants CAP_NET_BIND_SERVICE, same pattern as
+# install_pxmx.sh's standalone mode. --no-agent-listener opts OUT for the rare
+# all-in-one/relay-only deployment, where this cs spoke never binds :443 and
+# agents go through the pxmx spoke (or the hub's /ws/agent byte-proxy) instead.
+CS_AGENT_LISTENER=1
 while [[ "$#" -gt 0 ]]; do
     case $1 in
-        --hub)             HUB_URL="$2"; HUB_URL_PINNED=1; shift ;;
-        --id|--name)       SPOKE_ID="$2"; SPOKE_ID_PINNED=1; shift ;;
-        --secret)          SPOKE_SECRET="$2"; shift ;;
-        --hub-secret)      HUB_SECRET="$2";   shift ;;
-        --dhcp-iface)      DHCP_IFACE="$2";   shift ;;
-        --no-dhcp)         DHCP_SKIP=1 ;;
-        --tls-verify)      TLS_VERIFY=true ;;
-        --tls-ca-cert)     shift; TLS_CA_CERT="$1" ;;
-        --agent-listener)  CS_AGENT_LISTENER=1 ;;
+        --hub)                HUB_URL="$2"; HUB_URL_PINNED=1; shift ;;
+        --id|--name)          SPOKE_ID="$2"; SPOKE_ID_PINNED=1; shift ;;
+        --secret)             SPOKE_SECRET="$2"; shift ;;
+        --hub-secret)         HUB_SECRET="$2";   shift ;;
+        --dhcp-iface)         DHCP_IFACE="$2";   shift ;;
+        --no-dhcp)            DHCP_SKIP=1 ;;
+        --tls-verify)         TLS_VERIFY=true ;;
+        --tls-ca-cert)        shift; TLS_CA_CERT="$1" ;;
+        --agent-listener)     CS_AGENT_LISTENER=1 ;;  # default already; kept as a harmless no-op
+        --no-agent-listener)  CS_AGENT_LISTENER=0 ;;
         --admin-token) ;; # deprecated
         --all-prereqs) ;;
         *) echo "Unknown argument: $1"; exit 1 ;;
@@ -734,6 +736,6 @@ if [ "$CS_AGENT_LISTENER" = "1" ]; then
     echo "                  agent/install_agent.sh --spoke-url wss://${LOCAL_IP}:443/ws/agent"
     echo "                  (a cs spoke does not broadcast _lm-hub mDNS — the agent must be pinned)"
 else
-    echo "  Agent listener: disabled (relay-only; pass --agent-listener to accept cs-dialed agents)"
+    echo "  Agent listener: disabled (--no-agent-listener was passed; relay-only, this cs spoke never binds :443)"
 fi
 echo ""
