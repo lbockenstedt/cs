@@ -467,6 +467,49 @@ if [ "$CS_AGENT_LISTENER" = "1" ]; then
 LM_TLS_CERT=$CS_CERT
 LM_TLS_KEY=$CS_KEY"
     fi
+
+    # --- Agent Secret (shared with a pxmx host agent dialing THIS cs spoke) ---
+    # Mirrors install_pxmx.sh's AGENT_CONFIG block exactly. Without this,
+    # AgentHostingControlPlane.agent_secret stays None, so
+    # approve_pending_agent() pushes {"secret": null} to an approved agent —
+    # the agent's "if provisioned_secret:" guard then skips saving it and
+    # reconnects with the SAME empty secret, landing right back in
+    # pending/"needs admin approval" forever. Preserve an existing secret so
+    # a re-install doesn't break an already-approved agent.
+    CS_AGENT_CONFIG="/etc/lm-cs-agent/config.json"
+    EXISTING_CS_AGENT_SECRET=""
+    if [ -f "$CS_AGENT_CONFIG" ]; then
+        EXISTING_CS_AGENT_SECRET=$(python3 -c "import json,sys; d=json.load(open('$CS_AGENT_CONFIG')); print(d.get('agent_secret',''))" 2>/dev/null || true)
+    fi
+
+    if [ -z "$EXISTING_CS_AGENT_SECRET" ]; then
+        if command -v openssl >/dev/null 2>&1; then
+            CS_AGENT_SECRET=$(openssl rand -base64 32 | tr -d '/+=\n')
+        else
+            CS_AGENT_SECRET=$(python3 -c "import secrets; print(secrets.token_urlsafe(32))")
+        fi
+        echo "🔑 Generated new cs agent_secret."
+    else
+        CS_AGENT_SECRET="$EXISTING_CS_AGENT_SECRET"
+        echo "🔑 Preserved existing cs agent_secret."
+    fi
+
+    mkdir -p /etc/lm-cs-agent
+    python3 -c "
+import json, sys
+path = '$CS_AGENT_CONFIG'
+try:
+    with open(path) as f:
+        data = json.load(f)
+except Exception:
+    data = {}
+data['agent_secret'] = '$CS_AGENT_SECRET'
+with open(path, 'w') as f:
+    json.dump(data, f, indent=2)
+"
+    chmod 600 "$CS_AGENT_CONFIG"
+    chown "$SVC_USER:$SVC_USER" "$CS_AGENT_CONFIG" 2>/dev/null || true
+    echo "✅ cs agent secret written to $CS_AGENT_CONFIG"
 fi
 
 # ── .env ──────────────────────────────────────────────────────────────────────
