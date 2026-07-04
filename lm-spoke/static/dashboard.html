@@ -58,16 +58,22 @@
         <p class="text-[11px] text-slate-400">Standalone local dashboard</p>
     </header>
 
-    <!-- Tab nav — more tabs land as they're ported: Central / VM Server / Setup. -->
+    <!-- Tab nav — VM Server still to come. -->
     <nav class="flex gap-1 px-6 pt-3 bg-white border-b border-slate-200 shrink-0" role="tablist">
         <button class="cs-tab-btn px-4 py-2 text-sm font-semibold rounded-t-lg border border-b-0 border-slate-200"
                 data-view="Dashboard" role="tab" aria-selected="true">Simulations</button>
         <button class="cs-tab-btn px-4 py-2 text-sm font-semibold rounded-t-lg border border-b-0 border-transparent text-slate-500"
                 data-view="Clients" role="tab" aria-selected="false">Clients</button>
         <button class="cs-tab-btn px-4 py-2 text-sm font-semibold rounded-t-lg border border-b-0 border-transparent text-slate-500"
+                data-view="Central" role="tab" aria-selected="false">Central</button>
+        <button class="cs-tab-btn px-4 py-2 text-sm font-semibold rounded-t-lg border border-b-0 border-transparent text-slate-500"
                 data-view="API Server" role="tab" aria-selected="false">API Server</button>
         <button class="cs-tab-btn px-4 py-2 text-sm font-semibold rounded-t-lg border border-b-0 border-transparent text-slate-500"
                 data-view="Config" role="tab" aria-selected="false">Config</button>
+        <button class="cs-tab-btn px-4 py-2 text-sm font-semibold rounded-t-lg border border-b-0 border-transparent text-slate-500"
+                data-view="Auto-Provisioning" role="tab" aria-selected="false">Auto-Provisioning</button>
+        <button class="cs-tab-btn px-4 py-2 text-sm font-semibold rounded-t-lg border border-b-0 border-transparent text-slate-500"
+                data-view="Central API Setup" role="tab" aria-selected="false">Central API Setup</button>
     </nav>
 
     <!-- Content — sim-views.js renders into these two containers. -->
@@ -102,6 +108,17 @@
             setTimeout(() => location.reload(), 1000);
         }
 
+        // Auto-Provisioning: composes the two cards sim-views.js already has
+        // for this (the structured 5-section card + the remaining flat
+        // knobs), same as the hub's Setup/Proxmox page — neither is wired to
+        // a top-level loadCSData case on its own.
+        async function renderAutoProvisioning() {
+            csSetToolbar('');
+            const apCard = await csSetupAutoProvConfigCard();
+            const hcCard = await csHubConfigCard('/tenant/' + currentTenant + '/hub-config');
+            csSet(`<div class="space-y-4">${apCard}${hcCard}</div>`);
+        }
+
         // 'Config' bypasses loadCSData's default renderer (csRenderConfig —
         // the hub's cross-spoke config-push admin tool, not applicable to a
         // single standalone spoke) and calls the sim-conf/user-overrides
@@ -109,6 +126,8 @@
         // original webui-spoke's documented tab purpose.
         const TAB_RENDERERS = {
             'Config': () => csRenderConfigSimulation(),
+            'Auto-Provisioning': () => renderAutoProvisioning(),
+            'Central API Setup': () => csRenderSetupCentralApi(),
         };
 
         function activateTab(view) {

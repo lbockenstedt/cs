@@ -132,6 +132,11 @@ class CSControlPlane(AgentHostingControlPlane):
             logger.info("CS agent listener disabled (relay-only; --agent-listener to enable)")
         # Start the demo-scenario TTL expiry sweep (no-op without a loop).
         cs_spoke.demo.start()
+        # Start the Aruba Central poll loop (see central_poller.py). Runs
+        # regardless of hub-connection — its output feeds both the local
+        # dashboard's Simulations tab AND (via _cs_telemetry_relay_loop below)
+        # the hub's Simulations tab when this spoke is hub-connected.
+        cs_spoke.central_poller.start()
         # Start the client API server as a long-lived task that SURVIVES hub
         # reconnects (NOT via _create_spoke_tasks, which the base class tears
         # down per-connection). Server.serve() is awaitable (vs blocking
@@ -180,6 +185,10 @@ class CSControlPlane(AgentHostingControlPlane):
                     await asyncio.sleep(interval)
                     continue
                 payload = deploy.relay_payload(self.spoke_id, self.spoke_id)
+                # relay_payload's own "central" field is a placeholder ({}) —
+                # overlay this spoke's real CentralPoller output so a
+                # hub-connected deployment's Simulations tab gets live data too.
+                payload["central"] = getattr(cs_mod, "central_status", {}) or {}
                 msg = {
                     "header": {
                         "message_id": str(uuid.uuid4()),
@@ -210,6 +219,11 @@ class CSControlPlane(AgentHostingControlPlane):
                     self.api_host, self.api_port)
         spoke = CSSpoke(self.spoke_id, self.startup_config)
         app = build_client_api_app(spoke)
+        # uvicorn.run() manages its own event loop (not yet running at this
+        # point), so the Central poller must start from a FastAPI startup
+        # hook rather than a direct call here (mirrors cs_spoke.demo.start()'s
+        # own "needs a running loop" guard, just triggered later).
+        app.add_event_handler("startup", spoke.central_poller.start)
         uvicorn.run(app, host=self.api_host, port=self.api_port)
 
 if __name__ == "__main__":

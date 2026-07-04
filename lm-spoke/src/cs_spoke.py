@@ -39,6 +39,8 @@ from command_queue import CommandQueue, CSSettings
 from token_store import TokenStore, sync_all_sim_tags
 from client_registry import ClientRegistry
 from demo_scenarios import DemoManager, DEMO_SCENARIOS
+from local_store import LocalStore
+from central_poller import CentralPoller
 import client_api  # for client_api.push_pending (live command delivery to WS agents)
 
 try:
@@ -87,6 +89,17 @@ class CSSpoke(BaseSpoke):
         # connected_agents / approve_pending_agent / send_to_agent (mirrors
         # ProxmoxSpoke(control_plane=...)). None when driven standalone.
         self.control_plane = None
+        # Local Setup-tab config this spoke now owns itself instead of an LM
+        # hub tenant store: auto-provisioning knobs (hub_config) + Aruba
+        # Central credentials/sites (central_config/central_sites_config).
+        # See local_store.py / central_poller.py module docstrings.
+        self.local_store = LocalStore(data_dir)
+        # Populated by CentralPoller in the exact shape sim-views.js's
+        # Simulations Checks/Hardware/Client-Count tabs already expect
+        # (status/hardware_alerts/client_count_status) — started by
+        # CSControlPlane.run()/run_standalone_mode() (needs a running loop).
+        self.central_status: Dict[str, Any] = {}
+        self.central_poller = CentralPoller(self)
 
     # ── BaseSpoke: status (fallback for *_GET_STATUS) ───────────────────────
     async def get_status(self) -> Dict[str, Any]:
@@ -532,6 +545,65 @@ class CSSpoke(BaseSpoke):
             # auto-provision never fires ("no dongle_vidpids configured").
             applied = self._apply_hub_config(d if isinstance(d, dict) else {})
             return {"status": "SUCCESS", "applied": applied}
+
+        # ── local Setup-tab config (hub_config / central) ───────────────────
+        # This spoke owns these knobs itself now (local_store.py) instead of
+        # relaying them from an LM hub tenant store — see that module's
+        # docstring. _apply_hub_config below is the SAME logic CS_CONFIG_UPDATE
+        # already uses, so a locally-saved hub_config flows to the settings
+        # store (and any cs-dialed pxmx agent) exactly like a hub-pushed one.
+        if cmd in ("CS_GET_HUB_CONFIG",):
+            return {"status": "SUCCESS", **self.local_store.get_hub_config()}
+
+        if cmd in ("CS_SET_HUB_CONFIG",):
+            enabled = bool(d.get("hub_config_enabled", False))
+            hc = d.get("hub_config") or {}
+            self.local_store.set_hub_config(enabled, hc)
+            applied = self._apply_hub_config(hc) if enabled else []
+            return {"status": "SUCCESS", "applied": applied}
+
+        if cmd in ("CS_RESET_HUB_CONFIG",):
+            result = self.local_store.reset_hub_config()
+            if result.get("hub_config_enabled"):
+                self._apply_hub_config(result.get("hub_config") or {})
+            return {"status": "SUCCESS", **result}
+
+        if cmd in ("CS_GET_CENTRAL_CONFIG",):
+            return {"status": "SUCCESS", "central_config": self.local_store.get_central_config()}
+
+        if cmd in ("CS_SET_CENTRAL_CONFIG",):
+            cfg = d.get("central_config") or {}
+            # Sentinel-merge: an empty secret field means "keep the stored
+            # value" (the Setup UI never round-trips secrets back to the
+            # browser as plaintext-on-load... it does here, since this is a
+            # local-only dashboard with no separate viewer/editor trust
+            # boundary, but the merge-not-clobber behavior still matters for
+            # partial saves, e.g. Save Connection after only changing Mode).
+            current = self.local_store.get_central_config()
+            merged = dict(current)
+            for k, v in cfg.items():
+                if v not in (None, ""):
+                    merged[k] = v
+                elif k not in current:
+                    merged[k] = v
+            self.local_store.set_central_config(merged)
+            self.central_poller.reload()
+            return {"status": "SUCCESS"}
+
+        if cmd in ("CS_GET_CENTRAL_SITES_CONFIG",):
+            return {"status": "SUCCESS", **self.local_store.get_central_sites_config()}
+
+        if cmd in ("CS_SET_CENTRAL_SITES_CONFIG",):
+            cfg = d if isinstance(d, dict) else {}
+            self.local_store.set_central_sites_config(cfg)
+            self.central_poller.reload()
+            return {"status": "SUCCESS"}
+
+        if cmd in ("CS_GET_CENTRAL_AVAILABLE",):
+            return await self.central_poller.available_checks()
+
+        if cmd in ("CS_TEST_CENTRAL",):
+            return await self.central_poller.test_connection()
 
         # Phase 2/3 commands (queue/proxmox/clients) return NotImplemented until
         # those modules land, so the LM hub sees a clear "not yet" rather than a

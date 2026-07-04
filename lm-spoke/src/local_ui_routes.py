@@ -18,11 +18,10 @@ duplicated.
 sends them) but ignored: a single spoke has no tenant concept of its own, so
 every response always describes just this one spoke.
 
-Known gap: Aruba Central integration (the source of the original webui-spoke's
-Simulations "Checks"/"Hardware"/"Client Count" data) is not yet implemented in
-lm-spoke at all — /aggregate/central* honestly returns an empty spoke list
-rather than fabricating data, which renders sim-views.js's existing
-"No spokes reporting simulation data yet" empty state.
+Central API data comes from CentralPoller (central_poller.py), driven by this
+spoke's own local_store.py config (no LM hub tenant store needed) — see that
+module's docstring. Auto-provisioning config (hub-config) is likewise stored
+locally and applied via the SAME _apply_hub_config path CS_CONFIG_UPDATE uses.
 """
 from __future__ import annotations
 
@@ -74,15 +73,36 @@ def build_local_ui_router(spoke) -> APIRouter:
         return {"tenant_id": "default", "clients": rows}
 
     # ── Simulations tab (Checks/Hardware/Client Count sub-tabs) ─────────────
-    # Central integration doesn't exist in lm-spoke yet — see module docstring.
+    # Real data from CentralPoller now (see module docstring) — empty
+    # central_status (no Central configured yet) still renders sim-views.js's
+    # own "No spokes reporting simulation data yet" empty state gracefully.
+
+    def _central_spoke_entry() -> Dict[str, Any]:
+        return {
+            "spoke_id": spoke.spoke_id, "spoke_name": spoke.spoke_id,
+            "spoke_online": True,
+            "central_status": spoke.central_status or {},
+        }
 
     @router.get("/aggregate/central")
     async def aggregate_central():
-        return {"spokes": [], "mode": "standalone"}
+        if not spoke.central_status:
+            return {"spokes": [], "mode": "standalone"}
+        return {"spokes": [_central_spoke_entry()], "mode": "standalone"}
 
     @router.get("/aggregate/central-status")
     async def aggregate_central_status():
-        return {"spokes": [], "mode": "standalone"}
+        cc = spoke.local_store.get_central_config()
+        data: Dict[str, Any] = (
+            {"spokes": [_central_spoke_entry()], "mode": "standalone"}
+            if spoke.central_status else {"spokes": [], "mode": "standalone"}
+        )
+        # Merge hub-owned central config (mode + cluster creds) so the Setup →
+        # Central API tab's form populates (mirrors the hub's get_central_status).
+        data["hub_central_config"] = {k: v for k, v in cc.items() if k != "mode"}
+        if cc.get("mode"):
+            data["mode"] = cc["mode"]
+        return data
 
     # ── Kill switch ──────────────────────────────────────────────────────────
 
@@ -210,5 +230,55 @@ def build_local_ui_router(spoke) -> APIRouter:
         body = await request.json()
         res = await _cmd("CS_UPDATE_USER_OVERRIDES", {"content": body.get("content") or ""})
         return {**res, "synced_spokes": 1 if res.get("status") == "SUCCESS" else 0}
+
+    # ── Setup tab: hub-config (auto-provisioning knobs) ──────────────────────
+    # csHubConfigCard/csSaveHubConfig/csResetHubConfig (sim-views.js) reused
+    # as-is — same route shapes as the hub's /tenant/{tenant}/hub-config.
+
+    @router.get("/tenant/{tenant}/hub-config")
+    async def get_hub_config(tenant: str):
+        return await _cmd("CS_GET_HUB_CONFIG")
+
+    @router.put("/tenant/{tenant}/hub-config")
+    async def set_hub_config(tenant: str, request: Request):
+        body = await request.json()
+        res = await _cmd("CS_SET_HUB_CONFIG", body)
+        return {"saved": res.get("status") == "SUCCESS", "pushed_to_spokes": 1}
+
+    @router.post("/tenant/{tenant}/hub-config/reset")
+    async def reset_hub_config(tenant: str):
+        return await _cmd("CS_RESET_HUB_CONFIG")
+
+    # ── Setup → Central API tab ──────────────────────────────────────────────
+    # csRenderSetupCentralApi (sim-views.js) reused as-is.
+
+    @router.post("/aggregate/central")
+    async def save_central(request: Request):
+        body = await request.json()
+        mode = body.get("mode")
+        hub_cc = body.get("hub_central_config") or {}
+        cfg = dict(hub_cc)
+        if mode:
+            cfg["mode"] = mode
+        res = await _cmd("CS_SET_CENTRAL_CONFIG", {"central_config": cfg})
+        return {"saved": res.get("status") == "SUCCESS", "pushed_to_spokes": 1}
+
+    @router.get("/{tenant}/central-sites-config")
+    async def get_central_sites(tenant: str):
+        return await _cmd("CS_GET_CENTRAL_SITES_CONFIG")
+
+    @router.post("/{tenant}/central-sites-config")
+    async def set_central_sites(tenant: str, request: Request):
+        body = await request.json()
+        res = await _cmd("CS_SET_CENTRAL_SITES_CONFIG", body if isinstance(body, dict) else {})
+        return {"saved": res.get("status") == "SUCCESS", "pushed_to_spokes": 1}
+
+    @router.get("/{tenant}/central/available")
+    async def get_central_available(tenant: str):
+        return await _cmd("CS_GET_CENTRAL_AVAILABLE")
+
+    @router.post("/{tenant}/test-central")
+    async def test_central(tenant: str):
+        return await _cmd("CS_TEST_CENTRAL")
 
     return router
