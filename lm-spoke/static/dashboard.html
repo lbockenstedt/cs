@@ -1,0 +1,129 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Client Simulator</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <style>
+        /* System font stack — matches the Client-Sim UI; no external font fetch
+           (a standalone cs spoke often runs on a disconnected lab network). */
+        :root {
+            --hpe-green: #01A982;
+            --hpe-navy: #263040;
+            --hpe-bg-light: #F5F5F5;
+            --hpe-white: #FFFFFF;
+            --hpe-text-main: #444444;
+        }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+            background: var(--hpe-bg-light);
+            color: var(--hpe-text-main);
+        }
+        ::-webkit-scrollbar { width: 8px; height: 8px; }
+        ::-webkit-scrollbar-track { background: transparent; }
+        ::-webkit-scrollbar-thumb { background: #ccc; border-radius: 10px; }
+        .hpe-card {
+            background: var(--hpe-white);
+            border: 1px solid #E5E7EB;
+            border-radius: 0.75rem;
+        }
+        .hidden { display: none !important; }
+        #cs-toast-region {
+            position: fixed; bottom: 1rem; right: 1rem; z-index: 9999;
+            display: flex; flex-direction: column; gap: 0.5rem;
+        }
+        .cs-toast {
+            padding: 0.6rem 1rem; border-radius: 0.5rem; font-size: 0.8rem;
+            font-weight: 600; color: #fff; box-shadow: 0 4px 12px rgba(0,0,0,0.15);
+            animation: cs-toast-in 0.15s ease-out;
+        }
+        .cs-toast.success { background: var(--hpe-green); }
+        .cs-toast.error { background: #DC2626; }
+        @keyframes cs-toast-in { from { opacity: 0; transform: translateY(6px); } to { opacity: 1; transform: translateY(0); } }
+    </style>
+</head>
+<body class="flex flex-col h-screen w-screen overflow-hidden">
+
+    <!-- Top bar — mirrors the lm hub shell's header band, scoped to this one
+         spoke (no tenant/spoke switcher: a standalone deployment IS one spoke). -->
+    <header class="flex items-center justify-between px-6 py-3 bg-[#263040] text-white shrink-0">
+        <div class="flex items-center gap-3">
+            <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 180 504 144" width="84" height="24" role="img" aria-label="HPE" style="height:24px;width:auto;color:#fff;"><path fill="#01A982" d="M391.2 261.27v35.46H504V324H362.4v-90H504v27.27H391.2Z"/><path fill="currentColor" d="M276.67 180h-89.25v144h28.8v-36.6h60c37.92 0 59.7-21.6 59.7-53.4 0-32.01-21.78-54-59.25-54Zm-1.88 79.8h-58.57v-52.54h58.57c22.68 0 31.28 10.48 31.28 26.73 0 16.08-8.6 25.8-31.28 25.8Zm116.41-39.18h-28.8V180H504v27.27H391.2v13.36ZM151.2 180v144h-28.8v-59.02H28.8V324H0V180h28.8v57.38h93.6V180h28.8Z"/></svg>
+            <div>
+                <h1 class="text-sm font-bold leading-none">Client Simulator</h1>
+                <p id="cs-spoke-id-label" class="text-[11px] text-slate-400 leading-none mt-0.5">—</p>
+            </div>
+        </div>
+        <p class="text-[11px] text-slate-400">Standalone local dashboard</p>
+    </header>
+
+    <!-- Tab nav — Simulations + Clients (first slice; more tabs land as they're
+         ported: Central / VM Server / API Server / Config / Setup). -->
+    <nav class="flex gap-1 px-6 pt-3 bg-white border-b border-slate-200 shrink-0" role="tablist">
+        <button class="cs-tab-btn px-4 py-2 text-sm font-semibold rounded-t-lg border border-b-0 border-slate-200"
+                data-view="Dashboard" role="tab" aria-selected="true">Simulations</button>
+        <button class="cs-tab-btn px-4 py-2 text-sm font-semibold rounded-t-lg border border-b-0 border-transparent text-slate-500"
+                data-view="Clients" role="tab" aria-selected="false">Clients</button>
+    </nav>
+
+    <!-- Content — sim-views.js renders into these two containers. -->
+    <main class="flex-1 overflow-y-auto p-6">
+        <div id="cs-add-toolbar" class="flex gap-2 mb-4 hidden"></div>
+        <div id="cs-content" class="hpe-card p-5 shadow-sm"></div>
+    </main>
+
+    <div id="cs-toast-region"></div>
+
+    <script>
+        // Minimal bootstrap shim standing in for lm/WebUI/main.js's globals —
+        // sim-views.js's renderers only need these three things from the host
+        // page (see local_ui_routes.py / sim-views.js header comment).
+        let currentTenant = 'default';   // no tenant concept for a single spoke
+        let currentSubView = 'Dashboard';
+        let currentSubChild = '';
+
+        function showToast(message, kind) {
+            const region = document.getElementById('cs-toast-region');
+            const el = document.createElement('div');
+            el.className = 'cs-toast ' + (kind === 'error' ? 'error' : 'success');
+            el.textContent = message;
+            region.appendChild(el);
+            setTimeout(() => el.remove(), 3500);
+        }
+
+        function handleSessionExpired() {
+            // No login/session flow in standalone mode — csFetch calls this
+            // only on a 401, which this spoke's local routes never return.
+            showToast('Session expired — reloading…', 'error');
+            setTimeout(() => location.reload(), 1000);
+        }
+
+        function activateTab(view) {
+            currentSubView = view;
+            currentSubChild = '';
+            document.querySelectorAll('.cs-tab-btn').forEach((btn) => {
+                const active = btn.dataset.view === view;
+                btn.setAttribute('aria-selected', active ? 'true' : 'false');
+                btn.classList.toggle('border-slate-200', active);
+                btn.classList.toggle('border-transparent', !active);
+                btn.classList.toggle('text-slate-500', !active);
+            });
+            loadCSData(view, '');
+        }
+
+        document.querySelectorAll('.cs-tab-btn').forEach((btn) => {
+            btn.addEventListener('click', () => activateTab(btn.dataset.view));
+        });
+
+        // Spoke identity label — best-effort, purely cosmetic.
+        fetch('/api/health').then((r) => r.json()).then((d) => {
+            const label = document.getElementById('cs-spoke-id-label');
+            if (label && d && d.spoke_id) label.textContent = d.spoke_id;
+        }).catch(() => {});
+
+        window.addEventListener('DOMContentLoaded', () => activateTab('Dashboard'));
+    </script>
+    <script src="/static/sim-views.js"></script>
+</body>
+</html>

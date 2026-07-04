@@ -44,13 +44,17 @@ from fastapi import (
     WebSocket,
     WebSocketDisconnect,
 )
+from fastapi.staticfiles import StaticFiles
 # Response classes are canonically starlette's; fastapi re-exports them in newer
 # versions but not all, so import from the source for cross-version safety.
 from starlette.responses import FileResponse, JSONResponse, PlainTextResponse
 
 import sim_config
+from local_ui_routes import build_local_ui_router
 
 logger = logging.getLogger("CSClientAPI")
+
+_STATIC_DIR = Path(__file__).resolve().parent.parent / "static"
 
 # lm-spoke/src/client_api.py → src → lm-spoke → <repo root>
 REPO = Path(__file__).resolve().parent.parent.parent
@@ -140,6 +144,7 @@ def build_client_api_app(spoke) -> FastAPI:
     async def api_health() -> Dict[str, Any]:
         return {
             "status": "ok",
+            "spoke_id": spoke.spoke_id,
             "version": spoke.get_version(),
             "clients": spoke.registry.count() if spoke.registry is not None else 0,
             "repo_synced": True,
@@ -331,5 +336,18 @@ def build_client_api_app(spoke) -> FastAPI:
     @app.get("/version")
     async def mgmt_version() -> Dict[str, str]:
         return {"version": spoke.get_version()}
+
+    # ── local standalone dashboard (Simulations/Clients — see local_ui_routes.py
+    # module docstring) ──────────────────────────────────────────────────────
+    # Available in both --standalone and hub-connected mode (same client API
+    # surface either way, per run_standalone_mode's design) so a small
+    # deployment gets a working local UI without needing an LM hub at all.
+    app.include_router(build_local_ui_router(spoke))
+    if _STATIC_DIR.is_dir():
+        app.mount("/static", StaticFiles(directory=str(_STATIC_DIR)), name="static")
+
+        @app.get("/")
+        async def dashboard() -> FileResponse:
+            return FileResponse(str(_STATIC_DIR / "dashboard.html"))
 
     return app
