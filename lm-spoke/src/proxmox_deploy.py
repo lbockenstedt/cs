@@ -260,7 +260,8 @@ class ProxmoxDeploy:
         a host hasn't reported yet."""
         return {k: st.get(k) for k in self._SUMMARY_KEYS}
 
-    def relay_payload(self, spoke_id: str, spoke_name: str = "") -> Dict[str, Any]:
+    def relay_payload(self, spoke_id: str, spoke_name: str = "",
+                      dhcp: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         """Build the CS_TELEMETRY frame the cs spoke pushes to the hub.
 
         Ports ``_build_relay_telemetry_payload`` (server.py:6011-6161) at the
@@ -325,7 +326,13 @@ class ProxmoxDeploy:
             # defensive probe — never raises; degrades to {installed: False}
             # when dnsmasq isn't configured. Read by the hub's
             # /sim/api/superadmin/dhcp-status route → Setup → Simulations card.
-            "dhcp":        collect_dhcp_status(),
+            # ``collect_dhcp_status`` runs a ``systemctl is-active`` subprocess
+            # (blocking, up to 3s). The 10s telemetry relay loop offloads it via
+            # asyncio.to_thread and passes the result in as ``dhcp`` so it never
+            # stalls the event loop (that recurring stall cascaded hub requests
+            # into 5s/30s Request Timeouts). Fall back to an inline probe for any
+            # other (non-hot-path) caller that doesn't pre-compute it.
+            "dhcp":        dhcp if dhcp is not None else collect_dhcp_status(),
         }
         return payload
 

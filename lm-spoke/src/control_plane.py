@@ -211,7 +211,21 @@ class CSControlPlane(AgentHostingControlPlane):
                 if deploy is None:
                     await asyncio.sleep(interval)
                     continue
-                payload = deploy.relay_payload(self.spoke_id, self.spoke_id)
+                # collect_dhcp_status() runs a blocking `systemctl is-active`
+                # subprocess (up to 3s). Offload it so this 10s loop never stalls
+                # the shared event loop — that recurring stall backed up inline
+                # hub-command handling into 5s/30s Request Timeouts. Best-effort:
+                # on any failure fall back to letting relay_payload probe inline.
+                dhcp = None
+                try:
+                    try:
+                        from dhcp_status import collect_dhcp_status
+                    except ImportError:
+                        from .dhcp_status import collect_dhcp_status
+                    dhcp = await asyncio.to_thread(collect_dhcp_status)
+                except Exception:
+                    dhcp = None
+                payload = deploy.relay_payload(self.spoke_id, self.spoke_id, dhcp=dhcp)
                 # relay_payload's own "central" field is a placeholder ({}) —
                 # overlay this spoke's real CentralPoller output so a
                 # hub-connected deployment's Simulations tab gets live data too.
