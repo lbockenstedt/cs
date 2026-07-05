@@ -118,121 +118,19 @@ WEBUI_VMID: int | None = _detect_own_vmid()
 _HARDCODED_PROTECTED_VMIDS: frozenset[int] = frozenset({1001})
 
 
-def _parse_protected_vmids(raw: str) -> list[int | tuple[int, int]]:
-    """Parse a protected VMIDs string into a list of ints and (lo, hi) range tuples.
-
-    Accepts comma-separated entries where each entry is either a single VMID
-    (e.g. ``101``) or an inclusive range (e.g. ``100-90000``).
-    """
-    result: list[int | tuple[int, int]] = []
-    for part in raw.split(","):
-        part = part.strip()
-        if not part:
-            continue
-        if "-" in part:
-            # Could be a range like "100-90000"
-            lo_s, _, hi_s = part.partition("-")
-            try:
-                lo, hi = int(lo_s.strip()), int(hi_s.strip())
-                if lo <= hi:
-                    result.append((lo, hi))
-            except ValueError:
-                pass
-        else:
-            try:
-                result.append(int(part))
-            except ValueError:
-                pass
-    return result
-
-
-_TEMPLATE_VMID_RANGE_CAP = 1000
-
-
-def _normalize_vmid_spec(raw: Any, *, field_name: str = "template VMID spec") -> str:
-    parts: list[str] = []
-    for part in str(raw or "").split(","):
-        token = part.strip()
-        if not token:
-            continue
-        m = re.fullmatch(r"(\d+)-(\d+)", token)
-        if m:
-            lo, hi = int(m.group(1)), int(m.group(2))
-            if lo > hi:
-                raise ValueError(f"{field_name}: range start must be <= end ({token})")
-            if (hi - lo) > _TEMPLATE_VMID_RANGE_CAP:
-                raise ValueError(f"{field_name}: range too large ({token}); max span is {_TEMPLATE_VMID_RANGE_CAP + 1} VMIDs")
-            parts.append(f"{lo}-{hi}")
-            continue
-        if re.fullmatch(r"\d+", token):
-            parts.append(str(int(token)))
-            continue
-        raise ValueError(f"{field_name}: invalid token '{token}'")
-    return ", ".join(parts)
-
-
-def _parse_vmid_spec(raw: Any, *, field_name: str = "template VMID spec") -> list[int]:
-    normalized = _normalize_vmid_spec(raw, field_name=field_name)
-    vmids: set[int] = set()
-    for token in normalized.split(","):
-        token = token.strip()
-        if not token:
-            continue
-        m = re.fullmatch(r"(\d+)-(\d+)", token)
-        if m:
-            lo, hi = int(m.group(1)), int(m.group(2))
-            vmids.update(range(lo, hi + 1))
-        else:
-            vmids.add(int(token))
-    return sorted(vmids)
-
-
-def _template_spec_key(slot: int) -> str:
-    return f"vm_image_{slot}_template_spec"
-
-
-def _template_id_key(slot: int) -> str:
-    return f"vm_image_{slot}_template_id"
-
-
-def _legacy_template_id(source: Mapping[str, Any], slot: int) -> str:
-    if slot == 1:
-        keys = ("vm_image_1_template_id", "usb_linux_template_id", "usb_template_id")
-        default = "100"
-    else:
-        keys = ("vm_image_2_template_id", "usb_windows_template_id")
-        default = "200"
-    for key in keys:
-        raw = str(source.get(key, "") or "").strip()
-        if re.fullmatch(r"\d+", raw):
-            return str(max(1, int(raw)))
-    return default
-
-
-def _resolved_template_spec(source: Mapping[str, Any], slot: int) -> str:
-    spec_key = _template_spec_key(slot)
-    if spec_key in source:
-        raw = str(source.get(spec_key, "") or "").strip()
-        if not raw:
-            return ""
-        try:
-            return _normalize_vmid_spec(raw, field_name=spec_key)
-        except ValueError:
-            return _legacy_template_id(source, slot)
-    return _legacy_template_id(source, slot)
-
-
-def _primary_template_id(spec: str, fallback: str) -> str:
-    vmids = _parse_vmid_spec(spec) if str(spec or "").strip() else []
-    return str(vmids[0]) if vmids else fallback
-
-
-def _validate_template_specs(spec1: str, spec2: str) -> None:
-    overlap = sorted(set(_parse_vmid_spec(spec1, field_name="vm_image_1_template_spec")) & set(_parse_vmid_spec(spec2, field_name="vm_image_2_template_spec")))
-    if overlap:
-        preview = ", ".join(str(vmid) for vmid in overlap[:5])
-        suffix = "…" if len(overlap) > 5 else ""
-        raise HTTPException(status_code=422, detail=f"VM Image 1 and VM Image 2 template VMID specs overlap: {preview}{suffix}")
+# Pure VMID / template-spec parsing helpers moved to services/vmid.py
+from services.vmid import (  # noqa: E402
+    _parse_protected_vmids,
+    _TEMPLATE_VMID_RANGE_CAP,
+    _normalize_vmid_spec,
+    _parse_vmid_spec,
+    _template_spec_key,
+    _template_id_key,
+    _legacy_template_id,
+    _resolved_template_spec,
+    _primary_template_id,
+    _validate_template_specs,
+)
 
 
 def _is_protected_vmid(vmid: int | str | None) -> bool:
@@ -262,99 +160,20 @@ def _is_protected_vmid(vmid: int | str | None) -> bool:
 # Fernet symmetric encryption for sensitive fields in settings.json.
 # Key is generated once at install time and stored in .secret_key (chmod 600).
 # Falls back to plaintext if key file or cryptography package is unavailable.
-_ENC_PREFIX = "enc:"
-_SENSITIVE_CFG_KEYS = {"access_token", "refresh_token", "client_secret"}
-_SENSITIVE_CLASSIC_API_KEYS = {"password"}
-_SENSITIVE_CENTRAL_API_KEYS = {"client_secret"}
-_SENSITIVE_TOP_KEYS = {"relay_api_key", "github_token", "client_api_key", "admin_ws_token", "admin_password", "auth_ldap_bind_password", "auth_radius_secret", "auth_tacacs_secret"}
-_SENSITIVE_TOP_DICT_KEYS = {"proxmox_approved_agents"}
-_SENSITIVE_NOTIF_KEYS = {"smtp_password", "teams_webhook_url"}
-
-try:
-    from cryptography.fernet import Fernet as _Fernet, InvalidToken as _InvalidToken
-    _key_file = BASE_DIR / ".secret_key"
-    if _key_file.exists():
-        _fernet = _Fernet(_key_file.read_bytes().strip())
-    else:
-        _fernet = None
-        logger.warning("No .secret_key found — credentials stored as plaintext")
-except Exception:
-    _fernet = None
-    logger.warning("cryptography unavailable or key error — credentials stored as plaintext")
-
-
-def _encrypt_secret(value: str) -> str:
-    if not _fernet or not value:
-        return value
-    return _ENC_PREFIX + _fernet.encrypt(value.encode()).decode()
-
-
-def _decrypt_secret(value: str) -> str:
-    if not value or not value.startswith(_ENC_PREFIX):
-        return value  # plaintext or empty — return as-is (legacy compat)
-    if not _fernet:
-        return value  # no key — return ciphertext unchanged
-    try:
-        return _fernet.decrypt(value[len(_ENC_PREFIX):].encode()).decode()
-    except Exception:
-        logger.warning("Failed to decrypt a secret field — may be corrupted or from a different key")
-        return ""
-
-
-def _encrypt_settings(raw: dict) -> dict:
-    """Return a deep copy of settings with sensitive fields encrypted for disk storage."""
-    out = copy.deepcopy(raw)
-    for key in _SENSITIVE_TOP_KEYS:
-        if out.get(key):
-            out[key] = _encrypt_secret(out[key])
-    for key in _SENSITIVE_TOP_DICT_KEYS:
-        value = out.get(key)
-        if isinstance(value, dict):
-            out[key] = {
-                str(dict_key): _encrypt_secret(str(dict_value)) if dict_value not in (None, "") else ""
-                for dict_key, dict_value in value.items()
-            }
-    for key in _SENSITIVE_CFG_KEYS:
-        if out.get("central_config", {}).get(key):
-            out["central_config"][key] = _encrypt_secret(out["central_config"][key])
-    for key in _SENSITIVE_CLASSIC_API_KEYS:
-        if out.get("central_api", {}).get("classic", {}).get(key):
-            out["central_api"]["classic"][key] = _encrypt_secret(out["central_api"]["classic"][key])
-    for key in _SENSITIVE_CENTRAL_API_KEYS:
-        if out.get("central_api", {}).get("central", {}).get(key):
-            out["central_api"]["central"][key] = _encrypt_secret(out["central_api"]["central"][key])
-    for key in _SENSITIVE_NOTIF_KEYS:
-        if out.get("notifications", {}).get(key):
-            out["notifications"][key] = _encrypt_secret(out["notifications"][key])
-    return out
-
-
-def _decrypt_settings(raw: dict) -> dict:
-    """Return a deep copy of settings with sensitive fields decrypted into memory."""
-    out = copy.deepcopy(raw)
-    for key in _SENSITIVE_TOP_KEYS:
-        if out.get(key):
-            out[key] = _decrypt_secret(out[key])
-    for key in _SENSITIVE_TOP_DICT_KEYS:
-        value = out.get(key)
-        if isinstance(value, dict):
-            out[key] = {
-                str(dict_key): _decrypt_secret(str(dict_value)) if dict_value not in (None, "") else ""
-                for dict_key, dict_value in value.items()
-            }
-    for key in _SENSITIVE_CFG_KEYS:
-        if out.get("central_config", {}).get(key):
-            out["central_config"][key] = _decrypt_secret(out["central_config"][key])
-    for key in _SENSITIVE_CLASSIC_API_KEYS:
-        if out.get("central_api", {}).get("classic", {}).get(key):
-            out["central_api"]["classic"][key] = _decrypt_secret(out["central_api"]["classic"][key])
-    for key in _SENSITIVE_CENTRAL_API_KEYS:
-        if out.get("central_api", {}).get("central", {}).get(key):
-            out["central_api"]["central"][key] = _decrypt_secret(out["central_api"]["central"][key])
-    for key in _SENSITIVE_NOTIF_KEYS:
-        if out.get("notifications", {}).get(key):
-            out["notifications"][key] = _decrypt_secret(out["notifications"][key])
-    return out
+from services.credential_store import (  # noqa: E402
+    _ENC_PREFIX,
+    _SENSITIVE_CFG_KEYS,
+    _SENSITIVE_CLASSIC_API_KEYS,
+    _SENSITIVE_CENTRAL_API_KEYS,
+    _SENSITIVE_TOP_KEYS,
+    _SENSITIVE_TOP_DICT_KEYS,
+    _SENSITIVE_NOTIF_KEYS,
+    _fernet,
+    _encrypt_secret,
+    _decrypt_secret,
+    _encrypt_settings,
+    _decrypt_settings,
+)
 
 
 # Installer version — written by install-lxc.sh at install time
@@ -1546,58 +1365,8 @@ def _auto_device_type(alert_id: str) -> str:
 
 
 # ── History file helpers ──────────────────────────────────────────────────────
-def _history_cutoff() -> float:
-    return time.time() - HISTORY_HOURS * 3600
-
-
-def _load_history() -> list[dict[str, Any]]:
-    """Load last 24 h from the JSONL file into memory."""
-    if not HISTORY_FILE.exists():
-        return []
-    cutoff = _history_cutoff()
-    result: list[dict[str, Any]] = []
-    try:
-        for line in HISTORY_FILE.read_text(encoding="utf-8").splitlines():
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                record = json.loads(line)
-                if record.get("ts", 0) >= cutoff:
-                    result.append(record)
-            except json.JSONDecodeError:
-                pass
-    except Exception as exc:
-        logger.warning("Could not read history file: %s", exc)
-    return result
-
-
-def _append_and_trim_history(new_records: list[dict[str, Any]]) -> None:
-    """Append new records to the JSONL file and remove lines older than 24 h."""
-    cutoff = _history_cutoff()
-    existing: list[str] = []
-    if HISTORY_FILE.exists():
-        try:
-            for line in HISTORY_FILE.read_text(encoding="utf-8").splitlines():
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    rec = json.loads(line)
-                    if rec.get("ts", 0) >= cutoff:
-                        existing.append(line)
-                except json.JSONDecodeError:
-                    pass
-        except Exception as exc:
-            logger.warning("Could not read history file for trimming: %s", exc)
-
-    for record in new_records:
-        existing.append(json.dumps(record))
-
-    try:
-        HISTORY_FILE.write_text("\n".join(existing) + "\n", encoding="utf-8")
-    except Exception as exc:
-        logger.warning("Could not write history file: %s", exc)
+# History file helpers moved to services/history.py
+from services.history import _history_cutoff, _load_history, _append_and_trim_history  # noqa: E402
 
 
 # ── Client history persistence ────────────────────────────────────────────────
@@ -12771,54 +12540,6 @@ def _demo_active_summary() -> list[dict[str, Any]]:
     ]
 
 
-class DemoScenarioRequest(BaseModel):
-    scenario: str  # e.g. "dns_fail", "dhcp_fail", "normal"
-
-
-@app.post("/api/demo/client/{hostname}/scenario")
-async def api_demo_set_scenario(
-    hostname: str,
-    body: DemoScenarioRequest,
-    user: SpokeUser = Depends(require_auth),
-) -> dict[str, Any]:
-    """Trigger a named demo scenario on a client.
-
-    Called via hub WebSocket relay or directly by an admin.
-    The override is in-memory and expires after 120 minutes or on reboot.
-    """
-    payload = await _apply_demo_scenario(hostname, body.scenario, triggered_by=user.username)
-    entry = _demo_active.get(hostname)
-    return {
-        "ok": True,
-        "hostname": hostname,
-        "scenario": body.scenario,
-        "minutes_remaining": round(entry["minutes_remaining"] if entry and "minutes_remaining" in entry else 0),
-        "client": payload,
-    }
-
-
-@app.delete("/api/demo/client/{hostname}/scenario")
-async def api_demo_clear_scenario(
-    hostname: str,
-    _user: SpokeUser = Depends(require_auth),
-) -> dict[str, Any]:
-    """Clear the demo scenario override for a specific client."""
-    payload = await _clear_demo_scenario(hostname)
-    return {"ok": True, "hostname": hostname, "cleared": True, "client": payload}
-
-
-@app.get("/api/demo/active")
-async def api_demo_active(_user: SpokeUser = Depends(require_auth)) -> dict[str, Any]:
-    """Return all currently active demo scenario overrides."""
-    return {"active": _demo_active_summary()}
-
-
-@app.get("/api/demo/scenarios")
-async def api_demo_scenarios(_user: SpokeUser = Depends(require_auth)) -> dict[str, Any]:
-    """Return the available scenario names and their flag definitions."""
-    return {"scenarios": DEMO_SCENARIOS}
-
-
 async def _demo_expiry_task() -> None:
     """Background task: check every 30 s and clear any expired demo overrides."""
     while True:
@@ -13949,3 +13670,7 @@ async def root(request: Request):
 
 
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
+
+# Demo scenario routes moved to routers/demo.py
+from routers import demo as _demo_router  # noqa: E402
+app.include_router(_demo_router.router)
