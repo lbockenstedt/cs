@@ -113,6 +113,33 @@ class CSControlPlane(AgentHostingControlPlane):
                                 else os.getenv("CS_API_PORT", "8080"))
         except (TypeError, ValueError):
             self.api_port = 8080
+        # Last client-simulation config the hub pushed for each agent (keyed by
+        # agent_id), captured in CSSpoke's SET_AGENT_CONFIG handler. Re-pushed on
+        # every agent (re)connect via _on_agent_registered so a restarted /
+        # self-updated agent gets its config back from the spoke locally, without
+        # waiting for the hub to re-send SET_AGENT_CONFIG through a possibly
+        # backlogged link — the recurring cause of "provision loop not running"
+        # after an agent restart. Complements the agent-side config persistence.
+        self._agent_config_cache: Dict[str, Any] = {}
+
+    async def _on_agent_registered(self, agent_id: str) -> None:
+        """Re-push the agent's last-known client-simulation config the moment it
+        (re)connects, so an agent restart / self-update re-enters CS mode (and
+        auto-provisioning) without depending on the hub re-sending
+        SET_AGENT_CONFIG. Fire-and-forget: this hook runs BEFORE the agent
+        message loop starts, so awaiting send_to_agent's response here would
+        just block until timeout — we only need the send to go out (the loop,
+        now starting, resolves the response)."""
+        cfg = self._agent_config_cache.get(agent_id)
+        if cfg:
+            asyncio.create_task(self._repush_agent_config(agent_id, cfg))
+
+    async def _repush_agent_config(self, agent_id: str, cfg: Dict[str, Any]) -> None:
+        try:
+            await self.send_to_agent("UPDATE_CONFIG", cfg, agent_id=agent_id)
+            logger.info(f"Re-pushed cached client-sim config to agent '{agent_id}'")
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"Failed to re-push config to agent '{agent_id}': {e}")
 
     async def run(self):
         logger.info(f"Starting CS (Client Simulator) -> {self.hub_url}")

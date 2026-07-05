@@ -204,6 +204,14 @@ class CSSpoke(BaseSpoke):
             if not agent_id:
                 return {"status": "ERROR", "message": "Missing agent_id"}
             if self.control_plane:
+                # Cache so the agent gets its config re-pushed on every
+                # (re)connect (restart / self-update) without the hub having to
+                # re-send SET_AGENT_CONFIG — see _on_agent_registered. Stored
+                # even if the immediate send below fails (agent momentarily
+                # offline), so the next connect still delivers it.
+                cache = getattr(self.control_plane, "_agent_config_cache", None)
+                if cache is not None:
+                    cache[agent_id] = cfg
                 return await self.control_plane.send_to_agent(
                     "UPDATE_CONFIG", cfg, agent_id=agent_id)
             return {"status": "ERROR", "message": "Agent not connected"}
