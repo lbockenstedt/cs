@@ -321,10 +321,10 @@ class ProxmoxDeploy:
             "reclone_state": {},
             "api_server":  {},
             "central":     {},
-            # dnsmasq DHCP-server status for the isolated sim-client network
-            # (provisioned by install_cs.sh on the spoke's second NIC). Cheap,
-            # defensive probe — never raises; degrades to {installed: False}
-            # when dnsmasq isn't configured. Read by the hub's
+            # cs-owned Kea (kea-dhcp4-sim) DHCP-server status for the isolated
+            # sim-client network (provisioned by install_cs.sh on the spoke's
+            # second NIC). Cheap, defensive probe — never raises; degrades to
+            # {installed: False} when Kea isn't configured. Read by the hub's
             # /sim/api/superadmin/dhcp-status route → Setup → Simulations card.
             # ``collect_dhcp_status`` runs a ``systemctl is-active`` subprocess
             # (blocking, up to 3s). The 10s telemetry relay loop offloads it via

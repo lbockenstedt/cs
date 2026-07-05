@@ -293,7 +293,7 @@ if __name__ == "__main__":
                         help="run without a hub (local-only mode)")
     # Client API listener (169.253.1.1:8080 on the DHCP NIC). 0.0.0.0 binds it
     # onto every interface, including the sim-client DHCP NIC, so clients on
-    # 169.253.1.0/24 reach it directly (dnsmasq serves no router option).
+    # 169.253.1.0/24 reach it directly (the cs Kea serves no router option).
     # 8080, not 8000: the LM hub owns 0.0.0.0:8000 (admin WebUI/API) and in hub
     # mode this spoke shares that box — 8000 here collided with the hub.
     parser.add_argument("--port",       type=int, default=os.getenv("CS_API_PORT", "8080"))

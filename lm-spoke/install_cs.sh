@@ -9,11 +9,13 @@ export DEBIAN_FRONTEND=noninteractive
 # Deploys the LM client simulator spoke.
 # Safe to re-run (updates code, preserves credentials).
 #
-# DHCP (dnsmasq on the second NIC):
+# DHCP (a cs-OWNED Kea instance on the second NIC):
 #   The spoke provides DHCP for the isolated simulation-client network on a
-#   second NIC, ported verbatim from installers/install-lxc.sh STEP 3. The 2nd
-#   NIC is auto-detected; if only one NIC is present, DHCP is skipped. The NIC
-#   must already be attached to the container/host in Proxmox.
+#   second NIC via its OWN Kea DHCP4 instance (kea-dhcp4-sim) — SEPARATE from the
+#   lm/dhcp module's Kea, so both coexist on an all-in-one box. The 2nd NIC is
+#   auto-detected; if only one NIC is present, DHCP is skipped. The NIC must
+#   already be attached to the container/host in Proxmox. Serves 169.253.1.0/24
+#   with no router option (parity with the prior dnsmasq scope).
 #
 # Usage:
 #   curl -sSL https://raw.githubusercontent.com/lbockenstedt/cs/main/install_cs.sh \
@@ -48,8 +50,8 @@ LM_DIR="/opt/lm"
 # Client API listener. The spoke owns the isolated sim-client DHCP scope
 # (169.253.1.1/24 on the 2nd NIC) and is also the client API gateway on
 # 169.253.1.1:8080. Binding 0.0.0.0 puts the listener on the DHCP NIC too;
-# dnsmasq serves 169.253.1.0/24 with no router option, so clients reach it
-# directly. Override either before running.
+# the cs-owned Kea instance serves 169.253.1.0/24 with no router option, so
+# clients reach the listener directly. Override either before running.
 # 8080 (not 8000): the LM hub serves its admin WebUI/API on 0.0.0.0:8000, and
 # in hub mode the cs spoke runs on the SAME box — binding 8000 here collided
 # with the hub and took the WebUI down. The cs client API takes 8080.
@@ -60,9 +62,10 @@ CS_API_HOST="${CS_API_HOST:-0.0.0.0}"
 # prior install is bumped to 8080. Any other explicitly-chosen port is kept.
 [ "${CS_API_PORT:-}" = "8000" ] && CS_API_PORT="8080"
 
-# ── DHCP (sim-client isolated network) — port of install-lxc.sh STEP 3 ─────────
-# A second NIC runs dnsmasq DHCP for the isolated simulation-client network.
-# Auto-detected (2nd NIC) unless DHCP_IFACE is set. DHCP_SKIP=1 skips entirely.
+# ── DHCP (sim-client isolated network) — cs-owned Kea instance ─────────────────
+# A second NIC runs a cs-owned Kea DHCP4 instance for the isolated simulation-
+# client network. Auto-detected (2nd NIC) unless DHCP_IFACE is set. DHCP_SKIP=1
+# skips entirely. Same subnet/pool/lease behaviour the prior dnsmasq scope had.
 DHCP_IFACE="${DHCP_IFACE:-}"
 DHCP_SKIP="${DHCP_SKIP:-0}"
 DHCP_SUBNET="${DHCP_SUBNET:-169.253.1.0}"
@@ -87,8 +90,8 @@ TLS_CA_CERT=""
 # all-in-one/relay-only deployment, where this cs spoke never binds :443 and
 # agents go through the pxmx spoke (or the hub's /ws/agent byte-proxy) instead.
 CS_AGENT_LISTENER=1
-# --infra-only: set up ONLY the OS/host-level simulation infrastructure (dnsmasq
-# DHCP on the 2nd NIC, sysctl rp_filter, the agent-listener self-signed TLS cert,
+# --infra-only: set up ONLY the OS/host-level simulation infrastructure (cs-owned
+# Kea DHCP on the 2nd NIC, sysctl rp_filter, the agent-listener self-signed TLS cert,
 # and /etc/lm-cs-agent/config.json) then exit — WITHOUT cloning the spoke code,
 # building the venv, writing the spoke .env, extracting lm core, creating the
 # lm-cs systemd unit, or installing the rollback watchdog/sudoers. This is the
@@ -171,10 +174,18 @@ step() { echo -e "\n${GRN}━━  $*  ━━${NC}"; }
 # / cert-path variables still escape to the full-install .env writer below.
 # ══════════════════════════════════════════════════════════════════════════════
 
-# ── DHCP on the second NIC (sim-client network) ───────────────────────────────
-# Port of installers/install-lxc.sh STEP 3: auto-detect a second NIC and run
-# dnsmasq DHCP (169.253.1.0/24) on it for the isolated simulation-client
-# network. Skipped on single-NIC hosts or when --no-dhcp / DHCP_SKIP=1.
+# ── DHCP on the second NIC (sim-client network) — cs-owned Kea instance ────────
+# Auto-detect a second NIC and run a cs-OWNED Kea DHCP4 instance (kea-dhcp4-sim,
+# SEPARATE from the lm/dhcp module's Kea) serving 169.253.1.0/24 on it for the
+# isolated simulation-client network. Same subnet/pool/lease behaviour the prior
+# dnsmasq scope had (no router option). Skipped on single-NIC hosts or when
+# --no-dhcp / DHCP_SKIP=1.
+#
+# Distinct-from-the-dhcp-module names so both Kea instances coexist on one box:
+#   config  /etc/kea/kea-dhcp4-sim.conf + /etc/kea/kea-ctrl-agent-sim.conf
+#   units   kea-dhcp4-sim.service + kea-ctrl-agent-sim.service
+#   socket  /run/kea/kea4-ctrl-socket-sim   ctrl-agent http-port 8002 (dhcp=8001)
+#   leases  /var/lib/kea/kea-leases4-sim.csv
 setup_sim_dhcp() {
 if [[ "$DHCP_SKIP" != "1" ]]; then
     step "Detecting DHCP interface (sim-client network)"
@@ -204,10 +215,10 @@ if [[ "$DHCP_SKIP" != "1" ]]; then
 
     if [[ -n "$DHCP_IFACE" ]]; then
         echo "   Configuring DHCP on ${DHCP_IFACE} (${DHCP_GATEWAY}/${DHCP_PREFIX})"
-        DEBIAN_FRONTEND=noninteractive apt-get install -y -q dnsmasq \
+        DEBIAN_FRONTEND=noninteractive apt-get install -y -q kea-dhcp4-server kea-ctrl-agent \
             -o Dpkg::Options::="--force-confdef" \
             -o Dpkg::Options::="--force-confold"
-        ok "dnsmasq installed"
+        ok "Kea (kea-dhcp4-server + kea-ctrl-agent) installed"
 
         # ── Static IP on the internal interface ───────────────────────────────
         IFACE_CFG="/etc/network/interfaces.d/${DHCP_IFACE}.conf"
@@ -241,67 +252,152 @@ net.ipv4.conf.default.rp_filter=2
 SYSCTL
         ok "rp_filter set to loose mode (DestNat-compatible)"
 
-        # ── dnsmasq config scoped only to the internal interface ─────────────
-        DNSMASQ_CONF="/etc/dnsmasq.d/client-sim.conf"
-        cat >"$DNSMASQ_CONF" <<EOF
-# Client-Sim isolated network DHCP — managed by install_cs.sh
-# Only listen on the internal interface; never touches eth0 or other NICs
-interface=${DHCP_IFACE}
-bind-interfaces
-except-interface=lo
-
-# DHCP scope
-dhcp-range=${DHCP_RANGE_START},${DHCP_RANGE_END},${DHCP_LEASE_TIME}
-
-# Explicitly suppress default gateway — clients must not receive a router
-# option. Sim clients route through their own WiFi/USB adapter; an injected
-# gateway would override that and break traffic generation.
-dhcp-option=option:router
-
-# No DNS forwarding — isolated network has no upstream
-port=0
-
-# Lease file
-dhcp-leasefile=/var/lib/misc/dnsmasq.leases
-
-log-dhcp
-EOF
-        ok "dnsmasq config written (no default gateway advertised)"
-
-        # Ensure dnsmasq's default config doesn't conflict with our interface
-        if [[ -f /etc/dnsmasq.conf ]]; then
-            sed -i 's/^#\?interface=.*$//' /etc/dnsmasq.conf 2>/dev/null || true
+        # ── Convert the dnsmasq-style lease time (e.g. 1h/30m/3600) to the
+        #    integer seconds Kea's valid-lifetime wants. Default 1h → 3600.
+        LEASE_SECS=3600
+        if [[ "$DHCP_LEASE_TIME" =~ ^([0-9]+)([smhd]?)$ ]]; then
+            _n="${BASH_REMATCH[1]}"; _u="${BASH_REMATCH[2]}"
+            case "$_u" in
+                m) LEASE_SECS=$(( _n * 60 )) ;;
+                h) LEASE_SECS=$(( _n * 3600 )) ;;
+                d) LEASE_SECS=$(( _n * 86400 )) ;;
+                *) LEASE_SECS="$_n" ;;   # 's' or bare number = seconds
+            esac
         fi
 
-        # Systemd drop-in: wait for the DHCP interface to appear before dnsmasq
-        # starts. Without this, dnsmasq fails with "unknown interface" on reboot
-        # because the NIC attachment isn't ready yet. ExecStartPre reads the
-        # interface name from the dnsmasq config at runtime, so it works
-        # regardless of the interface name (net1, eth1, ens3, etc.).
-        mkdir -p /etc/systemd/system/dnsmasq.service.d
-        cat > /etc/systemd/system/dnsmasq.service.d/wait-for-interface.conf <<'DROPIN'
+        # Locate the kea binaries (systemd units need absolute ExecStart paths).
+        KEA_DHCP4_BIN="$(command -v kea-dhcp4 2>/dev/null || echo /usr/sbin/kea-dhcp4)"
+        KEA_CA_BIN="$(command -v kea-ctrl-agent 2>/dev/null || echo /usr/sbin/kea-ctrl-agent)"
+        mkdir -p /etc/kea /run/kea /var/lib/kea
+
+        # ── kea-dhcp4 config for the cs sim subnet — bound ONLY to the internal
+        #    interface; one static subnet4 = 169.253.1.0/24. No routers option
+        #    (parity with the prior dnsmasq "no default gateway": sim clients
+        #    route through their own WiFi/USB adapter, so an injected gateway
+        #    would break traffic generation). Memfile leases at the -sim CSV;
+        #    control socket at the -sim path so it never clashes with the
+        #    dhcp-module Kea. SEPARATE instance — do NOT touch the distro default
+        #    kea-dhcp4-server.service (that belongs to the lm/dhcp module).
+        KEA_DHCP4_CONF="/etc/kea/kea-dhcp4-sim.conf"
+        cat >"$KEA_DHCP4_CONF" <<EOF
+{
+  "Dhcp4": {
+    "interfaces-config": {
+      "interfaces": [ "${DHCP_IFACE}" ]
+    },
+    "control-socket": {
+      "socket-type": "unix",
+      "socket-name": "/run/kea/kea4-ctrl-socket-sim"
+    },
+    "lease-database": {
+      "type": "memfile",
+      "persist": true,
+      "name": "/var/lib/kea/kea-leases4-sim.csv"
+    },
+    "valid-lifetime": ${LEASE_SECS},
+    "subnet4": [
+      {
+        "id": 1,
+        "subnet": "${DHCP_SUBNET}/${DHCP_PREFIX}",
+        "pools": [ { "pool": "${DHCP_RANGE_START} - ${DHCP_RANGE_END}" } ]
+      }
+    ],
+    "loggers": [
+      {
+        "name": "kea-dhcp4",
+        "output_options": [ { "output": "syslog" } ],
+        "severity": "INFO"
+      }
+    ]
+  }
+}
+EOF
+        ok "kea-dhcp4-sim config written (169.253.1.0/24, no default gateway advertised)"
+
+        # ── cs kea-ctrl-agent config — loopback only, port 8002 (the dhcp module
+        #    uses 8001), control socket pointing at the -sim dhcp4 socket, no
+        #    auth. Optional/nice-to-have: lets tooling read leases/health via the
+        #    ctrl-agent RPC; dhcp_status reads the memfile CSV directly instead.
+        KEA_CA_CONF="/etc/kea/kea-ctrl-agent-sim.conf"
+        cat >"$KEA_CA_CONF" <<'EOF'
+{
+  "Control-agent": {
+    "http-host": "127.0.0.1",
+    "http-port": 8002,
+    "control-sockets": {
+      "dhcp4": {
+        "socket-type": "unix",
+        "socket-name": "/run/kea/kea4-ctrl-socket-sim"
+      }
+    },
+    "loggers": [
+      {
+        "name": "kea-ctrl-agent",
+        "output_options": [ { "output": "syslog" } ],
+        "severity": "WARN"
+      }
+    ]
+  }
+}
+EOF
+        ok "kea-ctrl-agent-sim config written (127.0.0.1:8002 → -sim socket)"
+
+        # ── Custom systemd units (independent of the distro default kea units) ─
+        # kea-dhcp4-sim waits for the DHCP interface to appear before it binds —
+        # without this it fails with "no such interface" on reboot when the NIC
+        # attachment isn't ready yet. The iface name is baked in at install time
+        # (stable per host). RuntimeDirectory recreates /run/kea on boot.
+        cat > /etc/systemd/system/kea-dhcp4-sim.service <<EOF
 [Unit]
+Description=CS sim-client Kea DHCP4 (isolated ${DHCP_SUBNET}/${DHCP_PREFIX})
 After=network.target network-online.target
+Wants=network-online.target
 
 [Service]
-ExecStartPre=/bin/bash -c '\
-  iface=$(grep "^interface=" /etc/dnsmasq.d/client-sim.conf 2>/dev/null | cut -d= -f2 | tr -d " \t"); \
-  [ -z "$iface" ] && exit 0; \
-  n=0; until ip link show "$iface" >/dev/null 2>&1; do \
-    n=$((n+1)); [ $n -ge 30 ] && exit 1; sleep 1; \
-  done'
+Type=simple
+RuntimeDirectory=kea
+RuntimeDirectoryPreserve=yes
+ExecStartPre=/bin/bash -c 'n=0; until ip link show "${DHCP_IFACE}" >/dev/null 2>&1; do n=\$((n+1)); [ \$n -ge 30 ] && exit 1; sleep 1; done'
+ExecStart=${KEA_DHCP4_BIN} -c ${KEA_DHCP4_CONF}
 Restart=on-failure
 RestartSec=5
-DROPIN
-        systemctl daemon-reload >/dev/null 2>&1 || true
-        ok "dnsmasq systemd drop-in written (waits for DHCP interface)"
 
-        systemctl enable dnsmasq >/dev/null 2>&1 || true
-        systemctl restart dnsmasq >/dev/null 2>&1 || true
-        if systemctl is-active --quiet dnsmasq; then
-            ok "dnsmasq running — DHCP active on ${DHCP_IFACE}"
+[Install]
+WantedBy=multi-user.target
+EOF
+
+        cat > /etc/systemd/system/kea-ctrl-agent-sim.service <<EOF
+[Unit]
+Description=CS sim-client Kea Control Agent (127.0.0.1:8002)
+After=network.target kea-dhcp4-sim.service
+Wants=kea-dhcp4-sim.service
+
+[Service]
+Type=simple
+RuntimeDirectory=kea
+RuntimeDirectoryPreserve=yes
+ExecStart=${KEA_CA_BIN} -c ${KEA_CA_CONF}
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+EOF
+        systemctl daemon-reload >/dev/null 2>&1 || true
+        ok "kea-dhcp4-sim + kea-ctrl-agent-sim systemd units written (wait for DHCP interface)"
+
+        # Enable + (re)start ONLY the -sim units. Never enable the distro default
+        # kea-dhcp4-server.service / kea-ctrl-agent.service — those are the
+        # lm/dhcp module's. On a fresh install the packages may auto-enable the
+        # defaults; leave them to the dhcp module (they bind :8001 / their own
+        # socket and don't clash with the -sim instance's :8002 / -sim socket).
+        systemctl enable kea-dhcp4-sim kea-ctrl-agent-sim >/dev/null 2>&1 || true
+        systemctl restart kea-dhcp4-sim >/dev/null 2>&1 || true
+        systemctl restart kea-ctrl-agent-sim >/dev/null 2>&1 || true
+        if systemctl is-active --quiet kea-dhcp4-sim; then
+            ok "kea-dhcp4-sim running — DHCP active on ${DHCP_IFACE}"
         else
-            warn "dnsmasq failed to start — check: journalctl -u dnsmasq"
+            warn "kea-dhcp4-sim failed to start — check: journalctl -u kea-dhcp4-sim"
         fi
     fi
 fi
@@ -402,7 +498,7 @@ if [ "$INFRA_ONLY" = "1" ]; then
     setup_sim_agent_listener
     echo ""
     ok "CS simulation infra-only setup complete."
-    echo "  DHCP:           $( [ -n "${DHCP_IFACE:-}" ] && [ "$DHCP_SKIP" != "1" ] && echo "dnsmasq on ${DHCP_IFACE}" || echo "skipped (single NIC or --no-dhcp)" )"
+    echo "  DHCP:           $( [ -n "${DHCP_IFACE:-}" ] && [ "$DHCP_SKIP" != "1" ] && echo "cs-owned Kea (kea-dhcp4-sim) on ${DHCP_IFACE}" || echo "skipped (single NIC or --no-dhcp)" )"
     echo "  Agent listener: cert $LM_DIR/cs/certs/hub.crt + /etc/lm-cs-agent/config.json"
     echo "                  The root agent binds :443 directly (no CAP_NET_BIND_SERVICE / systemd unit created here)."
     echo "  Install log:    $INSTALL_LOG"
@@ -834,10 +930,10 @@ echo "                automatically. NOTE: this watchdog + sudoers land only on 
 echo "                full installer re-run; a box that only git-pulled the new"
 echo "                spoke code must be re-installed once to enable rollback."
 if [[ -n "${DHCP_IFACE:-}" && "$DHCP_SKIP" != "1" ]]; then
-    if systemctl is-active --quiet dnsmasq 2>/dev/null; then
-        echo "  DHCP:          dnsmasq RUNNING on ${DHCP_IFACE} (${DHCP_RANGE_START}–${DHCP_RANGE_END})"
+    if systemctl is-active --quiet kea-dhcp4-sim 2>/dev/null; then
+        echo "  DHCP:          cs-owned Kea (kea-dhcp4-sim) RUNNING on ${DHCP_IFACE} (${DHCP_RANGE_START}–${DHCP_RANGE_END}); ctrl-agent :8002"
     else
-        echo "  DHCP:          ${DHCP_IFACE} configured — dnsmasq NOT RUNNING (journalctl -u dnsmasq)"
+        echo "  DHCP:          ${DHCP_IFACE} configured — kea-dhcp4-sim NOT RUNNING (journalctl -u kea-dhcp4-sim)"
     fi
 else
     echo "  DHCP:          skipped (single NIC or --no-dhcp)"

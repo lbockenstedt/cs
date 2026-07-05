@@ -8,7 +8,7 @@ The active LM spoke is `lm-spoke/` (`CSSpoke`), **relay-only** for Proxmox/USB a
 
 ## Entrypoints
 
-- **lm-spoke (native):** `python3 -m src.control_plane` (`CSControlPlane`), systemd `lm-cs.service`, `User=svc_lm`, `--port $CS_API_PORT --host $CS_API_HOST`. Installer `lm-spoke/install_cs.sh` (clones lm core `core/` to `/opt/lm/core`, cs to `/opt/lm/cs`, dnsmasq DHCP on 2nd NIC, `lm-cs.service`, rollback watchdog + sudoers). `--standalone` opts out of hub mode.
+- **lm-spoke (native):** `python3 -m src.control_plane` (`CSControlPlane`), systemd `lm-cs.service`, `User=svc_lm`, `--port $CS_API_PORT --host $CS_API_HOST`. Installer `lm-spoke/install_cs.sh` (clones lm core `core/` to `/opt/lm/core`, cs to `/opt/lm/cs`, a cs-owned Kea DHCP instance `kea-dhcp4-sim` on the 2nd NIC, `lm-cs.service`, rollback watchdog + sudoers). `--standalone` opts out of hub mode.
 - **webui-spoke (legacy):** `uvicorn server:app` :8000. Installer `installers/install-lxc.sh`.
 - **Sim agents:** `clients/linux/agent.sh` (systemd `client-sim-agent.service`), `clients/windows/*.ps1`, `clients/t3/*`.
 
@@ -17,7 +17,7 @@ The active LM spoke is `lm-spoke/` (`CSSpoke`), **relay-only** for Proxmox/USB a
 - lm-spoke client API: `CS_API_PORT` (default **8080**, not 8000 — the legacy webui-spoke used :8000; the unified LM hub owns :443). Bound `0.0.0.0`/`CS_API_HOST` so it also lands on the DHCP NIC `169.253.1.1`. Clients reach `169.253.1.1:8080`.
 - Spoke dials hub on **443** (`/ws/spoke`, wss — verify-off same-box).
 - webui-spoke legacy: **8000** HTTP + WS `/ws`.
-- DHCP: dnsmasq on the auto-detected 2nd NIC, scope `169.253.1.11`–`169.253.1.254`, no default gateway, `port=0`.
+- DHCP: a **cs-owned Kea instance** (`kea-dhcp4-sim`, separate from the `dhcp` module's Kea so both coexist on one box) on the auto-detected 2nd NIC. Subnet `169.253.1.0/24`, pool `169.253.1.11`–`169.253.1.254`, no router option (parity with the prior dnsmasq scope). Config `/etc/kea/kea-dhcp4-sim.conf`, leases `/var/lib/kea/kea-leases4-sim.csv`, control socket `/run/kea/kea4-ctrl-socket-sim`. A minimal cs `kea-ctrl-agent-sim` binds `127.0.0.1:8002` (the `dhcp` module uses :8001).
 
 ## Environment variables
 
