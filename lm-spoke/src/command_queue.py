@@ -273,6 +273,38 @@ class CSSettings:
 
     # ── USB config payload (port of _proxmox_usb_config_payload) ───────────
 
+    def _sim_phy_cached(self) -> str:
+        """``sim_phy`` from simulation.conf (+ hub-sim-overrides.conf overlay),
+        cached and re-parsed only when either file's mtime changes. Read+parse
+        ran on EVERY CS_GET_USB_CONFIG (~5s) before — a per-poll disk read +
+        configparser on the shared event loop. Two stat() calls (fast metadata)
+        replace it when the files are unchanged (the common case)."""
+        sim_conf = self.config_dir / "simulation.conf"
+        ov_conf = self.config_dir / "hub-sim-overrides.conf"
+
+        def _mtime(p: Path) -> int:
+            try:
+                return p.stat().st_mtime_ns
+            except OSError:
+                return 0
+        key = (_mtime(sim_conf), _mtime(ov_conf))
+        cache = getattr(self, "_sim_phy_cache", None)
+        if cache is not None and cache[0] == key:
+            return cache[1]
+        sim_phy = "wireless"
+        try:
+            if sim_conf.exists():
+                parser = configparser.ConfigParser()
+                parser.read_string(sim_conf.read_text(encoding="utf-8"))
+                self._merge_ini_override(parser, ov_conf)
+                sim_phy = parser.get("simulation", "sim_phy", fallback="wireless").strip().lower() or "wireless"
+        except Exception:
+            pass
+        if sim_phy not in {"wireless", "ethernet", "any"}:
+            sim_phy = "wireless"
+        self._sim_phy_cache = (key, sim_phy)
+        return sim_phy
+
     def usb_config_payload(self, hostname: Optional[str] = None) -> Dict[str, Any]:
         """Build the 27-key ``usb_config`` blob the agent provisions from.
 
@@ -280,18 +312,7 @@ class CSSettings:
         ``hub-sim-overrides.conf`` overlay merged on top) exactly as the legacy
         spoke did; the remaining knobs come from this settings store.
         """
-        sim_phy = "wireless"
-        try:
-            sim_conf = self.config_dir / "simulation.conf"
-            if sim_conf.exists():
-                parser = configparser.ConfigParser()
-                parser.read_string(sim_conf.read_text(encoding="utf-8"))
-                self._merge_ini_override(parser, self.config_dir / "hub-sim-overrides.conf")
-                sim_phy = parser.get("simulation", "sim_phy", fallback="wireless").strip().lower() or "wireless"
-        except Exception:
-            pass
-        if sim_phy not in {"wireless", "ethernet", "any"}:
-            sim_phy = "wireless"
+        sim_phy = self._sim_phy_cached()
 
         vm_set_override = _sanitize_vm_set_override(self.get("vm_set_override", 0))
         img1_spec = self.get("image1_template_spec")

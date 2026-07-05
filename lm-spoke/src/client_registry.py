@@ -10,10 +10,12 @@ This is the lm-spoke equivalent of the webui-spoke ``clients`` dict +
 ``CLIENT_HISTORY_FILE``. State is persisted to ``data/clients.json`` (runtime
 state — covered by ``.gitignore``, never committed).
 
-The registry is small and the dict ops trivial, so persistence is synchronous
-per mutation (no debounce needed at this scale). All public mutators are async
-and serialize through a single ``asyncio.Lock`` so the WS receive loop and HTTP
-handlers can't tear each other's writes.
+All public mutators are async and serialize through a single ``asyncio.Lock``
+so the WS receive loop and HTTP handlers can't tear each other's writes. The
+per-mutation persist runs on every client beacon (~20 sim clients) on the SAME
+event loop as the hub connection + uvicorn API, so the disk write is offloaded
+to a thread (``_apersist`` → ``asyncio.to_thread``); the list is snapshotted on
+the loop under the lock so the write sees a consistent state.
 """
 
 from __future__ import annotations
@@ -62,6 +64,18 @@ class ClientRegistry:
         except Exception as exc:  # noqa: BLE001
             logger.warning("could not persist %s: %s", self._path, exc)
 
+    async def _apersist(self) -> None:
+        """Persist off the event loop. apply_status runs on every client beacon
+        (~20 sim clients), on the SAME loop as the hub connection + uvicorn API,
+        so a synchronous write here contributed to the hub's Request Timeouts.
+        Snapshot on the loop (consistent under the caller's lock), offload the
+        write. Drops indent to shrink serialization + file size."""
+        try:
+            text = json.dumps(self.clients, sort_keys=True)
+            await asyncio.to_thread(self._path.write_text, text, encoding="utf-8")
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("could not persist %s: %s", self._path, exc)
+
     # ── status upsert ──────────────────────────────────────────────────────
     async def apply_status(self, hostname: str, payload: Dict[str, Any]) -> Dict[str, Any]:
         """Upsert *hostname* with *payload* (a status beacon) and return the entry.
@@ -92,7 +106,7 @@ class ClientRegistry:
                 entry["recent_errors"] = recent[-_MAX_RECENT_ERRORS:]
 
             self.clients[hostname] = entry
-            self._persist()
+            await self._apersist()
             return dict(entry)
 
     # ── read ───────────────────────────────────────────────────────────────
@@ -117,7 +131,7 @@ class ClientRegistry:
             entry["hostname"] = hostname
             entry["overrides"] = dict(overrides) if isinstance(overrides, dict) else {}
             self.clients[hostname] = entry
-            self._persist()
+            await self._apersist()
             return dict(entry)
 
     async def clear_overrides(self, hostname: str) -> Dict[str, Any]:
@@ -126,6 +140,6 @@ class ClientRegistry:
             entry = self.clients.get(hostname)
             if entry is not None:
                 entry.pop("overrides", None)
-                self._persist()
+                await self._apersist()
                 return dict(entry)
             return {}
