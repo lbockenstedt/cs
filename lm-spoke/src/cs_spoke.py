@@ -180,7 +180,12 @@ class CSSpoke(BaseSpoke):
 
     # ── command dispatch ───────────────────────────────────────────────────
     async def handle_command(self, command_type: str, data: Dict[str, Any]) -> Dict[str, Any]:
-        logger.info("Command: %s", command_type)
+        # DEBUG, not INFO: the hub polls GET_AGENTS / CS_POLL_AGENT_INBOX /
+        # CS_GET_USB_CONFIG every ~5s, so logging every command at INFO floods
+        # the steady-state log. Meaningful commands emit their own INFO line in
+        # their handler (e.g. "CS_CONFIG_UPDATE: applied ..."). See
+        # logging-observability-contract.md (normalization / level discipline).
+        logger.debug("Command: %s", command_type)
         cmd = command_type.upper()
         d = data or {}
 
