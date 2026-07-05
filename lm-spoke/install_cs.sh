@@ -785,8 +785,9 @@ else
 fi
 if [ "$CS_AGENT_LISTENER" = "1" ]; then
     echo "  Agent listener: ENABLED — a pxmx host agent can dial this cs spoke directly."
-    echo "                  Pin the agent install to THIS spoke (not the pxmx spoke):"
-    echo "                  agent/install_agent.sh --spoke-url wss://${LOCAL_IP}:443/ws/agent"
+    echo "                  Pin the agent install to THIS spoke (not the pxmx spoke) —"
+    echo "                  supply just this spoke's IP; the agent auto-determines the rest:"
+    echo "                  agent/install_agent.sh --spoke-ip ${LOCAL_IP}"
     echo "                  (a cs spoke does not broadcast _lm-hub mDNS — the agent must be pinned)"
 else
     echo "  Agent listener: disabled (--no-agent-listener was passed; relay-only, this cs spoke never binds :443)"
