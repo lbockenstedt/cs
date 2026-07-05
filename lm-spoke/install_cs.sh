@@ -87,6 +87,16 @@ TLS_CA_CERT=""
 # all-in-one/relay-only deployment, where this cs spoke never binds :443 and
 # agents go through the pxmx spoke (or the hub's /ws/agent byte-proxy) instead.
 CS_AGENT_LISTENER=1
+# --infra-only: set up ONLY the OS/host-level simulation infrastructure (dnsmasq
+# DHCP on the 2nd NIC, sysctl rp_filter, the agent-listener self-signed TLS cert,
+# and /etc/lm-cs-agent/config.json) then exit — WITHOUT cloning the spoke code,
+# building the venv, writing the spoke .env, extracting lm core, creating the
+# lm-cs systemd unit, or installing the rollback watchdog/sudoers. This is the
+# mode the generic agent (lm-agent, User=root) invokes when it hosts the CS
+# "simulation" role IN-PROCESS: the agent owns the process + self-updates and
+# gets its runtime config from the hub push, so it only needs the host-level
+# infra this installer would otherwise lay down. Idempotent + non-interactive.
+INFRA_ONLY=0
 while [[ "$#" -gt 0 ]]; do
     case $1 in
         --hub)                HUB_URL="$2"; HUB_URL_PINNED=1; shift ;;
@@ -99,6 +109,7 @@ while [[ "$#" -gt 0 ]]; do
         --tls-ca-cert)        shift; TLS_CA_CERT="$1" ;;
         --agent-listener)     CS_AGENT_LISTENER=1 ;;  # default already; kept as a harmless no-op
         --no-agent-listener)  CS_AGENT_LISTENER=0 ;;
+        --infra-only)         INFRA_ONLY=1 ;;
         --admin-token) ;; # deprecated
         --all-prereqs) ;;
         *) echo "Unknown argument: $1"; exit 1 ;;
@@ -150,19 +161,21 @@ ok()   { echo -e "${GRN}✅  $*${NC}"; }
 warn() { echo -e "${YLW}⚠️   $*${NC}"; }
 step() { echo -e "\n${GRN}━━  $*  ━━${NC}"; }
 
-step "Lab Manager — Generic Agent Installer"
-
-# ── System packages ───────────────────────────────────────────────────────────
-step "Installing system packages"
-apt-get update -qq
-DEBIAN_FRONTEND=noninteractive apt-get install -y -q \
-    python3 python3-venv python3-pip git curl jq sudo
-ok "Packages ready"
+# ══════════════════════════════════════════════════════════════════════════════
+# OS/host-level simulation infrastructure — shared by a full install AND the
+# --infra-only path the generic agent uses when it hosts the CS role in-process.
+# Defined up front (before the --infra-only early exit) but the full-install
+# flow still CALLS them at their original positions further down, so a normal
+# `install_cs.sh` run is byte-for-byte unchanged. Both functions run in the
+# current shell (no `local`), so setup_sim_agent_listener's CS_AGENT_LISTENER_*
+# / cert-path variables still escape to the full-install .env writer below.
+# ══════════════════════════════════════════════════════════════════════════════
 
 # ── DHCP on the second NIC (sim-client network) ───────────────────────────────
 # Port of installers/install-lxc.sh STEP 3: auto-detect a second NIC and run
 # dnsmasq DHCP (169.253.1.0/24) on it for the isolated simulation-client
 # network. Skipped on single-NIC hosts or when --no-dhcp / DHCP_SKIP=1.
+setup_sim_dhcp() {
 if [[ "$DHCP_SKIP" != "1" ]]; then
     step "Detecting DHCP interface (sim-client network)"
 
@@ -292,6 +305,123 @@ DROPIN
         fi
     fi
 fi
+}
+
+# ── Agent listener prerequisites (split topology, --agent-listener opt-in) ────
+# Mirrors install_pxmx.sh's standalone TLS-cert generation: a pxmx host agent
+# dialing THIS cs spoke's /ws/agent needs wss on :443, so a self-signed cert is
+# generated (once; preserved on re-run) and the agent_secret is written to
+# /etc/lm-cs-agent/config.json. Skipped entirely when the listener is off — a
+# relay-only cs spoke never touches any of this. Sets CS_AGENT_LISTENER_LINES
+# (consumed by the full-install .env writer; harmless/ignored under --infra-only).
+setup_sim_agent_listener() {
+CS_AGENT_LISTENER_LINES=""
+if [ "$CS_AGENT_LISTENER" = "1" ]; then
+    CS_CERT_DIR="$LM_DIR/cs/certs"
+    CS_CERT="$CS_CERT_DIR/hub.crt"
+    CS_KEY="$CS_CERT_DIR/hub.key"
+    mkdir -p "$CS_CERT_DIR"
+    if ! command -v openssl >/dev/null 2>&1; then
+        warn "openssl not found — skipping cs agent-listener TLS cert (listener stays plaintext :8767)."
+    elif [ -f "$CS_CERT" ] && [ -f "$CS_KEY" ]; then
+        ok "cs agent-listener TLS cert already present at $CS_CERT — preserving."
+    else
+        echo "🔒 Generating self-signed cs agent-listener TLS cert at $CS_CERT…"
+        openssl req -x509 -newkey rsa:2048 -nodes \
+            -keyout "$CS_KEY" -out "$CS_CERT" -days 3650 \
+            -subj "/CN=lm-cs" -addext "subjectAltName=IP:127.0.0.1,DNS:lm-hub,DNS:lm-hub.local" \
+            >/dev/null 2>&1 || warn "openssl cert generation failed — agent listener stays plaintext."
+    fi
+    if [ -f "$CS_KEY" ]; then
+        chmod 600 "$CS_KEY"
+        chown "$SVC_USER:$SVC_USER" "$CS_KEY" "$CS_CERT" 2>/dev/null || true
+    fi
+    CS_AGENT_LISTENER_LINES="LM_CS_AGENT_LISTENER=1"
+    if [ -f "$CS_CERT" ] && [ -f "$CS_KEY" ]; then
+        CS_AGENT_LISTENER_LINES="$CS_AGENT_LISTENER_LINES
+LM_TLS_CERT=$CS_CERT
+LM_TLS_KEY=$CS_KEY"
+    fi
+
+    # --- Agent Secret (shared with a pxmx host agent dialing THIS cs spoke) ---
+    # Mirrors install_pxmx.sh's AGENT_CONFIG block exactly. Without this,
+    # AgentHostingControlPlane.agent_secret stays None, so
+    # approve_pending_agent() pushes {"secret": null} to an approved agent —
+    # the agent's "if provisioned_secret:" guard then skips saving it and
+    # reconnects with the SAME empty secret, landing right back in
+    # pending/"needs admin approval" forever. Preserve an existing secret so
+    # a re-install doesn't break an already-approved agent.
+    CS_AGENT_CONFIG="/etc/lm-cs-agent/config.json"
+    EXISTING_CS_AGENT_SECRET=""
+    if [ -f "$CS_AGENT_CONFIG" ]; then
+        EXISTING_CS_AGENT_SECRET=$(python3 -c "import json,sys; d=json.load(open('$CS_AGENT_CONFIG')); print(d.get('agent_secret',''))" 2>/dev/null || true)
+    fi
+
+    if [ -z "$EXISTING_CS_AGENT_SECRET" ]; then
+        if command -v openssl >/dev/null 2>&1; then
+            CS_AGENT_SECRET=$(openssl rand -base64 32 | tr -d '/+=\n')
+        else
+            CS_AGENT_SECRET=$(python3 -c "import secrets; print(secrets.token_urlsafe(32))")
+        fi
+        echo "🔑 Generated new cs agent_secret."
+    else
+        CS_AGENT_SECRET="$EXISTING_CS_AGENT_SECRET"
+        echo "🔑 Preserved existing cs agent_secret."
+    fi
+
+    mkdir -p /etc/lm-cs-agent
+    python3 -c "
+import json, sys
+path = '$CS_AGENT_CONFIG'
+try:
+    with open(path) as f:
+        data = json.load(f)
+except Exception:
+    data = {}
+data['agent_secret'] = '$CS_AGENT_SECRET'
+with open(path, 'w') as f:
+    json.dump(data, f, indent=2)
+"
+    chmod 600 "$CS_AGENT_CONFIG"
+    chown "$SVC_USER:$SVC_USER" "$CS_AGENT_CONFIG" 2>/dev/null || true
+    echo "✅ cs agent secret written to $CS_AGENT_CONFIG"
+fi
+}
+
+# ── --infra-only fast path (generic-agent-hosted CS role) ─────────────────────
+# Lay down ONLY the host-level sim infra, then exit — no spoke clone, no venv, no
+# lm core, no spoke .env, no lm-cs unit, no rollback watchdog/sudoers. The agent
+# has already cloned this repo to $LM_DIR/cs and owns the process + updates + the
+# role's runtime config (pushed from the hub). Idempotent + non-interactive.
+if [ "$INFRA_ONLY" = "1" ]; then
+    step "CS simulation infra-only setup (generic-agent-hosted role)"
+    apt-get update -qq
+    DEBIAN_FRONTEND=noninteractive apt-get install -y -q python3 openssl
+    ok "Base packages ready"
+    setup_sim_dhcp
+    setup_sim_agent_listener
+    echo ""
+    ok "CS simulation infra-only setup complete."
+    echo "  DHCP:           $( [ -n "${DHCP_IFACE:-}" ] && [ "$DHCP_SKIP" != "1" ] && echo "dnsmasq on ${DHCP_IFACE}" || echo "skipped (single NIC or --no-dhcp)" )"
+    echo "  Agent listener: cert $LM_DIR/cs/certs/hub.crt + /etc/lm-cs-agent/config.json"
+    echo "                  The root agent binds :443 directly (no CAP_NET_BIND_SERVICE / systemd unit created here)."
+    echo "  Install log:    $INSTALL_LOG"
+    exit 0
+fi
+
+step "Lab Manager — Generic Agent Installer"
+
+# ── System packages ───────────────────────────────────────────────────────────
+step "Installing system packages"
+apt-get update -qq
+DEBIAN_FRONTEND=noninteractive apt-get install -y -q \
+    python3 python3-venv python3-pip git curl jq sudo
+ok "Packages ready"
+
+# ── DHCP on the second NIC (sim-client network) ───────────────────────────────
+# (Implementation lifted into setup_sim_dhcp() near the top so --infra-only can
+# reuse it; called here for the full install exactly where it used to run.)
+setup_sim_dhcp
 
 # ── Service user ──────────────────────────────────────────────────────────────
 if ! id "$SVC_USER" &>/dev/null; then
@@ -435,82 +565,11 @@ TLS_CA_LINE=""
 [ -n "$HUB_TLS_CA_ENV" ] && TLS_CA_LINE="LM_HUB_CA_CERT=$HUB_TLS_CA_ENV"
 
 # ── Agent listener (split topology, --agent-listener opt-in) ─────────────────
-# Mirrors install_pxmx.sh's standalone TLS-cert generation: a pxmx host agent
-# dialing THIS cs spoke's /ws/agent needs wss on :443, so a self-signed cert is
-# generated (once; preserved on re-run) and the systemd unit below gets
-# CAP_NET_BIND_SERVICE so svc_lm can bind :443. Skipped entirely when the
-# listener is off — a relay-only cs spoke never touches any of this.
-CS_AGENT_LISTENER_LINES=""
-if [ "$CS_AGENT_LISTENER" = "1" ]; then
-    CS_CERT_DIR="$LM_DIR/cs/certs"
-    CS_CERT="$CS_CERT_DIR/hub.crt"
-    CS_KEY="$CS_CERT_DIR/hub.key"
-    mkdir -p "$CS_CERT_DIR"
-    if ! command -v openssl >/dev/null 2>&1; then
-        warn "openssl not found — skipping cs agent-listener TLS cert (listener stays plaintext :8767)."
-    elif [ -f "$CS_CERT" ] && [ -f "$CS_KEY" ]; then
-        ok "cs agent-listener TLS cert already present at $CS_CERT — preserving."
-    else
-        echo "🔒 Generating self-signed cs agent-listener TLS cert at $CS_CERT…"
-        openssl req -x509 -newkey rsa:2048 -nodes \
-            -keyout "$CS_KEY" -out "$CS_CERT" -days 3650 \
-            -subj "/CN=lm-cs" -addext "subjectAltName=IP:127.0.0.1,DNS:lm-hub,DNS:lm-hub.local" \
-            >/dev/null 2>&1 || warn "openssl cert generation failed — agent listener stays plaintext."
-    fi
-    if [ -f "$CS_KEY" ]; then
-        chmod 600 "$CS_KEY"
-        chown "$SVC_USER:$SVC_USER" "$CS_KEY" "$CS_CERT" 2>/dev/null || true
-    fi
-    CS_AGENT_LISTENER_LINES="LM_CS_AGENT_LISTENER=1"
-    if [ -f "$CS_CERT" ] && [ -f "$CS_KEY" ]; then
-        CS_AGENT_LISTENER_LINES="$CS_AGENT_LISTENER_LINES
-LM_TLS_CERT=$CS_CERT
-LM_TLS_KEY=$CS_KEY"
-    fi
-
-    # --- Agent Secret (shared with a pxmx host agent dialing THIS cs spoke) ---
-    # Mirrors install_pxmx.sh's AGENT_CONFIG block exactly. Without this,
-    # AgentHostingControlPlane.agent_secret stays None, so
-    # approve_pending_agent() pushes {"secret": null} to an approved agent —
-    # the agent's "if provisioned_secret:" guard then skips saving it and
-    # reconnects with the SAME empty secret, landing right back in
-    # pending/"needs admin approval" forever. Preserve an existing secret so
-    # a re-install doesn't break an already-approved agent.
-    CS_AGENT_CONFIG="/etc/lm-cs-agent/config.json"
-    EXISTING_CS_AGENT_SECRET=""
-    if [ -f "$CS_AGENT_CONFIG" ]; then
-        EXISTING_CS_AGENT_SECRET=$(python3 -c "import json,sys; d=json.load(open('$CS_AGENT_CONFIG')); print(d.get('agent_secret',''))" 2>/dev/null || true)
-    fi
-
-    if [ -z "$EXISTING_CS_AGENT_SECRET" ]; then
-        if command -v openssl >/dev/null 2>&1; then
-            CS_AGENT_SECRET=$(openssl rand -base64 32 | tr -d '/+=\n')
-        else
-            CS_AGENT_SECRET=$(python3 -c "import secrets; print(secrets.token_urlsafe(32))")
-        fi
-        echo "🔑 Generated new cs agent_secret."
-    else
-        CS_AGENT_SECRET="$EXISTING_CS_AGENT_SECRET"
-        echo "🔑 Preserved existing cs agent_secret."
-    fi
-
-    mkdir -p /etc/lm-cs-agent
-    python3 -c "
-import json, sys
-path = '$CS_AGENT_CONFIG'
-try:
-    with open(path) as f:
-        data = json.load(f)
-except Exception:
-    data = {}
-data['agent_secret'] = '$CS_AGENT_SECRET'
-with open(path, 'w') as f:
-    json.dump(data, f, indent=2)
-"
-    chmod 600 "$CS_AGENT_CONFIG"
-    chown "$SVC_USER:$SVC_USER" "$CS_AGENT_CONFIG" 2>/dev/null || true
-    echo "✅ cs agent secret written to $CS_AGENT_CONFIG"
-fi
+# (Implementation lifted into setup_sim_agent_listener() near the top so
+# --infra-only can reuse it; called here for the full install exactly where it
+# used to run. The CS_AGENT_LISTENER_LINES / LM_TLS_CERT / LM_TLS_KEY vars it
+# sets are consumed by the .env writer just below and by the CAP_LINES check.)
+setup_sim_agent_listener
 
 # ── .env ──────────────────────────────────────────────────────────────────────
 cat > "$LM_DIR/cs/.env" <<DOTENV
