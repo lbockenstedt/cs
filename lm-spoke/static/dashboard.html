@@ -98,6 +98,13 @@
         let currentSubView = 'Dashboard';
         let currentSubChild = '';
 
+        // helpIcon() shim: the hub's sim-views renderers embed inline ⓘ help
+        // affordances (helpIcon('cs', …)) that open the hub's Help drawer, which
+        // pulls from the hub's /docs endpoint. Standalone cs serves no /docs and
+        // has no drawer, so resolve helpIcon to a no-op (empty string) — the
+        // section headers render identically to the hub, minus the help icon.
+        function helpIcon() { return ''; }
+
         function showToast(message, kind) {
             const region = document.getElementById('cs-toast-region');
             const el = document.createElement('div');
