@@ -579,6 +579,16 @@ ok "Generic Agent service started"
 
 chown -R "$SVC_USER:$SVC_USER" "$LM_DIR/cs" 2>/dev/null || true
 
+# The per-spoke recovery state dir lives under /var/lib/lm/ but the spoke runs
+# as $SVC_USER (non-root) and CANNOT create a dir under /var/lib/lm itself — so
+# without this, the pre-update snapshot + rollback silently disable with
+# "Permission denied: '/var/lib/lm'". Create it (as root, here) and make it
+# writable by the spoke. chown is non-recursive so a co-located hub's
+# /var/lib/lm/state (root-owned) is untouched.
+mkdir -p /var/lib/lm 2>/dev/null || true
+chown "$SVC_USER:$SVC_USER" /var/lib/lm 2>/dev/null || true
+chmod 755 /var/lib/lm 2>/dev/null || true
+
 # ── Failed-update rollback watchdog + sudoers ─────────────────────────────────
 # Per-spoke recovery state lives in /var/lib/lm/<spoke_id>/ (created on demand at
 # runtime by the spoke): pre-swap code snapshot, pending-update manifest, healthy

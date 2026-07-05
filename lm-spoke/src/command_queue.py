@@ -418,6 +418,21 @@ class CommandQueue:
         except Exception as exc:  # noqa: BLE001
             logger.warning("Command queue save failed (%s): %s", self.path, exc)
 
+    async def _asave(self) -> None:
+        """Persist off the event loop. The command list is serialized HERE (on
+        the loop, so it's a consistent snapshot while callers hold self.lock),
+        but the slow atomic disk write is offloaded to a thread. This is the hot
+        path — CS_POLL_AGENT_INBOX (~5s) and CS_ACK_COMMAND both save — and a
+        synchronous write on a contended disk stalled the whole shared event
+        loop (hub connection + uvicorn API), producing the hub's 5s/30s Request
+        Timeouts. See logging/observability + cs-svr-02 starvation notes."""
+        try:
+            self.data_dir.mkdir(parents=True, exist_ok=True)
+            text = json.dumps(self.commands, default=str)
+            await asyncio.to_thread(_write_atomic, self.path, text)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Command queue save failed (%s): %s", self.path, exc)
+
     # ── shape helpers ──────────────────────────────────────────────────────
 
     def _make_command(self, target: str, action: str, args: Optional[dict],
@@ -536,7 +551,7 @@ class CommandQueue:
             cmd = self._make_command(ntarget, naction, nargs, ntype)
             self.commands.append(cmd)
             self._trim()
-            self._save()
+            await self._asave()
             return {"command": cmd, "created": True,
                     "expired": expired, "purged": purged}
 
@@ -575,7 +590,7 @@ class CommandQueue:
                     cmd["updated_at"] = now
 
             if reset or delivered_ids or expired or purged:
-                self._save()
+                await self._asave()
 
             return {
                 "commands": [self._serialize_for_agent(c) for c in pending],
@@ -603,7 +618,7 @@ class CommandQueue:
             cmd["result"] = result if result is not None else cmd.get("result")
             cmd["updated_at"] = time.time()
             cmd["purge_after"] = cmd["updated_at"] + COMMAND_RESULT_RETENTION_SECS
-            self._save()
+            await self._asave()
             return {"ok": True, "id": cmd_id, "status": status}
 
     async def list_commands(self) -> List[Dict[str, Any]]:
@@ -633,7 +648,7 @@ class CommandQueue:
                 cmd["purge_after"] = now + COMMAND_RESULT_RETENTION_SECS
                 cleared += 1
             if cleared:
-                self._save()
+                await self._asave()
             return {"cleared": cleared, "remaining": len(self.commands)}
 
     async def delete_command(self, cmd_id: str) -> Dict[str, Any]:
@@ -647,7 +662,7 @@ class CommandQueue:
             self.commands[:] = [c for c in self.commands if c.get("id") != cmd_id]
             removed = before - len(self.commands)
             if removed:
-                self._save()
+                await self._asave()
             return {"ok": bool(removed), "id": cmd_id, "removed": removed}
 
     async def get_usb_config(self, hostname: Optional[str] = None) -> Dict[str, Any]:
