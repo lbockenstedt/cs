@@ -240,9 +240,30 @@ class CSControlPlane(AgentHostingControlPlane):
                 registry = getattr(cs_mod, "registry", None)
                 if registry is not None:
                     now = time.time()
+                    # Tier join (client → VM → USB): a client whose Proxmox VM has
+                    # a dongle assigned is T2, else T1 — mirrors the original
+                    # webui-hub classifyClient(client, usbVmids). usb_state carries
+                    # {vmid,bus_path}; a sim client's hostname equals its VM name,
+                    # so match hostname→vm→vmid and test membership in the
+                    # USB-assigned vmid set. has_usb is what csClassifyClient reads.
+                    pstates = getattr(deploy, "proxmox_states", {}) or {}
+                    usb_vmids = set()
+                    name_to_vmid = {}
+                    for st in pstates.values():
+                        for u in (st.get("usb_state") or []):
+                            v = u.get("vmid")
+                            if v not in (None, ""):
+                                usb_vmids.add(str(v))
+                        for vm in (st.get("vms") or []):
+                            nm = str(vm.get("name") or "").strip().lower()
+                            v = vm.get("vmid")
+                            if nm and v not in (None, ""):
+                                name_to_vmid.setdefault(nm, str(v))
                     clients = []
                     for hn, c in registry.get_all().items():
                         ls = c.get("last_seen")
+                        vmid = name_to_vmid.get(str(hn).strip().lower())
+                        has_usb = bool(vmid and vmid in usb_vmids)
                         clients.append({
                             "hostname": hn, "id": hn,
                             "platform": c.get("platform") or "—",
@@ -254,6 +275,8 @@ class CSControlPlane(AgentHostingControlPlane):
                             "last_seen": ls if ls is not None else "—",
                             "error_count": len(c.get("recent_errors") or []),
                             "recent_errors": c.get("recent_errors") or [],
+                            "vmid": vmid,
+                            "has_usb": has_usb,
                         })
                     payload["clients"] = clients
                 msg = {
