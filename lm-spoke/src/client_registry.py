@@ -151,3 +151,21 @@ class ClientRegistry:
                 await self._apersist()
                 return dict(entry)
             return {}
+
+    async def purge(self) -> Dict[str, Any]:
+        """Drop every registered client from memory AND delete ``clients.json``
+        on disk, restoring a fresh-empty registry. This is the lm-spoke
+        equivalent of the legacy cs-webui "Purge Clients" button
+        (``DELETE /api/clients/history``) — it removes all client records from
+        memory and disk (cannot be undone). Returns ``{"purged": <count>}``
+        naming how many clients were removed. Disk unlink offloaded via
+        ``asyncio.to_thread`` for the same event-loop reason as ``_apersist``.
+        """
+        async with self._lock:
+            n = len(self.clients)
+            self.clients = {}
+            try:
+                await asyncio.to_thread(self._path.unlink, missing_ok=True)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("could not remove %s: %s", self._path, exc)
+            return {"purged": n}

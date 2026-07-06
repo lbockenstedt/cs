@@ -413,6 +413,18 @@ class CSSpoke(BaseSpoke):
             return {"status": "SUCCESS", "applied": applied,
                     "overrides": dict(overrides)}
 
+        if cmd in ("CS_PURGE_CLIENTS",):
+            # The "Purge Clients" button (original cs-webui
+            # DELETE /api/clients/history): drop every registered client from
+            # memory + delete clients.json on disk — irreversible. The hub/UI
+            # forwards here via DELETE /sim/api/{tenant}/clients. Returns the
+            # count removed so the UI can confirm. Sits before the
+            # NOT_IMPLEMENTED matcher below (second-segment "PURGE" isn't in
+            # its set, but without this handler it would fall through to
+            # "Unknown command").
+            res = await self.registry.purge()
+            return {"status": "SUCCESS", **res}
+
         # ── Per-host USB VMID overrides ──────────────────────────────────────
         # Optional per-host vmid_start/vmid_end/vm_set_override that override the
         # global range for one proxmox host (the pxmx agent honors a non-default

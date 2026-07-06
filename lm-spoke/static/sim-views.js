@@ -581,13 +581,38 @@ window.csToggleKillSwitch = async function (on) {
             { method: 'POST', body: JSON.stringify({ on }) });
         if (typeof showToast === 'function') showToast(on ? 'Kill switch ON — sims halted' : 'Kill switch OFF — sims resumed', on ? 'error' : 'success');
         loadCSData(currentSubView, currentSubChild, true);
+        if (typeof window.csKillSwitchMountChip === 'function') window.csKillSwitchMountChip('cs-ks-chip');
     } catch (e) { console.error('csToggleKillSwitch: toggle failed', e); if (typeof showToast === 'function') showToast('Kill-switch toggle failed: ' + (e.message || e), 'error'); }
+};
+
+// Compact kill-switch control mounted into the Clients child strip (All/T1/T2),
+// pinned far right by renderSecondaryNav. Reads the same GET /kill-switch state
+// as the banner and toggles via csToggleKillSwitch. Spoke-offline → a muted label.
+window.csKillSwitchMountChip = async function (elId) {
+    const el = document.getElementById(elId);
+    if (!el) return;
+    let ks = false, connected = false;
+    try {
+        const r = await csFetch(`/${csTenant()}/kill-switch?tenant_id=${csTenant()}`);
+        ks = r && r.kill_switch; connected = !!(r && r.spoke_connected);
+    } catch (e) { console.warn('csKillSwitchMountChip: read failed', e); }
+    if (!connected) {
+        el.innerHTML = `<span class="text-[10px] normal-case tracking-normal text-slate-400">Kill switch: spoke offline</span>`;
+        return;
+    }
+    el.innerHTML = ks
+        ? `<button onclick="csToggleKillSwitch(false)" title="Simulations halted — click to resume"
+             class="normal-case tracking-normal bg-red-600 hover:bg-red-700 text-white px-3 py-1 rounded-md text-xs font-bold">▶ Resume Sims</button>`
+        : `<button onclick="csToggleKillSwitch(true)" title="Emergency stop all simulations on this tenant"
+             class="normal-case tracking-normal bg-white hover:bg-red-50 text-red-600 border border-red-300 px-3 py-1 rounded-md text-xs font-bold">⛔ Emergency Stop</button>`;
 };
 
 async function csRenderSimulations() {
     // Simulations → Checks child (default).
     csSetToolbar('');
-    const ksBanner = await csKillSwitchBanner();
+    // Kill switch moved to the Checks/Hardware/Client Count child strip
+    // (renderSecondaryNav → csKillSwitchMountChip), pinned far right — no longer
+    // a content banner here.
     const data = await csSimLoadCentral();
     const spokes = csSimSpokes(data);
     if (!spokes) return;
@@ -618,7 +643,7 @@ async function csRenderSimulations() {
             window._csSimCheckRows.push({ spoke: name, site: w, check: c, status: cell && cell.status, detail: cell });
         }));
     });
-    csSet(`<div class="space-y-4">${ksBanner}${pills}<div id="cs-sim-checks-body"></div></div>`);
+    csSet(`<div class="space-y-4">${pills}<div id="cs-sim-checks-body"></div></div>`);
     csSimChecksFilter();
 }
 
@@ -947,7 +972,8 @@ async function csRenderClients(tier) {
     csSetToolbar(`<input id="cs-client-search" oninput="csClientFilter()" placeholder="Search clients…" class="bg-white border border-slate-300 rounded-md px-3 py-1.5 text-sm outline-none focus:ring-2 focus:ring-green-500 w-64">
       <select id="cs-client-status" onchange="csClientFilter()" class="bg-white border border-slate-300 rounded-md px-3 py-1.5 text-sm outline-none focus:ring-2 focus:ring-green-500">
         <option value="">All</option><option value="online">Online</option><option value="offline">Offline</option>
-      </select>`);
+      </select>
+      <button id="cs-purge-clients-btn" onclick="csPurgeClients(this)" title="Remove all client records from memory and disk" class="ml-auto bg-white border border-red-300 text-red-600 hover:bg-red-50 rounded-md px-3 py-1.5 text-sm font-semibold">🗑 Purge Clients</button>`);
     const data = await csFetch(`/aggregate/clients?tenant_id=${csTenant()}`);
     const rows = csNormalizeClients(data);
     csClientCache = rows;
@@ -956,11 +982,39 @@ async function csRenderClients(tier) {
     const t2 = rows.filter(c => csClassifyClient(c) === 't2').length;
     const online = rows.filter(c => c.online).length;
     const pills = csSummaryRow([[all, 'Clients'], [t1, 'T1'], [t2, 'T2'], [online, 'Online']]);
-    const ksBanner = await csKillSwitchBanner();
     const demoCard = await csDemoCard();
-    csSet(`<div class="space-y-4">${ksBanner}${demoCard}${pills}<div id="cs-client-body"></div></div>`);
+    // Kill switch moved to the All/T1/T2 child strip (renderSecondaryNav →
+    // csKillSwitchMountChip), pinned far right — no longer a content banner here.
+    csSet(`<div class="space-y-4">${demoCard}${pills}<div id="cs-client-body"></div></div>`);
     csClientFilter();
 }
+
+// "Purge Clients" — ports the original solutions-hpe cs-webui button
+// (DELETE /api/clients/history → clients_purged WS). Clears every client
+// record from the spoke's registry (memory + clients.json on disk). Hits the
+// tenant's cs spoke via the hub relay DELETE /sim/api/{tenant}/clients (or the
+// spoke's own local_ui_routes equivalent when run from the cs standalone
+// dashboard — same /sim/api/* contract). The hub also drops its cached
+// `clients` for the spoke, so re-rendering shows empty immediately.
+window.csPurgeClients = async function (btn) {
+    if (!confirm('Clear all client history? Records on disk will also be deleted. This cannot be undone.'))
+        return;
+    const orig = btn.textContent;
+    btn.disabled = true;
+    btn.textContent = '⏳ Purging…';
+    try {
+        const r = await csFetch(`/${csTenant()}/clients`, { method: 'DELETE' });
+        const n = (r && r.purged != null) ? r.purged : '?';
+        if (typeof showToast === 'function') showToast(`Purged ${n} client record(s)`, 'success');
+        // Re-render the Clients tab so the now-empty list shows immediately.
+        await csRenderClients(csClientTier);
+    } catch (e) {
+        console.error('csPurgeClients: purge failed', e);
+        if (typeof showToast === 'function') showToast('Purge failed: ' + (e.message || e), 'error');
+        btn.disabled = false;
+        btn.textContent = orig;
+    }
+};
 
 function csNormalizeClients(data) {
     if (!data) return [];
@@ -1666,6 +1720,7 @@ async function csRenderConfigSimulation() {
 
     const fetchedSim = (sim && sim.fetched_at) ? csFmtFetched(sim.fetched_at) : '—';
     const simSource = (sim && sim.source) || 'spoke';
+    const simConnected = !!(sim && sim.spoke_connected);
     const sections = (sim && sim.sections) || {};
     const raw = (sim && sim.raw) || '';
 
@@ -1718,7 +1773,9 @@ async function csRenderConfigSimulation() {
         <div class="flex items-center gap-2">
           <h3 class="text-sm font-bold text-slate-500 uppercase tracking-wider">Simulation Config ${helpIcon('cs', null, 'Simulations help')}</h3>
           <span class="inline-block bg-slate-100 text-slate-500 rounded-full px-2 py-0.5 text-[10px] font-bold">Hub-managed override (no GitHub API key)</span>
-          ${simSource === 'spoke' ? '' : '<span class="inline-block bg-amber-100 text-amber-700 rounded-full px-2 py-0.5 text-[10px] font-bold">spoke offline — showing stored override</span>'}
+          ${simSource === 'spoke' ? '' : (simConnected
+            ? '<span class="inline-block bg-amber-100 text-amber-700 rounded-full px-2 py-0.5 text-[10px] font-bold">spoke online — live config fetch timed out, showing stored override</span>'
+            : '<span class="inline-block bg-amber-100 text-amber-700 rounded-full px-2 py-0.5 text-[10px] font-bold">spoke offline — showing stored override</span>')}
         </div>
         <span class="text-[10px] text-slate-400">Last fetched: ${csEscape(fetchedSim)}</span>
       </div>

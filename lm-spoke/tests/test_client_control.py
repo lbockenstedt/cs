@@ -133,3 +133,43 @@ def test_bad_overrides_type_errors(spoke_loop):
         {"hostname": "host-a", "overrides": "not-a-dict"}))
     assert resp["status"] == "ERROR"
     assert "object" in resp["message"]
+
+
+def test_purge_clients_clears_memory_and_disk(spoke_loop):
+    """CS_PURGE_CLIENTS drops every client from memory AND deletes clients.json
+    (the legacy cs-webui "Purge Clients" button → DELETE /api/clients/history).
+    Returns the count removed; the on-disk file is gone."""
+    spoke, loop = spoke_loop
+    for h in ("host-a", "host-b", "host-c"):
+        _run(loop, spoke.registry.set_overrides(h, {"sim_load": "100"}))
+    assert spoke.registry.count() == 3
+    assert spoke.registry._path.exists()
+    resp = _run(loop, spoke.handle_command("CS_PURGE_CLIENTS", {}))
+    assert resp["status"] == "SUCCESS"
+    assert resp["purged"] == 3
+    assert spoke.registry.count() == 0
+    assert spoke.registry.get_all() == {}
+    assert not spoke.registry._path.exists()
+
+
+def test_purge_clients_when_empty_reports_zero(spoke_loop):
+    """Purging an already-empty registry is a no-op that reports 0 (and does
+    not error when clients.json is already absent)."""
+    spoke, loop = spoke_loop
+    assert spoke.registry.count() == 0
+    resp = _run(loop, spoke.handle_command("CS_PURGE_CLIENTS", {}))
+    assert resp["status"] == "SUCCESS"
+    assert resp["purged"] == 0
+    assert not spoke.registry._path.exists()
+
+
+def test_purge_then_repopulate_works(spoke_loop):
+    """After a purge the registry is fresh-empty and accepts new clients again
+    (the file is recreated on the next persist)."""
+    spoke, loop = spoke_loop
+    _run(loop, spoke.registry.set_overrides("host-a", {"dns_fail": "on"}))
+    _run(loop, spoke.handle_command("CS_PURGE_CLIENTS", {}))
+    _run(loop, spoke.registry.set_overrides("host-b", {"kill_switch": "on"}))
+    assert spoke.registry.count() == 1
+    assert spoke.registry.get("host-b")["overrides"] == {"kill_switch": "on"}
+    assert spoke.registry._path.exists()

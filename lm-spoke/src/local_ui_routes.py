@@ -141,6 +141,13 @@ def build_local_ui_router(spoke) -> APIRouter:
 
     # ── Per-client override control panel ───────────────────────────────────
 
+    # "Purge Clients" — registered BEFORE the {hostname}/control routes so the
+    # {hostname} path param doesn't swallow a bare collection DELETE. Mirrors
+    # the hub's DELETE /sim/api/{tenant}/clients → CS_PURGE_CLIENTS.
+    @router.delete("/{tenant}/clients")
+    async def purge_clients(tenant: str):
+        return await _cmd("CS_PURGE_CLIENTS", {})
+
     @router.get("/{tenant}/clients/{hostname}/control")
     async def get_control(tenant: str, hostname: str):
         return await _cmd("CS_GET_CLIENT_OVERRIDES", {"hostname": hostname})
