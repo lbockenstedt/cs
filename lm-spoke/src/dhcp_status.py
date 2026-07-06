@@ -83,7 +83,11 @@ def collect_dhcp_status() -> Dict[str, Any]:
 
 def _collect() -> Dict[str, Any]:
     conf_path = Path(KEA_DHCP4_CONF)
-    installed = shutil.which("kea-dhcp4") is not None or conf_path.exists()
+    # "installed" must mean the SIM instance exists (its conf) — not merely that
+    # the shared kea-dhcp4 binary is present (the lm/dhcp module installs that too).
+    # Keying on the binary made a box that never provisioned the sim Kea show a
+    # false "Not running" instead of the intended "Not configured".
+    installed = conf_path.exists()
     if not installed:
         return {"installed": False}
 

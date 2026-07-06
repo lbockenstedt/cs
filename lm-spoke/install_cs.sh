@@ -372,6 +372,14 @@ EOF
         chmod 0755 /etc/kea /var/lib/kea 2>/dev/null || true
         chmod 0644 "$KEA_DHCP4_CONF" "$KEA_CA_CONF" 2>/dev/null || true
 
+        # Fail loudly at install if the generated Kea config is invalid, instead of
+        # discovering it later via a silently-inactive unit (kea-dhcp4 -t is the
+        # same syntax check an operator would run).
+        if ! "$KEA_DHCP4_BIN" -t "$KEA_DHCP4_CONF" >/tmp/kea-sim-check.log 2>&1; then
+            warn "kea-dhcp4-sim config FAILED validation ($KEA_DHCP4_CONF):"
+            sed 's/^/      /' /tmp/kea-sim-check.log 2>/dev/null || true
+        fi
+
         # ── Custom systemd units (independent of the distro default kea units) ─
         # kea-dhcp4-sim waits for the DHCP interface to appear before it binds —
         # without this it fails with "no such interface" on reboot when the NIC
@@ -382,12 +390,18 @@ EOF
 Description=CS sim-client Kea DHCP4 (isolated ${DHCP_SUBNET}/${DHCP_PREFIX})
 After=network.target network-online.target
 Wants=network-online.target
+StartLimitIntervalSec=0
 
 [Service]
 Type=simple
 RuntimeDirectory=kea
 RuntimeDirectoryPreserve=yes
-ExecStartPre=/bin/bash -c 'n=0; until ip link show "${DHCP_IFACE}" >/dev/null 2>&1; do n=\$((n+1)); [ \$n -ge 30 ] && exit 1; sleep 1; done'
+# Bounded wait for the sim NIC, then force it up and idempotently re-apply the
+# sim address (a reboot that did not process /etc/network/interfaces.d otherwise
+# leaves the link down/unaddressed so Kea cannot bind). Never hard-fail here: on
+# timeout exit 0 and let Kea + Restart=on-failure retry rather than parking the
+# unit in 'failed' forever.
+ExecStartPre=/bin/bash -c 'n=0; until ip link show "${DHCP_IFACE}" >/dev/null 2>&1; do n=\$((n+1)); [ \$n -ge 60 ] && break; sleep 1; done; ip link set "${DHCP_IFACE}" up 2>/dev/null || true; ip addr show dev "${DHCP_IFACE}" | grep -q "${DHCP_GATEWAY}/" || ip addr add "${DHCP_GATEWAY}/${DHCP_PREFIX}" dev "${DHCP_IFACE}" 2>/dev/null || true; exit 0'
 ExecStart=${KEA_DHCP4_BIN} -c ${KEA_DHCP4_CONF}
 Restart=on-failure
 RestartSec=5
@@ -421,13 +435,14 @@ EOF
         # lm/dhcp module's. On a fresh install the packages may auto-enable the
         # defaults; leave them to the dhcp module (they bind :8001 / their own
         # socket and don't clash with the -sim instance's :8002 / -sim socket).
-        systemctl enable kea-dhcp4-sim kea-ctrl-agent-sim >/dev/null 2>&1 || true
-        systemctl restart kea-dhcp4-sim >/dev/null 2>&1 || true
-        systemctl restart kea-ctrl-agent-sim >/dev/null 2>&1 || true
+        systemctl enable --now kea-dhcp4-sim kea-ctrl-agent-sim >/dev/null 2>&1 || true
+        systemctl restart kea-dhcp4-sim kea-ctrl-agent-sim >/dev/null 2>&1 || true
         if systemctl is-active --quiet kea-dhcp4-sim; then
             ok "kea-dhcp4-sim running — DHCP active on ${DHCP_IFACE}"
         else
-            warn "kea-dhcp4-sim failed to start — check: journalctl -u kea-dhcp4-sim"
+            warn "kea-dhcp4-sim failed to start on ${DHCP_IFACE} — recent log:"
+            journalctl -u kea-dhcp4-sim -n 20 --no-pager 2>/dev/null | sed 's/^/      /' || true
+            warn "diagnose: systemctl status kea-dhcp4-sim ; ${KEA_DHCP4_BIN} -t ${KEA_DHCP4_CONF} ; ip -br link"
         fi
     fi
 fi
