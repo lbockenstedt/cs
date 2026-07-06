@@ -120,6 +120,17 @@ while [[ "$#" -gt 0 ]]; do
     shift
 done
 
+# Accept a bare hub IP/host for --hub (e.g. `--hub 172.16.1.31` == `--hub
+# wss://172.16.1.31:443`). A ws://|wss:// scheme or the "auto" sentinel is left
+# as-is; host:port gets a scheme; a bare host defaults to the unified :443.
+if [ -n "${HUB_URL:-}" ] && [ "$HUB_URL" != "auto" ]; then
+    case "$HUB_URL" in
+        ws://*|wss://*) : ;;
+        *:[0-9]*)       HUB_URL="wss://${HUB_URL}" ;;
+        *)              HUB_URL="wss://${HUB_URL}:443" ;;
+    esac
+fi
+
 if $TLS_VERIFY && [ -z "$TLS_CA_CERT" ]; then
     echo "❌ --tls-verify requires --tls-ca-cert <path> on a standalone spoke (the hub CA cert is not on this box)."
     exit 1
