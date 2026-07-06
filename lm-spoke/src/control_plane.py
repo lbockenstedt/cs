@@ -283,6 +283,13 @@ class CSControlPlane(AgentHostingControlPlane):
                             "recent_errors": c.get("recent_errors") or [],
                             "vmid": vmid,
                             "has_usb": has_usb,
+                            # Carry the persisted per-client sim overrides + config
+                            # up so the WebUI's per-sim override buttons reflect
+                            # what's SET (not just what's running) and STAY across
+                            # refreshes. Without this the override round-trip is
+                            # invisible and the buttons revert on the next frame.
+                            "config": c.get("config") or {},
+                            "overrides": c.get("overrides") or {},
                         })
                     payload["clients"] = clients
                 msg = {

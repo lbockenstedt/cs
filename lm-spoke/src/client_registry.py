@@ -129,7 +129,15 @@ class ClientRegistry:
         async with self._lock:
             entry = self.clients.setdefault(hostname, {"hostname": hostname})
             entry["hostname"] = hostname
-            entry["overrides"] = dict(overrides) if isinstance(overrides, dict) else {}
+            # MERGE (not replace) so a per-sim toggle that sends a single flag
+            # doesn't wipe the client's other overrides. The WebUI sends one flag
+            # per click; the Control panel's "Apply" sends the full set (merge of
+            # the full set == replace, so no behavior change there). clear_overrides
+            # removes them all.
+            cur = dict(entry.get("overrides") or {})
+            if isinstance(overrides, dict):
+                cur.update(overrides)
+            entry["overrides"] = cur
             self.clients[hostname] = entry
             await self._apersist()
             return dict(entry)
