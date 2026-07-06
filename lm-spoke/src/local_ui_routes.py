@@ -53,9 +53,25 @@ def build_local_ui_router(spoke) -> APIRouter:
     async def aggregate_clients():
         rows = []
         now = time.time()
+        # Tier join (client → VM → USB dongle): a client whose Proxmox VM has a
+        # dongle assigned — or that reported its own USB WiFi adapter — is T2.
+        # has_usb is what sim-views.js's csClassifyClient reads; without it every
+        # row falls through to the T1 default (the "everything shows T1" bug).
+        # Mirrors control_plane.py's hub-telemetry path so the local dashboard
+        # and hub Clients views agree.
+        deploy = getattr(spoke, "deploy", None)
+        if deploy is not None:
+            usb_vmids, name_to_vmid = deploy.usb_vmid_index()
+        else:
+            usb_vmids, name_to_vmid = set(), {}
         for hostname, c in spoke.registry.get_all().items():
             last_seen = c.get("last_seen")
             online = bool(last_seen and (now - last_seen) < 300)
+            if deploy is not None:
+                vmid, has_usb = deploy.client_has_usb(
+                    hostname, c, usb_vmids, name_to_vmid)
+            else:
+                vmid, has_usb = None, False
             rows.append({
                 "spoke_id": spoke.spoke_id, "spoke_name": spoke.spoke_id,
                 "spoke_online": True,
@@ -69,6 +85,8 @@ def build_local_ui_router(spoke) -> APIRouter:
                 "last_seen": last_seen if last_seen is not None else "—",
                 "error_count": len(c.get("recent_errors") or []),
                 "recent_errors": c.get("recent_errors") or [],
+                "vmid": vmid,
+                "has_usb": has_usb,
             })
         return {"tenant_id": "default", "clients": rows}
 

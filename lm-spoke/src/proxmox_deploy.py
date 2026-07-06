@@ -252,6 +252,43 @@ class ProxmoxDeploy:
             return None
         return round(sum(recent) / len(recent), 2)
 
+    # ── tier join (client → VM → USB dongle) ─────────────────────────────────
+
+    def usb_vmid_index(self) -> Tuple[set, Dict[str, str]]:
+        """Build ``(usb_vmids, name_to_vmid)`` across all reporting hosts for the
+        client→VM→dongle tier join. ``usb_state`` carries ``{vmid,bus_path}`` for
+        each dongle currently assigned to a VM; ``vms[].name`` (== a sim client's
+        hostname) maps a hostname to its ``vmid``. Membership of that vmid in
+        ``usb_vmids`` is what makes a client T2. Built once per request so the
+        per-client resolve is O(1)."""
+        usb_vmids: set = set()
+        name_to_vmid: Dict[str, str] = {}
+        for st in self.proxmox_states.values():
+            for u in (st.get("usb_state") or []):
+                v = u.get("vmid")
+                if v not in (None, ""):
+                    usb_vmids.add(str(v))
+            for vm in (st.get("vms") or []):
+                nm = str(vm.get("name") or "").strip().lower()
+                v = vm.get("vmid")
+                if nm and v not in (None, ""):
+                    name_to_vmid.setdefault(nm, str(v))
+        return usb_vmids, name_to_vmid
+
+    @staticmethod
+    def client_has_usb(hostname: str, client: Dict[str, Any],
+                       usb_vmids: set, name_to_vmid: Dict[str, str]) -> Tuple[Optional[str], bool]:
+        """``(vmid, has_usb)`` for one client. Client-reported ``has_usb``
+        (standalone clients detect their own USB WiFi adapter) wins; else fall
+        back to the VM→dongle join. Mirrors the original webui-hub
+        classifyClient, which checks ``client.has_usb`` before the vmid set.
+        ``has_usb`` is what csClassifyClient reads to render T2."""
+        vmid = name_to_vmid.get(str(hostname).strip().lower())
+        reported = client.get("has_usb")
+        has_usb = bool(reported) if reported is not None \
+            else bool(vmid and vmid in usb_vmids)
+        return vmid, has_usb
+
     # ── relay payload ────────────────────────────────────────────────────────
 
     def _host_summary(self, st: Dict[str, Any]) -> Dict[str, Any]:

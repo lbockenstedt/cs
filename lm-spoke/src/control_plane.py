@@ -246,30 +246,12 @@ class CSControlPlane(AgentHostingControlPlane):
                     # {vmid,bus_path}; a sim client's hostname equals its VM name,
                     # so match hostname→vm→vmid and test membership in the
                     # USB-assigned vmid set. has_usb is what csClassifyClient reads.
-                    pstates = getattr(deploy, "proxmox_states", {}) or {}
-                    usb_vmids = set()
-                    name_to_vmid = {}
-                    for st in pstates.values():
-                        for u in (st.get("usb_state") or []):
-                            v = u.get("vmid")
-                            if v not in (None, ""):
-                                usb_vmids.add(str(v))
-                        for vm in (st.get("vms") or []):
-                            nm = str(vm.get("name") or "").strip().lower()
-                            v = vm.get("vmid")
-                            if nm and v not in (None, ""):
-                                name_to_vmid.setdefault(nm, str(v))
+                    usb_vmids, name_to_vmid = deploy.usb_vmid_index()
                     clients = []
                     for hn, c in registry.get_all().items():
                         ls = c.get("last_seen")
-                        vmid = name_to_vmid.get(str(hn).strip().lower())
-                        # Client-reported has_usb (standalone clients detect their
-                        # own USB WiFi adapter) wins; else fall back to the
-                        # VM→dongle join. Mirrors the original classifyClient,
-                        # which checks client.has_usb before the vmid/usb_state set.
-                        reported = c.get("has_usb")
-                        has_usb = bool(reported) if reported is not None \
-                            else bool(vmid and vmid in usb_vmids)
+                        vmid, has_usb = deploy.client_has_usb(
+                            hn, c, usb_vmids, name_to_vmid)
                         clients.append({
                             "hostname": hn, "id": hn,
                             "platform": c.get("platform") or "—",
