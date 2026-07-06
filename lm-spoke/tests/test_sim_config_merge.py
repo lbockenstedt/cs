@@ -171,3 +171,26 @@ def test_serialize_ini_round_trips(tmp_path):
     again.read_string(text)
     assert again.get("simulation", "kill_switch") == "off"
     assert again.get("s0", "ssid") == "PSK"
+
+# ── SET_AGENT_CONFIG cache deep-merge (enabled/tenant save must not wipe usb_config) ──
+from cs_spoke import _deep_merge_cfg  # noqa: E402
+
+
+def test_deep_merge_preserves_usb_config_on_enabled_only_save():
+    # Bridge cached the full config (with vidpids); UI then saves enabled/tenant only.
+    cached = {"display_name": "cs", "client_simulation": {
+        "enabled": True, "tenant_id": "default",
+        "usb_config": {"vidpids": [{"vidpid": "2357:012e"}], "max_slots": 24}}}
+    ui_save = {"client_simulation": {"enabled": True, "tenant_id": "default"}}
+    merged = _deep_merge_cfg(cached, ui_save)
+    cs = merged["client_simulation"]
+    assert cs["usb_config"]["vidpids"] == [{"vidpid": "2357:012e"}]  # NOT wiped
+    assert cs["usb_config"]["max_slots"] == 24
+    assert cs["enabled"] is True and cs["tenant_id"] == "default"
+
+
+def test_deep_merge_replaces_vidpids_list_whole_on_real_usb_push():
+    cached = {"client_simulation": {"usb_config": {"vidpids": [{"vidpid": "2357:012e"}]}}}
+    bridge = {"client_simulation": {"usb_config": {"vidpids": [{"vidpid": "1234:5678"}]}}}
+    merged = _deep_merge_cfg(cached, bridge)
+    assert merged["client_simulation"]["usb_config"]["vidpids"] == [{"vidpid": "1234:5678"}]

@@ -51,6 +51,30 @@ except ImportError:
 logger = logging.getLogger("CSSpoke")
 
 
+def _deep_merge_cfg(base, incoming):
+    """Recursively merge ``incoming`` into ``base`` (dicts), replacing non-dict
+    leaves (lists included) whole. Mirrors the pxmx agent's UPDATE_CONFIG merge.
+
+    Used so the SET_AGENT_CONFIG cache doesn't lose sibling sub-trees: the hub
+    sends agent config from TWO sources — the Agent-Config UI save
+    (``client_simulation:{enabled,tenant_id}``, no usb_config) and the CS bridge
+    (``client_simulation:{...,usb_config:{vidpids:[...]}}``). A blind
+    ``cache[agent_id] = cfg`` let the enabled/tenant-only save wipe the cached
+    ``usb_config.vidpids``; the spoke then re-pushed a vidpid-less config on the
+    agent's next reconnect and the provision loop reported
+    "no dongle_vidpids configured". Merging preserves usb_config while still
+    letting a real usb_config push replace the vidpids list."""
+    if not isinstance(base, dict) or not isinstance(incoming, dict):
+        return incoming
+    out = dict(base)
+    for k, v in incoming.items():
+        if isinstance(out.get(k), dict) and isinstance(v, dict):
+            out[k] = _deep_merge_cfg(out[k], v)
+        else:
+            out[k] = v
+    return out
+
+
 class CSSpoke(BaseSpoke):
     """Client simulator spoke. Owns the sim engine (+ registry/queue/deploy later)."""
 
@@ -214,8 +238,15 @@ class CSSpoke(BaseSpoke):
                 # re-send SET_AGENT_CONFIG — see _on_agent_registered. Stored
                 # even if the immediate send below fails (agent momentarily
                 # offline), so the next connect still delivers it.
+                # Deep-merge into the cached config so an enabled/tenant-only UI
+                # save doesn't wipe the usb_config the CS bridge cached (and vice
+                # versa), and push the FULL merged config so even a pre-merge-fix
+                # agent gets its usb_config.vidpids on this push and every
+                # reconnect. Without this, "no dongle_vidpids configured" persists
+                # after any Agent-Config save. See _deep_merge_cfg.
                 cache = getattr(self.control_plane, "_agent_config_cache", None)
                 if cache is not None:
+                    cfg = _deep_merge_cfg(cache.get(agent_id) or {}, cfg)
                     cache[agent_id] = cfg
                 return await self.control_plane.send_to_agent(
                     "UPDATE_CONFIG", cfg, agent_id=agent_id)
