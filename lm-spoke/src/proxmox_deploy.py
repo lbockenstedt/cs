@@ -278,16 +278,23 @@ class ProxmoxDeploy:
     @staticmethod
     def client_has_usb(hostname: str, client: Dict[str, Any],
                        usb_vmids: set, name_to_vmid: Dict[str, str]) -> Tuple[Optional[str], bool]:
-        """``(vmid, has_usb)`` for one client. Client-reported ``has_usb``
-        (standalone clients detect their own USB WiFi adapter) wins; else fall
-        back to the VM→dongle join. Mirrors the original webui-hub
-        classifyClient, which checks ``client.has_usb`` before the vmid set.
-        ``has_usb`` is what csClassifyClient reads to render T2."""
+        """``(vmid, has_usb)`` for one client. The Proxmox USB passthrough is
+        AUTHORITATIVE for T2: a VM whose vmid holds a dongle in ``usb_state`` IS
+        T2 (has_usb=True), regardless of the client's own report. The in-guest
+        ``detect_has_usb`` frequently reports False for a passed-through dongle
+        the guest hasn't yet enumerated as a wireless netdev (driver/boot timing)
+        — and that False USED to override the hypervisor truth, so every
+        auto-provisioned USB VM fell to T1. Now the join wins; the client report
+        can only ADD T2 for a client with no VM mapping (a standalone physical
+        box). ``has_usb`` is what csClassifyClient reads to render T2.
+
+        NOTE: this is the USB-passthrough → T2 signal only. The full T1/T2/T3
+        split (T1 = physical or PCI passthrough 1912:0015; T3 = a specific USB
+        VID:PID) is a separate change — see memory todo-delete-gate-tier-t2-only."""
         vmid = name_to_vmid.get(str(hostname).strip().lower())
-        reported = client.get("has_usb")
-        has_usb = bool(reported) if reported is not None \
-            else bool(vmid and vmid in usb_vmids)
-        return vmid, has_usb
+        joined = bool(vmid and vmid in usb_vmids)   # hypervisor truth
+        reported = bool(client.get("has_usb"))       # fallback for non-VM clients
+        return vmid, (joined or reported)
 
     # ── relay payload ────────────────────────────────────────────────────────
 
