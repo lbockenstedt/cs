@@ -230,6 +230,32 @@ class CSControlPlane(AgentHostingControlPlane):
                 # overlay this spoke's real CentralPoller output so a
                 # hub-connected deployment's Simulations tab gets live data too.
                 payload["central"] = getattr(cs_mod, "central_status", {}) or {}
+                # Client registry → telemetry so the hub's Simulations "Clients"
+                # tab shows this spoke's connected sim clients. The hub reads
+                # data["clients"] (service.get_clients_data); relay_payload never
+                # carried it, so the registry lived only on the spoke (local
+                # /api/clients showed clients but the hub view was always empty).
+                # Mirror local_ui_routes.aggregate_clients' row shape (online =
+                # seen within 300s) so the hub and local Clients views match.
+                registry = getattr(cs_mod, "registry", None)
+                if registry is not None:
+                    now = time.time()
+                    clients = []
+                    for hn, c in registry.get_all().items():
+                        ls = c.get("last_seen")
+                        clients.append({
+                            "hostname": hn, "id": hn,
+                            "platform": c.get("platform") or "—",
+                            "hw_type": c.get("platform") or "",
+                            "online": bool(ls and (now - ls) < 300),
+                            "connected_ssid": c.get("connected_ssid") or "—",
+                            "simulation_id": c.get("simulation_id") or "",
+                            "active_simulations": c.get("active_simulations") or [],
+                            "last_seen": ls if ls is not None else "—",
+                            "error_count": len(c.get("recent_errors") or []),
+                            "recent_errors": c.get("recent_errors") or [],
+                        })
+                    payload["clients"] = clients
                 msg = {
                     "header": {
                         "message_id": str(uuid.uuid4()),
