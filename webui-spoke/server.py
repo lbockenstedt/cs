@@ -28,6 +28,7 @@ import zlib
 from dataclasses import asdict, dataclass
 
 import acme as spoke_acme
+import state
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -262,15 +263,14 @@ def _load_persisted_settings() -> dict[str, Any]:
         return {}
 
 
-_settings_cache: dict[str, Any] = {}
-_settings_cache_time: float = 0.0
+state._settings_cache = {}
+state._settings_cache_time = 0.0
 _SETTINGS_CACHE_TTL: float = 30.0  # seconds
 
 
 def _invalidate_settings_cache() -> None:
-    global _settings_cache, _settings_cache_time
-    _settings_cache = {}
-    _settings_cache_time = 0.0
+    state._settings_cache = {}
+    state._settings_cache_time = 0.0
 
 
 def _save_settings() -> None:
@@ -382,11 +382,11 @@ def _ensure_relay_spoke_id(persisted: dict[str, Any] | None = None) -> str:
 
 
 # ── State snapshot cache (JSON file, no DB) ──────────────────────────────────
-_state_cache_last_save: float = 0.0
+state._state_cache_last_save = 0.0
 STATE_CACHE_MIN_INTERVAL = 10.0  # max one write per 10 s
 
 # WS delta: skip proxmox broadcast when payload hasn't changed
-_last_proxmox_hash: str = ""
+state._last_proxmox_hash = ""
 
 # INI cache: avoid re-parsing simulation.conf + client-setup.conf on every request
 _sim_conf_cache: dict[str, Any] = {
@@ -478,33 +478,6 @@ def _write_atomic_str(path: Path, serialized: str) -> None:
         raise
 
 
-async def _async_save_vm_watchdog() -> None:
-    """Persist VM watchdog state without blocking the event loop."""
-    serialized = json.dumps(vm_watchdog, default=str)
-    try:
-        await asyncio.to_thread(_write_atomic_str, VM_WATCHDOG_FILE, serialized)
-    except Exception as exc:
-        logger.warning("Could not persist VM watchdog state to %s: %s", VM_WATCHDOG_FILE, exc)
-
-
-async def _async_save_commands() -> None:
-    """Persist command queue without blocking the event loop."""
-    serialized = json.dumps(commands, default=str)
-    try:
-        await asyncio.to_thread(_write_atomic_str, COMMAND_QUEUE_FILE, serialized)
-    except Exception as exc:
-        logger.warning("Could not persist command queue to %s: %s", COMMAND_QUEUE_FILE, exc)
-
-
-async def _async_save_reclone_state() -> None:
-    """Persist reclone state without blocking the event loop."""
-    serialized = json.dumps(reclone_state, default=str)
-    try:
-        await asyncio.to_thread(_write_atomic_str, RECLONE_STATE_FILE, serialized)
-    except Exception as exc:
-        logger.warning("Could not persist reclone state to %s: %s", RECLONE_STATE_FILE, exc)
-
-
 def _merge_ini_override(parser: "configparser.ConfigParser", override_path: "Path") -> None:
     """Merge a hub-managed override .conf file on top of an already-parsed INI parser.
 
@@ -526,40 +499,6 @@ def _merge_ini_override(parser: "configparser.ConfigParser", override_path: "Pat
         logger.warning("Could not apply hub override %s: %s", override_path, exc)
 
 
-def _save_state_cache(force: bool = False) -> None:
-    global _state_cache_last_save
-    now = time.time()
-    if not force and (now - _state_cache_last_save) < STATE_CACHE_MIN_INTERVAL:
-        return
-    try:
-        cache = {
-            "proxmox_state": dict(proxmox_state),
-            "proxmox_states": {k: {ek: ev for ek, ev in v.items() if ek != "vms"} for k, v in proxmox_states.items()},
-            "central_status": central_status,
-            "central_wireless_clients": dict(central_wireless_clients),
-            "repo_state": dict(repo_state),
-            "ts": now,
-        }
-        _atomic_write_json(STATE_CACHE_FILE, cache)
-        _state_cache_last_save = now
-    except Exception as exc:
-        logger.warning("Could not write state cache: %s", exc)
-
-
-def _save_commands() -> None:
-    try:
-        _atomic_write_json(COMMAND_QUEUE_FILE, commands)
-    except Exception as exc:
-        logger.warning("Could not persist command queue to %s: %s", COMMAND_QUEUE_FILE, exc)
-
-
-def _save_reclone_state() -> None:
-    try:
-        _atomic_write_json(RECLONE_STATE_FILE, reclone_state)
-    except Exception as exc:
-        logger.warning("Could not persist reclone state to %s: %s", RECLONE_STATE_FILE, exc)
-
-
 def _save_relay_state() -> None:
     try:
         _atomic_write_json(RELAY_STATE_FILE, relay_state)
@@ -567,139 +506,7 @@ def _save_relay_state() -> None:
         logger.warning("Could not persist relay state to %s: %s", RELAY_STATE_FILE, exc)
 
 
-def _save_update_state() -> None:
-    try:
-        _atomic_write_json(UPDATE_STATE_FILE, update_state)
-    except Exception as exc:
-        logger.warning("Could not persist update state to %s: %s", UPDATE_STATE_FILE, exc)
-
-
-def _save_vm_watchdog() -> None:
-    try:
-        _atomic_write_json(VM_WATCHDOG_FILE, vm_watchdog)
-    except Exception as exc:
-        logger.warning("Could not persist VM watchdog state to %s: %s", VM_WATCHDOG_FILE, exc)
-
-
-def _load_state_cache() -> None:
-    """Restore last-known state from disk so the UI renders immediately on restart
-    instead of showing empty state for up to one full agent poll interval (60 s)."""
-    try:
-        if not STATE_CACHE_FILE.exists():
-            return
-        cache = json.loads(STATE_CACHE_FILE.read_text(encoding="utf-8"))
-        age = time.time() - cache.get("ts", 0)
-        cached_px = cache.get("proxmox_state", {})
-        if cached_px:
-            proxmox_state.update(cached_px)
-            # Restore connected status only if last_seen is within OFFLINE_TIMEOUT;
-            # otherwise agent has gone quiet and we should show disconnected.
-            last_seen_ts = cached_px.get("last_seen")
-            if last_seen_ts and (time.time() - last_seen_ts) <= OFFLINE_TIMEOUT:
-                proxmox_state["connected"] = cached_px.get("connected", False)
-            else:
-                proxmox_state["connected"] = False
-        central_status.update(cache.get("central_status", {}))
-        central_wireless_clients.update(cache.get("central_wireless_clients", {}))
-        # Restore per-agent states (without VMs — those re-populate on first telemetry push).
-        # Mark connected=False if the agent hasn't been seen within OFFLINE_TIMEOUT.
-        cached_px_states = cache.get("proxmox_states", {})
-        for hn, st in cached_px_states.items():
-            if not isinstance(st, dict):
-                continue
-            last_seen_ts = st.get("last_seen")
-            connected = bool(st.get("connected", False)) and bool(
-                last_seen_ts and (time.time() - last_seen_ts) <= OFFLINE_TIMEOUT
-            )
-            proxmox_states[hn] = {**st, "connected": connected, "vms": []}
-        cached_repo = cache.get("repo_state", {})
-        if cached_repo:
-            # Restore last_sync timestamp and last error for display, but mark
-            # synced=False — we haven't actually synced since this restart yet.
-            repo_state["last_sync"] = cached_repo.get("last_sync")
-            repo_state["error"] = cached_repo.get("error")
-            repo_state["synced"] = False
-        logger.info("Restored state cache from disk (age=%.0fs)", age)
-    except Exception as exc:
-        logger.warning("Could not load state cache: %s", exc)
-
-
-def _load_commands() -> None:
-    try:
-        if not COMMAND_QUEUE_FILE.exists():
-            return
-        raw = json.loads(COMMAND_QUEUE_FILE.read_text(encoding="utf-8"))
-        if not isinstance(raw, list):
-            raise ValueError("command queue must be a list")
-        now = time.time()
-        changed = False
-        restored: list[dict[str, Any]] = []
-        for entry in raw:
-            if not isinstance(entry, dict):
-                changed = True
-                continue
-            cmd = dict(entry)
-            if cmd.get("status") in ("executing", "delivered"):
-                cmd["status"] = "pending"
-                cmd["updated_at"] = now
-                changed = True
-            restored.append(cmd)
-        commands[:] = restored
-        expired, purged = _cleanup_commands_locked(now)
-        if expired or purged:
-            changed = True
-        if changed:
-            _save_commands()
-        logger.info("Restored %d command(s) from disk", len(commands))
-    except Exception as exc:
-        logger.warning("Could not load command queue: %s", exc)
-
-
-def _load_reclone_state() -> None:
-    try:
-        if not RECLONE_STATE_FILE.exists():
-            return
-        raw = json.loads(RECLONE_STATE_FILE.read_text(encoding="utf-8"))
-        if not isinstance(raw, dict):
-            raise ValueError("reclone state must be an object")
-        for key in reclone_state:
-            if key in raw:
-                reclone_state[key] = raw[key]
-        changed = False
-        if reclone_state.get("status") == "running":
-            reclone_state["status"] = "interrupted"
-            reclone_state["current_vm"] = None
-            reclone_state["started_at"] = None
-            log_entry = {
-                "vmid": None,
-                "name": "System",
-                "status": "interrupted",
-                "timestamp": iso_utcnow(),
-                "message": "Rolling reclone interrupted by restart",
-            }
-            reclone_state["log"] = list(reclone_state.get("log") or []) + [log_entry]
-            reclone_state["log"] = reclone_state["log"][-200:]
-            changed = True
-        if reclone_state.get("status") == "completed":
-            last_run = reclone_state.get("last_run") or {}
-            ts = _parse_ts(last_run.get("timestamp"))
-            if ts and (time.time() - ts) >= 8 * 3600:
-                reclone_state.update({
-                    "status": "idle", "type": None, "total": 0,
-                    "completed": 0, "failed": 0, "current_vm": None,
-                    "log": [], "started_at": None, "last_run": None,
-                    "auto_recovery_log": [],
-                })
-                changed = True
-        if changed:
-            _save_reclone_state()
-        logger.info("Restored reclone state from disk")
-    except Exception as exc:
-        logger.warning("Could not load reclone state: %s", exc)
-
-
 def _load_relay_state() -> None:
-    global relay_registration_refresh_needed
     try:
         if not RELAY_STATE_FILE.exists():
             return
@@ -710,79 +517,11 @@ def _load_relay_state() -> None:
             if key in raw:
                 relay_state[key] = raw[key]
         relay_state["connected"] = False
-        relay_registration_refresh_needed = bool(relay_state.get("enabled"))
+        state.relay_registration_refresh_needed = bool(relay_state.get("enabled"))
         _save_relay_state()
         logger.info("Restored relay state from disk")
     except Exception as exc:
         logger.warning("Could not load relay state: %s", exc)
-
-
-def _load_update_state() -> None:
-    try:
-        if not UPDATE_STATE_FILE.exists():
-            return
-        raw = json.loads(UPDATE_STATE_FILE.read_text(encoding="utf-8"))
-        if not isinstance(raw, dict):
-            raise ValueError("update state must be an object")
-        for key in update_state:
-            # Never restore current_version from disk — it must always reflect
-            # the INSTALLER_VERSION file so that a self-update restart shows the
-            # new version rather than the stale pre-update value.
-            if key == "current_version":
-                continue
-            if key in raw:
-                update_state[key] = raw[key]
-        if update_state.get("update_in_progress"):
-            update_state["update_in_progress"] = False
-            update_state["update_error"] = "Update interrupted by restart"
-            _save_update_state()
-        logger.info("Restored update state from disk")
-    except Exception as exc:
-        logger.warning("Could not load update state: %s", exc)
-
-
-def _load_vm_watchdog() -> None:
-    try:
-        if not VM_WATCHDOG_FILE.exists():
-            return
-        raw = json.loads(VM_WATCHDOG_FILE.read_text(encoding="utf-8"))
-        if not isinstance(raw, dict):
-            raise ValueError("vm watchdog state must be an object")
-        restored: dict[str, dict[str, Any]] = {}
-        changed = False
-        for raw_vmid, entry in raw.items():
-            if not isinstance(entry, dict):
-                changed = True
-                continue
-            try:
-                vmid_key = str(int(raw_vmid))
-            except (TypeError, ValueError):
-                changed = True
-                continue
-            clone_completed_at = _parse_ts(entry.get("clone_completed_at"))
-            if clone_completed_at is None:
-                changed = True
-                continue
-            try:
-                reclone_count = max(0, int(entry.get("reclone_count", 0) or 0))
-            except (TypeError, ValueError):
-                reclone_count = 0
-                changed = True
-            normalized = {
-                "clone_completed_at": clone_completed_at,
-                "reclone_count": reclone_count,
-                "hostname": str(entry.get("hostname") or "").strip(),
-            }
-            if entry != normalized or raw_vmid != vmid_key:
-                changed = True
-            restored[vmid_key] = normalized
-        vm_watchdog.clear()
-        vm_watchdog.update(restored)
-        if changed:
-            _save_vm_watchdog()
-        logger.info("Restored VM watchdog state from disk")
-    except Exception as exc:
-        logger.warning("Could not load VM watchdog state: %s", exc)
 
 
 def _normalize_relay_enabled(value: Any) -> str:
@@ -1042,164 +781,6 @@ else:
     }
 
 
-def _reset_central_runtime_tokens() -> None:
-    global central_auth_error
-    central_token["access_token"] = None
-    central_token["refresh_token"] = None
-    central_token["expires_at"] = 0.0
-    central_auth_error = None
-
-
-def _get_cached_settings() -> dict[str, Any]:
-    global _settings_cache, _settings_cache_time
-    now = time.monotonic()
-    if _settings_cache and (now - _settings_cache_time) < _SETTINGS_CACHE_TTL:
-        return copy.deepcopy(_settings_cache)
-
-    cfg = dict(settings["central_config"])
-    # Strip all secrets — return only non-sensitive fields + presence flags.
-    # Runtime token flags are refreshed in api_settings_get() so they never go stale.
-    for secret_key in ("client_secret", "access_token", "refresh_token"):
-        cfg.pop(secret_key, None)
-    cfg["access_token_configured"] = bool(settings["central_config"].get("access_token") or central_token.get("access_token"))
-    cfg["refresh_token_configured"] = bool(settings["central_config"].get("refresh_token") or central_token.get("refresh_token"))
-    cfg["client_secret_configured"] = bool(settings["central_config"].get("client_secret"))
-
-    _settings_cache = {
-        "repo_url": REPO_URL,
-        "repo_branch": settings.get("repo_branch", ""),
-        "repo_sync_interval": settings.get("repo_sync_interval", SYNC_INTERVAL),
-        "session_timeout_minutes": int(settings.get("session_timeout_minutes", 30)),
-        "github_token_configured": bool(settings.get("github_token")),
-        "hub_managed": bool(settings.get("hub_managed", False)),
-        "hub_isolation_timeout": int(settings.get("hub_isolation_timeout", 3600)),  # Expose the stored isolation timeout so the setup form can render the current safeguard value.
-        "central_api": _public_central_api_settings(),
-        "central_config": cfg,
-        "site_mappings": settings["site_mappings"],
-        "spoke_monitored_items": settings.get("spoke_monitored_items", []),
-        "monitored_checks": settings["monitored_checks"],
-        "hardware_checks": settings.get("hardware_checks", []),
-        "usb_vidpids": settings.get("usb_vidpids", "[]"),
-        "usb_missing_timeout": settings.get("usb_missing_timeout", "60"),
-        "vm_image_1_template_id": settings.get("vm_image_1_template_id", settings.get("usb_linux_template_id", settings.get("usb_template_id", "100"))),
-        "vm_image_1_template_spec": settings.get("vm_image_1_template_spec", _resolved_template_spec(settings, 1)),
-        "vm_image_2_template_id": settings.get("vm_image_2_template_id", settings.get("usb_windows_template_id", "200")),
-        "vm_image_2_template_spec": settings.get("vm_image_2_template_spec", _resolved_template_spec(settings, 2)),
-        "vm_image_1_pct": settings.get("vm_image_1_pct", "50"),
-        "usb_auto_provision": settings.get("usb_auto_provision", "off"),
-        "use_all_dongles": _setting_bool("use_all_dongles", False),
-        "usb_max_slots": settings.get("usb_max_slots", "24"),
-        "cpu_provision_threshold": settings.get("cpu_provision_threshold", "80"),
-        "cpu_delete_threshold": settings.get("cpu_delete_threshold", "90"),
-        "mem_provision_threshold": settings.get("mem_provision_threshold", "80"),
-        "mem_delete_threshold": settings.get("mem_delete_threshold", "90"),
-        "vmid_start": int(settings.get("vmid_start", 0) or 0),
-        "usb_ignored_vidpids": settings.get("usb_ignored_vidpids", "[]"),
-        "ignored_hostnames": settings.get("ignored_hostnames", '["sim-rpi-0000"]'),
-        "vm_silent_timeout": settings.get("vm_silent_timeout", "24"),
-        "reclone_schedule_enabled": settings.get("reclone_schedule_enabled", "off"),
-        "reclone_schedule_cron": settings.get("reclone_schedule_cron", "sunday 02:00"),
-        "reclone_concurrency": settings.get("reclone_concurrency", "1"),
-        "protected_vmids": settings.get("protected_vmids", ""),
-        "l1_vlan_start": settings.get("l1_vlan_start", "100"),
-        "l1_vlan_end": settings.get("l1_vlan_end", "199"),
-        "guest_agent_watchdog_enabled": settings.get("guest_agent_watchdog_enabled", "on"),
-        "watchdog_reboot_enabled": settings.get("watchdog_reboot_enabled", "on"),
-        "guest_agent_grace_minutes": settings.get("guest_agent_grace_minutes", "20"),
-        "guest_agent_check_interval_minutes": settings.get("guest_agent_check_interval_minutes", "10"),
-        "guest_agent_reboot_after_minutes": settings.get("guest_agent_reboot_after_minutes", "10"),
-        "guest_agent_reclone_after_minutes": settings.get("guest_agent_reclone_after_minutes", "30"),
-        "notifications": _public_notification_settings(),
-        "relay_enabled": settings.get("relay_enabled", "off"),
-        "relay_server_url": settings.get("relay_server_url", ""),
-        "hub_tls_verify": settings.get("hub_tls_verify", "off"),
-        "relay_spoke_name": settings.get("relay_spoke_name", ""),
-        "relay_tenant_hint": settings.get("relay_tenant_hint", settings.get("relay_tenant_id", "")),
-        "relay_spoke_id": settings.get("relay_spoke_id", ""),
-        "relay_tenant_id": settings.get("relay_tenant_id", settings.get("relay_tenant_hint", "")),
-        "relay_poll_interval": settings.get("relay_poll_interval", RELAY_INTERVAL_DEFAULT),
-        "relay_api_key_configured": bool(settings.get("relay_api_key")),
-        "admin_password_configured": bool(_admin_password()),
-        "auth_provider": _normalize_spoke_auth_provider(settings.get("auth_provider", "local")),
-        "auth_ldap_url": settings.get("auth_ldap_url", ""),
-        "auth_ldap_bind_dn": settings.get("auth_ldap_bind_dn", ""),
-        "auth_ldap_bind_password_configured": bool(settings.get("auth_ldap_bind_password")),
-        "auth_ldap_user_base": settings.get("auth_ldap_user_base", ""),
-        "auth_ldap_user_filter": settings.get("auth_ldap_user_filter", "(&(objectClass=user)(sAMAccountName={username}))"),
-        "auth_ldap_group_admin": settings.get("auth_ldap_group_admin", ""),
-        "auth_ldap_group_viewer": settings.get("auth_ldap_group_viewer", ""),
-        "auth_radius_host": settings.get("auth_radius_host", ""),
-        "auth_radius_port": int(settings.get("auth_radius_port", 1812)),
-        "auth_radius_secret_configured": bool(settings.get("auth_radius_secret")),
-        "auth_radius_role_attr": settings.get("auth_radius_role_attr", "Filter-Id"),
-        "auth_radius_admin_val": settings.get("auth_radius_admin_val", "admin"),
-        "auth_tacacs_host": settings.get("auth_tacacs_host", ""),
-        "auth_tacacs_port": int(settings.get("auth_tacacs_port", 49)),
-        "auth_tacacs_secret_configured": bool(settings.get("auth_tacacs_secret")),
-        "auth_tacacs_admin_priv": int(settings.get("auth_tacacs_admin_priv", 15)),
-        "spoke_tls": settings.get("spoke_tls", "off"),
-        "proxmox_api_token_configured": bool(settings.get("proxmox_api_token", "").strip()),
-        "proxmox_tokens_configured": {
-            hn: bool(str(tok or "").strip())
-            for hn, tok in (settings.get("proxmox_tokens") or {}).items()
-        },
-        "proxmox_config": copy.deepcopy(settings.get("proxmox_config") or {}),
-    }
-    _settings_cache_time = now
-    return copy.deepcopy(_settings_cache)
-
-
-
-def _public_settings() -> dict[str, Any]:
-    payload = _get_cached_settings()
-    payload["central_config"]["access_token_configured"] = bool(
-        settings["central_config"].get("access_token") or central_token.get("access_token")
-    )
-    payload["central_config"]["refresh_token_configured"] = bool(
-        settings["central_config"].get("refresh_token") or central_token.get("refresh_token")
-    )
-    payload["admin_password_configured"] = bool(_admin_password())
-    payload["proxmox_config"] = copy.deepcopy(settings.get("proxmox_config") or {})
-    return payload
-
-
-def _public_central_api_settings() -> dict[str, Any]:
-    cfg = copy.deepcopy(settings.get("central_api", _default_central_api_settings()))
-    cfg.setdefault("classic", {})
-    cfg.setdefault("central", {})
-    cfg["classic"].pop("password", None)
-    cfg["central"].pop("client_secret", None)
-    cfg["classic"]["password_configured"] = bool(settings.get("central_api", {}).get("classic", {}).get("password"))
-    cfg["central"]["client_secret_configured"] = bool(settings.get("central_api", {}).get("central", {}).get("client_secret"))
-    return cfg
-
-
-
-def _public_notification_settings() -> dict[str, Any]:
-    notif = copy.deepcopy(settings.get("notifications", {}))
-    smtp_password = str(notif.pop("smtp_password", "") or "")
-    teams_webhook_url = str(notif.pop("teams_webhook_url", "") or "")
-    notif["smtp_password_configured"] = bool(smtp_password)
-    notif["teams_webhook_url_configured"] = bool(teams_webhook_url)
-    return notif
-
-
-
-def _public_acme_settings(cfg: Any) -> dict[str, Any]:
-    data = asdict(cfg)
-    credentials = dict(cfg.dns_credentials or {})
-    data["dns_credentials"] = {key: "" for key in credentials}
-    data["dns_credentials_configured"] = {key: bool(value) for key, value in credentials.items()}
-    data["cf_api_token_set"] = bool(credentials.get("cf_api_token"))
-    data["he_ddns_key_set"] = bool(credentials.get("he_ddns_key"))
-    return data
-
-
-def _sync_central_runtime_config() -> None:
-    settings["central_config"] = _build_runtime_central_config(settings.get("central_api", _default_central_api_settings()), settings.get("central_config", {}))
-    _reset_central_runtime_tokens()
-
-
 ALLOWED_PLATFORMS = {"linux", "windows"}
 SIMULATION_SECTION_KEYS = {
     "wsite",
@@ -1253,26 +834,26 @@ ALLOWED_CONFIG_SECTIONS = {"simulation", "address", "server", *(f"s{i}" for i in
 # ── Aruba Central state ───────────────────────────────────────────────────────
 # central_token is declared above, initialised from persisted settings.
 # {wsite: {check_id: {status, count, ts, check_name, check_type}}}
-central_status: dict[str, dict[str, Any]] = {}
-central_wireless_clients: dict[str, int] = {}   # wsite → client count from Central API
+state.central_status = {}
+state.central_wireless_clients = {}   # wsite → client count from Central API
 # wsite → list of (timestamp_float, client_count_int) samples (rolling 60 min)
 _client_count_samples: dict[str, list[tuple[float, int]]] = {}
 CLIENT_COUNT_WINDOW = 3600   # seconds of history to keep
 CLIENT_COUNT_MIN_SAMPLES = 3  # minimum samples before flagging
 CLIENT_COUNT_DROP_PCT = 25.0  # percent drop that triggers alert
-central_history: list[dict[str, Any]] = []   # in-memory 24-h window
-central_auth_error: str | None = None          # last auth/token failure message
+state.central_history = []   # in-memory 24-h window
+state.central_auth_error = None          # last auth/token failure message
 history_lock = asyncio.Lock()
 # Browse data for distributed mode — populated each poll cycle (new_central only)
-central_browse_alerts: list[dict[str, Any]] = []
-central_browse_insights: list[dict[str, Any]] = []
-central_browse_devices_by_site: dict[str, list[dict[str, Any]]] = {}
-central_browse_clients_by_site: dict[str, dict[str, Any]] = {}
-central_browse_clients: list[dict[str, Any]] = []  # individual client records
+state.central_browse_alerts = []
+state.central_browse_insights = []
+state.central_browse_devices_by_site = {}
+state.central_browse_clients_by_site = {}
+state.central_browse_clients = []  # individual client records
 # Server-side cache for /api/central/browse — avoids hammering Central API on every tab open.
-_central_browse_response_cache: dict[str, Any] = {}
-_central_browse_response_cached_at: float = 0.0
-_central_browse_fetching: bool = False  # lock to prevent concurrent on-demand fetches
+state._central_browse_response_cache = {}
+state._central_browse_response_cached_at = 0.0
+state._central_browse_fetching = False  # lock to prevent concurrent on-demand fetches
 NC_BROWSE_SERVER_CACHE_TTL_S: int = 300  # 5 minutes — same as hub
 # Serialise all git operations (fetch, reset, add, commit, push) on REPO_DIR.
 # Running two git commands concurrently on the same repo creates .git/index.lock
@@ -1315,13 +896,13 @@ except Exception:
     pass
 
 # Populated during each Central poll cycle from alert objects.
-hardware_alert_devices: dict[str, dict[str, list[str]]] = {}
+state.hardware_alert_devices = {}
 
 # In hub-connected (centralized) mode the hub computes hardware_alerts and pushes the
 # full pre-built list (id/name/device_type/total/sites) to the spoke.  We cache it
 # here so _hw_alerts_payload() can return it when local settings["hardware_checks"] is
 # empty (i.e. the spoke has no locally-configured checks).
-_hub_fed_hardware_alerts: list[dict] = []
+state._hub_fed_hardware_alerts = []
 
 # Previous check states for transition detection (green→red email/Teams trigger).
 # {check_key: "OK"|"ERROR"}  where check_key = f"{check_id}:{wsite}" or just check_id for hw
@@ -1442,173 +1023,6 @@ async def client_history_saver() -> None:
         await asyncio.sleep(CLIENT_SAVE_INTERVAL)
 
 
-
-def _central_cfg() -> dict[str, str]:
-    return settings.get("central_config", {})
-
-
-def _is_new_central_api() -> bool:
-    return _central_cfg().get("api_version") == "new_central"
-
-
-def _central_ready() -> bool:
-    """Minimum config needed to make API calls."""
-    cfg = _central_cfg()
-    if not cfg.get("cluster_url"):
-        return False
-    if _is_new_central_api():
-        # New Central: need client_id + client_secret to auto-fetch tokens
-        return bool(cfg.get("client_id") and cfg.get("client_secret"))
-    # Classic: need a token already loaded or stored
-    return bool(cfg.get("access_token") or central_token.get("access_token"))
-
-
-def _central_token_state() -> dict[str, str]:
-    """Return {state, detail} describing the current Central API auth status.
-
-    States: not_configured | auth_failed | token_expired | connected
-    """
-    cfg = _central_cfg()
-    if not cfg.get("cluster_url"):
-        return {"state": "not_configured", "detail": "No cluster URL — configure in Setup tab"}
-    if _is_new_central_api():
-        if not cfg.get("client_id") or not cfg.get("client_secret"):
-            return {"state": "not_configured", "detail": "Client ID / Client Secret required for Central mode"}
-    else:
-        if not cfg.get("access_token") and not central_token.get("access_token"):
-            if settings.get("central_api", {}).get("mode") == "classic":
-                return {"state": "not_configured", "detail": "Classic mode is saved separately — use Test Connection in Setup to validate credentials."}
-            return {"state": "not_configured", "detail": "No access token — configure in Setup tab"}
-    tok = central_token.get("access_token")
-    if not tok:
-        err = central_auth_error or "Authentication not yet attempted"
-        return {"state": "auth_failed", "detail": err}
-    if time.time() >= central_token.get("expires_at", 0):
-        if central_auth_error:
-            return {"state": "auth_failed", "detail": central_auth_error}
-        if _can_refresh():
-            return {"state": "token_expired", "detail": "Token has expired — will refresh on next poll"}
-        return {"state": "token_expired", "detail": "Token has expired — re-enter a valid token in Setup tab"}
-    return {"state": "connected", "detail": "Token valid"}
-
-
-async def _apply_central_feed(feed: dict) -> None:
-    """Apply hub-provided Central data feed to local in-memory state (centralized mode)."""
-    global central_status, central_wireless_clients, hardware_alert_devices, _hub_fed_hardware_alerts
-    new_status = feed.get("status") or {}
-    new_wireless = feed.get("wireless_clients") or {}
-    new_total = feed.get("total_clients") or {}
-    token_valid = bool(feed.get("token_valid", False))
-    hardware_alerts = feed.get("hardware_alerts") or []
-
-    central_status.clear()
-    for wsite, checks in new_status.items():
-        if isinstance(checks, dict):
-            central_status[wsite] = {
-                cid: dict(v) for cid, v in checks.items() if isinstance(v, dict)
-            }
-    central_wireless_clients.clear()
-    central_wireless_clients.update({w: int(c or 0) for w, c in new_wireless.items()})
-
-    # In centralized mode the hub polls Central and pushes total_clients (wired + wireless).
-    # Populate _client_count_samples so the Sites health tab works the same way
-    # it does in distributed mode (where _poll_central_once fills the samples).
-    # Prefer total_clients; fall back to wireless_clients for older hub versions.
-    counts_for_health = new_total or new_wireless
-    if counts_for_health:
-        now_cc = time.time()
-        cutoff_cc = now_cc - CLIENT_COUNT_WINDOW
-        for _wsite, _count in counts_for_health.items():
-            _val = int(_count or 0)
-            existing = _client_count_samples.get(_wsite)
-            if not existing:
-                # First-time feed for this site: seed CLIENT_COUNT_MIN_SAMPLES synthetic
-                # backdated samples so the UI can show status immediately rather than
-                # staying in "Collecting" until 3 real polls have accumulated.
-                _client_count_samples[_wsite] = [
-                    (now_cc - (CLIENT_COUNT_MIN_SAMPLES - i) * 60, _val)
-                    for i in range(CLIENT_COUNT_MIN_SAMPLES)
-                ]
-            else:
-                _client_count_samples[_wsite].append((now_cc, _val))
-                _client_count_samples[_wsite] = [
-                    s for s in _client_count_samples[_wsite] if s[0] >= cutoff_cc
-                ]
-        _save_client_count_baseline()
-
-    hardware_alert_devices = {}
-    for alert in hardware_alerts:
-        if not isinstance(alert, dict):
-            continue
-        check_id = str(alert.get("id") or "").strip()
-        if not check_id:
-            continue
-        sites = alert.get("sites") or {}
-        site_devices: dict[str, list[str]] = {}
-        for wsite, info in sites.items():
-            if not isinstance(info, dict):
-                continue
-            devices = [str(device).strip() for device in info.get("devices") or [] if str(device).strip()]
-            if devices:
-                site_devices[str(wsite)] = devices
-        hardware_alert_devices[check_id] = site_devices
-
-    # Cache the full pre-built hardware_alerts list from the hub feed.  This is used
-    # by _hw_alerts_payload() when the spoke has no locally-configured hardware_checks
-    # (i.e. in hub-connected / centralized mode).  The hub already includes id, name,
-    # device_type, total, and sites — exactly the shape _hw_alerts_payload() produces.
-    _hub_fed_hardware_alerts = [a for a in hardware_alerts if isinstance(a, dict) and a.get("id")]
-
-    # Update token state so spoke Central tab shows connected status
-    if token_valid:
-        central_token.setdefault("access_token", "_hub_managed_")
-        central_token["expires_at"] = time.time() + 3600
-    else:
-        central_token["access_token"] = None
-        central_token["expires_at"] = 0.0
-
-    # Apply browse data pushed by the hub (centralized mode only).
-    # The hub filters the browse cache to only this spoke's assigned sites before pushing.
-    global central_browse_alerts, central_browse_insights, central_browse_devices_by_site, central_browse_clients_by_site, central_browse_clients
-    browse_alerts = feed.get("central_browse_alerts")
-    browse_insights = feed.get("central_browse_insights")
-    browse_clients_by_site = feed.get("central_browse_clients_by_site")
-    browse_clients = feed.get("central_browse_clients")  # individual records
-    browse_devices = feed.get("central_browse_devices_by_site")
-    browse_changed = False
-    if isinstance(browse_alerts, list):
-        central_browse_alerts = browse_alerts
-        browse_changed = True
-    if isinstance(browse_insights, list):
-        central_browse_insights = browse_insights
-        browse_changed = True
-    if isinstance(browse_clients_by_site, dict):
-        central_browse_clients_by_site = browse_clients_by_site
-        browse_changed = True
-    if isinstance(browse_clients, list):
-        central_browse_clients = browse_clients
-        browse_changed = True
-    if isinstance(browse_devices, dict):
-        central_browse_devices_by_site = browse_devices
-        browse_changed = True
-    if browse_changed:
-        # Invalidate the server-side browse response cache so the next API call
-        # assembles fresh data from the hub-pushed browse globals.
-        global _central_browse_response_cache, _central_browse_response_cached_at
-        _central_browse_response_cache = {}
-        _central_browse_response_cached_at = 0.0
-
-    await broadcast({
-        "type": "central_update",
-        "status": _central_status_payload(),
-        "wireless_clients": dict(central_wireless_clients),
-        "hardware_alerts": _hw_alerts_payload(),
-        "client_count_status": _client_count_payload(),
-        "ts": time.time(),
-        "token_state": _central_token_state(),
-    })
-
-
 def _can_refresh() -> bool:
     """True when we can obtain a fresh token automatically."""
     cfg = _central_cfg()
@@ -1621,194 +1035,6 @@ def _can_refresh() -> bool:
 
 # New Central GLP SSO token endpoint
 _NEW_CENTRAL_TOKEN_URL = "https://sso.common.cloud.hpe.com/as/token.oauth2"
-
-
-async def _fetch_new_central_token(client: httpx.AsyncClient) -> tuple[bool, str]:
-    """Obtain a token for New Central via HPE GreenLake client_credentials grant."""
-    cfg = _central_cfg()
-    try:
-        resp = await client.post(
-            _NEW_CENTRAL_TOKEN_URL,
-            data={
-                "grant_type": "client_credentials",
-                "client_id": cfg["client_id"],
-                "client_secret": cfg["client_secret"],
-            },
-            headers={"Content-Type": "application/x-www-form-urlencoded"},
-            timeout=15,
-        )
-        if not resp.is_success:
-            return False, f"Token request failed (HTTP {resp.status_code}): {resp.text[:300]}"
-        payload = resp.json()
-        token = payload.get("access_token")
-        if not token:
-            return False, f"No access_token in GLP response: {resp.text[:300]}"
-        expires_in = payload.get("expires_in", 7200)
-        central_token["access_token"] = token
-        central_token["refresh_token"] = None
-        central_token["expires_at"] = time.time() + expires_in - 60
-        logger.info("New Central token obtained via client_credentials (expires in %ss)", expires_in)
-        return True, "Token obtained via client_credentials."
-    except Exception as exc:
-        return False, f"GLP token request error: {exc}"
-
-
-async def _fetch_central_token(client: httpx.AsyncClient) -> tuple[bool, str]:
-    """Load/obtain the access token and verify it against a probe endpoint.
-
-    For New Central: obtains a token via GLP client_credentials grant.
-    For Classic: loads the user-pasted token from settings and probes the API.
-    Returns (success, detail_message).
-    """
-    global central_auth_error
-    if _is_new_central_api():
-        ok, msg = await _fetch_new_central_token(client)
-        if not ok:
-            central_auth_error = msg
-            return False, msg
-        # Probe to confirm the token works against the base URL
-        ok, msg = await _probe_central_token(client)
-        central_auth_error = None if ok else msg
-        return ok, msg
-
-    cfg = _central_cfg()
-    token = cfg.get("access_token", "").strip()
-    if not token:
-        return False, "No access token configured."
-
-    central_token["access_token"] = token
-    if cfg.get("refresh_token"):
-        central_token["refresh_token"] = cfg["refresh_token"]
-    central_token["expires_at"] = time.time() + 7200
-
-    ok, msg = await _probe_central_token(client)
-    central_auth_error = None if ok else msg
-    return ok, msg
-
-
-async def _probe_central_token(client: httpx.AsyncClient) -> tuple[bool, str]:
-    """Probe the Central API to confirm the in-memory token is accepted."""
-    cfg = _central_cfg()
-    base_url = cfg["cluster_url"].rstrip("/")
-    token = central_token.get("access_token", "")
-    headers = {"Authorization": f"Bearer {token}"}
-
-    if _is_new_central_api():
-        # New Central v1alpha1 — sites-health is the lightest reliable endpoint
-        probe_urls = [
-            (f"{base_url}/network-monitoring/v1alpha1/sites-health", {}),
-            (f"{base_url}/network-monitoring/v1alpha1/devices", {"limit": 1}),
-        ]
-    else:
-        # Classic Central
-        probe_urls = [
-            (f"{base_url}/configuration/v2/groups", {"limit": 1, "offset": 0}),
-            (f"{base_url}/monitoring/v1/alerts", {"limit": 1}),
-            (f"{base_url}/monitoring/v2/alerts", {"limit": 1}),
-            (f"{base_url}/platform/v1/customer_id", {}),
-        ]
-    last_status: int = 0
-    last_body: str = ""
-    for url, params in probe_urls:
-        try:
-            logger.info("Central probe → GET %s params=%s", url, params)
-            resp = await client.get(url, headers=headers, params=params, timeout=15)
-            last_status = resp.status_code
-            last_body = resp.text[:400]
-            logger.info("Central probe ← %s: %s", resp.status_code, last_body[:200])
-            if resp.status_code == 200:
-                logger.info("Aruba Central token validated via %s", url)
-                return True, "Token validated successfully."
-            if resp.status_code == 401:
-                # Token is definitely invalid — try refresh before giving up
-                central_token["access_token"] = None
-                ok, msg = await _refresh_central_token(client)
-                if ok:
-                    return True, f"Access token was expired; successfully refreshed. {msg}"
-                return False, f"Token rejected (401). Central response: {last_body}"
-            if resp.status_code == 400:
-                # 400 means the endpoint exists and accepted our token but wants different params.
-                # That's enough to confirm the token is valid.
-                logger.info("Central token confirmed via %s (400 = endpoint live, token accepted)", url)
-                return True, "Token validated successfully (endpoint reachable, token accepted)."
-            # 403/404 = wrong scope or endpoint missing — try next probe
-            logger.info("Central probe %s returned %s — trying next", url, resp.status_code)
-        except Exception as exc:
-            return False, f"Connection error reaching {base_url}: {exc}"
-
-    return False, (
-        f"Could not confirm token with Central (last HTTP status: {last_status}). "
-        f"Response: {last_body}. "
-        "Check the Cluster URL and that the token has monitoring or configuration scope."
-    )
-
-
-async def _refresh_central_token(client: httpx.AsyncClient) -> tuple[bool, str]:
-    """Refresh/renew the access token.
-
-    New Central: re-requests via GLP client_credentials (no refresh token).
-    Classic: uses refresh_token grant against Central's OAuth endpoint.
-    Returns (success, detail_message).
-    """
-    if not _can_refresh():
-        return False, "Cannot refresh: missing client_id or client_secret."
-    if _is_new_central_api():
-        return await _fetch_new_central_token(client)
-    cfg = _central_cfg()
-    token_url = cfg["cluster_url"].rstrip("/") + "/oauth2/token"
-    refresh_tok = cfg.get("refresh_token") or central_token.get("refresh_token", "")
-    data: dict[str, str] = {
-        "grant_type": "refresh_token",
-        "client_id": cfg["client_id"],
-        "client_secret": cfg["client_secret"],
-        "refresh_token": refresh_tok,
-    }
-    if cfg.get("customer_id"):
-        data["customer_id"] = cfg["customer_id"]
-    try:
-        resp = await client.post(token_url, data=data, timeout=15)
-        if not resp.is_success:
-            return False, f"Refresh failed (HTTP {resp.status_code}): {resp.text[:300]}"
-        payload = _parse_upstream_json(resp)
-        new_access = payload["access_token"]
-        new_refresh = payload.get("refresh_token", refresh_tok)
-        central_token["access_token"] = new_access
-        central_token["refresh_token"] = new_refresh
-        central_token["expires_at"] = time.time() + payload.get("expires_in", 7200) - 60
-        settings["central_config"]["access_token"] = new_access
-        settings["central_config"]["refresh_token"] = new_refresh
-        _save_settings()
-        logger.info("Aruba Central token refreshed successfully")
-        return True, "Token refreshed successfully."
-    except UpstreamJSONError as exc:
-        return False, str(exc)
-    except Exception as exc:
-        return False, f"Refresh request failed: {exc}"
-
-
-async def _test_classic_central_connection(client: httpx.AsyncClient) -> tuple[bool, str]:
-    classic_cfg = settings.get("central_api", {}).get("classic", {})
-    base_url = str(classic_cfg.get("url", "")).strip().rstrip("/")
-    username = str(classic_cfg.get("username", "")).strip()
-    password = str(classic_cfg.get("password", ""))
-    if not base_url or not username or not password:
-        return False, "Central API not configured — enter URL, Username, and Password in Setup."
-    try:
-        resp = await client.get(base_url, auth=(username, password), timeout=15, follow_redirects=True)
-    except Exception as exc:
-        return False, f"Connection error reaching {base_url}: {exc}"
-    if resp.status_code in (401, 403):
-        return False, f"Classic credentials rejected (HTTP {resp.status_code})."
-    if resp.status_code >= 500:
-        return False, f"Classic endpoint returned HTTP {resp.status_code}: {resp.text[:300]}"
-    return True, "Connected to Classic API successfully."
-
-
-def _central_headers() -> dict[str, str]:
-    token = central_token.get("access_token")
-    if not token:
-        raise HTTPException(status_code=503, detail="Aruba Central token not available — check connection settings")
-    return {"Authorization": f"Bearer {token}"}
 
 
 def _parse_bearer_token(authorization: str | None) -> str:
@@ -1842,46 +1068,12 @@ def _require_shared_client_key(provided_key: str, context: str) -> None:
     raise HTTPException(status_code=403, detail="invalid client key")
 
 
-async def central_token_manager() -> None:
-    """Background task: keep token valid. Runs every 5 minutes."""
-    global central_auth_error
-    async with httpx.AsyncClient() as client:
-        while True:
-            try:
-                if _central_ready():
-                    no_token = not central_token.get("access_token")
-                    expiring = time.time() >= central_token.get("expires_at", 0) - 300
-                    if no_token:
-                        ok, msg = await _fetch_central_token(client)
-                        if not ok:
-                            logger.warning("Central token load failed: %s", msg)
-                        # Broadcast updated token state regardless of success
-                        await broadcast({"type": "central_update", "status": _central_status_payload(), "wireless_clients": dict(central_wireless_clients), "hardware_alerts": _hw_alerts_payload(), "client_count_status": _client_count_payload(), "ts": time.time(), "token_state": _central_token_state()})
-                    elif expiring and _can_refresh():
-                        ok, msg = await _refresh_central_token(client)
-                        if not ok:
-                            logger.warning("Central token refresh failed: %s", msg)
-                            central_auth_error = f"Token refresh failed: {msg}"
-                            central_token["access_token"] = None  # force re-fetch next cycle
-                        else:
-                            central_auth_error = None
-                        await broadcast({"type": "central_update", "status": _central_status_payload(), "wireless_clients": dict(central_wireless_clients), "hardware_alerts": _hw_alerts_payload(), "client_count_status": _client_count_payload(), "ts": time.time(), "token_state": _central_token_state()})
-                _update_service_health("central_token", ok=True)
-            except asyncio.CancelledError:
-                raise
-            except Exception as exc:
-                _update_service_health("central_token", ok=False, error=str(exc))
-                logger.exception("Central token manager error: %s", exc)
-            await asyncio.sleep(300)
-
-
 # ── Aruba Central poll loop ───────────────────────────────────────────────────
 
 async def _fetch_nc_browse_for_spoke(client: httpx.AsyncClient) -> None:
     """Fetch new_central browse data (alerts, insights, devices, clients) filtered to
     this spoke's assigned sites.  Results are stored in the module-level
     central_browse_* variables so they can be included in the telemetry sent to hub."""
-    global central_browse_alerts, central_browse_insights, central_browse_devices_by_site, central_browse_clients_by_site, central_browse_clients
 
     cfg = _central_cfg()
     base_url = cfg["cluster_url"].rstrip("/")
@@ -2090,359 +1282,15 @@ async def _fetch_nc_browse_for_spoke(client: httpx.AsyncClient) -> None:
         except Exception as exc:
             logger.warning("NC browse clients fetch failed for site %s: %s", central_site, exc)
 
-    central_browse_alerts = new_alerts
-    central_browse_insights = new_insights
-    central_browse_devices_by_site = new_devices_by_site
-    central_browse_clients_by_site = new_clients_by_site
-    central_browse_clients = new_clients
-    # Invalidate the server-side browse response cache so the next API call
-    # returns fresh data assembled from these updated globals.
-    global _central_browse_response_cache, _central_browse_response_cached_at
-    _central_browse_response_cache = {}
-    _central_browse_response_cached_at = 0.0
+    state.central_browse_alerts = new_alerts
+    state.central_browse_insights = new_insights
+    state.central_browse_devices_by_site = new_devices_by_site
+    state.central_browse_clients_by_site = new_clients_by_site
+    state.central_browse_clients = new_clients
+    state._central_browse_response_cache = {}
+    state._central_browse_response_cached_at = 0.0
     logger.info("NC browse fetch complete: %d alerts, %d insights, %d sites with devices, %d sites with clients (%d individual)",
                 len(new_alerts), len(new_insights), len(new_devices_by_site), len(new_clients_by_site), len(new_clients))
-
-
-async def _poll_central_once(client: httpx.AsyncClient) -> None:
-    """Single poll cycle: fetch alerts + insights per mapped site, evaluate checks."""
-    if not _central_ready() or not central_token.get("access_token"):
-        return
-
-    site_mappings: dict[str, str] = settings.get("site_mappings", {})
-    monitored: list[dict[str, Any]] = settings.get("monitored_checks", [])
-    hw_checks: list[dict[str, Any]] = settings.get("hardware_checks", [])
-    if not site_mappings or (not monitored and not hw_checks):
-        return
-
-    hw_check_ids: set[str] = {c["id"] for c in hw_checks}
-
-    cfg = _central_cfg()
-    base_url = cfg["cluster_url"].rstrip("/")
-    headers = _central_headers()
-    now = time.time()
-    new_records: list[dict[str, Any]] = []
-
-    # Accumulate hardware alert devices across all sites this cycle
-    new_hw_devices: dict[str, dict[str, list[str]]] = {c["id"]: {} for c in hw_checks}
-
-    for wsite, central_site in site_mappings.items():
-        site_check_status: dict[str, Any] = {}
-
-        # ── Fetch alerts for this site ────────────────────────────
-        alert_type_counts: dict[str, int] = {}
-        site_health: dict[str, Any] = {}
-
-        if _is_new_central_api():
-            # New Central v1alpha1: derive synthetic alert_type_counts from available endpoints.
-            # Fetch sites-health, devices, and clients in parallel for the mapped site.
-
-            # ── sites-health ──────────────────────────────────────────────
-            site_id: str | None = None
-            try:
-                resp = await client.get(
-                    f"{base_url}/network-monitoring/v1alpha1/sites-health",
-                    headers=headers,
-                    timeout=20,
-                )
-                if resp.status_code == 401 and _can_refresh():
-                    ok, _ = await _refresh_central_token(client)
-                    if ok:
-                        headers = _central_headers()
-                    resp = await client.get(
-                        f"{base_url}/network-monitoring/v1alpha1/sites-health",
-                        headers=headers,
-                        timeout=20,
-                    )
-                if resp.status_code == 200:
-                    for item in resp.json().get("items", []):
-                        sname = item.get("siteName") or item.get("site_name") or ""
-                        if sname.lower() == central_site.lower():
-                            site_health = item
-                            site_id = item.get("siteId") or item.get("site_id")
-                            score = item.get("healthScore", item.get("health_score", 100))
-                            ap_count = item.get("apCount", item.get("ap_count", 0))
-                            alert_type_counts["SITE_HEALTH"] = int(score)
-                            alert_type_counts["AP_COUNT"] = int(ap_count)
-                            break
-            except Exception as exc:
-                logger.warning("New Central sites-health fetch failed for site %s: %s", central_site, exc)
-
-            # ── devices (AP_DOWN, SWITCH_DOWN, GATEWAY_DOWN) ──────────────
-            try:
-                params: dict[str, Any] = {"limit": 500}
-                if site_id:
-                    params["filter"] = f"siteId eq '{site_id}'"
-                resp = await client.get(
-                    f"{base_url}/network-monitoring/v1alpha1/devices",
-                    headers=headers, params=params, timeout=20,
-                )
-                if resp.status_code == 200:
-                    ap_down = switch_down = gw_down = 0
-                    for dev in resp.json().get("items", []):
-                        dtype = (dev.get("deviceType") or "").upper()
-                        status = (dev.get("status") or "").upper()
-                        is_down = status not in ("UP", "ONLINE")
-                        if dtype == "ACCESS_POINT" and is_down:
-                            ap_down += 1
-                        elif dtype == "SWITCH" and is_down:
-                            switch_down += 1
-                        elif dtype == "GATEWAY" and is_down:
-                            gw_down += 1
-                    alert_type_counts["AP_DOWN"] = ap_down
-                    alert_type_counts["SWITCH_DOWN"] = switch_down
-                    alert_type_counts["GATEWAY_DOWN"] = gw_down
-            except Exception as exc:
-                logger.warning("New Central devices fetch failed for site %s: %s", central_site, exc)
-
-            # ── clients (CLIENT_COUNT) ─────────────────────────────────────
-            try:
-                cparams: dict[str, Any] = {}
-                if site_id:
-                    cparams["site-id"] = site_id
-                resp = await client.get(
-                    f"{base_url}/network-monitoring/v1alpha1/clients",
-                    headers=headers, params=cparams, timeout=20,
-                )
-                if resp.status_code == 200:
-                    alert_type_counts["CLIENT_COUNT"] = int(resp.json().get("count", 0))
-            except Exception as exc:
-                logger.warning("New Central clients fetch failed for site %s: %s", central_site, exc)
-
-            # New Central: no insights endpoint — skip
-            insight_cat_counts: dict[str, int] = {}
-        else:
-            for alerts_path in ["/monitoring/v1/alerts", "/monitoring/v2/alerts"]:
-                try:
-                    resp = await client.get(
-                        f"{base_url}{alerts_path}",
-                        headers=headers,
-                        params={"site": central_site, "limit": 1000},
-                        timeout=20,
-                    )
-                    if resp.status_code == 401 and _can_refresh():
-                        ok, _ = await _refresh_central_token(client)
-                        if ok:
-                            headers = _central_headers()
-                        resp = await client.get(
-                            f"{base_url}{alerts_path}",
-                            headers=headers,
-                            params={"site": central_site, "limit": 1000},
-                            timeout=20,
-                        )
-                    if resp.status_code == 200:
-                        data = resp.json()
-                        for alert in data.get("alerts", []):
-                            atype = alert.get("alert_type") or alert.get("type", "")
-                            if atype:
-                                alert_type_counts[atype] = alert_type_counts.get(atype, 0) + 1
-                                # Collect device names for hardware checks
-                                if atype in hw_check_ids:
-                                    dev = (alert.get("device_name") or alert.get("hostname")
-                                           or alert.get("name") or "").strip()
-                                    if dev:
-                                        new_hw_devices.setdefault(atype, {}).setdefault(wsite, [])
-                                        if dev not in new_hw_devices[atype][wsite]:
-                                            new_hw_devices[atype][wsite].append(dev)
-                        break
-                    if resp.status_code == 404:
-                        continue
-                except Exception as exc:
-                    logger.warning("Central alerts fetch failed for site %s: %s", central_site, exc)
-                    break
-
-            # ── Fetch insights for this site ──────────────────────────
-            insight_cat_counts: dict[str, int] = {}
-            try:
-                resp = await client.get(
-                    f"{base_url}/aiops/v1/insights",
-                    headers=headers,
-                    params={"site_name": central_site, "limit": 1000},
-                    timeout=20,
-                )
-                if resp.status_code == 200:
-                    data = resp.json()
-                    for insight in data.get("insights", []):
-                        cat = insight.get("category") or insight.get("type", "")
-                        if cat:
-                            insight_cat_counts[cat] = insight_cat_counts.get(cat, 0) + 1
-            except Exception as exc:
-                logger.warning("Central insights fetch failed for site %s: %s", central_site, exc)
-
-        # ── Evaluate each monitored check ─────────────────────────
-        for check in monitored:
-            check_type = check.get("type", "")
-            check_id = check.get("id", "")
-            check_name = check.get("name", check_id)
-            if not check_id:
-                continue
-
-            if check_type == "alert":
-                count = alert_type_counts.get(check_id, 0)
-            elif check_type == "insight":
-                count = insight_cat_counts.get(check_id, 0)
-            else:
-                continue
-
-            status = "OK" if count > 0 else "ERROR"
-            site_check_status[check_id] = {
-                "status": status,
-                "count": count,
-                "check_name": check_name,
-                "check_type": check_type,
-                "ts": now,
-            }
-            new_records.append({
-                "ts": now,
-                "wsite": wsite,
-                "central_site": central_site,
-                "check_type": check_type,
-                "check_id": check_id,
-                "check_name": check_name,
-                "status": status,
-                "count": count,
-            })
-
-        central_status[wsite] = site_check_status
-
-        # ── Fetch wireless client count for this site from Central ─
-        wl_count = 0
-        try:
-            if _is_new_central_api():
-                # New API: client count lives in site_health payload
-                wl_count = int(
-                    site_health.get("clientCount")
-                    or site_health.get("client_count")
-                    or 0
-                )
-            else:
-                # Classic API: query wireless clients with site filter.
-                # Try both "site" and "site_name" — Central uses each in
-                # different API versions.
-                fetched = False
-                for clients_path in ["/monitoring/v2/clients/wireless", "/monitoring/v1/clients/wireless"]:
-                    for site_param in ["site", "site_name"]:
-                        resp = await client.get(
-                            f"{base_url}{clients_path}",
-                            headers=headers,
-                            params={site_param: central_site, "limit": 1},
-                            timeout=20,
-                        )
-                        if resp.status_code == 401 and _can_refresh():
-                            ok, _ = await _refresh_central_token(client)
-                            if ok:
-                                headers = _central_headers()
-                            resp = await client.get(
-                                f"{base_url}{clients_path}",
-                                headers=headers,
-                                params={site_param: central_site, "limit": 1},
-                                timeout=20,
-                            )
-                        logger.info(
-                            "Central wireless clients %s ?%s=%s → %s body=%s",
-                            clients_path, site_param, central_site,
-                            resp.status_code, resp.text[:200],
-                        )
-                        if resp.status_code == 200:
-                            body = resp.json()
-                            wl_count = int(body.get("total") or body.get("count") or 0)
-                            fetched = True
-                            break
-                        if resp.status_code == 404:
-                            continue
-                    if fetched:
-                        break
-        except Exception as exc:
-            logger.warning("Central wireless client count fetch failed for site %s: %s", central_site, exc)
-        central_wireless_clients[wsite] = wl_count
-
-        _client_count_samples.setdefault(wsite, []).append((now, wl_count))
-        cutoff_cc = now - CLIENT_COUNT_WINDOW
-        _client_count_samples[wsite] = [
-            s for s in _client_count_samples[wsite] if s[0] >= cutoff_cc
-        ]
-
-    # ── Commit hardware alert devices + detect transitions ────────
-    global hardware_alert_devices
-    hardware_alert_devices = new_hw_devices
-    await _check_transitions_and_notify(now)
-
-    # ── Persist client count baseline ─────────────────────────────
-    _save_client_count_baseline()
-
-    # ── Persist history ───────────────────────────────────────────
-    if new_records:
-        cutoff = _history_cutoff()
-        async with history_lock:
-            central_history[:] = [r for r in central_history if r["ts"] >= cutoff]
-            central_history.extend(new_records)
-        await asyncio.to_thread(_append_and_trim_history, new_records)
-
-    await broadcast({"type": "central_update", "status": _central_status_payload(), "wireless_clients": dict(central_wireless_clients), "hardware_alerts": _hw_alerts_payload(), "client_count_status": _client_count_payload(), "ts": now, "token_state": _central_token_state()})
-    _save_state_cache()
-    # In distributed mode with new_central, also fetch browse data (alerts, insights,
-    # devices, clients) filtered to this spoke's assigned sites so the hub can assemble
-    # a complete multi-site view.
-    if _is_new_central_api():
-        try:
-            await _fetch_nc_browse_for_spoke(client)
-        except Exception as exc:
-            logger.warning("NC browse fetch failed: %s", exc)
-
-
-def _central_status_payload() -> dict[str, Any]:
-    """Serialize current central_status for WS / API responses."""
-    return {
-        wsite: {
-            check_id: {
-                "status": info["status"],
-                "count": info["count"],
-                "check_name": info["check_name"],
-                "check_type": info["check_type"],
-                "ts": info["ts"],
-            }
-            for check_id, info in checks.items()
-        }
-        for wsite, checks in central_status.items()
-    }
-
-
-def _hw_alerts_payload() -> list[dict[str, Any]]:
-    """Serialize hardware_alert_devices merged with check metadata for broadcast.
-
-    In distributed mode (spoke has its own Central credentials) the spoke builds
-    hardware_alert_devices from its own polling and this function assembles the
-    payload from settings["hardware_checks"].
-
-    In hub-connected (centralized) mode the spoke's settings["hardware_checks"] is
-    empty — the hub computes the alerts and pushes a pre-built list via the feed,
-    stored in _hub_fed_hardware_alerts.  Fall back to that list so the simulation
-    view can display gateway/AP/switch status correctly.
-    """
-    hw_checks: list[dict[str, Any]] = settings.get("hardware_checks", [])
-    if not hw_checks:
-        # Hub-connected mode: return the pre-built list pushed by the hub
-        return list(_hub_fed_hardware_alerts)
-    site_mappings: dict[str, str] = settings.get("site_mappings", {})
-    result = []
-    for check in hw_checks:
-        cid = check["id"]
-        devices_by_wsite = hardware_alert_devices.get(cid, {})
-        total = sum(len(devs) for devs in devices_by_wsite.values())
-        sites_out = {}
-        for wsite, devs in devices_by_wsite.items():
-            sites_out[wsite] = {
-                "site_name": site_mappings.get(wsite, wsite),
-                "devices": devs,
-            }
-        result.append({
-            "id": cid,
-            "name": check.get("name") or _HW_FRIENDLY.get(cid, cid),
-            "device_type": check.get("device_type") or _auto_device_type(cid),
-            "total": total,
-            "sites": sites_out,
-        })
-    return result
 
 
 def _save_client_count_baseline() -> None:
@@ -2499,48 +1347,6 @@ async def hourly_baseline_saver() -> None:
             _update_service_health("baseline_saver", ok=False, error=str(exc))
             logger.exception("Hourly baseline saver error: %s", exc)
         await asyncio.sleep(3600)
-
-
-
-
-def _sim_clients_per_wsite(active_snap: dict[str, Any]) -> dict[str, int]:
-    """Count currently-online sim clients grouped by wsite.
-
-    Reads simulation.conf directly so the result is always fresh regardless
-    of whether the /api/simulations endpoint has been called.  Falls back to
-    _sim_conf_cache when the conf file is unavailable.
-    """
-    # Build sim_id → wsite from simulation.conf (s0..s9 buckets)
-    sim_to_wsite: dict[str, str] = {}
-    sim_conf_path = REPO_DIR / "configs" / "simulation.conf"
-    try:
-        parser = configparser.ConfigParser()
-        parser.read_string(sim_conf_path.read_text(encoding="utf-8"))
-        for section in parser.sections():
-            if parser.has_option(section, "wsite"):
-                wsite_val = parser.get(section, "wsite").strip()
-                if wsite_val:
-                    sim_to_wsite[section] = wsite_val
-    except Exception:
-        # Fall back to cached data if conf is unreadable
-        for sim_id, info in _sim_conf_cache.get("simulations", {}).items():
-            wsite_val = str(info.get("wsite", "")).strip()
-            if wsite_val:
-                sim_to_wsite[sim_id] = wsite_val
-
-    if not sim_to_wsite:
-        return {}
-
-    # Count online clients per wsite
-    counts: dict[str, int] = {w: 0 for w in set(sim_to_wsite.values())}
-    for client_data in active_snap.values():
-        sim_id = client_data.get("simulation_id", "")
-        wsite_val = sim_to_wsite.get(sim_id, "")
-        if not wsite_val:
-            continue
-        if compute_online(client_data.get("last_seen", datetime.min.replace(tzinfo=timezone.utc))):
-            counts[wsite_val] = counts.get(wsite_val, 0) + 1
-    return counts
 
 
 SIM_CLIENT_SAMPLE_INTERVAL = 60  # seconds between sim-client count samples
@@ -2679,172 +1485,13 @@ def _client_count_payload() -> dict[str, Any]:
     return result
 
 
-async def _check_transitions_and_notify(now: float) -> None:
-    """Detect green→red transitions for sim checks and hardware checks, fire notifications."""
-    notif = settings.get("notifications", {})
-    transitions: list[dict[str, Any]] = []
-
-    # ── Sim check transitions ─────────────────────────────────────
-    for wsite, checks in central_status.items():
-        for check_id, info in checks.items():
-            key = f"sim:{check_id}:{wsite}"
-            new_state = info["status"]  # "OK" or "ERROR"
-            old_state = _prev_check_states.get(key)
-            _prev_check_states[key] = new_state
-            if old_state == "OK" and new_state == "ERROR":
-                transitions.append({
-                    "type": "sim",
-                    "name": info.get("check_name", check_id),
-                    "wsite": wsite,
-                    "detail": f"Check '{info.get('check_name', check_id)}' turned red at site {wsite}",
-                })
-
-    # ── Hardware alert transitions ────────────────────────────────
-    hw_checks: list[dict[str, Any]] = settings.get("hardware_checks", [])
-    for check in hw_checks:
-        cid = check["id"]
-        total = sum(len(d) for d in hardware_alert_devices.get(cid, {}).values())
-        new_state = "ERROR" if total > 0 else "OK"
-        key = f"hw:{cid}"
-        old_state = _prev_check_states.get(key)
-        _prev_check_states[key] = new_state
-        if old_state == "OK" and new_state == "ERROR":
-            name = check.get("name") or _HW_FRIENDLY.get(cid, cid)
-            transitions.append({
-                "type": "hardware",
-                "name": name,
-                "detail": f"Hardware alert '{name}' is now active ({total} device(s) affected)",
-            })
-
-    for wsite, info in _client_count_payload().items():
-        key = f"cc:{wsite}"
-        new_state = info["status"]
-        if new_state == "NO_DATA":
-            _prev_check_states[key] = new_state
-            continue
-        old_state = _prev_check_states.get(key)
-        _prev_check_states[key] = new_state
-        if old_state == "OK" and new_state == "DEGRADED":
-            transitions.append({
-                "type": "client_count",
-                "name": f"Client count — {info['site_name']}",
-                "detail": (
-                    f"Client count at {info['site_name']} dropped {info['drop_pct']:.1f}% "
-                    f"(current: {info['current']}, avg: {info['hourly_avg']:.1f})"
-                ),
-            })
-
-    if not transitions:
-        return
-
-    # ── Send notifications ────────────────────────────────────────
-    for t in transitions:
-        logger.warning("ALERT TRANSITION: %s", t["detail"])
-
-    if notif.get("teams_enabled") and notif.get("teams_webhook_url"):
-        await _send_teams_notifications(notif["teams_webhook_url"], transitions)
-
-    if notif.get("email_enabled") and notif.get("smtp_host") and notif.get("smtp_to"):
-        await asyncio.to_thread(_send_email_notifications, notif, transitions)
-
-
-async def _send_teams_notifications(webhook_url: str, transitions: list[dict]) -> None:
-    """POST an Adaptive Card to a Teams incoming webhook for each transition."""
-    try:
-        async with httpx.AsyncClient(timeout=10) as client:
-            for t in transitions:
-                card = {
-                    "type": "message",
-                    "attachments": [{
-                        "contentType": "application/vnd.microsoft.card.adaptive",
-                        "content": {
-                            "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
-                            "type": "AdaptiveCard",
-                            "version": "1.4",
-                            "body": [
-                                {"type": "TextBlock", "size": "Medium", "weight": "Bolder",
-                                 "text": f"🔴 Client Simulator Alert: {t['name']}"},
-                                {"type": "TextBlock", "text": t["detail"], "wrap": True},
-                            ],
-                        },
-                    }],
-                }
-                resp = await client.post(webhook_url, json=card)
-                if resp.status_code not in (200, 202):
-                    logger.warning("Teams webhook returned %s: %s", resp.status_code, resp.text[:200])
-    except Exception as exc:
-        logger.warning("Teams notification failed: %s", exc)
-
-
-def _send_email_notifications(notif: dict, transitions: list[dict]) -> None:
-    """Send SMTP email for each transition (runs in thread pool)."""
-    import smtplib
-    from email.mime.text import MIMEText
-    from email.mime.multipart import MIMEMultipart
-
-    to_addrs = notif.get("smtp_to", [])
-    if isinstance(to_addrs, str):
-        to_addrs = [a.strip() for a in to_addrs.split(",") if a.strip()]
-    if not to_addrs:
-        return
-
-    body_lines = ["Client Simulator Alert\n"]
-    for t in transitions:
-        body_lines.append(f"• {t['detail']}")
-    body = "\n".join(body_lines)
-
-    msg = MIMEMultipart()
-    msg["From"] = notif.get("smtp_from", "client-sim@localhost")
-    msg["To"] = ", ".join(to_addrs)
-    msg["Subject"] = f"[Client Simulator] {len(transitions)} check(s) turned RED"
-    msg.attach(MIMEText(body, "plain"))
-
-    try:
-        host = notif.get("smtp_host", "")
-        port = int(notif.get("smtp_port", 587))
-        with smtplib.SMTP(host, port, timeout=15) as smtp:
-            smtp.ehlo()
-            if port != 25:
-                smtp.starttls()
-            user = notif.get("smtp_user", "")
-            pwd = notif.get("smtp_password", "")
-            if user and pwd:
-                smtp.login(user, pwd)
-            smtp.sendmail(msg["From"], to_addrs, msg.as_string())
-        logger.info("Email notification sent to %s", to_addrs)
-    except Exception as exc:
-        logger.warning("Email notification failed: %s", exc)
-
-
-async def central_poller() -> None:
-    """Background task: poll Central every CENTRAL_POLL_INTERVAL seconds."""
-    async with httpx.AsyncClient() as client:
-        while True:
-            try:
-                if settings.get("hub_aruba_polling_mode") == "centralized":
-                    # Polling is delegated to the hub — mark health ok so the
-                    # UI doesn't show a stale warning, then sleep until next check.
-                    _update_service_health("central_poller", ok=True)
-                    await asyncio.sleep(300)
-                    continue
-                await _poll_central_once(client)
-                _update_service_health("central_poller", ok=True)
-            except asyncio.CancelledError:
-                raise
-            except Exception as exc:
-                _update_service_health("central_poller", ok=False, error=str(exc))
-                logger.exception("Central poll error: %s", exc)
-            await asyncio.sleep(CENTRAL_POLL_INTERVAL)
-
-
 @asynccontextmanager
 async def lifespan(app: FastAPI):  # noqa: ARG001
-    global central_history
     logger.info("=" * 60)
     logger.info("Client Simulator  v%s  starting up", INSTALLER_VERSION)
     logger.info("=" * 60)
     _debug_event("server_start", f"v{INSTALLER_VERSION} ui:v{APP_VERSION}")
-    central_history = await asyncio.to_thread(_load_history)
+    state.central_history = await asyncio.to_thread(_load_history)
     _load_state_cache()
     _load_commands()
     _load_reclone_state()
@@ -3296,9 +1943,9 @@ COMMAND_RESULT_RETENTION_SECS = 86400  # keep completed/expired results for 24 h
 
 ws_connections: list[WebSocket] = []
 client_ws_connections: dict[str, WebSocket] = {}
-proxmox_ws_connection: WebSocket | None = None
-proxmox_ws_hostname: str | None = None
-proxmox_ws_disconnect_task: asyncio.Task[Any] | None = None
+state.proxmox_ws_connection = None
+state.proxmox_ws_hostname = None
+state.proxmox_ws_disconnect_task = None
 PROXMOX_WS_GRACE_SECS = 30
 _acme_challenges: dict[str, str] = {}
 _acme_status: dict[str, Any] = {"running": False, "last_result": None, "last_error": None}
@@ -3334,18 +1981,18 @@ relay_state: dict[str, Any] = {
     "telemetry_build_ms": None, # how long the last _build_relay_telemetry_payload call took
     "hub_loop_lag_ms": None,    # hub event-loop lag reported in the last telemetry_ack
 }
-relay_registration_refresh_needed = bool(relay_state["enabled"])
+state.relay_registration_refresh_needed = bool(relay_state["enabled"])
 # Capped registration diagnostic log — last 50 attempts
 _RELAY_DIAG_MAX = 50
 relay_diag_log: list[dict[str, Any]] = []
-_relay_ws_send_json: Callable[[dict[str, Any]], Awaitable[None]] | None = None
-_relay_ws_spoke_id: str | None = None
+state._relay_ws_send_json = None
+state._relay_ws_spoke_id = None
 _shell_sessions: dict[str, dict[str, Any]] = {}
-_repo_ver: str | None = None
-_proxmox_reseed_in_progress = False
+state._repo_ver = None
+state._proxmox_reseed_in_progress = False
 
 # Hub-synced monitored items — fetched each relay cycle, cached here
-_hub_monitored_items: dict[str, Any] = {"items": [], "has_sites": False, "assigned_sites": []}
+state._hub_monitored_items = {"items": [], "has_sites": False, "assigned_sites": []}
 
 
 def _relay_diag_append(event: str, **kwargs: Any) -> None:
@@ -3388,13 +2035,13 @@ proxmox_state: dict[str, Any] = {
     "prov_run": _default_provision_run_state(),
 }
 # Previous usb_state vmid→prov_status snapshot for transition detection
-_prev_usb_by_vmid: dict[str, str] = {}
+state._prev_usb_by_vmid = {}
 # VMIDs for which a delete command has been queued but not yet confirmed by telemetry.
 # Kept as a set so the UI can show "deleting…" immediately instead of the row vanishing.
 _pending_delete_vmids: set[int] = set()
 # Cooldown: earliest time a new auto-delete may be queued (updated after each
 # confirmed deletion so the fleet has time to stabilise before the next one).
-_delete_gate_cooldown_until: float = 0.0
+state._delete_gate_cooldown_until = 0.0
 DELETE_GATE_COOLDOWN_S: int = 300  # 5 minutes between consecutive auto-deletes
 # VMID gap audit: detect and repair out-of-order VMID assignments.
 # Runs at most once per host per interval (even if multiple telemetry cycles occur).
@@ -3416,23 +2063,16 @@ def _autoprov_gate_log(reason_key: str, msg: str, *args: object) -> None:
 _proxmox_agent_vm_map: dict[int, str] = {}
 # Rolling resource samples for 1-hour average CPU/memory threshold checks.
 # Each entry is (unix_timestamp, value_percent).  Pruned to the last hour on each update.
-_cpu_samples: list[tuple[float, float]] = []
-_mem_samples: list[tuple[float, float]] = []
-_resource_samples_started: float = 0.0  # epoch when first sample was recorded
+state._cpu_samples = []
+state._mem_samples = []
+state._resource_samples_started = 0.0  # epoch when first sample was recorded
 _RESOURCE_SAMPLE_WINDOW = 3600  # seconds (1 hour)
 
 # ── Proxmox VM simulation tags ────────────────────────────────────────────────
 # Tracks which sim tags we last applied per (agent_hostname, vmid) to avoid
 # redundant API calls.  Keyed this way because VMIDs can collide across nodes.
-_vm_applied_sim_tags: dict[tuple[str, int], frozenset[str]] = {}
+state._vm_applied_sim_tags = {}
 _SIM_TAG_PREFIX = "sim-"
-
-
-def _sanitize_proxmox_tag(name: str) -> str:
-    """Normalize a simulation name to a Proxmox-safe tag with sim- prefix."""
-    name = re.sub(r'[^a-z0-9]+', '-', str(name).strip().lower()).strip('-')
-    tag = f"{_SIM_TAG_PREFIX}{name}" if not name.startswith(_SIM_TAG_PREFIX) else name
-    return tag[:64] if name else ""
 
 
 def _merge_sim_tags(current_tags_str: str, desired_sim_tags: list[str]) -> str:
@@ -3441,15 +2081,6 @@ def _merge_sim_tags(current_tags_str: str, desired_sim_tags: list[str]) -> str:
     non_sim = [t for t in existing if not t.lower().startswith(_SIM_TAG_PREFIX)]
     merged = non_sim + sorted(set(t for t in desired_sim_tags if t))
     return ';'.join(merged)
-
-
-def _get_proxmox_token_for_host(hostname: str | None) -> str:
-    """Return per-host token if set, falling back to the legacy global token."""
-    if hostname:
-        per_host = str((settings.get("proxmox_tokens") or {}).get(hostname, "") or "").strip()
-        if per_host:
-            return per_host
-    return str(settings.get("proxmox_api_token", "") or "").strip()
 
 
 def _sanitize_vm_set_override(value: Any) -> int:
@@ -3471,61 +2102,11 @@ def _hostname_vm_set_number(hostname: Any) -> int:
     return max(1, bucket)
 
 
-def _get_proxmox_host_config(hostname: Any) -> dict[str, Any]:
-    proxmox_config = settings.get("proxmox_config") or {}
-    if not isinstance(proxmox_config, dict):
-        return {}
-    normalized = _normalize_proxmox_hostname(hostname)
-    if not normalized:
-        return {}
-    resolved = _resolve_proxmox_agent_hostname(normalized, proxmox_config) or normalized
-    data = proxmox_config.get(resolved, {})
-    return dict(data) if isinstance(data, dict) else {}
-
-
-def _save_proxmox_host_config(hostname: str, updates: dict[str, Any]) -> dict[str, Any]:
-    proxmox_config = settings.setdefault("proxmox_config", {})
-    persisted_config = _persisted.setdefault("proxmox_config", {})
-    current = proxmox_config.get(hostname, {})
-    if not isinstance(current, dict):
-        current = {}
-    entry = dict(current)
-    if "vm_set_override" in updates:
-        vm_set_override = _sanitize_vm_set_override(updates.get("vm_set_override"))
-        if vm_set_override:
-            entry["vm_set_override"] = vm_set_override
-        else:
-            entry.pop("vm_set_override", None)
-    if entry:
-        proxmox_config[hostname] = entry
-        persisted_config[hostname] = dict(entry)
-    else:
-        proxmox_config.pop(hostname, None)
-        persisted_config.pop(hostname, None)
-    _save_settings()
-    return dict(entry)
-
-
-def _has_any_proxmox_token() -> bool:
-    if _get_proxmox_token_for_host(None):
-        return True
-    return any(str(tok or "").strip() for tok in (settings.get("proxmox_tokens") or {}).values())
-
-
-def _save_proxmox_token_for_host(hostname: str, token: str) -> None:
-    tokens = settings.setdefault("proxmox_tokens", {})
-    persisted_tokens = _persisted.setdefault("proxmox_tokens", {})
-    tokens[hostname] = token
-    persisted_tokens[hostname] = token
-    _save_settings()
-
-
 async def _apply_sim_tags_for_vm(vmid: int, agent_hostname: str, desired_sim_tags: list[str], current_tags_str: str = "") -> None:
     """Call Proxmox REST API to update simulation tags on a single VM."""
-    global _vm_applied_sim_tags
     desired_set = frozenset(t for t in desired_sim_tags if t)
     cache_key = (agent_hostname, vmid)
-    if _vm_applied_sim_tags.get(cache_key) == desired_set:
+    if state._vm_applied_sim_tags.get(cache_key) == desired_set:
         return  # no change since last apply
     api_token = _get_proxmox_token_for_host(agent_hostname)
     if not api_token or not agent_hostname:
@@ -3539,7 +2120,7 @@ async def _apply_sim_tags_for_vm(vmid: int, agent_hostname: str, desired_sim_tag
         async with httpx.AsyncClient(verify=False, timeout=8) as hc:
             resp = await hc.put(url, headers=headers, data={"tags": merged})
         if resp.status_code == 200:
-            _vm_applied_sim_tags[cache_key] = desired_set
+            state._vm_applied_sim_tags[cache_key] = desired_set
             logger.debug("VM %s tags updated: %s", vmid, merged or "(cleared)")
         else:
             logger.debug("VM %s tag update failed: HTTP %s", vmid, resp.status_code)
@@ -3748,35 +2329,33 @@ def _resource_estimated_average(samples: list[tuple[float, float]]) -> float | N
 
 def _record_resource_samples(node: dict[str, Any], now: float) -> None:
     """Append a CPU and memory sample from the latest node telemetry."""
-    global _resource_samples_started
     cpu_pct = node.get("cpu_percent")
     mem_used = node.get("mem_used_kb")
     mem_total = node.get("mem_total_kb")
     cutoff = now - _RESOURCE_SAMPLE_WINDOW
     if cpu_pct is not None:
-        if not _resource_samples_started:
-            _resource_samples_started = now
-        _cpu_samples.append((now, float(cpu_pct)))
-        _cpu_samples[:] = [(ts, v) for ts, v in _cpu_samples if ts >= cutoff]
+        if not state._resource_samples_started:
+            state._resource_samples_started = now
+        state._cpu_samples.append((now, float(cpu_pct)))
+        state._cpu_samples[:] = [(ts, v) for ts, v in state._cpu_samples if ts >= cutoff]
     try:
         if mem_used is not None and mem_total:
             mem_total_f = float(mem_total)
             if mem_total_f > 0:
-                if not _resource_samples_started:
-                    _resource_samples_started = now
+                if not state._resource_samples_started:
+                    state._resource_samples_started = now
                 mem_pct = (float(mem_used) / mem_total_f) * 100.0
-                _mem_samples.append((now, mem_pct))
-                _mem_samples[:] = [(ts, v) for ts, v in _mem_samples if ts >= cutoff]
+                state._mem_samples.append((now, mem_pct))
+                state._mem_samples[:] = [(ts, v) for ts, v in state._mem_samples if ts >= cutoff]
     except (TypeError, ValueError, ZeroDivisionError):
         pass
     _save_resource_cache()
 _RESOURCE_CACHE_SAVE_INTERVAL = 60.0  # persist at most once per minute
-_resource_cache_last_saved: float = 0.0
+state._resource_cache_last_saved = 0.0
 
 
 def _load_resource_cache() -> None:
     """Restore resource samples from disk so restarts don't reset the 1-hour window."""
-    global _cpu_samples, _mem_samples, _resource_samples_started
     try:
         if not RESOURCE_CACHE_FILE.exists():
             return
@@ -3785,9 +2364,9 @@ def _load_resource_cache() -> None:
         loaded_cpu = [(float(ts), float(v)) for ts, v in (data.get("cpu_samples") or []) if float(ts) >= cutoff]
         loaded_mem = [(float(ts), float(v)) for ts, v in (data.get("mem_samples") or []) if float(ts) >= cutoff]
         started = float(data.get("started") or 0)
-        _cpu_samples = loaded_cpu
-        _mem_samples = loaded_mem
-        _resource_samples_started = started if started > 0 else 0.0
+        state._cpu_samples = loaded_cpu
+        state._mem_samples = loaded_mem
+        state._resource_samples_started = started if started > 0 else 0.0
         # Restore agent/pve version so hub Details shows versions immediately after restart
         if data.get("agent_version"):
             proxmox_state["agent_version"] = data["agent_version"]
@@ -3801,8 +2380,8 @@ def _load_resource_cache() -> None:
                 proxmox_state[field] = data.get(cache_key)
         logger.info(
             "Loaded resource cache: %d CPU samples, %d mem samples (started %.0fs ago)",
-            len(_cpu_samples), len(_mem_samples),
-            time.time() - _resource_samples_started if _resource_samples_started else 0,
+            len(state._cpu_samples), len(state._mem_samples),
+            time.time() - state._resource_samples_started if state._resource_samples_started else 0,
         )
     except Exception:
         logger.debug("Could not load resource cache from %s", RESOURCE_CACHE_FILE, exc_info=True)
@@ -3810,16 +2389,15 @@ def _load_resource_cache() -> None:
 
 def _save_resource_cache(force: bool = False) -> None:
     """Persist resource samples so the 1-hour window survives service restarts."""
-    global _resource_cache_last_saved
     now = time.time()
-    if not force and (now - _resource_cache_last_saved) < _RESOURCE_CACHE_SAVE_INTERVAL:
+    if not force and (now - state._resource_cache_last_saved) < _RESOURCE_CACHE_SAVE_INTERVAL:
         return
-    _resource_cache_last_saved = now
+    state._resource_cache_last_saved = now
     try:
         _atomic_write_json(RESOURCE_CACHE_FILE, {
-            "cpu_samples": _cpu_samples,
-            "mem_samples": _mem_samples,
-            "started": _resource_samples_started,
+            "cpu_samples": state._cpu_samples,
+            "mem_samples": state._mem_samples,
+            "started": state._resource_samples_started,
             "agent_version": proxmox_state.get("agent_version"),
             "pve_version": proxmox_state.get("pve_version"),
             # Persist key proxmox_state fields so spoke server restarts don't blank
@@ -3867,7 +2445,7 @@ reclone_state: dict[str, Any] = {
     "started_at": None,
 }
 vm_watchdog: dict[str, dict[str, Any]] = {}
-update_all_state: dict[str, Any] = {
+state.update_all_state = {
     "running": False,
     "phase": "idle",
     "total_agents": 0,
@@ -3881,8 +2459,8 @@ relay_sites: dict[str, dict[str, Any]] = {}
 background_tasks: dict[str, asyncio.Task[Any]] = {}
 service_health: dict[str, dict[str, Any]] = {}
 reclone_run_lock = asyncio.Lock()
-last_schedule_trigger: str | None = None
-_hub_repo_sync_task: asyncio.Task[Any] | None = None  # dedup guard for fire-and-forget repo_sync
+state.last_schedule_trigger = None
+state._hub_repo_sync_task = None  # dedup guard for fire-and-forget repo_sync
 
 class ClientStatus(BaseModel):
     hostname: str
@@ -4001,22 +2579,6 @@ def iso_utcnow() -> str:
     return utcnow().isoformat().replace("+00:00", "Z")
 
 
-def _update_service_health(name: str, *, ok: bool, error: str | None = None) -> None:
-    now = iso_utcnow()
-    entry = service_health.setdefault(name, {"run_count": 0, "consecutive_errors": 0})
-    entry["last_run"] = now
-    entry["run_count"] = entry.get("run_count", 0) + 1
-    if ok:
-        entry["last_success"] = now
-        entry["last_error_msg"] = None
-        entry["consecutive_errors"] = 0
-        entry["status"] = "ok"
-    else:
-        entry["last_error_msg"] = error or "unknown error"
-        entry["consecutive_errors"] = entry.get("consecutive_errors", 0) + 1
-        entry["status"] = "error" if entry["consecutive_errors"] >= 3 else "warning"
-
-
 def compute_online(last_seen: datetime) -> bool:
     return (utcnow() - last_seen).total_seconds() <= OFFLINE_TIMEOUT
 
@@ -4089,246 +2651,6 @@ async def current_clients() -> list[dict[str, Any]]:
         return [serialize_client(hostname, clients[hostname]) for hostname in sorted(clients)]
 
 
-def _normalize_command_action(value: Any) -> str:
-    return str(value or "").strip().lower().replace("-", "_")
-
-
-def _normalize_command_type(value: Any) -> str | None:
-    normalized = str(value or "").strip().replace("-", "_")
-    return normalized or None
-
-
-def _command_args_signature(args: dict[str, Any] | None) -> str:
-    try:
-        return json.dumps(args or {}, sort_keys=True, separators=(",", ":"), default=str)
-    except TypeError:
-        safe_args = json.loads(json.dumps(args or {}, default=str))
-        return json.dumps(safe_args, sort_keys=True, separators=(",", ":"))
-
-
-def _trim_commands_locked() -> None:
-    if len(commands) <= COMMAND_MAX:
-        return
-    terminal = {"completed", "failed", "expired"}
-    idx = 0
-    while len(commands) > COMMAND_MAX and idx < len(commands):
-        if commands[idx].get("status") in terminal:
-            del commands[idx]
-            continue
-        idx += 1
-    if len(commands) > COMMAND_MAX:
-        del commands[:len(commands) - COMMAND_MAX]
-
-
-def _cleanup_commands_locked(now: float | None = None) -> tuple[int, int]:
-    now = now or time.time()
-    expired = 0
-    for cmd in commands:
-        if cmd.get("status") in {"pending", "delivered"} and (now - cmd.get("created_at", now)) > COMMAND_EXPIRE_SECS:
-            cmd["status"] = "expired"
-            cmd["updated_at"] = now
-            cmd["purge_after"] = now + COMMAND_RESULT_RETENTION_SECS
-            expired += 1
-            _trace(
-                "command_expired",
-                cmd_id=cmd.get("id"),
-                action=cmd.get("action"),
-                target=cmd.get("target"),
-                age_secs=round(now - cmd.get("created_at", now)),
-            )
-
-    before = len(commands)
-    commands[:] = [
-        cmd for cmd in commands
-        if cmd.get("status") not in {"completed", "failed", "expired"}
-        or now < float(cmd.get("purge_after") or cmd.get("updated_at", cmd.get("created_at", now)) + COMMAND_RESULT_RETENTION_SECS)
-    ]
-    purged = before - len(commands)
-    _trim_commands_locked()
-    if expired or purged:
-        _save_commands()
-    return expired, purged
-
-
-def _find_active_duplicate_command_locked(target: str, action: str, args: dict[str, Any]) -> dict[str, Any] | None:
-    args_sig = _command_args_signature(args)
-    for cmd in commands:
-        if cmd.get("target") != target or cmd.get("action") != action:
-            continue
-        if cmd.get("status") not in {"pending", "delivered"}:
-            continue
-        if _command_args_signature(cmd.get("args", {})) == args_sig:
-            return cmd
-    return None
-
-
-def _enqueue_command_locked(target: str, action: str, args: dict[str, Any] | None = None, command_type: str | None = None, relay: bool = False) -> tuple[dict[str, Any], bool, int, int]:
-    normalized_action = _normalize_command_action(action)
-    normalized_type = _normalize_command_type(command_type)
-    normalized_args = dict(args or {})
-    if target == "proxmox" and normalized_action == "delete_vm":
-        # Hub relay commands use lenient validation — inventory may be stale or not yet loaded.
-        # The proxmox agent performs the real validation before executing the delete.
-        normalized_args = _prepare_delete_vm_args(normalized_args, strict=not relay)
-
-    # Block all single-VM actions on protected VMIDs (start, stop, reboot, snapshot, reclone)
-    _VM_ACTIONS = {"start_vm", "stop_vm", "reboot_vm", "snapshot_vm", "reclone_vm", "delete_vm"}
-    if target == "proxmox" and normalized_action in _VM_ACTIONS:
-        vmid = normalized_args.get("vmid")
-        if _is_protected_vmid(vmid):
-            raise HTTPException(
-                status_code=403,
-                detail=f"VM {vmid} is protected and cannot be managed from this UI",
-            )
-
-    now = time.time()
-    expired, purged = _cleanup_commands_locked(now)
-    existing = _find_active_duplicate_command_locked(target, normalized_action, normalized_args)
-    if existing is not None:
-        return existing, False, expired, purged
-
-    cmd = _make_command(target, normalized_action, normalized_args, command_type=normalized_type)
-    commands.append(cmd)
-    _trim_commands_locked()
-    _save_commands()
-    return cmd, True, expired, purged
-
-
-def _make_command(target: str, action: str, args: dict | None = None, command_type: str | None = None) -> dict[str, Any]:
-    now = time.time()
-    return {
-        "id": str(uuid.uuid4()),
-        "target": target,
-        "action": _normalize_command_action(action),
-        "args": dict(args or {}),
-        "type": _normalize_command_type(command_type),
-        "status": "pending",
-        "created_at": now,
-        "updated_at": now,
-        "expires_at": now + COMMAND_EXPIRE_SECS,
-        "purge_after": None,
-        "result": None,
-        "message": None,
-    }
-
-
-def _serialize_command_for_agent(command: dict[str, Any]) -> dict[str, Any]:
-    return {"id": command["id"], "action": command["action"], "args": command["args"], "type": command.get("type")}
-
-
-def _command_matches_agent(command: dict[str, Any], hostname: str, approved_hostname: str | None = None) -> bool:
-    if command["target"] == hostname:
-        return True
-    if approved_hostname is None:
-        return False
-    return (
-        _proxmox_hostnames_match(command["target"], approved_hostname)
-        or command["target"] == "proxmox"
-    )
-
-
-def _reset_delivered_commands_locked(hostname: str, approved_hostname: str | None = None) -> int:
-    """On WS reconnect, reset 'delivered' commands back to 'pending' so they are re-sent.
-
-    Commands that were pushed via WS and marked 'delivered' but never acked (because the
-    connection dropped before the agent could process them) would otherwise be silently
-    abandoned — _peek_pending_agent_commands_locked only returns 'pending' commands.
-    Resetting them to 'pending' ensures they are re-delivered on the next push.
-    """
-    now = time.time()
-    reset = 0
-    for cmd in commands:
-        if cmd.get("status") == "delivered" and _command_matches_agent(cmd, hostname, approved_hostname):
-            cmd["status"] = "pending"
-            cmd["updated_at"] = now
-            reset += 1
-    if reset:
-        _save_commands()
-    return reset
-
-
-def _peek_pending_agent_commands_locked(hostname: str, approved_hostname: str | None = None) -> tuple[list[dict[str, Any]], int, int]:
-    expired, purged = _cleanup_commands_locked()
-    pending = [
-        command for command in commands
-        if command["status"] == "pending" and _command_matches_agent(command, hostname, approved_hostname)
-    ]
-    return pending, expired, purged
-
-
-def _mark_commands_delivered_locked(command_ids: list[str]) -> bool:
-    if not command_ids:
-        return False
-    ids = set(command_ids)
-    now = time.time()
-    changed = False
-    for command in commands:
-        if command["id"] in ids and command["status"] == "pending":
-            command["status"] = "delivered"
-            command["updated_at"] = now
-            changed = True
-    if changed:
-        _save_commands()
-    return changed
-
-
-async def _push_pending_agent_commands(hostname: str, websocket: WebSocket, approved_hostname: str | None = None) -> bool:
-    async with state_lock:
-        pending, expired, purged = _peek_pending_agent_commands_locked(hostname, approved_hostname)
-        payload = [_serialize_command_for_agent(command) for command in pending]
-        serialized = _serialize_commands()
-    if not payload:
-        if expired or purged:
-            await broadcast({"type": "commands_update", "commands": serialized})
-        return True
-    _trace("agent_ws_push", hostname=hostname,
-           commands=[{"action": c.get("action"), "args": {k: v for k, v in (c.get("args") or {}).items() if k in {"vmid", "vm_type"}}} for c in payload])
-    try:
-        await websocket.send_json({"type": "commands", "commands": payload})
-    except Exception as exc:
-        _trace("agent_ws_push_err", hostname=hostname, error=str(exc))
-        return False
-    async with state_lock:
-        changed = _mark_commands_delivered_locked([command["id"] for command in pending])
-        serialized = _serialize_commands()
-    if changed or expired or purged:
-        await broadcast({"type": "commands_update", "commands": serialized})
-    return True
-
-
-async def _push_pending_commands_for_target(target: str) -> None:
-    normalized = str(target or "").strip()
-    if not normalized:
-        return
-    websocket = client_ws_connections.get(normalized)
-    if websocket is not None:
-        if not await _push_pending_agent_commands(normalized, websocket):
-            client_ws_connections.pop(normalized, None)
-    global proxmox_ws_connection, proxmox_ws_hostname
-    if proxmox_ws_connection is not None and proxmox_ws_hostname and (
-        normalized == "proxmox" or _proxmox_hostnames_match(normalized, proxmox_ws_hostname)
-    ):
-        if not await _push_pending_agent_commands(proxmox_ws_hostname, proxmox_ws_connection, proxmox_ws_hostname):
-            proxmox_ws_connection = None
-            proxmox_ws_hostname = None
-
-
-async def _push_pending_commands_for_targets(targets: list[str]) -> None:
-    seen: set[str] = set()
-    for target in targets:
-        normalized = str(target or "").strip()
-        if normalized and normalized not in seen:
-            seen.add(normalized)
-            await _push_pending_commands_for_target(normalized)
-
-
-def _serialize_commands() -> list[dict[str, Any]]:
-    return [
-        {**cmd, "age_secs": int(time.time() - cmd["created_at"])}
-        for cmd in commands
-    ]
-
-
 def _normalize_toggle(value: Any) -> str:
     if isinstance(value, str):
         return "on" if value.lower() == "on" else "off"
@@ -4392,13 +2714,6 @@ def _parse_ts(value: Any) -> float | None:
     return None
 
 
-def _vm_watchdog_key(vmid: Any) -> str | None:
-    try:
-        return str(int(vmid))
-    except (TypeError, ValueError):
-        return None
-
-
 def _client_last_seen_for_hostname(hostname: Any, client_seen: dict[str, Any] | None = None) -> datetime | None:
     normalized = str(hostname or "").strip().lower()
     if not normalized:
@@ -4417,30 +2732,6 @@ def _vm_has_checked_in(hostname: Any, clone_completed_at: float | None, client_s
     return bool(last_seen and last_seen.timestamp() > float(clone_completed_at))
 
 
-def _record_vm_watchdog_clone_completed(
-    vmid: Any,
-    hostname: Any,
-    *,
-    clone_completed_at: float | None = None,
-    reclone_count: int | None = None,
-) -> bool:
-    vmid_key = _vm_watchdog_key(vmid)
-    if vmid_key is None:
-        return False
-    current = vm_watchdog.get(vmid_key) or {}
-    if reclone_count is None:
-        try:
-            reclone_count = max(0, int(current.get("reclone_count", 0) or 0))
-        except (TypeError, ValueError):
-            reclone_count = 0
-    vm_watchdog[vmid_key] = {
-        "clone_completed_at": float(clone_completed_at if clone_completed_at is not None else time.time()),
-        "reclone_count": max(0, int(reclone_count)),
-        "hostname": str(hostname or current.get("hostname") or "").strip(),
-    }
-    return True
-
-
 def _vm_pending_checkin(vm: dict[str, Any], client_seen: dict[str, Any] | None = None) -> bool:
     vmid_key = _vm_watchdog_key(vm.get("vmid"))
     if vmid_key is None:
@@ -4451,112 +2742,6 @@ def _vm_pending_checkin(vm: dict[str, Any], client_seen: dict[str, Any] | None =
     clone_completed_at = _parse_ts(entry.get("clone_completed_at"))
     hostname = str(entry.get("hostname") or vm.get("name") or "").strip()
     return not _vm_has_checked_in(hostname, clone_completed_at, client_seen)
-
-
-def _proxmox_usb_config_payload(hostname: str | None = None) -> dict[str, Any]:
-    # Read sim_phy from the repo's simulation.conf so the agent knows which
-    # USB device type (wired/wireless/any) to provision and assign.
-    sim_phy = "wireless"
-    try:
-        sim_conf = REPO_DIR / "configs" / "simulation.conf"
-        if sim_conf.exists():
-            parser = configparser.ConfigParser()
-            parser.read_string(sim_conf.read_text(encoding="utf-8"))
-            _merge_ini_override(parser, REPO_DIR / "configs" / "hub-sim-overrides.conf")
-            sim_phy = parser.get("simulation", "sim_phy", fallback="wireless").strip().lower() or "wireless"
-    except Exception:
-        pass
-    if sim_phy not in {"wireless", "ethernet", "any"}:
-        sim_phy = "wireless"
-    image1_template_spec = _resolved_template_spec(settings, 1)
-    image2_template_spec = _resolved_template_spec(settings, 2)
-    host_config = _get_proxmox_host_config(hostname) if hostname else {}
-    vm_set_override = _sanitize_vm_set_override(host_config.get("vm_set_override", 0))
-    return {
-        "vidpids": _parse_json_list(settings.get("usb_vidpids", "[]")),
-        "missing_timeout": _setting_int("usb_missing_timeout", 60, 1),
-        "image1_template_id": int(_primary_template_id(image1_template_spec, _legacy_template_id(settings, 1)) or 100),
-        "image1_template_spec": image1_template_spec,
-        "image2_template_id": int(_primary_template_id(image2_template_spec, _legacy_template_id(settings, 2)) or 200),
-        "image2_template_spec": image2_template_spec,
-        "template_vmid_specs": [image1_template_spec, image2_template_spec],
-        "image1_pct": max(0, min(100, int(str(settings.get("vm_image_1_pct", "50")).strip() or "50"))),
-        "auto_provision": _normalize_toggle(settings.get("usb_auto_provision", "off")),
-        "use_all_dongles": _setting_bool("use_all_dongles", False),
-        "max_slots": max(1, min(256, int(str(settings.get("usb_max_slots", "24")).strip() or "24"))),
-        "vmid_start": int(settings.get("vmid_start", 0) or 0),
-        "vm_set_override": vm_set_override,
-        "ignored_vidpids": _parse_json_list(settings.get("usb_ignored_vidpids", "[]")),
-        "sim_phy": sim_phy,
-        "reclone_concurrency": max(1, int(str(settings.get("reclone_concurrency", "1")).strip() or "1")),
-        "l1_vlan_start": max(1, min(4094, int(str(settings.get("l1_vlan_start", "100")).strip() or "100"))),
-        "l1_vlan_end": max(1, min(4094, int(str(settings.get("l1_vlan_end", "199")).strip() or "199"))),
-        "guest_agent_watchdog_enabled": _normalize_toggle(settings.get("guest_agent_watchdog_enabled", "on")),
-        "guest_agent_grace_minutes": max(1, int(str(settings.get("guest_agent_grace_minutes", "20")).strip() or "20")),
-        "guest_agent_check_interval_minutes": max(1, int(str(settings.get("guest_agent_check_interval_minutes", "10")).strip() or "10")),
-        "guest_agent_reboot_after_minutes": max(1, int(str(settings.get("guest_agent_reboot_after_minutes", "10")).strip() or "10")),
-        "guest_agent_reclone_after_minutes": max(1, int(str(settings.get("guest_agent_reclone_after_minutes", "30")).strip() or "30")),
-        "watchdog_reboot_enabled": _normalize_toggle(settings.get("watchdog_reboot_enabled", "on")),
-        "cpu_provision_threshold": max(0, min(100, int(str(settings.get("cpu_provision_threshold", "80")).strip() or "80"))),
-        "mem_provision_threshold": max(0, min(100, int(str(settings.get("mem_provision_threshold", "80")).strip() or "80"))),
-    }
-
-
-def _normalize_proxmox_hostname(hostname: Any) -> str:
-    return str(hostname or "").strip().rstrip(".").lower()
-
-
-def _proxmox_hostname_aliases(hostname: Any) -> tuple[str, ...]:
-    normalized = _normalize_proxmox_hostname(hostname)
-    if not normalized:
-        return ()
-    aliases = [normalized]
-    short = normalized.split(".", 1)[0]
-    if short and short not in aliases:
-        aliases.append(short)
-    return tuple(aliases)
-
-
-def _proxmox_hostnames_match(left: Any, right: Any) -> bool:
-    left_aliases = set(_proxmox_hostname_aliases(left))
-    return bool(left_aliases and left_aliases.intersection(_proxmox_hostname_aliases(right)))
-
-
-def _resolve_proxmox_agent_hostname(hostname: Any, registry: dict[str, Any]) -> str | None:
-    if not isinstance(registry, dict):
-        return None
-    for registered_hostname in registry:
-        if _proxmox_hostnames_match(hostname, registered_hostname):
-            return registered_hostname
-    return None
-
-
-def _upsert_pending_proxmox_agent(hostname: Any, client_ip: str, now: float) -> str | None:
-    resolved_hostname = _resolve_proxmox_agent_hostname(hostname, pending_proxmox_agents)
-    if not resolved_hostname:
-        resolved_hostname = _normalize_proxmox_hostname(hostname)
-    if not resolved_hostname:
-        return None
-    entry = pending_proxmox_agents.get(resolved_hostname)
-    if entry is None:
-        pending_proxmox_agents[resolved_hostname] = {"ip": client_ip, "first_seen": now, "last_seen": now}
-    else:
-        entry["ip"] = client_ip
-        entry["last_seen"] = now
-    return resolved_hostname
-
-
-def _pending_proxmox_payload() -> list[dict[str, Any]]:
-    now = time.time()
-    return [
-        {
-            "hostname": hostname,
-            "ip": info.get("ip", ""),
-            "first_seen": info.get("first_seen", now),
-            "last_seen": info.get("last_seen", now),
-        }
-        for hostname, info in pending_proxmox_agents.items()
-    ]
 
 
 # Per-agent state tracking — hostname → state snapshot updated on each telemetry push.
@@ -4583,31 +2768,6 @@ def _clear_provision_halt_state() -> None:
     _save_resource_cache(force=True)
 
 
-def _approved_proxmox_payload() -> list[dict[str, Any]]:
-    result = []
-    for hostname in approved_proxmox_agents:
-        state = proxmox_states.get(hostname, {})
-        host_config = _get_proxmox_host_config(hostname)
-        vm_set_override = _sanitize_vm_set_override(state.get("vm_set_override", host_config.get("vm_set_override", 0)))
-        result.append({
-            "hostname": hostname,
-            "connected": bool(state.get("connected", False)),
-            "last_seen": state.get("last_seen"),
-            "agent_version": state.get("agent_version"),
-            "pve_version": state.get("pve_version"),
-            "vm_count": int(state.get("vm_count", 0)),
-            "usb_count": int(state.get("usb_count", 0)),
-            "node": state.get("node", {}),
-            "provision_halt": _current_provision_halt(state),
-            "cpu_1h_avg": state.get("cpu_1h_avg"),
-            "mem_1h_avg": state.get("mem_1h_avg"),
-            "vmid_range": state.get("vmid_range"),
-            "vm_set_override": vm_set_override,
-            "effective_vm_set": int(state.get("effective_vm_set", vm_set_override or _hostname_vm_set_number(hostname))),
-        })
-    return result
-
-
 def _client_os_counts() -> dict[str, int]:
     """Count connected clients by platform (linux/windows)."""
     counts: dict[str, int] = {"linux": 0, "windows": 0}
@@ -4629,77 +2789,6 @@ def _read_local_kill_switch() -> str:
     except Exception:
         pass
     return "off"
-
-
-def _proxmox_status_payload() -> dict[str, Any]:
-    node = proxmox_state.get("node") or {}
-    client_seen = {hostname: client.get("last_seen") for hostname, client in clients.items()}
-    usb_by_vmid = {
-        str(entry.get("vmid")): entry
-        for entry in proxmox_state.get("usb_state", [])
-        if entry.get("vmid") is not None
-    }
-    vms = []
-    current_vmids: set[int] = set()
-    for vm in proxmox_state.get("vms") or []:
-        enriched_vm = dict(vm)
-        enriched_vm["pending_checkin"] = _vm_pending_checkin(enriched_vm, client_seen)
-        enriched_vm["watchdog_tracked"] = bool(_vm_watchdog_key(vm.get("vmid")) and vm_watchdog.get(_vm_watchdog_key(vm.get("vmid"))))
-        usb_entry = usb_by_vmid.get(str(vm.get("vmid")), {})
-        enriched_vm["prov_status"] = usb_entry.get("prov_status") or "active"
-        try:
-            vmid_int = int(vm.get("vmid"))
-            current_vmids.add(vmid_int)
-            if vmid_int in _pending_delete_vmids:
-                enriched_vm["status"] = "deleting"
-        except (TypeError, ValueError):
-            pass
-        vms.append(enriched_vm)
-    # Include any pending-delete VMIDs that have already been removed from agent telemetry
-    # so the UI keeps showing them as "deleting…" until the next full render cycle.
-    for pending_vmid in _pending_delete_vmids:
-        if pending_vmid not in current_vmids:
-            vms.append({
-                "vmid": pending_vmid,
-                "name": f"VM {pending_vmid}",
-                "status": "deleting",
-                "type": "qemu",
-                "prov_status": "active",
-                "pending_checkin": False,
-                "watchdog_tracked": False,
-            })
-    return {
-        **proxmox_state,
-        "vms": vms,
-        "prov_run": dict(proxmox_state.get("prov_run") or {}),
-        "hostname": str(node.get("hostname") or "").strip(),
-        "pending_proxmox": _pending_proxmox_payload(),
-        "approved_proxmox": _approved_proxmox_payload(),
-        "reclone_state": dict(reclone_state),
-        "client_os_counts": _client_os_counts(),
-        "auto_recovery_pending": _auto_recovery_pending_vmids(),
-        "webui_vmid": WEBUI_VMID,
-        "reseed_in_progress": bool(_proxmox_reseed_in_progress),
-        "cpu_1h_avg": _resource_1h_average(_cpu_samples),
-        "mem_1h_avg": _resource_1h_average(_mem_samples),
-        "provision_halt": _current_provision_halt(),
-        "cpu_est_avg": _resource_estimated_average(_cpu_samples),
-        "mem_est_avg": _resource_estimated_average(_mem_samples),
-        "resource_samples_started": _resource_samples_started or None,
-        "resource_sample_count": len(_cpu_samples),
-        "pending_command_count": len([c for c in commands if c.get("status") in ("queued", "delivered")]),
-        "spoke_version": APP_VERSION,
-    }
-
-
-def _find_proxmox_vm(vmid: int) -> dict[str, Any] | None:
-    for vm in proxmox_state.get("vms") or []:
-        try:
-            if int(vm.get("vmid")) == vmid:
-                return dict(vm)
-        except (TypeError, ValueError):
-            continue
-    return None
 
 
 def _prepare_delete_vm_args(args: dict[str, Any] | None, strict: bool = True) -> dict[str, Any]:
@@ -4744,69 +2833,6 @@ def _prepare_delete_vm_args(args: dict[str, Any] | None, strict: bool = True) ->
     return prepared
 
 
-async def _broadcast_proxmox_state() -> None:
-    global _last_proxmox_hash
-    _save_state_cache()
-    payload = _proxmox_status_payload()
-    h = hashlib.md5(json.dumps(payload, sort_keys=True, default=str).encode()).hexdigest()
-    if h == _last_proxmox_hash:
-        return
-    _last_proxmox_hash = h
-    await broadcast({"type": "proxmox_update", **payload})
-
-
-async def _broadcast_reclone_state() -> None:
-    await _async_save_reclone_state()
-    await broadcast({"type": "reclone_update", **dict(reclone_state)})
-
-
-def _update_reclone_log(vmid: int, name: str, status: str, message: str | None = None) -> None:
-    timestamp = iso_utcnow()
-    for entry in reversed(reclone_state["log"]):
-        if entry.get("vmid") == vmid and entry.get("status") in {"queued", "in_progress"}:
-            entry.update({"name": name, "status": status, "timestamp": timestamp})
-            if message:
-                entry["message"] = message
-            elif entry.get("message") and status in {"queued", "in_progress"}:
-                entry.pop("message", None)
-            break
-    else:
-        entry = {"vmid": vmid, "name": name, "status": status, "timestamp": timestamp}
-        if message:
-            entry["message"] = message
-        reclone_state["log"].append(entry)
-    reclone_state["log"] = reclone_state["log"][-200:]
-    _save_reclone_state()
-
-
-def _parse_reclone_schedule(value: Any) -> tuple[str, int, int] | None:
-    raw = str(value or "").strip().lower()
-    parts = raw.split()
-    if len(parts) != 2:
-        return None
-    day, clock = parts
-    if day not in {"monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"}:
-        return None
-    try:
-        hour, minute = (int(piece) for piece in clock.split(":", 1))
-    except ValueError:
-        return None
-    if hour not in range(24) or minute not in range(60):
-        return None
-    return day, hour, minute
-
-
-def _has_pending_reclone(vmid: int) -> bool:
-    for cmd in commands:
-        if cmd.get("action") != "reclone_vm":
-            continue
-        if int(cmd.get("args", {}).get("vmid", -1)) != vmid:
-            continue
-        if cmd.get("status") in {"pending", "delivered"}:
-            return True
-    return False
-
-
 def _auto_recovery_pending_vmids() -> list[int]:
     """Return VMIDs that have a pending/delivered auto-recovery reclone command."""
     return [
@@ -4817,49 +2843,6 @@ def _auto_recovery_pending_vmids() -> list[int]:
         and cmd.get("status") in {"pending", "delivered"}
         and cmd.get("args", {}).get("vmid") is not None
     ]
-
-
-def _proxmox_unassigned_present_usb() -> list[dict[str, Any]]:
-    assigned_buses = {
-        str(entry.get("bus_path", "")).strip()
-        for entry in proxmox_state.get("usb_state", [])
-        if str(entry.get("bus_path", "")).strip() and entry.get("vmid") is not None
-    }
-    return [
-        dict(entry)
-        for entry in proxmox_state.get("present_usb", [])
-        if str(entry.get("bus_path", "")).strip()
-        and str(entry.get("bus_path", "")).strip() not in assigned_buses
-    ]
-
-
-
-def _normalize_proxmox_usb_state(
-    usb_state: Any,
-    present_usb: Any,
-) -> list[dict[str, Any]]:
-    present_by_bus = {
-        str(entry.get("bus_path", "")).strip(): dict(entry)
-        for entry in (present_usb if isinstance(present_usb, list) else [])
-        if isinstance(entry, dict) and str(entry.get("bus_path", "")).strip()
-    }
-    normalized: list[dict[str, Any]] = []
-    for raw_entry in usb_state if isinstance(usb_state, list) else []:
-        if not isinstance(raw_entry, dict):
-            continue
-        entry = dict(raw_entry)
-        bus_path = str(entry.get("bus_path", "")).strip()
-        present_entry = present_by_bus.get(bus_path)
-        if present_entry:
-            entry["missing_since"] = None
-            if entry.get("prov_status") in {None, "", "missing", "tearing_down"}:
-                entry["prov_status"] = "active"
-            if not entry.get("vidpid") and present_entry.get("vidpid"):
-                entry["vidpid"] = present_entry.get("vidpid")
-            if not entry.get("name") and present_entry.get("name"):
-                entry["name"] = present_entry.get("name")
-        normalized.append(entry)
-    return normalized
 
 
 def _derive_provision_run_item_status(
@@ -4873,212 +2856,6 @@ def _derive_provision_run_item_status(
     return "configuring" if vm_status == "running" else "cloning"
 
 
-def _update_provision_run_state(vms: list[dict[str, Any]], usb_state: list[dict[str, Any]], now: int) -> None:
-    run = _default_provision_run_state()
-    current = proxmox_state.get("prov_run")
-    if isinstance(current, dict):
-        for key in ("running", "started_at", "updated_at", "completed_at", "total", "completed", "failed"):
-            run[key] = current.get(key)
-        run["items"] = [
-            dict(item)
-            for item in current.get("items", [])
-            if isinstance(item, dict) and item.get("vmid") is not None
-        ]
-
-    vm_by_vmid = {
-        str(vm.get("vmid")): dict(vm)
-        for vm in (vms if isinstance(vms, list) else [])
-        if isinstance(vm, dict) and vm.get("vmid") is not None
-    }
-    usb_by_vmid = {
-        str(entry.get("vmid")): dict(entry)
-        for entry in (usb_state if isinstance(usb_state, list) else [])
-        if isinstance(entry, dict) and entry.get("vmid") is not None
-    }
-    provisioning_vmids = [
-        vmid
-        for vmid, entry in usb_by_vmid.items()
-        if str(entry.get("prov_status") or "").strip().lower() == "provisioning"
-    ]
-    provisioning_vmids.sort(key=lambda value: int(value) if str(value).isdigit() else value)
-
-    if not run.get("running") and provisioning_vmids:
-        run = _default_provision_run_state()
-        run["running"] = True
-        run["started_at"] = now
-        run["updated_at"] = now
-
-    items = run["items"]
-    item_by_vmid = {str(item.get("vmid")): item for item in items if item.get("vmid") is not None}
-
-    if run.get("running"):
-        for vmid in provisioning_vmids:
-            entry = usb_by_vmid[vmid]
-            item = item_by_vmid.get(vmid)
-            if item is None:
-                vm = vm_by_vmid.get(vmid) or {}
-                item = {
-                    "vmid": entry.get("vmid"),
-                    "vm_name": str(vm.get("name") or "").strip() or None,
-                    "usb_name": str(entry.get("name") or "").strip() or None,
-                    "bus_path": str(entry.get("bus_path") or "").strip() or None,
-                    "vidpid": str(entry.get("vidpid") or "").strip() or None,
-                    "status": _derive_provision_run_item_status(entry, vm_by_vmid),
-                    "started_at": now,
-                    "updated_at": now,
-                    "completed_at": None,
-                }
-                items.append(item)
-                item_by_vmid[vmid] = item
-            elif item.get("status") in {"done", "failed"}:
-                item.update({
-                    "status": _derive_provision_run_item_status(entry, vm_by_vmid),
-                    "started_at": now,
-                    "updated_at": now,
-                    "completed_at": None,
-                })
-
-    for item in items:
-        vmid_key = str(item.get("vmid"))
-        entry = usb_by_vmid.get(vmid_key)
-        vm = vm_by_vmid.get(vmid_key) or {}
-        if vm.get("name"):
-            item["vm_name"] = str(vm.get("name"))
-        if entry:
-            if entry.get("name"):
-                item["usb_name"] = str(entry.get("name"))
-            if entry.get("bus_path"):
-                item["bus_path"] = str(entry.get("bus_path"))
-            if entry.get("vidpid"):
-                item["vidpid"] = str(entry.get("vidpid"))
-
-        previous_status = str(item.get("status") or "pending")
-        next_status = previous_status
-        if entry and str(entry.get("prov_status") or "").strip().lower() == "provisioning":
-            enriched = next((v for v in vms if str(v.get("vmid")) == vmid_key), None)
-            # If the watchdog confirms the client has already checked in, the USB state
-            # is just lagging — treat as done rather than staying stuck at "configuring".
-            if (enriched
-                    and enriched.get("watchdog_tracked")
-                    and not enriched.get("pending_checkin")
-                    and str(enriched.get("status", "")).lower() == "running"):
-                next_status = "done"
-                item["completed_at"] = item.get("completed_at") or now
-            else:
-                next_status = _derive_provision_run_item_status(entry, vm_by_vmid)
-                item["completed_at"] = None
-        elif entry and str(entry.get("prov_status") or "").strip().lower() == "active":
-            if previous_status != "failed":
-                # Clone finished — keep as "pending_checkin" until the VM's client
-                # actually contacts the API (pending_checkin flag on the enriched VM).
-                # This keeps run.running=True and the live panel visible through the
-                # boot-up gap between clone-complete and first API check-in.
-                enriched = next(
-                    (v for v in vms if str(v.get("vmid")) == vmid_key),
-                    None,
-                )
-                if enriched and enriched.get("pending_checkin"):
-                    next_status = "pending_checkin"
-                    item["completed_at"] = None
-                else:
-                    next_status = "done"
-                    item["completed_at"] = item.get("completed_at") or now
-        elif run.get("running") and previous_status not in {"done", "failed"}:
-            if _prev_usb_by_vmid.get(vmid_key) == "provisioning":
-                next_status = "failed"
-                item["completed_at"] = item.get("completed_at") or now
-
-        if next_status != previous_status or (entry and str(entry.get("prov_status") or "").strip().lower() == "provisioning"):
-            item["updated_at"] = now
-        item["status"] = next_status
-
-    run["total"] = len(items)
-    run["completed"] = sum(1 for item in items if item.get("status") == "done")
-    run["failed"] = sum(1 for item in items if item.get("status") == "failed")
-
-    # "pending_checkin" is an active (non-terminal) status — keep run alive
-    active_items = [item for item in items if item.get("status") not in {"done", "failed"}]
-    if run.get("running") and items and not active_items:
-        run["running"] = False
-        run["completed_at"] = now
-        run["updated_at"] = now
-    elif run.get("running"):
-        run["updated_at"] = now
-
-    proxmox_state["prov_run"] = run
-
-
-def _guest_supports_reclone(vm: dict[str, Any]) -> bool:
-    if vm.get("is_template"):
-        return False
-    if _is_protected_vmid(vm.get("vmid")):
-        return False
-    return bool(vm.get("reclone_supported"))
-
-
-def _reclone_targets_for_run() -> list[dict[str, Any]]:
-    return sorted(
-        [
-            dict(vm)
-            for vm in proxmox_state.get("vms") or []
-            if (
-                vm.get("vmid") is not None
-                and _guest_supports_reclone(vm)
-                and int(vm.get("vmid", 0)) > 9000  # only auto-provisioned sim clients
-            )
-        ],
-        key=lambda vm: int(vm.get("vmid", 0)),
-    )
-
-
-
-def _reclone_command_args(vm: dict[str, Any]) -> dict[str, Any]:
-    args: dict[str, Any] = {
-        "vmid": int(vm.get("vmid")),
-        "type": str(vm.get("type") or "qemu"),
-    }
-    if vm.get("reclone_source_vmid") is not None:
-        args["source_vmid"] = int(vm["reclone_source_vmid"])
-    if vm.get("reclone_bus_path"):
-        args["bus_path"] = str(vm["reclone_bus_path"])
-    return args
-
-
-async def _queue_command(target: str, action: str, args: dict[str, Any] | None = None, command_type: str | None = None) -> dict[str, Any]:
-    async with state_lock:
-        cmd, created, expired, purged = _enqueue_command_locked(target, action, args, command_type=command_type)
-        serialized = _serialize_commands()
-    if created or expired or purged:
-        await broadcast({"type": "commands_update", "commands": serialized})
-    if created:
-        await _push_pending_commands_for_target(target)
-    return cmd
-
-
-async def _queue_proxmox_command(action: str, args: dict[str, Any] | None = None, command_type: str | None = None, target: str = "proxmox") -> dict[str, Any]:
-    # In multi-agent setups, resolve the generic "proxmox" target to the currently
-    # WS-connected (primary) agent so the command is delivered to exactly one agent.
-    # Commands remain generic "proxmox" if no agent is currently connected via WS
-    # (they'll be picked up by whichever agent polls next).
-    resolved = target
-    if target == "proxmox" and proxmox_ws_hostname:
-        resolved = proxmox_ws_hostname
-    return await _queue_command(resolved, action, args, command_type=command_type)
-
-
-def _resolve_proxmox_vm_target(vmid: int | None) -> str:
-    """Return the specific agent hostname that owns this vmid, or 'proxmox' if unknown."""
-    if vmid is not None:
-        owner = _proxmox_agent_vm_map.get(int(vmid))
-        if owner and owner in approved_proxmox_agents:
-            return owner
-    return "proxmox"
-
-
-async def _queue_unlock_template_command(command_type: str = "unlock_template") -> dict[str, Any]:
-    return await _queue_proxmox_command("unlock_template", {}, command_type=command_type)
-
-
 def _unlock_template_result(cmd: dict[str, Any]) -> dict[str, Any]:
     return {
         "success": True,
@@ -5088,184 +2865,6 @@ def _unlock_template_result(cmd: dict[str, Any]) -> dict[str, Any]:
         "command_id": cmd.get("id"),
         "timestamp": datetime.now(timezone.utc).isoformat(),
     }
-
-
-def _proxmox_update_branch() -> str:
-    branch = str(settings.get("repo_branch", REPO_BRANCH) or REPO_BRANCH).strip()
-    return branch or REPO_BRANCH
-
-
-def _proxmox_update_args() -> dict[str, str]:
-    branch = _proxmox_update_branch()
-    return {
-        "branch": branch,
-        "repo_raw": f"{CLIENT_SIM_REPO_RAW.rstrip('/')}/{branch}",
-    }
-
-
-def _resolve_proxmox_update_target() -> str:
-    hostname = str((proxmox_state.get("node") or {}).get("hostname") or "").strip()
-    resolved_hostname = _resolve_proxmox_agent_hostname(hostname, approved_proxmox_agents)
-    if resolved_hostname:
-        return resolved_hostname
-    if len(approved_proxmox_agents) == 1:
-        return next(iter(approved_proxmox_agents))
-    if not approved_proxmox_agents:
-        raise HTTPException(status_code=409, detail="No approved Proxmox agent is available")
-    raise HTTPException(status_code=409, detail="Unable to determine which Proxmox host should be updated")
-
-
-async def _queue_proxmox_agent_update(target: str | None = None) -> dict[str, Any]:
-    resolved_target = target or _resolve_proxmox_update_target()
-    if resolved_target not in approved_proxmox_agents:
-        raise HTTPException(status_code=404, detail="Proxmox agent not approved")
-    async with state_lock:
-        expired, purged = _cleanup_commands_locked()
-        cmd, created, _expired, _purged = _enqueue_command_locked(resolved_target, "update_agent", _proxmox_update_args())
-        serialized = _serialize_commands()
-    if not created:
-        raise HTTPException(status_code=409, detail=f"An agent update is already queued for {resolved_target}")
-    if expired or purged or created:
-        await broadcast({"type": "commands_update", "commands": serialized})
-    await _push_pending_commands_for_target(resolved_target)
-    return cmd
-
-
-async def _run_rolling_reclone(trigger_type: str) -> None:
-    async with reclone_run_lock:
-        if reclone_state["status"] == "running":
-            return
-
-        vms = _reclone_targets_for_run()
-        reclone_state.update({
-            "status": "running",
-            "type": trigger_type,
-            "total": len(vms),
-            "completed": 0,
-            "failed": 0,
-            "current_vm": None,
-            "log": [],
-            "started_at": iso_utcnow(),
-        })
-        logger.info("Rolling reclone (%s): %d eligible VMs: %s", trigger_type, len(vms), [v.get("vmid") for v in vms])
-        await _broadcast_reclone_state()
-        await _broadcast_proxmox_state()
-
-        concurrency = max(1, int(str(settings.get("reclone_concurrency", "1")).strip() or "1"))
-
-        async def _reclone_one(vm: dict) -> None:
-            vmid = int(vm.get("vmid"))
-            name = vm.get("name") or f"VM {vmid}"
-            _update_reclone_log(vmid, name, "queued")
-            await _broadcast_reclone_state()
-            await _broadcast_proxmox_state()
-
-            cmd = await _queue_proxmox_command("reclone_vm", _reclone_command_args(vm), command_type=trigger_type)
-            deadline = time.time() + 1800
-            last_status = "pending"
-            poll_interval = 2.0
-            while time.time() < deadline:
-                # Commands remain in a small module-level list, so a linear scan keeps the
-                # lookup simple here without a broader commands storage refactor.
-                current = next((item for item in commands if item["id"] == cmd["id"]), None)
-                if current is None:
-                    break
-                status = current.get("status", "pending")
-                if status != last_status:
-                    if status == "delivered":
-                        _update_reclone_log(vmid, name, "in_progress")
-                        await _broadcast_reclone_state()
-                        await _broadcast_proxmox_state()
-                        poll_interval = 5.0
-                    last_status = status
-                if status in {"completed", "failed", "expired"}:
-                    final_status = "completed" if status == "completed" else "failed"
-                    _update_reclone_log(vmid, name, final_status, str(current.get("message") or "").strip() or None)
-                    if final_status == "completed":
-                        _record_vm_watchdog_clone_completed(vmid, name)
-                        await _async_save_vm_watchdog()
-                        reclone_state["completed"] += 1
-                    else:
-                        reclone_state["failed"] += 1
-                    await _broadcast_reclone_state()
-                    await _broadcast_proxmox_state()
-                    return
-                await asyncio.sleep(poll_interval)
-                if status == "pending":
-                    poll_interval = min(poll_interval * 2, 10.0)
-            logger.warning("Rolling reclone: VM %s (%s) timed out", vmid, name)
-            _trace("reclone_timeout", vmid=vmid, name=name, cmd_id=cmd.get("id"), trigger=trigger_type)
-            _update_reclone_log(vmid, name, "failed", "Timed out waiting for Proxmox agent ACK")
-            reclone_state["failed"] += 1
-            await _broadcast_reclone_state()
-            await _broadcast_proxmox_state()
-
-        try:
-            for i in range(0, len(vms), concurrency):
-                batch = vms[i:i + concurrency]
-                reclone_state["current_vm"] = int(batch[0].get("vmid")) if batch else None
-                await _broadcast_reclone_state()
-                await asyncio.gather(*(_reclone_one(vm) for vm in batch))
-
-            # After recloning existing VMs, trigger provisioning for any
-            # unassigned dongles (present USB device with no VM allocated).
-            unassigned = _proxmox_unassigned_present_usb()
-            if unassigned:
-                logger.info(
-                    "Rolling reclone: found %d unassigned dongle(s) — queuing provision_unassigned",
-                    len(unassigned),
-                )
-                await _queue_proxmox_command("provision_unassigned", {}, command_type=trigger_type)
-
-            reclone_state["status"] = "failed" if reclone_state["failed"] else "completed"
-        except Exception as exc:
-            logger.exception("Rolling reclone failed: %s", exc)
-            reclone_state["status"] = "failed"
-            reclone_state["failed"] += 1
-        finally:
-            reclone_state["current_vm"] = None
-            # Capture a last_run summary before resetting so the UI can show
-            # "Last run: X completed, Y failed" even after the tile goes idle.
-            reclone_state["last_run"] = {
-                "timestamp": iso_utcnow(),
-                "completed": reclone_state["completed"],
-                "failed": reclone_state["failed"],
-                "type": trigger_type,
-            }
-            if reclone_state["status"] != "running":
-                reclone_state["started_at"] = None
-
-            # Once the run has reached a terminal state (completed / failed),
-            # reset all counters and the log back to idle so the Fleet Reclone
-            # tile disappears and shows 0 instead of lingering at the last
-            # progress value.  The last_run summary we just captured above is
-            # preserved so the "Last run" line in the UI still reflects what
-            # happened.
-            terminal_statuses = {"completed", "failed", "interrupted"}
-            if reclone_state["status"] in terminal_statuses:
-                saved_last_run = reclone_state["last_run"]
-                saved_auto_log = reclone_state.get("auto_recovery_log") or []
-                reclone_state.update({
-                    "status": "idle",
-                    "type": None,
-                    "total": 0,
-                    "completed": 0,
-                    "failed": 0,
-                    "current_vm": None,
-                    "log": [],
-                    "started_at": None,
-                    "last_run": saved_last_run,
-                    "auto_recovery_log": saved_auto_log,
-                })
-                logger.info(
-                    "Rolling reclone: terminal state reached — reset to idle "
-                    "(completed=%d, failed=%d)",
-                    saved_last_run.get("completed", 0),
-                    saved_last_run.get("failed", 0),
-                )
-
-            await _broadcast_reclone_state()
-            await _broadcast_proxmox_state()
 
 
 async def auto_recovery_check() -> None:
@@ -5322,70 +2921,7 @@ async def auto_recovery_check() -> None:
         await asyncio.sleep(1800)
 
 
-
-
-async def vm_watchdog_loop() -> None:
-    await asyncio.sleep(VM_WATCHDOG_INTERVAL_SECS)
-    while True:
-        try:
-            now = time.time()
-            client_seen = {hostname: client.get("last_seen") for hostname, client in clients.items()}
-            vm_names = {
-                str(int(vm.get("vmid"))): str(vm.get("name") or "").strip()
-                for vm in proxmox_state.get("vms") or []
-                if vm.get("vmid") is not None
-            }
-            changed = False
-            broadcast_needed = False
-            for vmid_key, entry in list(vm_watchdog.items()):
-                clone_completed_at = _parse_ts(entry.get("clone_completed_at"))
-                if clone_completed_at is None:
-                    vm_watchdog.pop(vmid_key, None)
-                    changed = True
-                    broadcast_needed = True
-                    continue
-                hostname = str(entry.get("hostname") or vm_names.get(vmid_key) or "").strip()
-                if hostname and hostname != entry.get("hostname"):
-                    entry["hostname"] = hostname
-                    changed = True
-                if _vm_has_checked_in(hostname, clone_completed_at, client_seen):
-                    vm_watchdog.pop(vmid_key, None)
-                    changed = True
-                    broadcast_needed = True
-                    continue
-                if (now - clone_completed_at) <= VM_WATCHDOG_TIMEOUT_SECS:
-                    continue
-                vmid_int = int(vmid_key)
-                if _has_pending_reclone(vmid_int):
-                    continue
-                vm = _find_proxmox_vm(vmid_int) or {"vmid": vmid_int}
-                await _queue_proxmox_command("reclone_vm", _reclone_command_args(vm), command_type="watchdog")
-                reclone_count = max(0, int(entry.get("reclone_count", 0) or 0)) + 1
-                _record_vm_watchdog_clone_completed(
-                    vmid_int,
-                    hostname or vm.get("name"),
-                    clone_completed_at=now,
-                    reclone_count=reclone_count,
-                )
-                changed = True
-                broadcast_needed = True
-                logger.warning("VM watchdog queued reclone for VM %s (%s) after 24h without check-in", vmid_int, hostname or vm.get("name") or f"VM {vmid_int}")
-                _trace("watchdog_reclone_queued", vmid=vmid_int, name=hostname or vm.get("name") or f"VM {vmid_int}", reclone_count=reclone_count)
-            if changed:
-                await _async_save_vm_watchdog()
-            if broadcast_needed:
-                await _broadcast_proxmox_state()
-            _update_service_health("vm_watchdog", ok=True)
-        except asyncio.CancelledError:
-            raise
-        except Exception as exc:
-            _update_service_health("vm_watchdog", ok=False, error=str(exc))
-            logger.exception("VM watchdog error: %s", exc)
-        await asyncio.sleep(VM_WATCHDOG_INTERVAL_SECS)
-
-
 async def schedule_check() -> None:
-    global last_schedule_trigger
     day_names = ["monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"]
     await asyncio.sleep(60)
     while True:
@@ -5397,8 +2933,8 @@ async def schedule_check() -> None:
                     now = datetime.now()
                     if day_names[now.weekday()] == day and now.hour == hour and now.minute == minute:
                         trigger_key = now.strftime("%Y-%m-%d %H:%M")
-                        if last_schedule_trigger != trigger_key:
-                            last_schedule_trigger = trigger_key
+                        if state.last_schedule_trigger != trigger_key:
+                            state.last_schedule_trigger = trigger_key
                             asyncio.create_task(_run_rolling_reclone("scheduled"))
             _update_service_health("schedule_check", ok=True)
         except asyncio.CancelledError:
@@ -5441,31 +2977,6 @@ async def gkill_switch_poller() -> None:
 
 
 
-async def expire_commands() -> None:
-    """Expire stale active commands and purge terminal results after a short grace period."""
-    await asyncio.sleep(15)
-    while True:
-        try:
-            async with state_lock:
-                expired, purged = _cleanup_commands_locked()
-                serialized = _serialize_commands()
-            if expired:
-                logger.warning("Expired %d stale command(s) from the in-memory queue", expired)
-                await broadcast({"type": "commands_update", "commands": serialized})
-                await broadcast({"type": "notification", "level": "warning", "message": "One or more commands expired without being ACKed by the agent."})
-            elif purged:
-                await broadcast({"type": "commands_update", "commands": serialized})
-            _update_service_health("command_expiry", ok=True)
-        except asyncio.CancelledError:
-            raise
-        except Exception as exc:
-            _update_service_health("command_expiry", ok=False, error=str(exc))
-            logger.exception("Command expiry error: %s", exc)
-        await asyncio.sleep(15)
-
-
-
-
 async def broadcast(message: dict[str, Any]) -> None:
     if not ws_connections:
         return
@@ -5487,39 +2998,6 @@ async def broadcast_full_state() -> None:
     await broadcast({"type": "full_state", "clients": await current_clients()})
 
 
-def _hub_isolated() -> bool:  # Compute whether hub-driven config pushes must pause so every safeguard check shares one helper.
-    return bool(  # Evaluate the isolation rule in one expression so every caller uses the same last-sync timeout test.
-        settings.get("hub_managed")  # Only hub-managed spokes should self-protect because self-managed spokes do not accept hub config pushes.
-        and settings.get("relay_enabled") == "on"  # Only an enabled relay can be isolated because disabled hub connectivity should not trigger this safeguard.
-        and relay_state.get("last_sync")  # A real last check-in is required so the timeout compares against known hub contact instead of guessing.
-        and (time.time() - float(relay_state["last_sync"])) > int(settings.get("hub_isolation_timeout", 3600))  # Enter isolation after the configured no-contact window so stale hubs stop changing live config.
-    )  # Share one boolean source of truth so every relay path evaluates isolation consistently.
-
-
-def _revert_hub_managed_if_auth_failure(status_code: int | None, reason: str) -> bool:
-    """Immediately revert hub_managed to False when the hub returns a definitive auth/not-found error.
-
-    A 401 (wrong key), 403 (wrong PSK or forbidden), or 404 (tenant deleted) means the hub cannot
-    recognise this spoke anymore — waiting for the isolation timeout would leave the spoke stuck in
-    a read-only hub-managed state indefinitely.  Reverting immediately restores local control.
-
-    Returns True if hub_managed was cleared so callers can log/broadcast the change.
-    """
-    if not settings.get("hub_managed"):
-        return False
-    if status_code not in (401, 403, 404):
-        return False
-    settings["hub_managed"] = False
-    _save_settings()
-    logger.warning(
-        "hub_managed reverted to local control — hub auth failure (HTTP %s): %s",
-        status_code,
-        reason,
-    )
-    _relay_diag_append("hub_managed_reverted", status_code=status_code, reason=reason)
-    return True
-
-
 def _relay_status_payload() -> dict[str, Any]:  # Build the relay status payload once so REST and websocket updates expose identical isolation data.
     return {  # Merge relay, spoke, and isolation fields so the browser can render complete hub status from one payload.
         **dict(relay_state),  # Preserve the existing relay status fields so current UI behavior keeps working.
@@ -5535,32 +3013,6 @@ def _relay_status_payload() -> dict[str, Any]:  # Build the relay status payload
 async def _broadcast_relay_state() -> None:
     _save_relay_state()
     await broadcast({"type": "relay_status", **_relay_status_payload()})
-
-
-def _hub_config_isolation_result(task_type: str) -> dict[str, Any]:  # Build a consistent skip result so every blocked hub config push is acknowledged the same way.
-    return {  # Return a structured ack payload so the hub can tell a deliberate isolation skip from a transport failure.
-        "success": False,  # Mark the ack as non-success so the hub can distinguish a safeguard skip from an applied config change.
-        "skipped": True,  # Flag the result as skipped so operators can see the spoke deliberately ignored the push.
-        "reason": "hub_isolated",  # Identify the exact safeguard reason so downstream tooling can explain the skip clearly.
-        "task_type": task_type,  # Echo the original command type so the hub knows which config action was paused.
-        "detail": "Hub isolated — config pushes paused until contact resumes",  # Explain the safeguard outcome so the hub UI does not look like a silent failure.
-        "timestamp": datetime.now(timezone.utc).isoformat(),  # Stamp the skip result so operators can correlate it with outage timing.
-    }  # Return one reusable skip payload so every blocked hub config ack stays consistent.
-
-
-async def hub_isolation_monitor() -> None:  # Poll isolation state so the UI updates even when no relay message arrives to trigger a broadcast.
-    last_isolated = _hub_isolated()  # Capture the initial state so the monitor only broadcasts when isolation actually changes.
-    while True:  # Keep watching in the background so timeout expiry and recovery both reach the UI automatically.
-        await asyncio.sleep(60)  # Re-check once per minute so the safeguard flips even when no hub message arrives to trigger a relay broadcast.
-        current_isolated = _hub_isolated()  # Recompute isolation from last_sync so timeout expiry and recovery both use the live source of truth.
-        if current_isolated != last_isolated:  # Only broadcast on state changes so the monitor updates the UI without creating noisy relay traffic.
-            last_isolated = current_isolated  # Remember the new state so the next loop only announces another real transition.
-            await _broadcast_relay_state()  # Push the changed isolation state to browsers immediately so banners and status text stay accurate.
-
-
-async def _broadcast_update_state() -> None:
-    _save_update_state()
-    await broadcast({"type": "version_status", **dict(update_state)})
 
 
 def _build_registration_config() -> dict[str, Any]:
@@ -5601,163 +3053,6 @@ def _build_registration_config() -> dict[str, Any]:
     }
 
 
-async def _hub_self_register(server_url: str) -> None:
-    """POST to hub /api/spokes/register with full config payload.
-    Stores the returned spoke_id. If already approved, also stores api_key and tenant_id."""
-    global relay_registration_refresh_needed
-    hostname = socket.gethostname()
-    spoke_name = settings.get("relay_spoke_name", "").strip() or hostname
-    spoke_id = _ensure_relay_spoke_id()
-    payload = {
-        "spoke_id": spoke_id,
-        "hostname": hostname,
-        "label": hostname,
-        "spoke_name": spoke_name,
-        "tenant_id_hint": (settings.get("relay_tenant_id") or settings.get("relay_tenant_hint") or "").strip(),
-        "onboarding_psk": settings.get("relay_onboarding_psk", "").strip(),
-        "api_key": settings.get("relay_api_key", "").strip(),
-        "config": _build_registration_config(),
-    }
-    _relay_diag_append("register_attempt", url=f"{server_url}/api/spokes/register",
-                       hostname=hostname, spoke_name=spoke_name, spoke_id=spoke_id)
-    hub_base = _relay_hub_base_url(server_url, settings.get("relay_tenant_id", ""))
-    try:
-        async with httpx.AsyncClient(timeout=15, verify=_hub_tls_verify()) as hc:
-            resp = await hc.post(f"{hub_base}/api/spokes/register", json=payload)
-            if resp.status_code == 409:
-                data = resp.json()
-                conflict = data.get("conflict", "name_in_use")
-                msg = data.get("message", f"Spoke name '{spoke_name}' is already in use on the hub. Choose a different name.")
-                ts = datetime.now().strftime("%Y-%m-%d %H:%M")
-                relay_state.update({
-                    "connected": False,
-                    "registration_status": "name_conflict",
-                    "error": f"{ts} — {msg}",
-                })
-                relay_registration_refresh_needed = False
-                _save_relay_state()
-                _relay_diag_append("register_409", conflict=conflict, message=msg)
-                logger.warning("Hub registration name conflict: %s", msg)
-                return
-            resp.raise_for_status()
-            data = resp.json()
-        spoke_id = str(data.get("spoke_id", "")).strip()
-        status = data.get("status", "pending")
-        if spoke_id and not _relay_spoke_id_needs_rotation(spoke_id):
-            settings["relay_spoke_id"] = spoke_id
-        else:
-            spoke_id = _ensure_relay_spoke_id()
-        if status == "approved":
-            tenant_id = data.get("tenant_id", "")
-            settings["relay_api_key"] = data.get("api_key", "")
-            settings["relay_tenant_id"] = tenant_id
-            settings["relay_tenant_hint"] = tenant_id
-            relay_state["registration_status"] = "approved"
-            relay_state["error"] = ""
-            _relay_diag_append("register_ok", status="approved", spoke_id=spoke_id,
-                               tenant_id=data.get("tenant_id"))
-            logger.info("Hub registration: approved immediately spoke_id=%s tenant_id=%s", spoke_id, data.get("tenant_id"))
-        else:
-            tenant_hint = str(data.get("tenant_hint", "")).strip()
-            settings["relay_api_key"] = ""
-            settings["relay_tenant_id"] = ""
-            if tenant_hint:
-                settings["relay_tenant_hint"] = tenant_hint
-            relay_state["registration_status"] = "pending"
-            relay_state["error"] = ""
-            _relay_diag_append("register_ok", status="pending", spoke_id=spoke_id)
-            logger.info("Hub registration submitted: spoke_id=%s status=pending", spoke_id)
-        relay_registration_refresh_needed = False
-        _save_relay_state()
-        _save_settings()
-    except Exception as exc:
-        relay_registration_refresh_needed = True
-        _relay_diag_append("register_error", error=str(exc))
-        logger.warning("Hub self-register failed: %s", exc)
-        relay_state.update({"connected": False, "error": f"Registration failed: {exc}"})
-        _save_relay_state()
-
-
-async def _hub_check_approval(server_url: str, spoke_id: str) -> None:
-    """Re-POST registration to check if spoke has been approved.
-    Hub returns 'approved' with api_key and tenant_id once superadmin has approved."""
-    global relay_registration_refresh_needed
-    hostname = socket.gethostname()
-    spoke_name = settings.get("relay_spoke_name", "").strip() or hostname
-    tenant_hint = (settings.get("relay_tenant_id") or settings.get("relay_tenant_hint") or "").strip()
-    existing_api_key = settings.get("relay_api_key", "").strip()
-    existing_tenant_id = settings.get("relay_tenant_id", "").strip()
-    had_approval = bool(existing_api_key and existing_tenant_id)
-    _relay_diag_append("check_approval", spoke_id=spoke_id)
-    hub_base = _relay_hub_base_url(server_url, settings.get("relay_tenant_id", ""))
-    try:
-        async with httpx.AsyncClient(timeout=10, verify=_hub_tls_verify()) as hc:
-            resp = await hc.post(f"{hub_base}/api/spokes/register", json={
-                "spoke_id": spoke_id,
-                "hostname": hostname,
-                "label": hostname,
-                "spoke_name": spoke_name,
-                "tenant_id_hint": tenant_hint,
-                "onboarding_psk": settings.get("relay_onboarding_psk", "").strip(),
-                "api_key": existing_api_key,
-                "config": _build_registration_config(),
-            })
-            resp.raise_for_status()
-            data = resp.json()
-        status = data.get("status", "pending")
-        updated = False
-        returned_spoke_id = str(data.get("spoke_id", "")).strip()
-        if returned_spoke_id and not _relay_spoke_id_needs_rotation(returned_spoke_id) and returned_spoke_id != settings.get("relay_spoke_id", ""):
-            settings["relay_spoke_id"] = returned_spoke_id
-            spoke_id = returned_spoke_id
-            updated = True
-        if status == "approved":
-            tenant_id = data.get("tenant_id", "")
-            settings["relay_api_key"] = data.get("api_key", "")
-            settings["relay_tenant_id"] = tenant_id
-            settings["relay_tenant_hint"] = tenant_id
-            relay_state["registration_status"] = "approved"
-            relay_state["error"] = ""
-            updated = True
-            _relay_diag_append("approval_received", spoke_id=spoke_id,
-                               tenant_id=data.get("tenant_id"))
-            logger.info("Hub approval received: spoke_id=%s tenant_id=%s", spoke_id, data.get("tenant_id"))
-        else:
-            tenant_hint = str(data.get("tenant_hint", "")).strip()
-            if tenant_hint and tenant_hint != settings.get("relay_tenant_hint", ""):
-                settings["relay_tenant_hint"] = tenant_hint
-                updated = True
-            if had_approval:
-                relay_state["registration_status"] = "approved"
-                relay_state["error"] = "Hub registration check returned pending; keeping existing approval until credentials are explicitly rejected."
-                _relay_diag_append("pending_ignored", spoke_id=spoke_id, tenant_hint=tenant_hint)
-                logger.warning("Hub registration check returned pending for approved spoke %s; keeping stored approval", spoke_id)
-            else:
-                relay_state["registration_status"] = "pending"
-                relay_state["error"] = ""
-                _relay_diag_append("still_pending", spoke_id=spoke_id)
-                logger.info("Hub registration still pending: spoke_id=%s", spoke_id)
-        relay_registration_refresh_needed = False
-        _save_relay_state()
-        if updated:
-            _save_settings()
-    except Exception as exc:
-        relay_registration_refresh_needed = True
-        _relay_diag_append("check_approval_error", error=str(exc))
-        logger.warning("Hub approval check failed: %s", exc)
-
-
-def _relay_hub_base_url(server_url: str, tenant_id: str) -> str:
-    url = server_url.rstrip("/")
-    if tenant_id:
-        url = re.sub(rf"/api/{re.escape(tenant_id)}$", "", url)
-    return url.rstrip("/")
-
-
-def _hub_tls_verify() -> bool:
-    return _normalize_relay_enabled(settings.get("hub_tls_verify", "off")) == "on"
-
-
 def _relay_ws_url(server_url: str, tenant_id: str, spoke_id: str, api_key: str) -> str:
     hub_base = _relay_hub_base_url(server_url, tenant_id)
     if hub_base.startswith("https://"):
@@ -5765,30 +3060,6 @@ def _relay_ws_url(server_url: str, tenant_id: str, spoke_id: str, api_key: str) 
     elif hub_base.startswith("http://"):
         hub_base = "ws://" + hub_base[len("http://"):]
     return f"{hub_base}/api/{tenant_id}/spokes/{spoke_id}/ws?api_key={api_key}"
-
-
-def _telemetry_filtered_browse_list(items: list[dict[str, Any]], site_field: str) -> list[dict[str, Any]]:
-    """Return browse list items filtered to only this spoke's assigned Central sites.
-
-    Prevents unassigned-site data (fetched for the local browse tab) from being
-    sent to the hub and polluting its distributed-mode aggregation.
-    """
-    assigned: set[str] = {
-        str(v).strip().lower() for v in settings.get("site_mappings", {}).values() if v
-    }
-    if not assigned:
-        return list(items)
-    return [i for i in items if str(i.get(site_field) or "").strip().lower() in assigned]
-
-
-def _telemetry_filtered_browse_dict(by_site: dict[str, Any]) -> dict[str, Any]:
-    """Return a by-site browse dict filtered to only this spoke's assigned Central sites."""
-    assigned: set[str] = {
-        str(v).strip().lower() for v in settings.get("site_mappings", {}).values() if v
-    }
-    if not assigned:
-        return dict(by_site)
-    return {k: v for k, v in by_site.items() if str(k).strip().lower() in assigned}
 
 
 async def _build_relay_telemetry_payload(spoke_id: str) -> dict[str, Any]:
@@ -5852,7 +3123,7 @@ async def _build_relay_telemetry_payload(spoke_id: str) -> dict[str, Any]:
         "ws_last_reconnect_at": relay_state.get("ws_last_reconnect_at"),  # ISO UTC timestamp of last successful WS (re)connect.
         "ws_last_error": relay_state.get("ws_last_error"),  # Last WS disconnect reason.
         "sim_conf_read_error": _sim_conf_content_cache.get("error"),  # Non-None if the background sim_conf reader is failing (e.g. FS stall).
-        "reseed_in_progress": bool(_proxmox_reseed_in_progress),
+        "reseed_in_progress": bool(state._proxmox_reseed_in_progress),
         "proxmox": {
             "connected": bool(proxmox_state.get("connected", False)),
             "last_seen": proxmox_state.get("last_seen"),
@@ -5882,16 +3153,16 @@ async def _build_relay_telemetry_payload(spoke_id: str) -> dict[str, Any]:
             "usb_count": len(present_usb) if present_usb else len(usb_state),
             "agent_version": proxmox_state.get("agent_version"),
             "pve_version": proxmox_state.get("pve_version"),
-            "cpu_1h_avg": _resource_1h_average(_cpu_samples),
-            "mem_1h_avg": _resource_1h_average(_mem_samples),
+            "cpu_1h_avg": _resource_1h_average(state._cpu_samples),
+            "mem_1h_avg": _resource_1h_average(state._mem_samples),
             "provision_halt": _current_provision_halt(),
             "prov_run": dict(proxmox_state.get("prov_run") or {}),
-            "cpu_est_avg": _resource_estimated_average(_cpu_samples),
-            "mem_est_avg": _resource_estimated_average(_mem_samples),
-            "resource_samples_started": _resource_samples_started or None,
-            "resource_sample_count": len(_cpu_samples),
+            "cpu_est_avg": _resource_estimated_average(state._cpu_samples),
+            "mem_est_avg": _resource_estimated_average(state._mem_samples),
+            "resource_samples_started": state._resource_samples_started or None,
+            "resource_sample_count": len(state._cpu_samples),
             "template_lock": str(proxmox_state.get("template_lock") or ""),
-            "reseed_in_progress": bool(_proxmox_reseed_in_progress),
+            "reseed_in_progress": bool(state._proxmox_reseed_in_progress),
             "hw_faults": proxmox_state.get("hw_faults") or {},
             "hw_last_reset": proxmox_state.get("hw_last_reset"),
             # T3 IoT PCI devices found on this Proxmox node — list of {id, vidpid, name} dicts.
@@ -5918,7 +3189,7 @@ async def _build_relay_telemetry_payload(spoke_id: str) -> dict[str, Any]:
             },
             "central": {
                 "status": _central_status_payload(),
-                "wireless_clients": dict(central_wireless_clients),
+                "wireless_clients": dict(state.central_wireless_clients),
                 "hardware_alerts": _hw_alerts_payload(),
                 "client_count_status": _client_count_payload(),
                 "token_valid": bool(central_token.get("access_token") and time.time() < central_token.get("expires_at", 0)),
@@ -5931,12 +3202,12 @@ async def _build_relay_telemetry_payload(spoke_id: str) -> dict[str, Any]:
                 # hub should only see data for sites assigned to this spoke — otherwise
                 # the hub's distributed aggregation gets duplicate entries for sites
                 # shared between spokes or orphan alerts for unassigned sites.
-                "central_alerts": _telemetry_filtered_browse_list(central_browse_alerts, "site"),
-                "central_insights": _telemetry_filtered_browse_list(central_browse_insights, "site"),
-                "central_devices_by_site": _telemetry_filtered_browse_dict(central_browse_devices_by_site),
-                "central_clients_by_site": _telemetry_filtered_browse_dict(central_browse_clients_by_site),
+                "central_alerts": _telemetry_filtered_browse_list(state.central_browse_alerts, "site"),
+                "central_insights": _telemetry_filtered_browse_list(state.central_browse_insights, "site"),
+                "central_devices_by_site": _telemetry_filtered_browse_dict(state.central_browse_devices_by_site),
+                "central_clients_by_site": _telemetry_filtered_browse_dict(state.central_browse_clients_by_site),
                 # Individual client records (filtered to assigned sites) for hub distributed aggregation
-                "central_clients": _telemetry_filtered_browse_list(central_browse_clients, "site"),
+                "central_clients": _telemetry_filtered_browse_list(state.central_browse_clients, "site"),
             },
             "reclone_state": {
                 k: v for k, v in reclone_state.items() if k != "auto_recovery_log"
@@ -5944,310 +3215,11 @@ async def _build_relay_telemetry_payload(spoke_id: str) -> dict[str, Any]:
         }
 
 
-def _hub_reseed_block_result() -> dict[str, str]:
-    return {
-        "error": "reseed_in_progress",
-        "message": "Reseed in progress — provisioning paused. Try again shortly.",
-    }
-
-
-async def _forward_hub_passthrough_to_proxmox(cmd_type: str, payload: dict[str, Any]) -> dict[str, Any]:
-    if proxmox_ws_connection is None:
-        raise RuntimeError("Proxmox agent is not connected")
-    if cmd_type == "backup":
-        logger.info(f"Forwarding backup command to proxmox agent: vm_ids={payload.get('vm_ids')}")
-    elif cmd_type == "reseed":
-        logger.info(f"Forwarding reseed command to proxmox agent: vm_ids={payload.get('vm_ids')}")
-    else:
-        logger.info(f"Forwarding {cmd_type} command to proxmox agent: action={payload.get('action')}")
-    if cmd_type == "command":
-        await proxmox_ws_connection.send_json({"type": cmd_type, **payload})
-    else:
-        await proxmox_ws_connection.send_json({"type": cmd_type, "payload": payload})
-    return {
-        "success": True,
-        "task_type": cmd_type,
-        "detail": f"Forwarded {cmd_type} command to proxmox agent",
-        "timestamp": datetime.now(timezone.utc).isoformat(),
-    }
-
-
-def _hub_targets_proxmox_agent(target: str) -> bool:
-    normalized = _normalize_proxmox_hostname(target)
-    if not normalized:
-        return False
-    if normalized == "proxmox":
-        return True
-    if proxmox_ws_hostname and _proxmox_hostnames_match(normalized, proxmox_ws_hostname):
-        return True
-    return _resolve_proxmox_agent_hostname(normalized, approved_proxmox_agents) is not None
-
-
-def _hub_command_blocked_by_reseed(cmd_type: str, target: str, action: str) -> bool:
-    if not _proxmox_reseed_in_progress:
-        return False
-    if cmd_type == "proxmox_reclone_all":
-        return True
-    return _hub_targets_proxmox_agent(target) and action in {"reclone_vm", "provision_unassigned"}
-
-
-async def _relay_proxmox_progress_to_hub(message: dict[str, Any]) -> None:
-    if _relay_ws_send_json is None:
-        return
-    outbound = dict(message)
-    payload = outbound.get("payload") if isinstance(outbound.get("payload"), dict) else None
-    if payload is not None:
-        payload = dict(payload)
-        if "spoke_id" not in payload and _relay_ws_spoke_id:
-            payload["spoke_id"] = _relay_ws_spoke_id
-        outbound["payload"] = payload
-    elif "spoke_id" not in outbound and _relay_ws_spoke_id:
-        outbound["spoke_id"] = _relay_ws_spoke_id
-    await _relay_ws_send_json(outbound)
-
-
 # ── VNC relay ─────────────────────────────────────────────────────────────────
 
 _vnc_sessions: dict[str, asyncio.Queue] = {}
 _direct_console_sessions: dict[str, dict[str, Any]] = {}
 _DIRECT_CONSOLE_TTL = 60  # seconds until session token expires
-
-
-async def _relay_vnc_to_hub(message: dict[str, Any]) -> None:
-    """Forward a VNC frame/control message back to the hub."""
-    if _relay_ws_send_json is None:
-        return
-    outbound = dict(message)
-    if "spoke_id" not in outbound and _relay_ws_spoke_id:
-        outbound["spoke_id"] = _relay_ws_spoke_id
-    await _relay_ws_send_json(outbound)
-
-
-async def _handle_vnc_proxy_request(message: dict[str, Any]) -> None:
-    """Open a WebSocket to Proxmox vncwebsocket and relay frames to/from hub."""
-    request_id = str(message.get("request_id") or "").strip()
-    vmid = int(message.get("vmid") or 0)
-    vmtype = str(message.get("vmtype") or "qemu").strip().lower()
-
-    if not request_id or not vmid:
-        await _relay_vnc_to_hub({"type": "vnc_proxy_error", "request_id": request_id, "error": "Missing request_id or vmid"})
-        return
-
-    proxmox_host = str(_proxmox_agent_vm_map.get(vmid) or proxmox_ws_hostname or "").strip()
-    api_token = _get_proxmox_token_for_host(proxmox_host)
-
-    if not proxmox_host:
-        await _relay_vnc_to_hub({"type": "vnc_proxy_error", "request_id": request_id, "error": "Proxmox host unknown — no agent connected"})
-        return
-    if not api_token:
-        await _relay_vnc_to_hub({"type": "vnc_proxy_error", "request_id": request_id, "error": "Proxmox API token not configured on spoke"})
-        return
-
-    # Ask Proxmox to create a VNC ticket via REST
-    ssl_ctx = ssl.create_default_context()
-    ssl_ctx.check_hostname = False
-    ssl_ctx.verify_mode = ssl.CERT_NONE
-
-    node = proxmox_host.split(".")[0]
-    vncproxy_url = f"https://{proxmox_host}:8006/api2/json/nodes/{node}/{vmtype}/{vmid}/vncproxy"
-    headers = {"Authorization": f"PVEAPIToken={api_token}"}
-
-    try:
-        if httpx is None:
-            raise RuntimeError("httpx not installed")
-        async with httpx.AsyncClient(verify=False) as client:
-            resp = await client.post(vncproxy_url, headers=headers, json={"websocket": 1}, timeout=10)
-        if resp.status_code != 200:
-            await _relay_vnc_to_hub({"type": "vnc_proxy_error", "request_id": request_id, "error": f"Proxmox vncproxy returned {resp.status_code}: {resp.text[:200]}"})
-            return
-        body = resp.json()
-        ticket = body["data"]["ticket"]
-        port = body["data"]["port"]
-    except Exception as exc:
-        await _relay_vnc_to_hub({"type": "vnc_proxy_error", "request_id": request_id, "error": f"Proxmox vncproxy call failed: {exc}"})
-        return
-
-    # Register an inbound queue so browser→proxmox frames can be forwarded
-    inbound_queue: asyncio.Queue = asyncio.Queue()
-    _vnc_sessions[request_id] = inbound_queue
-
-    import urllib.parse as _urlparse
-    params = _urlparse.urlencode({"port": port, "vncticket": ticket})
-    ws_path = f"/api2/json/nodes/{node}/{vmtype}/{vmid}/vncwebsocket?{params}"
-    ws_url = f"wss://{proxmox_host}:8006{ws_path}"
-
-    if websockets is None:
-        await _relay_vnc_to_hub({"type": "vnc_proxy_error", "request_id": request_id, "error": "websockets library not installed"})
-        _vnc_sessions.pop(request_id, None)
-        return
-
-    try:
-        connect_kwargs: dict[str, Any] = {
-            "ssl": ssl_ctx,
-            "open_timeout": 20,
-            "max_size": None,
-        }
-        # Use correct keyword for this version of websockets
-        import inspect as _inspect
-        hdr_key = "additional_headers" if "additional_headers" in _inspect.signature(websockets.connect).parameters else "extra_headers"
-        connect_kwargs[hdr_key] = headers
-
-        await _relay_vnc_to_hub({"type": "vnc_proxy_response", "request_id": request_id})
-
-        async with websockets.connect(ws_url, **connect_kwargs) as px_ws:
-
-            async def proxmox_to_hub() -> None:
-                async for raw in px_ws:
-                    data = raw if isinstance(raw, bytes) else raw.encode()
-                    await _relay_vnc_to_hub({
-                        "type": "vnc_frame_to_browser",
-                        "request_id": request_id,
-                        "data": __import__("base64").b64encode(data).decode(),
-                    })
-
-            async def hub_to_proxmox() -> None:
-                while True:
-                    msg = await inbound_queue.get()
-                    if msg is None:
-                        break
-                    raw = __import__("base64").b64decode(msg.get("data", ""))
-                    await px_ws.send(raw)
-
-            t1 = asyncio.create_task(proxmox_to_hub())
-            t2 = asyncio.create_task(hub_to_proxmox())
-            try:
-                done, pending = await asyncio.wait([t1, t2], return_when=asyncio.FIRST_COMPLETED)
-                for t in pending:
-                    t.cancel()
-                await asyncio.gather(t1, t2, return_exceptions=True)
-            finally:
-                pass
-    except Exception as exc:
-        logger.warning("VNC relay error for request %s: %s", request_id, exc)
-        await _relay_vnc_to_hub({"type": "vnc_proxy_error", "request_id": request_id, "error": str(exc)})
-    finally:
-        _vnc_sessions.pop(request_id, None)
-        await _relay_vnc_to_hub({"type": "vnc_disconnect", "request_id": request_id})
-
-
-async def _handle_provision_proxmox_token(message: dict[str, Any]) -> None:
-    """Auto-create a Proxmox API token via pvesh and report it back to the hub."""
-    request_id = str(message.get("request_id") or "").strip()
-
-    async def _send_error(error: str) -> None:
-        await _relay_vnc_to_hub({"type": "proxmox_token_provision_error", "request_id": request_id, "error": error})
-
-    # pvesh may not be in the systemd service PATH — check all common Proxmox locations.
-    # Use os.path.isfile only (not os.access X_OK) since the service may run as a user
-    # that lacks execute permission on the stat but can still exec via the kernel.
-    pvesh_candidates = [
-        shutil.which("pvesh"),
-        "/usr/bin/pvesh",
-        "/usr/sbin/pvesh",
-        "/usr/local/bin/pvesh",
-        "/usr/share/pve-manager/bin/pvesh",
-        "/opt/proxmox/bin/pvesh",
-    ]
-    pvesh_path = next((c for c in pvesh_candidates if c and os.path.isfile(c)), None)
-    if not pvesh_path:
-        # Last resort: try running pvesh directly and let the OS sort out the path
-        try:
-            probe = await asyncio.create_subprocess_exec(
-                "pvesh", "--version",
-                stdout=asyncio.subprocess.DEVNULL,
-                stderr=asyncio.subprocess.DEVNULL,
-            )
-            await asyncio.wait_for(probe.wait(), timeout=5.0)
-            if probe.returncode == 0:
-                pvesh_path = "pvesh"
-        except Exception:
-            pass
-    if not pvesh_path:
-        # pvesh not available locally — try relaying to the Proxmox agent if connected.
-        if proxmox_ws_connection is not None:
-            logger.info("provision_proxmox_token: pvesh not found locally, relaying to proxmox agent")
-            q: asyncio.Queue = asyncio.Queue(maxsize=1)
-            _proxmox_token_provision_queues[request_id] = q
-            try:
-                await proxmox_ws_connection.send_json({
-                    "type": "create_proxmox_token",
-                    "request_id": request_id,
-                })
-                result = await asyncio.wait_for(q.get(), timeout=30.0)
-                if result.get("ok"):
-                    token = str(result.get("token") or "").strip()
-                    settings["proxmox_api_token"] = token
-                    _persisted["proxmox_api_token"] = token
-                    _save_settings()
-                    logger.info("Proxmox API token provisioned via agent: relaying to hub")
-                    await _relay_vnc_to_hub({
-                        "type": "proxmox_token_provisioned",
-                        "request_id": request_id,
-                        "token": token,
-                    })
-                else:
-                    await _send_error(str(result.get("error") or "Agent failed to provision token"))
-            except asyncio.TimeoutError:
-                await _send_error("Proxmox agent did not respond to token creation request within 30 seconds")
-            except Exception as exc:
-                await _send_error(f"Failed to relay token request to agent: {exc}")
-            finally:
-                _proxmox_token_provision_queues.pop(request_id, None)
-        else:
-            await _send_error(
-                "pvesh not found locally and no Proxmox agent is connected. "
-                "Ensure the proxmox-agent.sh service is running on the Proxmox host."
-            )
-        return
-
-    TOKEN_ID = "cs-hub"
-    USER = "root@pam"
-    logger.info("provision_proxmox_token: using pvesh at %s", pvesh_path)
-
-    try:
-        # Remove any existing token with this ID so we always get a fresh secret
-        del_proc = await asyncio.create_subprocess_exec(
-            pvesh_path, "delete", f"/access/users/{USER}/token/{TOKEN_ID}",
-            stdout=asyncio.subprocess.DEVNULL,
-            stderr=asyncio.subprocess.DEVNULL,
-        )
-        await asyncio.wait_for(del_proc.wait(), timeout=10.0)
-    except Exception:
-        pass  # Token may not exist yet — ignore
-
-    try:
-        proc = await asyncio.create_subprocess_exec(
-            pvesh_path, "create", f"/access/users/{USER}/token/{TOKEN_ID}",
-            "--privsep", "0",
-            "--output-format", "json",
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=15.0)
-        if proc.returncode != 0:
-            await _send_error(f"pvesh create failed: {stderr.decode().strip()[:300]}")
-            return
-
-        data = json.loads(stdout.decode().strip())
-        secret = str(data.get("value") or "").strip()
-        if not secret:
-            await _send_error("pvesh returned no token value in response")
-            return
-
-        full_token = f"{USER}!{TOKEN_ID}={secret}"
-        settings["proxmox_api_token"] = full_token
-        _persisted["proxmox_api_token"] = full_token
-        _save_settings()
-        logger.info("Proxmox API token auto-provisioned: %s!%s", USER, TOKEN_ID)
-
-        await _relay_vnc_to_hub({"type": "proxmox_token_provisioned", "request_id": request_id, "token": full_token})
-
-    except asyncio.TimeoutError:
-        await _send_error("pvesh timed out after 15 seconds")
-    except json.JSONDecodeError as exc:
-        await _send_error(f"Could not parse pvesh output: {exc}")
-    except Exception as exc:
-        await _send_error(f"Unexpected error: {exc}")
 
 async def _handle_log_fetch(message: dict[str, Any]) -> None:
     """Fetch log lines from journal/agent/watchdog/install and send back to hub."""
@@ -6259,7 +3231,7 @@ async def _handle_log_fetch(message: dict[str, Any]) -> None:
         return
 
     async def _send_response(log_lines: list[str], error: str | None = None) -> None:
-        if _relay_ws_send_json is None:
+        if state._relay_ws_send_json is None:
             return
         out: dict[str, Any] = {
             "type": "log_fetch_response",
@@ -6270,9 +3242,9 @@ async def _handle_log_fetch(message: dict[str, Any]) -> None:
             out["error"] = error
         else:
             out["lines"] = log_lines
-        if _relay_ws_spoke_id:
-            out["spoke_id"] = _relay_ws_spoke_id
-        await _relay_ws_send_json(out)
+        if state._relay_ws_spoke_id:
+            out["spoke_id"] = state._relay_ws_spoke_id
+        await state._relay_ws_send_json(out)
 
     try:
         if source == "agent":
@@ -6323,30 +3295,10 @@ async def _handle_log_fetch(message: dict[str, Any]) -> None:
         await _send_response([], error=str(exc))
 
 
-async def _handle_command_trace_request(message: dict[str, Any]) -> None:
-    """Send the command relay trace buffer back to the hub."""
-    request_id = str(message.get("request_id") or "").strip()
-    if not request_id or _relay_ws_send_json is None:
-        return
-    async with state_lock:
-        cmds_snapshot = list(_serialize_commands())
-    out: dict[str, Any] = {
-        "type": "command_trace_response",
-        "request_id": request_id,
-        "agent_connected": proxmox_ws_connection is not None,
-        "agent_hostname": proxmox_ws_hostname,
-        "command_queue": cmds_snapshot,
-        "trace": list(reversed(_command_trace)),
-    }
-    if _relay_ws_spoke_id:
-        out["spoke_id"] = _relay_ws_spoke_id
-    await _relay_ws_send_json(out)
-
-
 async def _relay_shell_message(message: dict[str, Any]) -> None:
-    if _relay_ws_send_json is None:
+    if state._relay_ws_send_json is None:
         raise RuntimeError("Hub relay is not connected")
-    await _relay_ws_send_json(message)
+    await state._relay_ws_send_json(message)
 
 
 def _resize_shell_fd(fd: int, cols: int, rows: int) -> None:
@@ -6401,7 +3353,7 @@ async def _cleanup_shell_session(session_id: str, *, exit_code: int | None = Non
         with contextlib.suppress(OSError):
             os.close(master_fd)
 
-    if notify_exit and _relay_ws_send_json is not None:
+    if notify_exit and state._relay_ws_send_json is not None:
         with contextlib.suppress(Exception):
             await _relay_shell_message({
                 "type": "shell_exit",
@@ -6621,8 +3573,7 @@ async def _apply_relay_command_batch(remote_cmds: list[dict[str, Any]], ack_fn) 
             continue
 
         if cmd_type == "repo_sync":
-            global _hub_repo_sync_task
-            already_running = _hub_repo_sync_task is not None and not _hub_repo_sync_task.done()
+            already_running = state._hub_repo_sync_task is not None and not state._hub_repo_sync_task.done()
             if cmd_id:
                 await ack_fn(cmd_id, "executed", {
                     "success": True,
@@ -6632,7 +3583,7 @@ async def _apply_relay_command_batch(remote_cmds: list[dict[str, Any]], ack_fn) 
                     "timestamp": datetime.now(timezone.utc).isoformat(),
                 })
             if not already_running:
-                _hub_repo_sync_task = asyncio.create_task(_run_hub_repo_sync())
+                state._hub_repo_sync_task = asyncio.create_task(_run_hub_repo_sync())
             continue
 
         if cmd_type == "self_update":
@@ -6824,7 +3775,7 @@ async def _apply_relay_command_batch(remote_cmds: list[dict[str, Any]], ack_fn) 
                     queued_targets.append(target)
                     _enqueue_command_locked(target, action, args, command_type=cmd_type, relay=True)
                 serialized_commands = _serialize_commands()
-            agent_connected = proxmox_ws_connection is not None if target == "proxmox" else bool(client_ws_connections.get(target))
+            agent_connected = state.proxmox_ws_connection is not None if target == "proxmox" else bool(client_ws_connections.get(target))
             _trace("hub_relay_enqueued", target=target, action=action, cmd_id=cmd_id,
                    agent_connected=agent_connected)
             commands_changed = True
@@ -7093,7 +4044,6 @@ async def _apply_hub_config(payload: dict[str, Any]) -> dict[str, Any]:
 async def relay_sync_once() -> None:
     """One relay cycle: register if needed, check approval if pending,
     then post telemetry, fetch inbox, process commands, and ack each."""
-    global relay_registration_refresh_needed
     if settings.get("relay_enabled") != "on" or not settings.get("relay_server_url"):
         relay_state["enabled"] = False
         _save_relay_state()
@@ -7116,7 +4066,7 @@ async def relay_sync_once() -> None:
         await _broadcast_relay_state()
         return
 
-    if relay_registration_refresh_needed:
+    if state.relay_registration_refresh_needed:
         await _hub_check_approval(server_url, spoke_id)
         spoke_id = settings.get("relay_spoke_id", spoke_id)
         api_key = settings.get("relay_api_key", "")
@@ -7159,10 +4109,9 @@ async def relay_sync_once() -> None:
                     logger.debug("Central feed fetch failed: %s", _feed_exc)
             # Fetch hub-managed monitored items filtered to this spoke's assigned sites
             try:
-                global _hub_monitored_items
                 mon_resp = await hc.get(f"{base}/monitored-items", headers=headers, timeout=10)
                 if mon_resp.status_code == 200:
-                    _hub_monitored_items = mon_resp.json()
+                    state._hub_monitored_items = mon_resp.json()
             except Exception as _mon_exc:
                 logger.debug("Monitored items fetch failed: %s", _mon_exc)
             resp.raise_for_status()
@@ -7520,7 +4469,7 @@ async def relay_sync_once() -> None:
     except httpx.HTTPStatusError as exc:
         status_code = exc.response.status_code if exc.response else None
         if status_code in (401, 403, 404):
-            relay_registration_refresh_needed = True
+            state.relay_registration_refresh_needed = True
             settings["relay_api_key"] = ""
             settings["relay_tenant_id"] = ""
             relay_state.update({
@@ -7550,7 +4499,6 @@ async def relay_sync_once() -> None:
 
 
 async def relay_ws_loop() -> None:
-    global relay_registration_refresh_needed, _relay_ws_send_json, _relay_ws_spoke_id
     if not _WEBSOCKETS_AVAILABLE or websockets is None:
         raise RuntimeError("websockets not installed")
 
@@ -7575,7 +4523,7 @@ async def relay_ws_loop() -> None:
                 await asyncio.sleep(interval)
                 continue
 
-            if relay_registration_refresh_needed:
+            if state.relay_registration_refresh_needed:
                 await _hub_check_approval(server_url, spoke_id)
                 spoke_id = settings.get("relay_spoke_id", spoke_id)
                 api_key = settings.get("relay_api_key", "")
@@ -7644,8 +4592,8 @@ async def relay_ws_loop() -> None:
                             logger.warning("relay telemetry_loop error (will retry in %ss): %s", interval, exc)
                         await asyncio.sleep(interval)
 
-                _relay_ws_send_json = send_json
-                _relay_ws_spoke_id = spoke_id
+                state._relay_ws_send_json = send_json
+                state._relay_ws_spoke_id = spoke_id
                 sender = asyncio.create_task(telemetry_loop())
                 try:
                     # Clear all active demo scenarios on hub reconnect so that a hub
@@ -7723,9 +4671,9 @@ async def relay_ws_loop() -> None:
                             asyncio.create_task(_do_purge_clients_relay())
                 finally:
                     await _close_all_shell_sessions(notify_exit=False)
-                    if _relay_ws_send_json is send_json:
-                        _relay_ws_send_json = None
-                        _relay_ws_spoke_id = None
+                    if state._relay_ws_send_json is send_json:
+                        state._relay_ws_send_json = None
+                        state._relay_ws_spoke_id = None
                     sender.cancel()
                     with contextlib.suppress(asyncio.CancelledError):
                         await sender
@@ -7736,7 +4684,7 @@ async def relay_ws_loop() -> None:
             relay_state.update({"connected": False, "error": f"websocket handshake failed: {exc}", "ws_last_error": f"HTTP {status_code}: {exc}"})
             await _broadcast_relay_state()
             if status_code in (401, 403):
-                relay_registration_refresh_needed = True
+                state.relay_registration_refresh_needed = True
                 settings["relay_api_key"] = ""
                 settings["relay_tenant_id"] = ""
                 _revert_hub_managed_if_auth_failure(status_code, f"websocket handshake HTTP {status_code}")
@@ -7759,7 +4707,7 @@ async def relay_ws_loop() -> None:
             ws_close_code = getattr(exc, "code", None) or getattr(exc, "rcvd", None)
             ws_close_int = int(ws_close_code.code) if hasattr(ws_close_code, "code") else (int(ws_close_code) if isinstance(ws_close_code, int) else None)
             if ws_close_int in (4401, 4403) or "4401" in exc_str or "4403" in exc_str:
-                relay_registration_refresh_needed = True
+                state.relay_registration_refresh_needed = True
                 settings["relay_api_key"] = ""
                 settings["relay_tenant_id"] = ""
                 _revert_hub_managed_if_auth_failure(401, f"websocket closed with code {ws_close_int or 'auth'}: hub rejected credentials")
@@ -7894,113 +4842,6 @@ def apply_overrides(config_text: str, client: dict[str, Any]) -> str:
     return "\n".join(updated_lines)
 
 
-def _push_to_github(files_changed: list[str], commit_message: str) -> bool:
-    token = settings.get("github_token", "").strip()
-    if not token:
-        raise ValueError("GitHub token not configured")
-
-    if not (REPO_DIR / ".git").exists():
-        raise RuntimeError(f"{REPO_DIR} exists but is not a git repository")
-
-    # Ensure git identity is set (required for commit)
-    try:
-        _git("config", "user.name")
-    except RuntimeError:
-        _git("config", "user.name", "Client Simulator")
-    try:
-        _git("config", "user.email")
-    except RuntimeError:
-        _git("config", "user.email", "client-sim@localhost")
-
-    askpass_script = BASE_DIR / f".git-askpass-{uuid.uuid4().hex}.sh"
-    askpass_script.write_text(
-        "#!/bin/sh\n"
-        "case \"$1\" in\n"
-        "  *Username*) printf '%s\\n' 'x-access-token' ;;\n"
-        "  *Password*) printf '%s\\n' \"$GITHUB_TOKEN\" ;;\n"
-        "  *) printf '%s\\n' \"$GITHUB_TOKEN\" ;;\n"
-        "esac\n",
-        encoding="utf-8",
-    )
-    askpass_script.chmod(0o700)
-    push_env = {
-        "GIT_ASKPASS": str(askpass_script),
-        "GIT_TERMINAL_PROMPT": "0",
-        "GITHUB_TOKEN": token,
-    }
-
-    _git("remote", "set-url", "origin", REPO_URL)
-    try:
-        _git("add", *files_changed)
-        # Check if there is anything staged
-        status = subprocess.run(
-            ["git", "diff", "--cached", "--quiet"],
-            cwd=REPO_DIR,
-        )
-        if status.returncode == 0:
-            return False  # nothing staged
-        _git("commit", "-m", commit_message)
-        _git("push", env=push_env)
-        return True
-    finally:
-        with contextlib.suppress(FileNotFoundError):
-            askpass_script.unlink()
-        _git("remote", "set-url", "origin", REPO_URL)
-
-
-def _update_ini_section(filepath: Path, section: str, updates: dict[str, str]) -> None:
-    text = filepath.read_text(encoding="utf-8") if filepath.exists() else ""
-    newline = "\r\n" if "\r\n" in text else "\n"
-    lines = text.splitlines()
-    normalized_updates = {str(key).strip(): str(value) for key, value in updates.items() if str(key).strip()}
-
-    updated_lines: list[str] = []
-    found_keys: set[str] = set()
-    section_found = False
-    in_target_section = False
-
-    def append_missing_keys() -> None:
-        for key, value in normalized_updates.items():
-            if key not in found_keys:
-                updated_lines.append(f"{key}={value}")
-
-    for line in lines:
-        match = re.match(r"^\s*\[(?P<section>[^\]]+)\]\s*$", line)
-        if match:
-            if in_target_section:
-                append_missing_keys()
-            current_section = match.group("section")
-            in_target_section = current_section == section
-            section_found = section_found or in_target_section
-            updated_lines.append(line)
-            continue
-
-        if in_target_section:
-            key_match = re.match(r"^(?P<indent>\s*)(?P<key>[^=\s#;][^=]*?)\s*=.*$", line)
-            if key_match:
-                key = key_match.group("key").strip()
-                if key in normalized_updates:
-                    updated_lines.append(f"{key_match.group('indent')}{key}={normalized_updates[key]}")
-                    found_keys.add(key)
-                    continue
-
-        updated_lines.append(line)
-
-    if in_target_section:
-        append_missing_keys()
-
-    if not section_found:
-        if updated_lines and updated_lines[-1].strip():
-            updated_lines.append("")
-        updated_lines.append(f"[{section}]")
-        append_missing_keys()
-
-    output = newline.join(updated_lines)
-    if updated_lines and (text.endswith("\n") or not text):
-        output += newline
-    filepath.write_text(output, encoding="utf-8")
-
-
 def _git(*args: str, cwd: Path | None = None, timeout: int = 120, env: dict[str, str] | None = None) -> str:
     """Run a git command, raise RuntimeError on failure.
 
@@ -8066,38 +4907,6 @@ async def _sync_repo_now() -> str | None:
         _update_service_health("sync_repo", ok=False, error=str(exc))
         await broadcast({"type": "repo_status", "synced": repo_state["synced"], "error": str(exc), "last_sync": repo_state["last_sync"]})
         raise
-
-
-async def _run_hub_repo_sync() -> dict[str, Any]:
-    repo_version = await _sync_repo_now()
-    output: dict[str, Any] = {"repo_version": repo_version}
-    detail = f"Client-Sim repo synced{f' ({repo_version})' if repo_version else ''}"
-
-    if approved_proxmox_agents:
-        try:
-            cmd = await _queue_proxmox_agent_update()
-            output.update({
-                "agent_command_id": cmd["id"],
-                "agent_target": cmd["target"],
-                "agent_branch": cmd.get("args", {}).get("branch"),
-            })
-            detail += f"; queued Proxmox agent update for {cmd['target']}"
-        except HTTPException as exc:
-            detail_msg = str(exc.detail or exc)
-            if exc.status_code == 409 and "already queued" in detail_msg.lower():
-                detail += f"; {detail_msg}"
-            else:
-                raise RuntimeError(detail_msg) from exc
-    else:
-        detail += "; no approved Proxmox agent available"
-
-    return {
-        "success": True,
-        "task_type": "repo_sync",
-        "detail": detail,
-        "output": output,
-        "timestamp": datetime.now(timezone.utc).isoformat(),
-    }
 
 
 async def sync_repo() -> None:
@@ -8245,238 +5054,6 @@ async def periodic_webui_refresh() -> None:
         await asyncio.sleep(INTERVAL)
 
 
-async def check_for_update() -> None:
-    """Background task: check for a new installer version every 24 hours with
-    a random 2-hour jitter. Auto-applies the update when a new version is
-    detected and the spoke is idle (no active reclone or reseed)."""
-    import random
-    # Spread initial check across first 2 hours to avoid update stampedes
-    initial_jitter = random.uniform(0, 7200)
-    logger.info("Update checker: first check in %.0f seconds", initial_jitter)
-    await asyncio.sleep(initial_jitter)
-    while True:
-        try:
-            available = await asyncio.to_thread(_get_repo_version)
-            import datetime
-            update_state["available_version"] = available
-            update_state["last_checked"] = datetime.datetime.now().isoformat(timespec="seconds")
-            update_state["update_available"] = (
-                available is not None
-                and available != update_state["current_version"]
-            )
-            logger.info(
-                "Version check: installed=%s repo=%s update_available=%s",
-                update_state["current_version"],
-                available,
-                update_state["update_available"],
-            )
-            _update_service_health("update_checker", ok=True)
-            await _broadcast_update_state()
-
-            # Auto-apply if update available and spoke is idle
-            if (
-                update_state["update_available"]
-                and not update_state["update_in_progress"]
-                and reclone_state.get("status") != "running"
-                and not _proxmox_reseed_in_progress
-            ):
-                logger.info(
-                    "Auto-update: new version %s available and spoke is idle — applying",
-                    available,
-                )
-                asyncio.create_task(_run_self_update())
-            elif update_state["update_available"]:
-                logger.info(
-                    "Auto-update: new version %s available but spoke is busy — will retry next cycle",
-                    available,
-                )
-        except asyncio.CancelledError:
-            raise
-        except Exception as exc:
-            _update_service_health("update_checker", ok=False, error=str(exc))
-            logger.exception("Update checker error: %s", exc)
-        # 24 hours + up to 2-hour jitter to prevent all spokes checking simultaneously
-        await asyncio.sleep(UPDATE_CHECK_INTERVAL + random.uniform(0, 7200))
-
-
-
-
-async def _run_update_all() -> None:
-    """Queue the shared Proxmox update command, wait for its ACK, then self-update the WebUI."""
-    global update_all_state
-
-    approved = list(approved_proxmox_agents.keys())
-    agent_cmd_ids: list[str] = []
-
-    # ── Phase 1: Agent update ────────────────────────────────────────────────
-    try:
-        async with state_lock:
-            update_args = _proxmox_update_args()
-            for hostname in approved:
-                cmd, _created, _expired, _purged = _enqueue_command_locked(hostname, "update_agent", dict(update_args))
-                agent_cmd_ids.append(cmd["id"])
-
-        update_all_state.update({
-            "running": True,
-            "phase": "agents" if agent_cmd_ids else "webui",
-            "total_agents": len(agent_cmd_ids),
-            "completed_agents": 0,
-            "failed_agents": 0,
-            "agent_cmds": agent_cmd_ids,
-            "started_at": time.time(),
-            "error": None,
-        })
-        await broadcast({"type": "update_all_progress", **update_all_state})
-        await broadcast({"type": "commands_update", "commands": _serialize_commands()})
-        await _push_pending_commands_for_targets(approved)
-
-        if agent_cmd_ids:
-            deadline = time.time() + 300
-            while time.time() < deadline:
-                await asyncio.sleep(5)
-                async with state_lock:
-                    command_statuses = {
-                        c["id"]: c["status"]
-                        for c in commands
-                        if c["id"] in agent_cmd_ids
-                    }
-                done = sum(1 for status in command_statuses.values() if status in ("completed", "failed"))
-                failed = sum(1 for status in command_statuses.values() if status == "failed")
-                update_all_state["completed_agents"] = done
-                update_all_state["failed_agents"] = failed
-                await broadcast({"type": "update_all_progress", **update_all_state})
-                if done >= len(agent_cmd_ids):
-                    break
-            else:
-                logger.warning(
-                    "Update All: agent ACK timed out after 300s — proceeding to WebUI update anyway"
-                )
-
-        if len(approved) == 0:
-            logger.info("Update All: no approved agents, proceeding directly to WebUI update")
-        else:
-            logger.info(
-                "Update All: agents done (%d/%d failed), proceeding to WebUI update",
-                update_all_state["completed_agents"],
-                update_all_state["failed_agents"],
-            )
-    except Exception as exc:
-        logger.error("Update All: agent phase error (continuing to WebUI update): %s", exc)
-        update_all_state["error"] = str(exc)
-
-    # ── Phase 2: WebUI self-update ───────────────────────────────────────────
-    try:
-        update_all_state["phase"] = "webui"
-        update_all_state["error"] = None
-        await broadcast({"type": "update_all_progress", **update_all_state})
-
-        # Sync the local repo cache before running the installer so it gets
-        # the freshest content from GitHub (same as the /api/self-update path).
-        try:
-            async with _git_lock:
-                await asyncio.to_thread(sync_repo_once)
-            logger.info("Update All: repo synced before installer")
-        except Exception as sync_exc:
-            logger.warning("Update All: repo sync failed (%s) — installer will retry git fetch", sync_exc)
-
-        await _run_self_update()
-        if update_state.get("update_error"):
-            update_all_state["phase"] = "failed"
-            update_all_state["error"] = str(update_state["update_error"])
-            logger.error("Update All: WebUI self-update failed: %s", update_state["update_error"])
-        else:
-            update_all_state["phase"] = "done"
-    except Exception as exc:
-        update_all_state["phase"] = "failed"
-        update_all_state["error"] = str(exc)
-        logger.error("Update All: WebUI phase error: %s", exc)
-    finally:
-        update_all_state["running"] = False
-        await broadcast({"type": "update_all_progress", **update_all_state})
-
-
-async def _run_self_update() -> None:
-    """Re-run the installer from the synced repo. Systemd will restart the service."""
-    if update_state["update_in_progress"]:
-        return
-    # Wait for any pending/delivered Proxmox agent commands (e.g. update_agent) to be
-    # acked before restarting. Without this delay, the spoke restarts and loses the
-    # in-memory command state before the agent has a chance to ack the command.
-    _agent_update_wait_secs = 180
-    _agent_update_deadline = time.time() + _agent_update_wait_secs
-    while time.time() < _agent_update_deadline:
-        async with state_lock:
-            active = [c for c in commands if c.get("status") in ("pending", "delivered")]
-        if not active:
-            break
-        logger.info(
-            "Self-update: waiting for %d Proxmox agent command(s) to complete before restarting (%.0fs remaining)...",
-            len(active),
-            _agent_update_deadline - time.time(),
-        )
-        await asyncio.sleep(5)
-    if not _INSTALLER_PATH.exists():
-        msg = f"Self-update: installer not found at {_INSTALLER_PATH}"
-        logger.error(msg)
-        update_state["update_error"] = msg
-        await _broadcast_update_state()
-        return
-    update_state["update_in_progress"] = True
-    update_state["update_log"] = []
-    update_state["update_error"] = None
-    await _broadcast_update_state()
-    try:
-        import shlex as _shlex, os as _os
-        # Use create_subprocess_shell so /bin/sh resolves bash via its own PATH.
-        # This is more robust than exec when systemd strips the PATH env.
-        full_path = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
-        installer = _shlex.quote(str(_INSTALLER_PATH))
-        # Pass --branch and --port so the bootstrap step can curl the right branch.
-        _branch = _shlex.quote(os.environ.get("REPO_BRANCH", "main"))
-        _port   = _shlex.quote(os.environ.get("PORT", "8000"))
-        _base     = f'/bin/bash {installer} --branch {_branch} --port {_port}'
-        shell_cmd = _base if _os.geteuid() == 0 else f'sudo -n /bin/bash {installer} --branch {_branch} --port {_port}'
-        logger.info("Self-update: shell_cmd=%s", shell_cmd)
-        proc = await asyncio.create_subprocess_shell(
-            shell_cmd,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.STDOUT,
-            env={**os.environ, "PATH": full_path},
-            start_new_session=True,  # detach from server's process group so SIGTERM on restart doesn't kill installer
-        )
-        assert proc.stdout is not None
-        _ansi_re = re.compile(r'\x1b(?:\[[0-9;]*[a-zA-Z]|\][^\x07\x1b]*(?:\x07|\x1b\\)|[^[\]])')
-        async for raw in proc.stdout:
-            line = _ansi_re.sub('', raw.decode(errors="replace")).rstrip()
-            update_state["update_log"].append(line)
-            logger.info("self-update: %s", line)
-            await _broadcast_update_state()
-        await proc.wait()
-        # -15 (SIGTERM) is expected when the installer schedules a deferred
-        # `systemctl restart` and asyncio cleans up the subprocess transport
-        # when the server is stopped.  If the restart step already ran, treat
-        # it as success rather than surfacing a misleading error.
-        restart_triggered = any(
-            "Restarting client-sim-dashboard" in l for l in update_state["update_log"]
-        )
-        if proc.returncode != 0 and not (proc.returncode == -15 and restart_triggered):
-            logger.error("Self-update installer exited with code %s", proc.returncode)
-            update_state["update_in_progress"] = False
-            update_state["update_error"] = f"Installer exited with code {proc.returncode} — check logs"
-            await _broadcast_update_state()
-        else:
-            logger.info("Self-update installer completed successfully (rc=%s)", proc.returncode)
-            update_state["update_in_progress"] = False
-            update_state["update_error"] = None
-            await _broadcast_update_state()
-    except Exception as exc:
-        logger.exception("Self-update failed")
-        update_state["update_in_progress"] = False
-        update_state["update_error"] = str(exc)
-        update_state["update_log"].append(f"ERROR: {exc}")
-        await _broadcast_update_state()
-
-
 
 
 async def acme_renewal_loop() -> None:
@@ -8566,1978 +5143,6 @@ class LocalUserCreatePayload(BaseModel):
     role: str = "admin"
 
 
-@app.get("/api/auth/check")
-async def spoke_auth_check(request: Request):
-    auth_required = _spoke_auth_required()
-    if not auth_required:
-        return {
-            "auth_required": False,
-            "authenticated": True,
-            "username": "admin",
-            "role": "admin",
-            "auth_provider": "local",
-        }
-    token = request.cookies.get(_SPOKE_SESSION_COOKIE, "")
-    user = _validate_spoke_session(token)
-    return {
-        "auth_required": True,
-        "authenticated": bool(user),
-        "username": user.username if user else "",
-        "role": user.role if user else "",
-        "auth_provider": user.auth_provider if user else _normalize_spoke_auth_provider(settings.get("auth_provider", "local")),
-    }
-
-
-@app.post("/api/auth/login")
-async def spoke_auth_login(payload: _SpokeLoginRequest):
-    username = str(payload.username or "").strip()
-    password = str(payload.password or "")
-    provider = _normalize_spoke_auth_provider(settings.get("auth_provider", "local"))
-    user: SpokeUser | None = None
-
-    if not _spoke_auth_required():
-        user = SpokeUser(username=username or "admin", role="admin", auth_provider="local")
-    elif provider == "ldap" and username and password:
-        user = await _ldap_authenticate(username, password)
-    elif provider == "radius" and username and password:
-        user = await _radius_authenticate(username, password)
-    elif provider == "tacacs" and username and password:
-        user = await _tacacs_authenticate(username, password)
-
-    if user is None:
-        user = _check_credentials(username, password)
-
-    if user is None:
-        raise HTTPException(status_code=401, detail="Invalid credentials")
-
-    token = _create_spoke_session(user)
-    resp = JSONResponse({"ok": True, "role": user.role, "username": user.username})
-    resp.set_cookie(_SPOKE_SESSION_COOKIE, token, httponly=True, samesite="strict", max_age=_get_session_ttl())
-    return resp
-
-
-@app.post("/api/auth/logout")
-async def spoke_auth_logout(request: Request):
-    token = request.cookies.get(_SPOKE_SESSION_COOKIE, "")
-    if token:
-        _spoke_sessions.pop(token, None)
-    resp = JSONResponse({"ok": True})
-    resp.delete_cookie(_SPOKE_SESSION_COOKIE)
-    return resp
-
-
-@app.post("/api/auth/change-password")
-async def change_password(payload: ChangePasswordPayload, user: SpokeUser = Depends(require_auth)):
-    if user.role != "admin":
-        raise HTTPException(status_code=403, detail="Admin required")
-    current_password = str(payload.current_password or "")
-    new_password = str(payload.new_password or "").strip()
-    stored_password = _admin_password()
-    if stored_password:
-        # A password is already set — require the current one to change it.
-        if not current_password:
-            raise HTTPException(status_code=401, detail="Current password is required.")
-        if not secrets.compare_digest(current_password.strip(), stored_password):
-            raise HTTPException(status_code=401, detail="Current password is incorrect.")
-    if not new_password:
-        raise HTTPException(status_code=422, detail="New password is required")
-    settings["admin_password"] = new_password
-    _save_settings()
-    _spoke_sessions.clear()
-    return {"ok": True}
-
-
-@app.get("/api/auth/local-users")
-async def list_local_users(user: SpokeUser = Depends(require_auth)):
-    if user.role != "admin":
-        raise HTTPException(status_code=403, detail="Admin required")
-    users = [{"username": "admin", "role": "admin"}]
-    users.extend({"username": entry["username"], "role": entry["role"]} for entry in _get_local_users())
-    return users
-
-
-@app.post("/api/auth/local-users")
-async def create_local_user(payload: LocalUserCreatePayload, user: SpokeUser = Depends(require_auth)):
-    if user.role != "admin":
-        raise HTTPException(status_code=403, detail="Admin required")
-    username = str(payload.username or "").strip()
-    password = str(payload.password or "")
-    role_raw = str(payload.role or "admin").strip().lower()
-    if not username:
-        raise HTTPException(status_code=422, detail="Username is required")
-    if username.lower() == "admin":
-        raise HTTPException(status_code=400, detail="The primary admin account already exists")
-    if not password:
-        raise HTTPException(status_code=422, detail="Password is required")
-    if role_raw not in _LOCAL_USER_ROLES:
-        raise HTTPException(status_code=422, detail="Role must be admin, viewer, or demo")
-
-    users = _get_local_users()
-    if any(str(entry.get("username", "")).strip().lower() == username.lower() for entry in users):
-        raise HTTPException(status_code=409, detail="User already exists")
-
-    users.append({
-        "username": username,
-        "password_hash": _hash_local_password(password),
-        "role": role_raw,
-    })
-    settings["local_users"] = users
-    _save_settings()
-    return {"ok": True}
-
-
-@app.delete("/api/auth/local-users/{username}")
-async def delete_local_user(username: str, user: SpokeUser = Depends(require_auth)):
-    if user.role != "admin":
-        raise HTTPException(status_code=403, detail="Admin required")
-    username = str(username or "").strip()
-    if not username:
-        raise HTTPException(status_code=422, detail="Username is required")
-    if username.lower() == "admin":
-        raise HTTPException(status_code=400, detail="The primary admin account cannot be deleted")
-    if username.lower() == user.username.lower():
-        raise HTTPException(status_code=400, detail="Cannot delete your own account.")
-
-    users = _get_local_users()
-    remaining = [entry for entry in users if str(entry.get("username", "")).strip().lower() != username.lower()]
-    if len(remaining) == len(users):
-        raise HTTPException(status_code=404, detail="User not found")
-
-    settings["local_users"] = remaining
-    _save_settings()
-    _spoke_sessions.clear()
-    return {"ok": True}
-
-
-@app.post("/api/auth/test")
-async def test_auth_provider(payload: dict, request: Request):
-    """Test auth provider connectivity (admin only)."""
-    user = _validate_spoke_session(request.cookies.get(_SPOKE_SESSION_COOKIE, ""))
-    if not user or user.role != "admin":
-        raise HTTPException(403, "Admin required")
-
-    provider = str(payload.get("provider", settings.get("auth_provider", "local")) or "local").strip().lower()
-    if provider == "ldap":
-        try:
-            from ldap3 import ALL, Connection, Server
-
-            def _ldap_probe() -> None:
-                srv = Server(settings["auth_ldap_url"], get_info=ALL)
-                with Connection(srv, user=settings["auth_ldap_bind_dn"], password=settings["auth_ldap_bind_password"], auto_bind=True):
-                    pass
-            await asyncio.to_thread(_ldap_probe)
-            return {"ok": True, "detail": f"Connected to {settings['auth_ldap_url']}"}
-        except Exception as exc:
-            return {"ok": False, "detail": str(exc)}
-    if provider == "radius":
-        return {"ok": True, "detail": "RADIUS: send a test login to verify"}
-    if provider == "tacacs":
-        try:
-            def _tacacs_probe() -> None:
-                s = socket.create_connection(
-                    (settings["auth_tacacs_host"], int(settings.get("auth_tacacs_port", 49))),
-                    timeout=5,
-                )
-                s.close()
-            await asyncio.to_thread(_tacacs_probe)
-            return {"ok": True, "detail": f"TCP connection to {settings['auth_tacacs_host']}:{settings.get('auth_tacacs_port', 49)} OK"}
-        except Exception as exc:
-            return {"ok": False, "detail": str(exc)}
-    return {"ok": True, "detail": "Local auth — no external connectivity needed"}
-
-
-@app.get("/api/settings")
-async def api_settings_get() -> dict[str, Any]:
-    return _public_settings()
-
-
-@app.post("/api/bootstrap")
-async def api_bootstrap(request: Request, body: dict[str, Any] = Body(...)) -> dict[str, str]:
-    """One-time hub configuration — only accepted from localhost (via qm guest exec / pct exec).
-
-    Security model:
-      - Only 127.0.0.1 / ::1 can call this endpoint — enforced server-side.
-      - If relay_server_url is already configured the endpoint returns 409 (idempotent lock).
-      - The installer invokes this via `qm guest exec` / `pct exec` so the request never
-        crosses the network; an external caller cannot reach it.
-    """
-    global relay_registration_refresh_needed
-
-    client_host = (request.client.host if request.client else "") or ""
-    if client_host not in ("127.0.0.1", "::1", "localhost"):
-        logger.warning("Bootstrap attempt rejected from non-localhost %s", client_host)
-        raise HTTPException(status_code=403, detail="bootstrap only accepted from localhost")
-
-    if settings.get("relay_server_url", "").strip():
-        raise HTTPException(status_code=409, detail="hub already configured — bootstrap is one-time only")
-
-    hub_url = str(body.get("relay_server_url", "") or "").strip()
-    tenant_id = str(body.get("relay_tenant_id", "") or "").strip()
-    onboarding_psk = str(body.get("relay_onboarding_psk", "") or "").strip()
-
-    if not hub_url:
-        raise HTTPException(status_code=422, detail="relay_server_url is required")
-
-    settings["relay_server_url"] = hub_url
-    if tenant_id:
-        settings["relay_tenant_id"] = tenant_id
-        settings["relay_tenant_hint"] = tenant_id
-    if onboarding_psk:
-        settings["relay_onboarding_psk"] = onboarding_psk
-    settings["relay_enabled"] = "on"
-    _save_settings()
-
-    relay_state.update({
-        "enabled": True,
-        "connected": False,
-        "error": None,
-        "registration_status": _relay_registration_status_from_settings(),
-    })
-    relay_registration_refresh_needed = True
-    _save_relay_state()
-    task = background_tasks.get("relay")
-    if task and not task.done():
-        task.cancel()
-    background_tasks["relay"] = asyncio.get_event_loop().create_task(relay_loop())
-
-    logger.info("Bootstrap: hub configured to %s (tenant: %s)", hub_url, tenant_id or "none")
-    return {"status": "ok", "relay_server_url": hub_url, "relay_tenant_id": tenant_id, "has_psk": bool(onboarding_psk)}
-
-
-@app.post("/api/settings")
-async def api_settings_update(update: SettingsUpdate) -> dict[str, Any]:
-    global relay_registration_refresh_needed
-    changed_branch = False
-    relay_config_changed = False
-    auth_provider_changed = False
-    autoprov_disabled = False
-    update_data = update.model_dump(exclude_none=True)
-
-    if settings.get("hub_managed"):
-        non_relay = set(update_data.keys()) - HUB_LOCAL_ALLOWED_KEYS
-        if non_relay:
-            raise HTTPException(status_code=403, detail="Settings are hub-managed. Only relay settings can be changed locally.")
-
-    if update.repo_branch is not None:
-        branch = update.repo_branch.strip()
-        if not branch or not re.match(r'^[a-zA-Z0-9._/\-]+$', branch):
-            raise HTTPException(status_code=422, detail="Invalid branch name")
-        settings["repo_branch"] = branch
-        changed_branch = True
-
-    if update.github_token is not None:
-        settings["github_token"] = update.github_token.strip()
-
-    if update.relay_server_url is not None:
-        settings["relay_server_url"] = update.relay_server_url.strip()
-        relay_config_changed = True
-
-    if update.hub_tls_verify is not None:
-        settings["hub_tls_verify"] = _normalize_relay_enabled(update.hub_tls_verify)
-        relay_config_changed = True
-
-    if update.relay_spoke_name is not None:
-        settings["relay_spoke_name"] = update.relay_spoke_name.strip()
-        relay_config_changed = True
-
-    if update.relay_tenant_hint is not None:
-        tenant_id = update.relay_tenant_hint.strip()
-        settings["relay_tenant_hint"] = tenant_id
-        settings["relay_tenant_id"] = tenant_id
-        relay_config_changed = True
-
-    if update.relay_api_key is not None:
-        settings["relay_api_key"] = update.relay_api_key.strip()
-        relay_config_changed = True
-
-    if update.relay_spoke_id is not None:
-        settings["relay_spoke_id"] = update.relay_spoke_id.strip()
-        relay_config_changed = True
-
-    if update.relay_tenant_id is not None:
-        tenant_id = update.relay_tenant_id.strip()
-        settings["relay_tenant_id"] = tenant_id
-        settings["relay_tenant_hint"] = tenant_id
-        relay_config_changed = True
-
-    if update.relay_enabled is not None:
-        settings["relay_enabled"] = _normalize_relay_enabled(update.relay_enabled)
-        relay_config_changed = True
-
-    if update.relay_poll_interval is not None:
-        settings["relay_poll_interval"] = _clamp_relay_interval(update.relay_poll_interval)
-        relay_config_changed = True
-
-    if update.hub_isolation_timeout is not None:  # Accept timeout edits from the setup UI so operators can tune when stale hub contact pauses pushes.
-        settings["hub_isolation_timeout"] = max(300, min(86400, int(update.hub_isolation_timeout)))  # Clamp the safeguard window so operators stay within the supported 5-minute to 24-hour range.
-        relay_config_changed = True  # Treat timeout edits as relay changes so isolation status is re-broadcast immediately when the threshold moves.
-        _save_settings()  # Persist the new timeout right away so the safeguard survives crashes even before the handler reaches its shared save call.
-
-    if update.admin_password is not None:
-        settings["admin_password"] = update.admin_password.strip()
-        _spoke_sessions.clear()
-
-    if update.session_timeout_minutes is not None:
-        settings["session_timeout_minutes"] = max(5, min(1440, int(update.session_timeout_minutes)))
-
-    if update.auth_provider is not None:
-        next_provider = _normalize_spoke_auth_provider(update.auth_provider)
-        if next_provider != _normalize_spoke_auth_provider(settings.get("auth_provider", "local")):
-            auth_provider_changed = True
-        settings["auth_provider"] = next_provider
-
-    for key in (
-        "auth_ldap_url",
-        "auth_ldap_bind_dn",
-        "auth_ldap_bind_password",
-        "auth_ldap_user_base",
-        "auth_ldap_user_filter",
-        "auth_ldap_group_admin",
-        "auth_ldap_group_viewer",
-        "auth_radius_host",
-        "auth_radius_secret",
-        "auth_radius_role_attr",
-        "auth_radius_admin_val",
-        "auth_tacacs_host",
-        "auth_tacacs_secret",
-    ):
-        value = getattr(update, key)
-        if value is not None:
-            settings[key] = str(value).strip()
-
-    if update.auth_radius_port is not None:
-        settings["auth_radius_port"] = max(1, min(65535, int(update.auth_radius_port)))
-
-    if update.auth_tacacs_port is not None:
-        settings["auth_tacacs_port"] = max(1, min(65535, int(update.auth_tacacs_port)))
-
-    if update.auth_tacacs_admin_priv is not None:
-        settings["auth_tacacs_admin_priv"] = max(0, int(update.auth_tacacs_admin_priv))
-
-    if auth_provider_changed:
-        _spoke_sessions.clear()
-
-    if relay_config_changed:
-        relay_state.update({
-            "enabled": settings.get("relay_enabled") == "on" and bool(settings.get("relay_server_url")),
-            "connected": False,
-            "error": None,
-            "registration_status": _relay_registration_status_from_settings(),
-        })
-        relay_registration_refresh_needed = bool(relay_state["enabled"])
-        _save_relay_state()
-        # Kick the relay loop immediately instead of waiting for the next poll interval
-        task = background_tasks.get("relay")
-        if task and not task.done():
-            task.cancel()
-        background_tasks["relay"] = asyncio.get_event_loop().create_task(relay_loop())
-
-    if update.central_api is not None:
-        merged_api = _normalize_central_api_settings(settings.get("central_api", {}), settings.get("central_config", {}))
-        mode = str(update.central_api.get("mode", merged_api.get("mode", "classic"))).strip().lower()
-        if mode not in {"classic", "central"}:
-            raise HTTPException(status_code=422, detail="central_api.mode must be 'classic' or 'central'")
-        merged_api["mode"] = mode
-
-        classic_update = update.central_api.get("classic")
-        if isinstance(classic_update, dict):
-            for key in ("url", "username"):
-                if key in classic_update:
-                    merged_api["classic"][key] = str(classic_update.get(key, "")).strip()
-            if "password" in classic_update:
-                merged_api["classic"]["password"] = str(classic_update.get("password", ""))
-
-        central_update = update.central_api.get("central")
-        if isinstance(central_update, dict):
-            for key in ("url", "client_id", "customer_id"):
-                if key in central_update:
-                    merged_api["central"][key] = str(central_update.get(key, "")).strip()
-            if "client_secret" in central_update:
-                merged_api["central"]["client_secret"] = str(central_update.get("client_secret", ""))
-
-        settings["central_api"] = merged_api
-        _sync_central_runtime_config()
-
-    if update.central_config is not None:
-        merged = dict(settings["central_config"])
-        # Only update keys that are explicitly provided so omitted secrets are preserved.
-        for key in ("cluster_url", "client_id", "customer_id", "api_version"):
-            if key in update.central_config:
-                merged[key] = update.central_config[key].strip()
-        for secret_key in ("client_secret", "access_token", "refresh_token"):
-            if secret_key in update.central_config:
-                merged[secret_key] = update.central_config.get(secret_key, "").strip()
-        # Switching to New Central — clear stale classic tokens from runtime
-        if merged.get("api_version") == "new_central":
-            central_token["access_token"] = None
-            central_token["refresh_token"] = None
-            central_token["expires_at"] = 0.0
-        settings["central_config"] = merged
-        merged_api = _normalize_central_api_settings(settings.get("central_api", {}), merged)
-        if merged.get("api_version") == "new_central":
-            merged_api["mode"] = "central"
-            merged_api["central"].update({
-                "url": merged.get("cluster_url", "").strip(),
-                "client_id": merged.get("client_id", "").strip(),
-                "client_secret": merged.get("client_secret", ""),
-                "customer_id": merged.get("customer_id", "").strip(),
-            })
-        settings["central_api"] = merged_api
-        # Classic: load new tokens into runtime state immediately
-        if merged.get("api_version", "classic") == "classic":
-            central_token["access_token"] = merged.get("access_token") or None
-            central_token["refresh_token"] = merged.get("refresh_token") or None
-            central_token["expires_at"] = time.time() + 7200 if merged.get("access_token") else 0.0
-
-    if update.site_mappings is not None:
-        settings["site_mappings"] = {k.strip(): v.strip() for k, v in update.site_mappings.items() if k.strip()}
-
-    if update.monitored_checks is not None:
-        settings["monitored_checks"] = [
-            {"type": c.get("type", ""), "id": c.get("id", ""), "name": c.get("name", c.get("id", ""))}
-            for c in update.monitored_checks
-            if c.get("type") and c.get("id")
-        ]
-
-    if update.hardware_checks is not None:
-        settings["hardware_checks"] = [
-            {
-                "id": c.get("id", ""),
-                "name": c.get("name") or _HW_FRIENDLY.get(c.get("id", ""), c.get("id", "")),
-                "device_type": c.get("device_type") or _auto_device_type(c.get("id", "")),
-            }
-            for c in update.hardware_checks
-            if c.get("id")
-        ]
-
-    if update.notifications is not None:
-        merged_notif = dict(settings.get("notifications", {}))
-        merged_notif.update(update.notifications)
-        # Ensure smtp_to is always a list
-        if isinstance(merged_notif.get("smtp_to"), str):
-            merged_notif["smtp_to"] = [a.strip() for a in merged_notif["smtp_to"].split(",") if a.strip()]
-        settings["notifications"] = merged_notif
-
-    if update.repo_sync_interval is not None:
-        interval = max(60, min(86400, update.repo_sync_interval))  # clamp 1min–24hr
-        settings["repo_sync_interval"] = interval
-
-    if update.usb_vidpids is not None:
-        settings["usb_vidpids"] = _ensure_json_list(update.usb_vidpids.strip(), "usb_vidpids")
-
-    if update.usb_missing_timeout is not None:
-        settings["usb_missing_timeout"] = str(max(1, int(update.usb_missing_timeout.strip() or "60")))
-
-    if any(value is not None for value in (
-        update.usb_template_id,
-        update.vm_image_1_template_id,
-        update.vm_image_1_template_spec,
-        update.vm_image_2_template_id,
-        update.vm_image_2_template_spec,
-    )):
-        spec1_raw = update.vm_image_1_template_spec
-        if spec1_raw is None:
-            spec1_raw = update.vm_image_1_template_id
-        if spec1_raw is None:
-            spec1_raw = update.usb_template_id
-        spec2_raw = update.vm_image_2_template_spec
-        if spec2_raw is None:
-            spec2_raw = update.vm_image_2_template_id
-
-        try:
-            spec1 = _resolved_template_spec(settings, 1) if spec1_raw is None else _normalize_vmid_spec(spec1_raw, field_name="vm_image_1_template_spec")
-            spec2 = _resolved_template_spec(settings, 2) if spec2_raw is None else _normalize_vmid_spec(spec2_raw, field_name="vm_image_2_template_spec")
-            _validate_template_specs(spec1, spec2)
-        except ValueError as exc:
-            raise HTTPException(status_code=422, detail=str(exc)) from exc
-
-        settings["vm_image_1_template_spec"] = spec1
-        settings["vm_image_2_template_spec"] = spec2
-        settings["vm_image_1_template_id"] = _primary_template_id(spec1, _legacy_template_id(settings, 1))
-        settings["vm_image_2_template_id"] = _primary_template_id(spec2, _legacy_template_id(settings, 2))
-
-    if update.vm_image_1_pct is not None:
-        settings["vm_image_1_pct"] = str(max(0, min(100, int(update.vm_image_1_pct.strip() or "50"))))
-
-    if update.usb_auto_provision is not None:
-        settings["usb_auto_provision"] = _normalize_toggle(update.usb_auto_provision)
-        autoprov_disabled = settings["usb_auto_provision"] != "on"
-
-    if update.use_all_dongles is not None:
-        settings["use_all_dongles"] = bool(update.use_all_dongles)  # validated: always boolean
-
-    if update.usb_max_slots is not None:
-        settings["usb_max_slots"] = str(max(1, min(256, int(update.usb_max_slots.strip() or "24"))))
-
-    def _clamp_pct(val: str, default: str) -> str:
-        return str(max(0, min(100, int(val.strip() or default))))
-
-    if update.cpu_provision_threshold is not None:
-        settings["cpu_provision_threshold"] = _clamp_pct(update.cpu_provision_threshold, "80")
-    if update.cpu_delete_threshold is not None:
-        settings["cpu_delete_threshold"] = _clamp_pct(update.cpu_delete_threshold, "90")
-    if update.mem_provision_threshold is not None:
-        settings["mem_provision_threshold"] = _clamp_pct(update.mem_provision_threshold, "80")
-    if update.mem_delete_threshold is not None:
-        settings["mem_delete_threshold"] = _clamp_pct(update.mem_delete_threshold, "90")
-
-    if update.vmid_start is not None:
-        settings["vmid_start"] = max(0, int(update.vmid_start))
-
-    if update.usb_ignored_vidpids is not None:
-        settings["usb_ignored_vidpids"] = _ensure_json_list(update.usb_ignored_vidpids.strip(), "usb_ignored_vidpids")
-
-    if update.ignored_hostnames is not None:
-        settings["ignored_hostnames"] = _ensure_json_list(update.ignored_hostnames.strip(), "ignored_hostnames")
-
-    if update.vm_silent_timeout is not None:
-        settings["vm_silent_timeout"] = str(max(1, int(update.vm_silent_timeout.strip() or "24")))
-
-    if update.reclone_schedule_enabled is not None:
-        settings["reclone_schedule_enabled"] = _normalize_toggle(update.reclone_schedule_enabled)
-
-    if update.reclone_schedule_cron is not None:
-        cron_value = update.reclone_schedule_cron.strip().lower() or "sunday 02:00"
-        if _parse_reclone_schedule(cron_value) is None:
-            raise HTTPException(status_code=422, detail="reclone_schedule_cron must be in '<day> HH:MM' format")
-        settings["reclone_schedule_cron"] = cron_value
-
-    if update.reclone_concurrency is not None:
-        settings["reclone_concurrency"] = str(max(1, int(update.reclone_concurrency.strip() or "1")))
-
-    if update.protected_vmids is not None:
-        # Normalize to a clean comma-separated list of ints and ranges (e.g. "101, 100-90000")
-        raw = str(update.protected_vmids or "")
-        parsed_strs = []
-        for entry in _parse_protected_vmids(raw):
-            if isinstance(entry, tuple):
-                lo, hi = entry
-                parsed_strs.append(f"{lo}-{hi}")
-            else:
-                parsed_strs.append(str(entry))
-        settings["protected_vmids"] = ", ".join(parsed_strs)
-
-    if update.l1_vlan_start is not None:
-        settings["l1_vlan_start"] = str(max(1, min(4094, int(update.l1_vlan_start.strip() or "100"))))
-
-    if update.l1_vlan_end is not None:
-        settings["l1_vlan_end"] = str(max(1, min(4094, int(update.l1_vlan_end.strip() or "199"))))
-
-    if update.guest_agent_watchdog_enabled is not None:
-        settings["guest_agent_watchdog_enabled"] = _normalize_toggle(update.guest_agent_watchdog_enabled)
-    if update.guest_agent_grace_minutes is not None:
-        settings["guest_agent_grace_minutes"] = str(max(1, int(update.guest_agent_grace_minutes.strip() or "20")))
-    if update.guest_agent_check_interval_minutes is not None:
-        settings["guest_agent_check_interval_minutes"] = str(max(1, int(update.guest_agent_check_interval_minutes.strip() or "10")))
-    if update.guest_agent_reboot_after_minutes is not None:
-        settings["guest_agent_reboot_after_minutes"] = str(max(1, int(update.guest_agent_reboot_after_minutes.strip() or "10")))
-    if update.guest_agent_reclone_after_minutes is not None:
-        settings["guest_agent_reclone_after_minutes"] = str(max(1, int(update.guest_agent_reclone_after_minutes.strip() or "30")))
-    if update.watchdog_reboot_enabled is not None:
-        settings["watchdog_reboot_enabled"] = _normalize_toggle(update.watchdog_reboot_enabled)
-
-    if update.proxmox_api_token is not None:
-        token = update.proxmox_api_token.strip()
-        settings["proxmox_api_token"] = token
-        _persisted["proxmox_api_token"] = token
-
-    if update.spoke_tls is not None:
-        settings["spoke_tls"] = _normalize_toggle(update.spoke_tls)
-
-    _save_settings()
-
-    if autoprov_disabled:
-        _clear_provision_halt_state()
-
-    if changed_branch:
-        if "sync_repo" in background_tasks:
-            background_tasks["sync_repo"].cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await background_tasks["sync_repo"]
-        background_tasks["sync_repo"] = asyncio.create_task(sync_repo())
-
-    # Re-filter unknown_usb immediately so subsequent proxmox_update broadcasts don't
-    # restore devices the user just certified or ignored.
-    if update.usb_vidpids is not None or update.usb_ignored_vidpids is not None:
-        _new_certified: set[str] = {
-            str(item.get("vidpid", "")).strip().lower()
-            for item in _parse_json_list(settings.get("usb_vidpids", "[]"))
-            if isinstance(item, dict) and item.get("vidpid")
-        }
-        _new_ignored: set[str] = {
-            str(v).strip().lower()
-            for v in _parse_json_list(settings.get("usb_ignored_vidpids", "[]"))
-            if str(v).strip()
-        }
-        _exclude = _new_certified | _new_ignored
-        proxmox_state["unknown_usb"] = [
-            d for d in proxmox_state.get("unknown_usb", [])
-            if str(d.get("vidpid", "")).strip()
-            and str(d.get("vidpid", "")).strip().lower() not in _exclude
-        ]
-
-    payload = await api_settings_get()
-    await broadcast({"type": "settings_update", "settings": payload})
-    if autoprov_disabled:
-        await _broadcast_proxmox_state()
-    if relay_config_changed:
-        await _broadcast_relay_state()
-    return {"status": "ok", "settings": payload}
-
-
-@app.get("/api/test-github")
-async def api_test_github() -> dict[str, Any]:
-    """Validate the stored GitHub token against the GitHub API."""
-    token = settings.get("github_token", "").strip()
-    if not token:
-        return {"valid": False, "error": "No GitHub token configured"}
-    if httpx is None:
-        return {"valid": False, "error": "httpx not available on server"}
-    try:
-        async with httpx.AsyncClient(timeout=10) as client:
-            resp = await client.get(
-                "https://api.github.com/user",
-                headers={"Authorization": f"token {token}", "Accept": "application/vnd.github+json"},
-            )
-        if resp.status_code == 200:
-            data = resp.json()
-            return {"valid": True, "username": data.get("login", ""), "error": None}
-        elif resp.status_code == 401:
-            return {"valid": False, "error": "Token is invalid or expired"}
-        else:
-            return {"valid": False, "error": f"GitHub returned HTTP {resp.status_code}"}
-    except Exception as exc:
-        return {"valid": False, "error": f"Request failed: {exc}"}
-
-
-@app.post("/api/settings/clear/{provider}")
-async def api_settings_clear(provider: str, payload: dict[str, Any] | None = Body(default=None)) -> dict[str, Any]:
-    provider_key = provider.strip().lower()
-    changed_branch = False
-    relay_config_changed = False
-    relay_payload: dict[str, Any] | None = None
-
-    if provider_key == "github":
-        changed_branch = bool(settings.get("repo_branch"))
-        settings["repo_branch"] = ""
-        settings["github_token"] = ""
-    elif provider_key == "relay":
-        settings.update({
-            "relay_enabled": "off",
-            "relay_server_url": "",
-            "hub_tls_verify": "off",
-            "relay_spoke_name": "",
-            "relay_tenant_hint": "",
-            "relay_api_key": "",
-            "relay_spoke_id": "",
-            "relay_tenant_id": "",
-            "relay_poll_interval": RELAY_INTERVAL_DEFAULT,
-        })
-        relay_state.update({
-            "enabled": False,
-            "connected": False,
-            "last_sync": None,
-            "error": None,
-            "registration_status": "unregistered",
-            "api_key_configured": bool(settings.get("relay_api_key")),
-        })
-        relay_registration_refresh_needed = False
-        _save_relay_state()
-        relay_config_changed = True
-        relay_payload = _relay_status_payload()
-    elif provider_key == "central":
-        requested_mode = str((payload or {}).get("mode") or settings.get("central_api", {}).get("mode", "classic")).strip().lower()
-        if requested_mode not in {"classic", "central"}:
-            raise HTTPException(status_code=422, detail="mode must be 'classic' or 'central'")
-        central_api_cfg = _normalize_central_api_settings(settings.get("central_api", {}), settings.get("central_config", {}))
-        central_api_cfg["mode"] = requested_mode
-        if requested_mode == "classic":
-            central_api_cfg["classic"] = {"url": "", "username": "", "password": ""}
-        else:
-            central_api_cfg["central"] = {"url": "", "client_id": "", "client_secret": "", "customer_id": ""}
-        settings["central_api"] = central_api_cfg
-        _sync_central_runtime_config()
-    else:
-        raise HTTPException(status_code=404, detail=f"Unknown settings provider: {provider}")
-
-    _save_settings()
-
-    if changed_branch:
-        if "sync_repo" in background_tasks:
-            background_tasks["sync_repo"].cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await background_tasks["sync_repo"]
-        background_tasks["sync_repo"] = asyncio.create_task(sync_repo())
-
-    payload = await api_settings_get()
-    await broadcast({"type": "settings_update", "settings": payload})
-    if relay_config_changed and relay_payload is not None:
-        await _broadcast_relay_state()
-
-    response: dict[str, Any] = {"status": "ok", "provider": provider_key, "settings": payload}
-    if relay_payload is not None:
-        response["relay_status"] = relay_payload
-    return response
-
-
-@app.post("/api/relay/trigger")
-async def api_relay_trigger() -> dict[str, Any]:
-    """Manually trigger an immediate relay sync."""
-    if settings.get("relay_enabled") != "on":
-        raise HTTPException(status_code=400, detail="Relay is not enabled")
-    if not settings.get("relay_server_url"):
-        raise HTTPException(status_code=400, detail="Relay server URL not configured")
-    asyncio.create_task(relay_sync_once())
-    return {"status": "ok", "message": "Relay sync triggered"}
-
-
-@app.post("/api/relay/ingest")
-async def api_relay_ingest(payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
-    """Accept a site snapshot from a remote WebUI acting as a relay agent."""
-    site_id = payload.get("site_id")
-    if not site_id:
-        raise HTTPException(status_code=422, detail="site_id is required")
-    tenant_id = payload.get("tenant_id") or "__untenanted__"
-    async with state_lock:
-        relay_sites.setdefault(tenant_id, {})[site_id] = {**payload, "ingested_at": time.time()}
-    await broadcast({
-        "type": "relay_ingest",
-        "tenant_id": tenant_id,
-        "site_id": site_id,
-        "client_count": payload.get("client_count", 0),
-        "timestamp": payload.get("timestamp"),
-    })
-    logger.info("Ingested relay snapshot from tenant=%s site=%s (%d clients)", tenant_id, site_id, payload.get("client_count", 0))
-    return {"status": "ok", "tenant_id": tenant_id, "site_id": site_id}
-
-
-@app.get("/api/relay/sites")
-async def api_relay_sites(tenant_id: str | None = Query(None)) -> dict[str, Any]:
-    """Return ingested site snapshots. Optionally filter by tenant_id."""
-    async with state_lock:
-        if tenant_id:
-            sites = list(relay_sites.get(tenant_id, {}).values())
-        else:
-            # Return all tenants flattened
-            sites = [site for tenant in relay_sites.values() for site in tenant.values()]
-    return {"sites": sites, "tenant_id": tenant_id}
-
-
-@app.get("/api/repo/status")
-async def api_repo_status() -> dict[str, Any]:
-    return {
-        "synced": repo_state.get("synced", False),
-        "error": repo_state.get("error"),
-        "last_sync": repo_state.get("last_sync"),
-        "repo_version": _repo_ver,
-    }
-
-
-@app.get("/api/relay/status")
-async def api_relay_status_endpoint() -> dict[str, Any]:  # Serve the enriched relay payload so on-demand status checks match websocket broadcasts exactly.
-    return _relay_status_payload()  # Reuse the shared relay payload so the REST endpoint matches broadcasted isolation, spoke, and check-in fields exactly.
-
-
-@app.get("/api/relay/monitored-items")
-async def api_relay_monitored_items() -> dict[str, Any]:
-    """Return hub-synced monitored items for this spoke (fetched each relay cycle)."""
-    return _hub_monitored_items
-
-
-@app.post("/api/relay/revert-local")
-async def api_relay_revert_local() -> dict[str, Any]:
-    """Immediately revert hub_managed to False, restoring local control.
-
-    Use when the hub tenant has been deleted or the hub is permanently unreachable.
-    The spoke will stop accepting hub config pushes and allow local settings changes.
-    """
-    was_managed = bool(settings.get("hub_managed"))
-    settings["hub_managed"] = False
-    settings["relay_api_key"] = ""
-    settings["relay_tenant_id"] = ""
-    _save_settings()
-    await _broadcast_relay_state()
-    await broadcast({"type": "settings_update", "settings": _public_settings()})
-    logger.info("hub_managed manually reverted to local control by operator")
-    _relay_diag_append("hub_managed_reverted", status_code=None, reason="manual operator revert via /api/relay/revert-local")
-    return {"status": "ok", "was_managed": was_managed, "message": "Reverted to local control — hub_managed cleared"}
-
-
-@app.get("/api/relay/diag")
-async def api_relay_diag() -> dict[str, Any]:
-    """Return registration diagnostics: config summary, live hub reachability, and registration log."""
-    server_url = settings.get("relay_server_url", "").rstrip("/")
-    hostname = socket.gethostname()
-
-    # Live reachability check — use just the base URL (scheme+host+port), not the tenant path
-    from urllib.parse import urlparse as _urlparse
-    _parsed = _urlparse(server_url) if server_url else None
-    hub_base_url = f"{_parsed.scheme}://{_parsed.netloc}" if _parsed and _parsed.netloc else server_url
-    reachability: dict[str, Any] = {"tested_url": server_url or "(not set)", "ok": False, "detail": ""}
-    if server_url:
-        try:
-            async with httpx.AsyncClient(timeout=8, verify=_hub_tls_verify()) as hc:
-                r = await hc.get(f"{hub_base_url}/api/health")
-                reachability = {
-                    "tested_url": f"{hub_base_url}/api/health",
-                    "ok": r.status_code < 400,
-                    "http_status": r.status_code,
-                    "detail": r.text[:200],
-                }
-        except Exception as exc:
-            reachability = {
-                "tested_url": f"{hub_base_url}/api/health",
-                "ok": False,
-                "detail": str(exc),
-            }
-    else:
-        reachability["detail"] = "Server URL not configured"
-
-    config_check = {
-        "relay_enabled": settings.get("relay_enabled", "off"),
-        "hub_tls_verify": settings.get("hub_tls_verify", "off"),
-        "server_url": server_url or "(not set)",
-        "spoke_name": settings.get("relay_spoke_name", "") or "(not set — will use hostname)",
-        "hostname": hostname,
-        "spoke_id": settings.get("relay_spoke_id", "") or "(none)",
-        "api_key_configured": bool(settings.get("relay_api_key")),
-        "tenant_id": settings.get("relay_tenant_id", "") or "(none)",
-    }
-
-    return {
-        "config": config_check,
-        "current_state": dict(relay_state),
-        "reachability": reachability,
-        "log": list(reversed(relay_diag_log)),
-    }
-
-
-@app.get("/api/logs/service")
-def api_service_logs(lines: int = Query(default=50, ge=1, le=500)) -> dict[str, Any]:
-    timestamp = iso_utcnow()
-    try:
-        result = subprocess.run(
-            [
-                "journalctl",
-                "-u",
-                JOURNAL_UNIT,
-                "-n",
-                str(lines),
-                "--no-pager",
-                "--output=short",
-            ],
-            capture_output=True,
-            text=True,
-            timeout=5,
-        )
-        if result.returncode == 0:
-            log_lines = result.stdout.splitlines()
-            return {"lines": log_lines, "count": len(log_lines), "timestamp": timestamp}
-    except Exception:
-        pass
-
-    fallback = ["journalctl not available"]
-    return {"lines": fallback, "count": len(fallback), "timestamp": timestamp}
-
-
-@app.get("/api/proxmox/usb-config")
-async def get_proxmox_usb_config(hostname: str | None = Query(default=None)) -> dict[str, Any]:
-    return _proxmox_usb_config_payload(hostname)
-
-
-@app.post("/api/proxmox/reclone-all")
-async def api_proxmox_reclone_all() -> dict[str, Any]:
-    if reclone_state.get("status") == "running":
-        raise HTTPException(status_code=409, detail="A reclone run is already in progress")
-    eligible = _reclone_targets_for_run()
-    unassigned_dongles = _proxmox_unassigned_present_usb()
-    if not eligible and not unassigned_dongles:
-        raise HTTPException(
-            status_code=400,
-            detail=(
-                "No reclone-capable guests or unassigned certified USB devices were found. "
-                "Guests without a USB mapping or LXC template source are skipped."
-            ),
-        )
-    asyncio.create_task(_run_rolling_reclone("manual"))
-    return {"status": "started", "vm_count": len(eligible), "unassigned_dongles": len(unassigned_dongles)}
-
-
-@app.post("/api/proxmox/reclone-state/clear")
-async def api_proxmox_reclone_state_clear() -> dict[str, Any]:
-    """Clear a stale failed/interrupted reclone state, resetting to idle.
-    The last_run summary is preserved so the UI can still show what happened."""
-    status = reclone_state.get("status", "idle")
-    if status == "running":
-        raise HTTPException(status_code=409, detail="Cannot clear reclone state while a reclone is running")
-    reclone_state.update({
-        "status": "idle",
-        "type": None,
-        "total": 0,
-        "completed": 0,
-        "failed": 0,
-        "current_vm": None,
-        "log": [],
-        "started_at": None,
-        "last_run": None,
-        "auto_recovery_log": [],
-    })
-    await _broadcast_reclone_state()
-    return {"cleared": True, "previous_status": status}
-
-
-async def _authorize_proxmox_agent(hostname: str, api_key: str, client_ip: str, now: float) -> tuple[str | None, JSONResponse | None]:
-    approved_hostname = _resolve_proxmox_agent_hostname(hostname, approved_proxmox_agents)
-    if approved_hostname is None:
-        _upsert_pending_proxmox_agent(hostname, client_ip, now)
-        await broadcast({"type": "proxmox_pending_update", "pending": _pending_proxmox_payload()})
-        if api_key:
-            return None, JSONResponse({"error": "agent not approved"}, status_code=401)
-        return None, JSONResponse({"pending": True}, status_code=202)
-
-    if api_key != approved_proxmox_agents[approved_hostname]:
-        return None, JSONResponse({"error": "invalid key"}, status_code=401)
-
-    pending_hostname = _resolve_proxmox_agent_hostname(hostname, pending_proxmox_agents)
-    if pending_hostname is not None:
-        pending_proxmox_agents.pop(pending_hostname, None)
-        await broadcast({"type": "proxmox_pending_update", "pending": _pending_proxmox_payload()})
-    return approved_hostname, None
-
-
-async def _apply_proxmox_telemetry_state(body: dict[str, Any], hostname: str, now: float) -> dict[str, bool]:
-    global _proxmox_reseed_in_progress
-    async with state_lock:
-        client_seen = {client_hostname: client.get("last_seen") for client_hostname, client in clients.items()}
-
-    enriched_vms: list[dict[str, Any]] = []
-    configured_template_ids: set[str] = {
-        str(settings.get("vm_image_1_template_id", "100")).strip(),
-        str(settings.get("vm_image_2_template_id", "200")).strip(),
-    } - {""}
-    for vm in body.get("vms", []):
-        enriched = dict(vm)
-        client_last_seen = client_seen.get(str(enriched.get("name", "")))
-        if isinstance(client_last_seen, datetime):
-            enriched["last_seen"] = client_last_seen.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
-        # Mark as template if agent flagged it OR if vmid matches a configured template ID
-        if enriched.get("is_template") or str(enriched.get("vmid", "")).strip() in configured_template_ids:
-            enriched["is_template"] = True
-        enriched_vms.append(enriched)
-
-    # Filter unknown_usb against currently certified and ignored vidpids so the device
-    # disappears from the UI immediately after a certify/ignore action, even before the
-    # Proxmox agent picks up the updated config on its next poll.
-    certified_vidpids: set[str] = {
-        str(item.get("vidpid", "")).strip().lower()
-        for item in _parse_json_list(settings.get("usb_vidpids", "[]"))
-        if isinstance(item, dict) and item.get("vidpid")
-    }
-    ignored_vidpids: set[str] = {
-        str(v).strip().lower()
-        for v in _parse_json_list(settings.get("usb_ignored_vidpids", "[]"))
-        if str(v).strip()
-    }
-    exclude_vidpids = certified_vidpids | ignored_vidpids
-    raw_unknown = body.get("unknown_usb", [])
-    proxmox_state["unknown_usb"] = [
-        d for d in raw_unknown
-        if str(d.get("vidpid", "")).strip()  # skip devices with no VID:PID
-        and str(d.get("vidpid", "")).strip().lower() not in exclude_vidpids
-    ]
-
-    normalized_present_usb = body.get("present_usb", [])
-    normalized_usb_state = _normalize_proxmox_usb_state(body.get("usb_state", []), normalized_present_usb)
-
-    was_connected = bool(proxmox_state.get("connected"))
-    proxmox_state["connected"] = True
-    proxmox_state["last_seen"] = now
-    if not was_connected:
-        gap = now - (proxmox_state.get("last_seen") or now)
-        _debug_event("proxmox_reconnected", f"agent={hostname} gap={gap:.0f}s")
-    _proxmox_reseed_in_progress = bool(body.get("reseed_in_progress", False))
-    proxmox_state["node"] = body.get("node", {}) or {}
-
-    # Tag each VM with the reporting agent hostname for client-side per-agent filtering.
-    tagged_vms = [{**vm, "_agent_hostname": hostname} for vm in enriched_vms]
-
-    # Tag each USB entry with the reporting agent hostname for client-side per-agent filtering.
-    tagged_usb_state   = [{**e, "_agent_hostname": hostname} for e in normalized_usb_state]
-    tagged_present_usb = [{**e, "_agent_hostname": hostname} for e in normalized_present_usb]
-    tagged_unknown_usb = [{**e, "_agent_hostname": hostname} for e in proxmox_state.get("unknown_usb", [])]
-
-    # Maintain per-agent rolling resource samples (1-hour window) so the detail
-    # card can show per-server CPU/mem averages in a multi-Proxmox setup.
-    _prev_agent = proxmox_states.get(hostname, {})
-    _agent_cpu_samples: list[tuple[float, float]] = _prev_agent.get("_cpu_samples", [])
-    _agent_mem_samples: list[tuple[float, float]] = _prev_agent.get("_mem_samples", [])
-    _sample_cutoff = now - _RESOURCE_SAMPLE_WINDOW
-    _anode = body.get("node", {}) or {}
-    _cpu_pct = _anode.get("cpu_percent")
-    if _cpu_pct is not None:
-        _agent_cpu_samples = [(ts, v) for ts, v in _agent_cpu_samples if ts >= _sample_cutoff]
-        _agent_cpu_samples.append((now, float(_cpu_pct)))
-    _mem_used  = _anode.get("mem_used_kb")
-    _mem_total = _anode.get("mem_total_kb")
-    if _mem_used is not None and _mem_total:
-        try:
-            _mem_pct = float(_mem_used) / float(_mem_total) * 100.0
-            _agent_mem_samples = [(ts, v) for ts, v in _agent_mem_samples if ts >= _sample_cutoff]
-            _agent_mem_samples.append((now, _mem_pct))
-        except (TypeError, ValueError, ZeroDivisionError):
-            pass
-    _agent_cpu_avg = (sum(v for _, v in _agent_cpu_samples) / len(_agent_cpu_samples)) if _agent_cpu_samples else None
-    _agent_mem_avg = (sum(v for _, v in _agent_mem_samples) / len(_agent_mem_samples)) if _agent_mem_samples else None
-    reported_provision_halt = body.get("provision_halt") if _autoprov_enabled() else None
-
-    # Update per-agent state for multi-server list UI.
-    # Preserve vmid_range from this telemetry cycle (or from prior state if not yet sent).
-    _vmid_range_raw = body.get("vmid_range") or {}
-    _vmid_range: dict[str, int] | None = None
-    try:
-        _vr_start = int(_vmid_range_raw.get("start", 0) or 0)
-        _vr_end   = int(_vmid_range_raw.get("end",   0) or 0)
-        if _vr_start > 0 and _vr_end >= _vr_start:
-            _vmid_range = {"start": _vr_start, "end": _vr_end}
-    except (TypeError, ValueError):
-        pass
-    if _vmid_range is None:
-        # Fall back to previously stored range if the agent hasn't sent it yet
-        _vmid_range = (_prev_agent or {}).get("vmid_range")
-
-    proxmox_states[hostname] = {
-        "connected": True,
-        "last_seen": now,
-        "agent_version": str(body.get("agent_version", "")).strip() or None,
-        "pve_version": str(body.get("pve_version", "")).strip() or None,
-        "vm_count": sum(1 for vm in enriched_vms if not vm.get("is_template")),
-        "usb_count": len(normalized_usb_state),
-        "node": body.get("node", {}) or {},
-        "provision_halt": reported_provision_halt,
-        "_cpu_samples": _agent_cpu_samples,
-        "_mem_samples": _agent_mem_samples,
-        "cpu_1h_avg": _agent_cpu_avg,
-        "mem_1h_avg": _agent_mem_avg,
-        "vmid_range": _vmid_range,
-        "vm_set_override": _sanitize_vm_set_override(body.get("vm_set_override", 0)),
-        "effective_vm_set": max(1, int(body.get("effective_vm_set", _hostname_vm_set_number(hostname)) or _hostname_vm_set_number(hostname))),
-        "vms": tagged_vms,
-        "usb_state": tagged_usb_state,
-        "present_usb": tagged_present_usb,
-        "unknown_usb": tagged_unknown_usb,
-    }
-
-    # Rebuild merged VM list from all approved agents so the VMs tab shows
-    # all agents' VMs (not just the most recently reporting one).
-    all_vms: list[dict[str, Any]] = []
-    all_usb_state: list[dict[str, Any]] = []
-    all_present_usb: list[dict[str, Any]] = []
-    all_unknown_usb: list[dict[str, Any]] = []
-    for st in proxmox_states.values():
-        all_vms.extend(st.get("vms", []))
-        all_usb_state.extend(st.get("usb_state", []))
-        all_present_usb.extend(st.get("present_usb", []))
-        all_unknown_usb.extend(st.get("unknown_usb", []))
-    proxmox_state["vms"] = all_vms
-
-    # Update the vmid→hostname routing map so delete/reclone commands target the right node.
-    reported_vmids = {int(vm["vmid"]) for vm in enriched_vms if vm.get("vmid") is not None}
-    # Remove stale entries owned by this agent (VMs it no longer reports).
-    stale = [vmid for vmid, owner in _proxmox_agent_vm_map.items() if owner == hostname and vmid not in reported_vmids]
-    for vmid in stale:
-        del _proxmox_agent_vm_map[vmid]
-    # Register/update all VMs reported by this agent.
-    for vmid in reported_vmids:
-        _proxmox_agent_vm_map[vmid] = hostname
-
-    proxmox_state["reseed_in_progress"] = _proxmox_reseed_in_progress
-    proxmox_state["usb_state"] = all_usb_state
-    proxmox_state["present_usb"] = all_present_usb
-    proxmox_state["unknown_usb"] = all_unknown_usb
-    proxmox_state["missing_timeout_mins"] = int(body.get("missing_timeout_mins", 60) or 60)
-    proxmox_state["vm_set_override"] = _sanitize_vm_set_override(body.get("vm_set_override", 0))
-    proxmox_state["effective_vm_set"] = max(1, int(body.get("effective_vm_set", _hostname_vm_set_number(hostname)) or _hostname_vm_set_number(hostname)))
-    proxmox_state["agent_version"] = str(body.get("agent_version", "")).strip() or None
-    proxmox_state["pve_version"] = str(body.get("pve_version", "")).strip() or None
-    proxmox_state["template_lock"] = str(body.get("template_lock", "") or "").strip()
-    proxmox_state["vh_devices"] = body.get("vh_devices", {})
-
-    # Record rolling resource samples for 1-hour average threshold checks.
-    # Called after agent_version/pve_version are set so _save_resource_cache persists them.
-    _record_resource_samples(proxmox_state["node"], now)
-
-    # T3 PCI devices — store the raw list from the agent and compute a filtered list
-    # of devices matching the T3 target VID:PIDs (currently just 168c:0034).
-    # T3_VIDPIDS defines which PCI vendor:device IDs qualify a node as a T3 host.
-    T3_VIDPIDS: set[str] = {"168c:0034"}
-    raw_pci: list[dict[str, Any]] = body.get("t3_pci_devices") or []
-    # Normalize: keep only dicts with a vidpid field, lower-case for consistent matching.
-    proxmox_state["t3_pci_devices"] = [
-        d for d in raw_pci
-        if isinstance(d, dict) and str(d.get("vidpid", "")).strip().lower() in T3_VIDPIDS
-    ]
-
-    # Hardware watchdog fault log + last reset reason (set by hw_watchdog_loop in agent)
-    if "hw_faults" in body:
-        proxmox_state["hw_faults"] = body["hw_faults"]
-    if "hw_last_reset" in body and body["hw_last_reset"]:
-        existing = proxmox_state.get("hw_last_reset") or {}
-        incoming = body["hw_last_reset"]
-        # Only overwrite if this is a newer reset record
-        if not existing or incoming.get("ts", 0) > existing.get("ts", 0):
-            proxmox_state["hw_last_reset"] = incoming
-            # Broadcast a dedicated alert so the hub hears about it in real-time
-            await broadcast({
-                "type": "proxmox_hw_reset",
-                "hostname": str((body.get("node") or {}).get("hostname", "") or ""),
-                "reason": incoming.get("reason", ""),
-                "ts": incoming.get("ts"),
-                "agent_version": incoming.get("agent_version", ""),
-            })
-
-    # Persist provision_halt from the agent's telemetry so the hub can display it.
-    # When auto-provisioning is disabled, force the state clear even if the agent
-    # has not yet refreshed its local cache.
-    if "provision_halt" in body or not _autoprov_enabled():
-        proxmox_state["provision_halt"] = reported_provision_halt
-
-    # Clear pending-delete VMIDs that the agent has confirmed are gone.
-    # intersection_update keeps only IDs still in the telemetry report;
-    # any VMID that has disappeared from the agent has been successfully deleted.
-    if _pending_delete_vmids:
-        telemetry_vmids = {int(v.get("vmid")) for v in enriched_vms if v.get("vmid") is not None}
-        confirmed_deleted = _pending_delete_vmids - telemetry_vmids
-        _pending_delete_vmids.intersection_update(telemetry_vmids)
-        # Cancel any pending auto-recovery reclone commands for confirmed-deleted VMIDs
-        if confirmed_deleted:
-            global _delete_gate_cooldown_until
-            # Start the post-delete cooldown now that the VM is actually gone so the
-            # fleet has time to stabilise before the gate may fire again.
-            _delete_gate_cooldown_until = time.time() + DELETE_GATE_COOLDOWN_S
-            logger.info(
-                "Auto-delete gate: %d VM(s) confirmed deleted — cooldown active for %ds",
-                len(confirmed_deleted), DELETE_GATE_COOLDOWN_S,
-            )
-            for cmd in commands:
-                if (cmd.get("action") == "reclone_vm"
-                        and cmd.get("type") == "auto-recovery"
-                        and cmd.get("status") in {"pending", "delivered"}
-                        and int(cmd.get("args", {}).get("vmid", -1)) in confirmed_deleted):
-                    cmd["status"] = "cancelled"
-                    cmd["error"] = "VM was deleted — auto-recovery cancelled"
-
-    # Detect provisioning/teardown completions for summary tracking
-    global _prev_usb_by_vmid
-    new_usb: list[dict] = proxmox_state["usb_state"]
-    new_by_vmid = {str(e["vmid"]): e.get("prov_status", "active") for e in new_usb if e.get("vmid") is not None}
-    if _prev_usb_by_vmid:
-        newly_provisioned = [
-            vmid for vmid, st in new_by_vmid.items()
-            if st == "active" and _prev_usb_by_vmid.get(vmid) == "provisioning"
-        ]
-        torn_down = [
-            vmid for vmid, st in _prev_usb_by_vmid.items()
-            if vmid not in new_by_vmid and st in ("tearing_down", "missing")
-        ]
-        if newly_provisioned:
-            proxmox_state["prov_summary"] = {"action": "provisioned", "count": len(newly_provisioned), "at": now}
-            for vmid in newly_provisioned:
-                vm = next((item for item in enriched_vms if str(item.get("vmid")) == vmid), {})
-                _record_vm_watchdog_clone_completed(vmid, vm.get("name"))
-            await _async_save_vm_watchdog()
-        elif torn_down:
-            proxmox_state["prov_summary"] = {"action": "deleted", "count": len(torn_down), "at": now}
-    _update_provision_run_state(proxmox_state["vms"], new_usb, now)
-    _prev_usb_by_vmid = new_by_vmid
-
-    # Auto-reset a stale reclone run to idle when:
-    #   • The run is in a non-running terminal/interrupted state
-    #     (interrupted, failed — "completed" is already reset in _run_rolling_reclone)
-    #   • The Proxmox agent now reports zero reclone-eligible VMs, which means
-    #     any VMs that were part of the interrupted run have since been deleted.
-    # This prevents the Fleet Reclone tile from staying stuck at "3/9" indefinitely
-    # after an operator cleans up VMs outside the normal reclone flow.
-    _stale_reclone_statuses = {"interrupted", "failed"}
-    if reclone_state.get("status") in _stale_reclone_statuses:
-        eligible_after_update = _reclone_targets_for_run()
-        # Also clear if every VM that previously failed is now running — the
-        # operator may have fixed them outside the reclone flow (e.g. by starting
-        # them manually) and the stale "Failed" badge is no longer meaningful.
-        failed_vmids_in_log = {
-            str(e.get("vmid"))
-            for e in (reclone_state.get("log") or [])
-            if e.get("status") == "failed" and e.get("vmid") is not None
-        }
-        running_vmids = {
-            str(v.get("vmid"))
-            for v in enriched_vms
-            if str(v.get("status", "")).lower() == "running" and v.get("vmid") is not None
-        }
-        all_failed_now_running = bool(failed_vmids_in_log) and failed_vmids_in_log.issubset(running_vmids)
-        if not eligible_after_update or all_failed_now_running:
-            reason = "0 eligible VMs" if not eligible_after_update else "all previously failed VMs are now running"
-            logger.info(
-                "Fleet Reclone: detected stale '%s' run (%s) — auto-resetting to idle",
-                reclone_state["status"], reason,
-            )
-            saved_last_run = reclone_state.get("last_run")
-            saved_auto_log = reclone_state.get("auto_recovery_log") or []
-            reclone_state.update({
-                "status": "idle",
-                "type": None,
-                "total": 0,
-                "completed": 0,
-                "failed": 0,
-                "current_vm": None,
-                "log": [],
-                "started_at": None,
-                "last_run": saved_last_run,
-                "auto_recovery_log": saved_auto_log,
-            })
-            # Persist the reset and push a reclone_update WS message so any
-            # connected browser sees the tile clear immediately without waiting
-            # for the next proxmox_update broadcast.
-            await _async_save_reclone_state()
-            await _broadcast_reclone_state()
-
-    # Auto-trigger provision_unassigned when usb_auto_provision is enabled and
-    # certified unassigned dongles are physically present.  Resource (CPU/memory)
-    # thresholds gate provisioning and can also trigger deletion of the newest sim VM.
-    _ap_enabled = settings.get("usb_auto_provision") == "on"
-    _reclone_running = reclone_state.get("status") == "running"
-    if not _ap_enabled:
-        _autoprov_gate_log("disabled", "usb_auto_provision=off — skipping all provision/delete checks")
-    elif _reclone_running:
-        _autoprov_gate_log("reclone_running", "reclone job is running (status=%s) — skipping provision checks", reclone_state.get("status"))
-    if _ap_enabled and not _reclone_running:
-        def _pct_setting(key: str, default: str) -> int:
-            try:
-                return max(0, min(100, int(str(settings.get(key, default)).strip() or default)))
-            except (TypeError, ValueError):
-                return int(default)
-
-        cpu_prov_thr  = _pct_setting("cpu_provision_threshold", "80")
-        cpu_del_thr   = _pct_setting("cpu_delete_threshold",   "90")
-        cpu_prov_ceil = _pct_setting("cpu_provision_ceiling",  "90")
-        mem_prov_thr  = _pct_setting("mem_provision_threshold", "80")
-        mem_del_thr   = _pct_setting("mem_delete_threshold",   "90")
-        cpu_avg = _resource_1h_average(_agent_cpu_samples)
-        mem_avg = _resource_1h_average(_agent_mem_samples)
-        # Most-recent instantaneous CPU reading (updated every ~30 s by telemetry).
-        # Used as a hard ceiling to block provisioning during ramp-up before the
-        # 1-hour average catches up.
-        cpu_instant = _agent_cpu_samples[-1][1] if _agent_cpu_samples else None
-
-        # Delete gate: if either metric exceeds its delete threshold and no delete is
-        # already in flight, remove the newest sim VM (highest VMID) to shed load.
-        #
-        # The check and enqueue are performed atomically under state_lock to prevent
-        # a TOCTOU race where multiple concurrent telemetry calls each see
-        # delete_queued=False and each independently queue a delete for the same VM.
-        delete_queued = False  # initialise; set True inside the atomic lock section below
-        _threshold_exceeded = (
-            (cpu_avg is not None and cpu_avg >= cpu_del_thr) or
-            (mem_avg is not None and mem_avg >= mem_del_thr)
-        )
-        if _threshold_exceeded:
-            usb_vmids_int: set[int] = set()
-            _usb_prov_status: dict[int, str] = {}
-            for _e in normalized_usb_state:
-                try:
-                    _evmid = int(_e["vmid"])
-                    usb_vmids_int.add(_evmid)
-                    _usb_prov_status[_evmid] = str(_e.get("prov_status") or "active").strip().lower()
-                except (KeyError, TypeError, ValueError):
-                    pass
-            # Correct stale "provisioning" status: the bash agent's usb_state lags by
-            # one telemetry cycle after the spoke's prov_run finishes configuring a VM.
-            # Without this correction newly-configured or failed VMs remain stuck in
-            # "provisioning" and are excluded from delete candidates.
-            # NOTE: do NOT guard on `not running` — if a parallel clone was killed mid-run
-            # (stuck >120s), the overall run stays running=True indefinitely but individual
-            # items already have status="done" or "failed". We must correct those too.
-            _prov_run_snap = proxmox_state.get("prov_run") or {}
-            for _pr_item in (_prov_run_snap.get("items") or []):
-                if isinstance(_pr_item, dict) and str(_pr_item.get("status") or "").strip().lower() in {"done", "failed"}:
-                    try:
-                        _pr_vid = int(_pr_item.get("vmid") or 0)
-                        if _pr_vid and _usb_prov_status.get(_pr_vid) == "provisioning":
-                            _usb_prov_status[_pr_vid] = "active"
-                    except (TypeError, ValueError):
-                        pass
-            # Exclude VMs that are mid-clone (provisioning) or already being torn down
-            # by the USB-missing timeout handler (tearing_down) — both are transient
-            # states where a second delete command causes wasted work or race conditions.
-            _skip_statuses = {"provisioning", "tearing_down"}
-            candidates: list[int] = []
-            for _vm in enriched_vms:
-                try:
-                    _vid = int(_vm.get("vmid", 0) or 0)
-                    if (
-                        _vm.get("type") == "qemu"
-                        and not _vm.get("is_template")
-                        and _vid in usb_vmids_int
-                        and _vid not in _pending_delete_vmids
-                        and _usb_prov_status.get(_vid, "active") not in _skip_statuses
-                    ):
-                        candidates.append(_vid)
-                except (TypeError, ValueError):
-                    pass
-            if candidates:
-                target_vmid = max(candidates)  # newest = highest VMID
-                _del_args = _prepare_delete_vm_args({"vmid": target_vmid})
-                # Re-check and enqueue atomically under state_lock to close the TOCTOU
-                # window between the threshold check above and the actual queue operation.
-                async with state_lock:
-                    # Respect the post-delete cooldown so consecutive auto-deletes are
-                    # separated by at least DELETE_GATE_COOLDOWN_S (set after the prior
-                    # delete is confirmed, not at enqueue time — see confirmed_deleted block).
-                    if time.time() < _delete_gate_cooldown_until:
-                        _remaining_cd = int(_delete_gate_cooldown_until - time.time())
-                        logger.info(
-                            "Auto-delete gate: cooldown active (%ds remaining) — skipping delete of VMID %d",
-                            _remaining_cd, target_vmid,
-                        )
-                    else:
-                        delete_queued = any(
-                            c.get("action") == "delete_vm"
-                            and c.get("status") not in {"completed", "failed", "expired"}
-                            for c in commands
-                        )
-                        if not delete_queued:
-                            _enqueue_command_locked(
-                                _resolve_proxmox_vm_target(target_vmid),
-                                "delete_vm",
-                                _del_args,
-                                command_type="auto-provision",
-                            )
-                            _pending_delete_vmids.add(target_vmid)
-                            # Also start the cooldown at enqueue time so the gate cannot
-                            # fire a second time during the window between "delete command
-                            # executed by agent" and "telemetry confirms VM gone".
-                            # The confirmed_deleted block will refresh the cooldown once
-                            # the deletion is confirmed, giving the full window from that
-                            # later point.
-                            _delete_gate_cooldown_until = time.time() + DELETE_GATE_COOLDOWN_S
-                            logger.info(
-                                "Auto-provision resource gate: delete threshold exceeded "
-                                "(cpu_avg=%.1f%% mem_avg=%.1f%%) — queued delete_vm for VMID %d; "
-                                "cooldown active for %ds",
-                                cpu_avg or 0.0, mem_avg or 0.0, target_vmid, DELETE_GATE_COOLDOWN_S,
-                            )
-            else:
-                logger.info(
-                    "Auto-provision resource gate: delete threshold exceeded "
-                    "(cpu_avg=%.1f%% mem_avg=%.1f%%) — no eligible candidates "
-                    "(all USB VMs are provisioning, tearing_down, or pending delete)",
-                    cpu_avg or 0.0, mem_avg or 0.0,
-                )
-
-        # Provision gate: skip new provisioning when either resource exceeds its threshold.
-        # Also skip for this cycle if we just queued a delete, to avoid churn.
-        # Also skip for the full delete-gate cooldown window — prevents the dongle that
-        # was just freed by a resource-triggered delete from being immediately re-provisioned
-        # (which would otherwise create a delete→reprovision→delete loop).
-        # cpu_prov_ceil is a hard ceiling on the *instantaneous* CPU reading so that
-        # provisioning is suppressed during ramp-up before the 1-hour average catches up.
-        _in_delete_cooldown = time.time() < _delete_gate_cooldown_until
-        if _in_delete_cooldown:
-            _remaining_prov_cd = int(_delete_gate_cooldown_until - time.time())
-            logger.info(
-                "Auto-provision gate: delete cooldown active (%ds remaining) — suppressing provision_unassigned",
-                _remaining_prov_cd,
-            )
-        _ceil_hit = cpu_instant is not None and cpu_instant >= cpu_prov_ceil
-        if _ceil_hit:
-            logger.info(
-                "Auto-provision ceiling: instantaneous CPU %.1f%% >= ceiling %d%% — suppressing provision_unassigned",
-                cpu_instant, cpu_prov_ceil,
-            )
-        resource_ok = (
-            not delete_queued
-            and not _in_delete_cooldown
-            and not _ceil_hit
-            and cpu_avg is not None and cpu_avg < cpu_prov_thr
-            and mem_avg is not None and mem_avg < mem_prov_thr
-        )
-        # Log resource state periodically so the journal shows what the gate sees
-        _autoprov_gate_log(
-            "resource_state",
-            "cpu_avg=%.1f%% (thr=%d%%) mem_avg=%.1f%% (thr=%d%%) cpu_instant=%.1f%% (ceil=%d%%) "
-            "delete_queued=%s in_delete_cooldown=%s ceil_hit=%s resource_ok=%s",
-            cpu_avg or 0.0, cpu_prov_thr,
-            mem_avg or 0.0, mem_prov_thr,
-            cpu_instant or 0.0, cpu_prov_ceil,
-            delete_queued, _in_delete_cooldown, _ceil_hit, resource_ok,
-        )
-        if not resource_ok and not _ceil_hit:
-            if delete_queued:
-                _autoprov_gate_log("delete_queued", "delete_vm already in queue — suppressing provision_unassigned")
-            elif _in_delete_cooldown:
-                pass  # already logged above
-            elif cpu_avg is None or mem_avg is None:
-                _autoprov_gate_log("no_telemetry", "waiting for CPU/mem telemetry (cpu_avg=%s mem_avg=%s) — suppressing provision_unassigned", cpu_avg, mem_avg)
-            elif cpu_avg >= cpu_prov_thr:
-                _autoprov_gate_log("cpu_threshold", "cpu_avg=%.1f%% >= threshold=%d%% — suppressing provision_unassigned", cpu_avg, cpu_prov_thr)
-            elif mem_avg >= mem_prov_thr:
-                _autoprov_gate_log("mem_threshold", "mem_avg=%.1f%% >= threshold=%d%% — suppressing provision_unassigned", mem_avg, mem_prov_thr)
-        prov_run = proxmox_state.get("prov_run") or {}
-        if resource_ok and prov_run.get("running"):
-            _autoprov_gate_log(
-                "prov_run_active",
-                "prov_run.running=True — provision loop already active, skipping trigger "
-                "(vmids=%s status=%s)",
-                [i.get("vmid") for i in (prov_run.get("items") or [])],
-                [i.get("status") for i in (prov_run.get("items") or [])],
-            )
-        if resource_ok and not prov_run.get("running"):
-            unassigned = _proxmox_unassigned_present_usb()
-            if not unassigned:
-                _autoprov_gate_log("no_unassigned", "no unassigned USB dongles present — nothing to provision")
-            if unassigned:
-                certified_set = {
-                    (str(v.get("vidpid", "")).strip().lower() if isinstance(v, dict) else str(v).strip().lower())
-                    for v in _parse_json_list(settings.get("usb_vidpids", "[]"))
-                    if (str(v.get("vidpid", "") if isinstance(v, dict) else v)).strip()
-                }
-                certified_unassigned = [
-                    u for u in unassigned
-                    if str(u.get("vidpid", "")).strip().lower() in certified_set
-                ]
-                if not certified_unassigned:
-                    _autoprov_gate_log(
-                        "not_certified",
-                        "unassigned dongles present but none match certified VIDPIDs — "
-                        "unassigned=%s certified_vidpids=%s",
-                        [u.get("vidpid") for u in unassigned],
-                        sorted(certified_set),
-                    )
-                if certified_unassigned:
-                    has_pending = any(
-                        c.get("action") == "provision_unassigned"
-                        and c.get("status") not in {"completed", "failed", "expired"}
-                        for c in commands
-                    )
-                    if has_pending:
-                        pending_cmd = next(
-                            (c for c in commands if c.get("action") == "provision_unassigned"
-                             and c.get("status") not in {"completed", "failed", "expired"}), None
-                        )
-                        _autoprov_gate_log(
-                            "already_pending",
-                            "provision_unassigned already pending (id=%s status=%s) — not queuing again",
-                            pending_cmd.get("id") if pending_cmd else "?",
-                            pending_cmd.get("status") if pending_cmd else "?",
-                        )
-                    if not has_pending:
-                        await _queue_proxmox_command("provision_unassigned", {}, command_type="auto-provision")
-                        logger.info(
-                            "Auto-provisioning: detected %d unassigned certified dongle(s) — queued provision_unassigned",
-                            len(certified_unassigned),
-                        )
-
-    # ── VMID gap audit ────────────────────────────────────────────────────────
-    # If the auto-provision loop previously deleted/re-provisioned VMs out of
-    # order, VMIDs can develop gaps (e.g. …90030, 90032 with 90031 missing).
-    # This audit detects such gaps and queues a delete for the highest VMID
-    # above the lowest gap so the provision loop can fill the hole on the next
-    # cycle.  It bypasses the normal delete-gate cooldown because it is a
-    # corrective bookkeeping action, not a resource-pressure shedding action.
-    # It does respect its own per-host interval to avoid hammering the queue.
-    if _ap_enabled and not _reclone_running and _vmid_range:
-        _audit_due = (now - _vmid_gap_audit_last_run.get(hostname, 0.0)) >= VMID_AUDIT_INTERVAL_S
-        if _audit_due:
-            _vmid_gap_audit_last_run[hostname] = now
-            _gap_start: int = _vmid_range["start"]
-            _gap_end:   int = _vmid_range["end"]
-
-            # Build map of VMID → prov_status for VMs in this host's range.
-            _gap_prov_status: dict[int, str] = {}
-            for _ge in normalized_usb_state:
-                try:
-                    _gvid = int(_ge["vmid"])
-                    if _gap_start <= _gvid <= _gap_end:
-                        _gap_prov_status[_gvid] = str(_ge.get("prov_status") or "active").strip().lower()
-                except (KeyError, TypeError, ValueError):
-                    pass
-            # Apply the same stale-provisioning correction used by the delete gate.
-            _gap_prov_snap = proxmox_state.get("prov_run") or {}
-            for _gpr in (_gap_prov_snap.get("items") or []):
-                if isinstance(_gpr, dict) and str(_gpr.get("status") or "").strip().lower() in {"done", "failed"}:
-                    try:
-                        _gpvid = int(_gpr.get("vmid") or 0)
-                        if _gap_prov_status.get(_gpvid) == "provisioning":
-                            _gap_prov_status[_gpvid] = "active"
-                    except (TypeError, ValueError):
-                        pass
-
-            # Active (stable) VMIDs only — skip anything in-flight.
-            _gap_skip = {"provisioning", "tearing_down"}
-            _gap_active = sorted(
-                vid for vid, st in _gap_prov_status.items()
-                if st not in _gap_skip and vid not in _pending_delete_vmids
-            )
-
-            if len(_gap_active) >= 2:
-                _gap_max = _gap_active[-1]
-                _gap_active_set = set(_gap_active)
-                _lowest_gap: int | None = None
-                for _chk in range(_gap_start, _gap_max):
-                    if _chk not in _gap_active_set:
-                        _lowest_gap = _chk
-                        break
-
-                if _lowest_gap is not None:
-                    # Find highest active VMID above the gap.
-                    _above_gap = [v for v in _gap_active if v > _lowest_gap]
-                    if _above_gap:
-                        _gap_target = max(_above_gap)
-                        _gap_del_args = _prepare_delete_vm_args({"vmid": _gap_target})
-                        async with state_lock:
-                            _gap_already_pending = any(
-                                c.get("action") == "delete_vm"
-                                and c.get("status") not in {"completed", "failed", "expired"}
-                                for c in commands
-                            )
-                            if not _gap_already_pending:
-                                _enqueue_command_locked(
-                                    _resolve_proxmox_vm_target(_gap_target),
-                                    "delete_vm",
-                                    _gap_del_args,
-                                    command_type="auto-provision",
-                                )
-                                _pending_delete_vmids.add(_gap_target)
-                                _gap_msg = (
-                                    f"VMID gap audit [{hostname}]: gap detected at {_lowest_gap} "
-                                    f"(range {_gap_start}-{_gap_end}, active={_gap_active}) — "
-                                    f"queued delete_vm for VMID {_gap_target} to restore sequential order"
-                                )
-                                logger.info(_gap_msg)
-                                proxmox_log_buffer.append(_gap_msg)
-                                if len(proxmox_log_buffer) > PROXMOX_LOG_MAX:
-                                    del proxmox_log_buffer[:len(proxmox_log_buffer) - PROXMOX_LOG_MAX]
-                                await broadcast({"type": "proxmox_log_update", "lines": [_gap_msg]})
-                            else:
-                                logger.info(
-                                    "VMID gap audit [%s]: gap at %d would target VMID %d "
-                                    "but a delete_vm is already pending — skipping",
-                                    hostname, _lowest_gap, _gap_target,
-                                )
-                else:
-                    logger.debug(
-                        "VMID gap audit [%s]: no gaps in active VMIDs %s (range %d-%d)",
-                        hostname, _gap_active, _gap_start, _gap_end,
-                    )
-
-    # Append new log lines to ring buffer and broadcast if any arrived
-    new_lines = [str(ln) for ln in (body.get("log_lines") or []) if ln]
-    if new_lines:
-        # Prefix log lines with the agent hostname so multi-agent logs are distinguishable
-        if len(approved_proxmox_agents) > 1:
-            new_lines = [f"[{hostname}] {ln}" if not ln.startswith(f"[{hostname}]") else ln for ln in new_lines]
-        proxmox_log_buffer.extend(new_lines)
-        if len(proxmox_log_buffer) > PROXMOX_LOG_MAX:
-            del proxmox_log_buffer[:len(proxmox_log_buffer) - PROXMOX_LOG_MAX]
-        await broadcast({"type": "proxmox_log_update", "lines": new_lines})
-
-    await _broadcast_proxmox_state()
-    return {"ok": True}
-
-
-@app.post("/api/proxmox/telemetry", response_model=None)
-async def proxmox_telemetry(request: Request, body: dict = Body(...)) -> dict[str, bool] | JSONResponse:
-    """Receive telemetry from the Proxmox host agent."""
-    node = body.get("node", {}) or {}
-    hostname = str(node.get("hostname", "") or "").strip()
-    api_key = request.headers.get("X-API-Key", "")
-    client_ip = request.client.host if request.client else "unknown"
-    now = time.time()
-
-    if not hostname:
-        return JSONResponse({"error": "hostname required"}, status_code=400)
-
-    _approved_hostname, response = await _authorize_proxmox_agent(hostname, api_key, client_ip, now)
-    if response is not None:
-        return response
-    # Use the canonical key from approved_proxmox_agents so proxmox_states entries
-    # are keyed consistently regardless of case or minor hostname format differences.
-    canonical_hostname = _approved_hostname or hostname
-    try:
-        return await _apply_proxmox_telemetry_state(body, canonical_hostname, now)
-    except Exception:
-        tb = traceback.format_exc()
-        logger.error("TELEMETRY HANDLER CRASH for %s:\n%s", hostname, tb)
-        last_line = tb.splitlines()[-1] if tb.splitlines() else "unknown"
-        proxmox_log_buffer.append(f"[SPOKE ERROR] telemetry crash: {last_line}")
-        try:
-            _trace("telemetry_crash", hostname=hostname, error=last_line)
-        except Exception:
-            pass
-        raise
-
-
-
-@app.get("/api/proxmox/logs")
-async def get_proxmox_logs() -> dict[str, Any]:
-    """Return the in-memory agent log ring buffer."""
-    return {"lines": proxmox_log_buffer}
-
-
-@app.post("/api/proxmox/logs/clear")
-async def clear_proxmox_logs() -> dict[str, bool]:
-    """Clear the in-memory agent log buffer."""
-    proxmox_log_buffer.clear()
-    await broadcast({"type": "proxmox_log_update", "lines": [], "cleared": True})
-    return {"ok": True}
-
-
-@app.post("/api/proxmox/log-push", response_model=None)
-async def proxmox_log_push(request: Request, body: dict = Body(...)) -> dict[str, bool] | JSONResponse:
-    """Lightweight HTTP log-push endpoint — agent sends log lines here even when WS is unavailable.
-    Accepts: {"hostname": "...", "log_lines": ["line1", ...]}
-    Auth: X-API-Key header (same as telemetry endpoint).
-    """
-    hostname = str(body.get("hostname") or body.get("node", {}).get("hostname") or "").strip()
-    api_key = request.headers.get("X-API-Key", "")
-    client_ip = request.client.host if request.client else "unknown"
-    if not hostname:
-        return JSONResponse({"error": "hostname required"}, status_code=400)
-    _approved_hostname, response = await _authorize_proxmox_agent(hostname, api_key, client_ip, time.time())
-    if response is not None:
-        return response
-    canonical_hn = _approved_hostname or hostname
-    new_lines = [str(ln) for ln in (body.get("log_lines") or []) if ln]
-    if new_lines:
-        if len(approved_proxmox_agents) > 1:
-            new_lines = [f"[{canonical_hn}] {ln}" if not ln.startswith(f"[{canonical_hn}]") else ln for ln in new_lines]
-        proxmox_log_buffer.extend(new_lines)
-        if len(proxmox_log_buffer) > PROXMOX_LOG_MAX:
-            del proxmox_log_buffer[:len(proxmox_log_buffer) - PROXMOX_LOG_MAX]
-        await broadcast({"type": "proxmox_log_update", "lines": new_lines})
-    return {"ok": True, "accepted": len(new_lines)}
-
-
-@app.post("/api/proxmox/watchdog_event")
-async def proxmox_watchdog_event(body: dict = Body(...)) -> dict[str, bool]:
-    event = str(body.get("event", "") or "").strip()
-    service = str(body.get("service", "") or "").strip()
-    hostname = str(body.get("hostname", "") or "").strip()
-    timestamp = str(body.get("timestamp", "") or "").strip()
-    detail_raw = body.get("detail", "") or ""
-    detail = json.dumps(detail_raw) if isinstance(detail_raw, dict) else str(detail_raw).strip()
-    try:
-        failure_count = max(0, int(body.get("failure_count", 0) or 0))
-    except (TypeError, ValueError):
-        raise HTTPException(status_code=400, detail="failure_count must be an integer")
-
-    if not all((event, hostname, timestamp)):
-        raise HTTPException(status_code=400, detail="event, hostname, and timestamp are required")
-
-    entry = {
-        "event": event,
-        "service": service,
-        "hostname": hostname,
-        "timestamp": timestamp,
-        "failure_count": failure_count,
-    }
-    if detail:
-        entry["detail"] = detail
-    proxmox_watchdog_log.append(entry)
-    if len(proxmox_watchdog_log) > PROXMOX_WATCHDOG_LOG_MAX:
-        del proxmox_watchdog_log[:len(proxmox_watchdog_log) - PROXMOX_WATCHDOG_LOG_MAX]
-
-    detail_suffix = f" detail={detail[:120]}" if detail else ""
-    log_line = (
-        f"[{timestamp}] WATCHDOG event={event} service={service} "
-        f"hostname={hostname} failure_count={failure_count}{detail_suffix}"
-    )
-    proxmox_log_buffer.append(log_line)
-    if len(proxmox_log_buffer) > PROXMOX_LOG_MAX:
-        del proxmox_log_buffer[:len(proxmox_log_buffer) - PROXMOX_LOG_MAX]
-
-    # For network-related events and startup, also store in hw_faults so they surface in the hub panel
-    if event in {"net_reboot", "net_down", "watchdog_started"}:
-        hw_faults = proxmox_state.get("hw_faults") or {"faults": []}
-        hw_faults.setdefault("faults", []).append({
-            "type": event,
-            "check": "network_watchdog" if event != "watchdog_started" else "watchdog_startup",
-            "message": detail or f"Gateway unreachable — {event}" if event != "watchdog_started" else f"Watchdog started — boot_time={detail_raw.get('boot_time','?') if isinstance(detail_raw, dict) else '?'}",
-            "hostname": hostname,
-            "ts": timestamp,
-        })
-        hw_faults["faults"] = hw_faults["faults"][-100:]
-        proxmox_state["hw_faults"] = hw_faults
-
-    await broadcast({"type": "proxmox_log_update", "lines": [log_line]})
-    return {"ok": True}
-
-
-@app.post("/api/proxmox/hw_reset_event")
-async def proxmox_hw_reset_event(body: dict = Body(...)) -> dict[str, bool]:
-    """Called by the proxmox agent immediately before triggering a hard reset.
-    Stores the event so the hub learns about it even if the agent never sends
-    another telemetry post after rebooting."""
-    hostname  = str(body.get("hostname", "") or "").strip()
-    reason    = str(body.get("reason", "") or "").strip()
-    tier      = str(body.get("tier", "") or "").strip()
-    ts        = body.get("ts") or time.time()
-    patterns  = body.get("patterns") or []
-    agent_ver = str(body.get("agent_version", "") or "").strip()
-
-    record = {
-        "ts": ts,
-        "hostname": hostname,
-        "reason": reason,
-        "tier": tier,
-        "patterns": patterns,
-        "agent_version": agent_ver,
-        "source": "pre_reboot_notification",
-    }
-
-    # Store as last reset so the relay includes it immediately
-    existing = proxmox_state.get("hw_last_reset") or {}
-    if not existing or float(ts) >= existing.get("ts", 0):
-        proxmox_state["hw_last_reset"] = record
-
-    # Append to fault log
-    hw_faults = proxmox_state.get("hw_faults") or {"faults": []}
-    hw_faults.setdefault("faults", []).append({**record, "type": "pre_reboot_notification"})
-    hw_faults["faults"] = hw_faults["faults"][-100:]
-    proxmox_state["hw_faults"] = hw_faults
-
-    log_line = (
-        f"[HW-RESET] {hostname} initiating hard reset — tier={tier} reason={reason[:160]}"
-    )
-    proxmox_log_buffer.append(log_line)
-    if len(proxmox_log_buffer) > PROXMOX_LOG_MAX:
-        del proxmox_log_buffer[:len(proxmox_log_buffer) - PROXMOX_LOG_MAX]
-
-    await broadcast({
-        "type": "proxmox_hw_reset",
-        "hostname": hostname,
-        "reason": reason,
-        "tier": tier,
-        "patterns": patterns,
-        "ts": ts,
-        "agent_version": agent_ver,
-    })
-    await broadcast({"type": "proxmox_log_update", "lines": [log_line]})
-    return {"ok": True}
-
-
-@app.get("/api/proxmox/status")
-async def get_proxmox_status() -> dict[str, Any]:
-    return _proxmox_status_payload()
-
-
-@app.get("/api/proxmox/config/{hostname}")
-async def get_proxmox_host_config(
-    hostname: str,
-    _user: SpokeUser = Depends(require_auth),
-) -> dict[str, Any]:
-    resolved_hostname = _resolve_proxmox_agent_hostname(hostname.strip(), approved_proxmox_agents) or _normalize_proxmox_hostname(hostname)
-    if not resolved_hostname:
-        raise HTTPException(status_code=400, detail="hostname is required")
-    host_config = _get_proxmox_host_config(resolved_hostname)
-    return {
-        "hostname": resolved_hostname,
-        "vm_set_override": _sanitize_vm_set_override(host_config.get("vm_set_override", 0)),
-    }
-
-
-@app.put("/api/proxmox/config/{hostname}")
-async def save_proxmox_host_config(
-    hostname: str,
-    body: dict[str, Any] = Body(...),
-    _user: SpokeUser = Depends(require_auth),
-) -> dict[str, Any]:
-    resolved_hostname = _resolve_proxmox_agent_hostname(hostname.strip(), approved_proxmox_agents) or _normalize_proxmox_hostname(hostname)
-    if not resolved_hostname:
-        raise HTTPException(status_code=400, detail="hostname is required")
-    try:
-        vm_set_override = int(body.get("vm_set_override", 0) or 0)
-    except (TypeError, ValueError) as exc:
-        raise HTTPException(status_code=422, detail="vm_set_override must be an integer") from exc
-    if vm_set_override < 0 or vm_set_override > 99:
-        raise HTTPException(status_code=422, detail="vm_set_override must be between 0 and 99")
-    config_entry = _save_proxmox_host_config(resolved_hostname, {"vm_set_override": vm_set_override})
-    logger.info("Proxmox VM set override saved for host %s: %s", resolved_hostname, config_entry.get("vm_set_override", 0) or 0)
-    settings_payload = _public_settings()
-    await broadcast({"type": "settings_update", "settings": settings_payload})
-    return {
-        "ok": True,
-        "hostname": resolved_hostname,
-        "vm_set_override": _sanitize_vm_set_override(config_entry.get("vm_set_override", 0)),
-    }
-
-
-@app.get("/api/proxmox/token/{hostname}")
-async def get_proxmox_host_token_status(
-    hostname: str,
-    _user: SpokeUser = Depends(require_auth),
-) -> dict[str, Any]:
-    resolved_hostname = _resolve_proxmox_agent_hostname(hostname.strip(), approved_proxmox_agents) or _normalize_proxmox_hostname(hostname)
-    per_host = str((settings.get("proxmox_tokens") or {}).get(resolved_hostname, "") or "").strip()
-    global_tok = _get_proxmox_token_for_host(None)
-    return {
-        "hostname": resolved_hostname,
-        "configured": bool(per_host),
-        "global_configured": bool(global_tok),
-    }
-
-
-@app.put("/api/proxmox/token/{hostname}")
-async def save_proxmox_host_token(
-    hostname: str,
-    body: dict[str, Any] = Body(...),
-    _user: SpokeUser = Depends(require_auth),
-) -> dict[str, Any]:
-    token = str(body.get("proxmox_token") or body.get("proxmox_api_token") or "").strip()
-    if not token:
-        raise HTTPException(status_code=422, detail="proxmox_token is required")
-    resolved_hostname = _resolve_proxmox_agent_hostname(hostname.strip(), approved_proxmox_agents) or _normalize_proxmox_hostname(hostname)
-    if not resolved_hostname:
-        raise HTTPException(status_code=400, detail="hostname is required")
-    _save_proxmox_token_for_host(resolved_hostname, token)
-    logger.info("Proxmox API token saved for host %s", resolved_hostname)
-    return {"ok": True, "hostname": resolved_hostname, "configured": True}
-
-
-@app.post("/api/proxmox/token/{hostname}/auto-provision")
-async def auto_provision_proxmox_host_token(
-    hostname: str,
-    _user: SpokeUser = Depends(require_auth),
-) -> dict[str, Any]:
-    resolved_hostname = _resolve_proxmox_agent_hostname(hostname.strip(), approved_proxmox_agents) or _normalize_proxmox_hostname(hostname)
-    if not resolved_hostname:
-        raise HTTPException(status_code=400, detail="hostname is required")
-    TOKEN_ID = "cs-hub"
-    USER = "root@pam"
-    request_id = str(uuid.uuid4())
-
-    pvesh_candidates = [
-        shutil.which("pvesh"),
-        "/usr/bin/pvesh",
-        "/usr/sbin/pvesh",
-        "/usr/local/bin/pvesh",
-        "/usr/share/pve-manager/bin/pvesh",
-        "/opt/proxmox/bin/pvesh",
-    ]
-    pvesh_path = next((c for c in pvesh_candidates if c and os.path.isfile(c)), None)
-    local_candidates = [socket.gethostname(), socket.getfqdn(), os.environ.get("HOSTNAME", "")]
-    use_local_pvesh = bool(
-        pvesh_path and any(_proxmox_hostnames_match(resolved_hostname, candidate) for candidate in local_candidates if candidate)
-    )
-
-    if not use_local_pvesh:
-        if resolved_hostname not in approved_proxmox_agents:
-            raise HTTPException(status_code=404, detail="Proxmox agent not approved")
-        q: asyncio.Queue = asyncio.Queue(maxsize=1)
-        _proxmox_token_provision_queues[request_id] = q
-        try:
-            await _queue_proxmox_command(
-                "create_proxmox_token",
-                {"request_id": request_id},
-                command_type="token-provision",
-                target=resolved_hostname,
-            )
-            result = await asyncio.wait_for(q.get(), timeout=30.0)
-            if result.get("ok"):
-                token = str(result.get("token") or "").strip()
-                if not token:
-                    raise HTTPException(status_code=500, detail="Agent returned an empty token")
-                _save_proxmox_token_for_host(resolved_hostname, token)
-                logger.info("Proxmox API token auto-provisioned via agent for host %s", resolved_hostname)
-                return {"ok": True, "hostname": resolved_hostname, "token_id": f"{USER}!{TOKEN_ID}"}
-            raise HTTPException(status_code=500, detail=str(result.get("error") or "Agent failed to provision token"))
-        except asyncio.TimeoutError as exc:
-            raise HTTPException(status_code=504, detail="Proxmox agent did not respond within 30 seconds") from exc
-        finally:
-            _proxmox_token_provision_queues.pop(request_id, None)
-
-    try:
-        del_proc = await asyncio.create_subprocess_exec(
-            pvesh_path, "delete", f"/access/users/{USER}/token/{TOKEN_ID}",
-            stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
-        )
-        await asyncio.wait_for(del_proc.wait(), timeout=10.0)
-    except Exception:
-        pass
-
-    try:
-        proc = await asyncio.create_subprocess_exec(
-            pvesh_path, "create", f"/access/users/{USER}/token/{TOKEN_ID}",
-            "--privsep", "0", "--output-format", "json",
-            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
-        )
-        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=15.0)
-    except asyncio.TimeoutError as exc:
-        raise HTTPException(status_code=504, detail="pvesh timed out after 15 seconds") from exc
-
-    if proc.returncode != 0:
-        raise HTTPException(status_code=500, detail=f"pvesh failed: {stderr.decode().strip()[:200]}")
-
-    try:
-        data = json.loads(stdout.decode().strip())
-    except json.JSONDecodeError as exc:
-        raise HTTPException(status_code=500, detail=f"Could not parse pvesh output: {exc}") from exc
-    secret = str(data.get("value") or "").strip()
-    if not secret:
-        raise HTTPException(status_code=500, detail="pvesh returned no token value")
-
-    full_token = f"{USER}!{TOKEN_ID}={secret}"
-    _save_proxmox_token_for_host(resolved_hostname, full_token)
-    logger.info("Proxmox API token auto-provisioned locally for host %s", resolved_hostname)
-    return {"ok": True, "hostname": resolved_hostname, "token_id": f"{USER}!{TOKEN_ID}"}
-
-
-@app.post("/api/proxmox/console/{vmid}")
-async def api_create_console_session(
-    vmid: int,
-    vmtype: str = Query("qemu"),
-    _user: SpokeUser = Depends(require_auth),
-) -> dict[str, Any]:
-    """Create a direct Proxmox VNC console session for the spoke's own VM Server view."""
-    proxmox_host = str(_proxmox_agent_vm_map.get(vmid) or proxmox_ws_hostname or "").strip()
-    api_token = _get_proxmox_token_for_host(proxmox_host)
-    if not proxmox_host:
-        raise HTTPException(status_code=503, detail="Proxmox host unknown — no agent connected")
-    if not api_token:
-        raise HTTPException(status_code=503, detail="Proxmox API token not configured on spoke")
-    normalized_vmtype = str(vmtype or "qemu").strip().lower()
-    if normalized_vmtype not in {"qemu", "lxc"}:
-        raise HTTPException(status_code=400, detail="vmtype must be qemu or lxc")
-    node = proxmox_host.split(".")[0]
-    vncproxy_url = f"https://{proxmox_host}:8006/api2/json/nodes/{node}/{normalized_vmtype}/{vmid}/vncproxy"
-    auth_header = {"Authorization": f"PVEAPIToken={api_token}"}
-    if httpx is None:
-        raise HTTPException(status_code=503, detail="httpx not installed")
-    try:
-        async with httpx.AsyncClient(verify=False) as client:
-            resp = await client.post(vncproxy_url, headers=auth_header, json={"websocket": 1}, timeout=10)
-        if resp.status_code != 200:
-            raise HTTPException(status_code=502, detail=f"Proxmox vncproxy returned {resp.status_code}: {resp.text[:200]}")
-        body = resp.json()
-        ticket = body["data"]["ticket"]
-        port = int(body["data"]["port"])
-    except HTTPException:
-        raise
-    except Exception as exc:
-        raise HTTPException(status_code=502, detail=f"Proxmox vncproxy call failed: {exc}") from exc
-    session_id = str(uuid.uuid4())
-    _direct_console_sessions[session_id] = {
-        "proxmox_host": proxmox_host,
-        "node": node,
-        "vmid": vmid,
-        "vmtype": normalized_vmtype,
-        "api_token": api_token,
-        "ticket": ticket,
-        "port": port,
-        "expires": time.time() + _DIRECT_CONSOLE_TTL,
-    }
-    return {"session_id": session_id, "expires_in": _DIRECT_CONSOLE_TTL}
-
-
 @app.websocket("/ws/console/{session_id}")
 async def ws_console_direct(websocket: WebSocket, session_id: str) -> None:
     """Relay raw VNC bytes between the browser (noVNC) and Proxmox vncwebsocket."""
@@ -10608,1268 +5213,9 @@ async def ws_console_direct(websocket: WebSocket, session_id: str) -> None:
         logger.warning("Direct VNC relay error for session %s: %s", session_id, exc)
 
 
-
-@app.post("/api/proxmox/update-agent")
-async def api_proxmox_update_agent(hostname: str | None = None) -> dict[str, Any]:
-    cmd = await _queue_proxmox_agent_update(target=hostname or None)
-    return {
-        "queued": 1,
-        "id": cmd["id"],
-        "target": cmd["target"],
-        "branch": cmd["args"].get("branch"),
-        "source": cmd["args"].get("repo_raw"),
-    }
-
-
-@app.post("/api/proxmox/unlock-template")
-async def api_proxmox_unlock_template() -> dict[str, Any]:
-    cmd = await _queue_unlock_template_command()
-    return {
-        "queued": True,
-        "id": cmd["id"],
-        "target": cmd["target"],
-        "action": cmd.get("action"),
-    }
-
-
-@app.delete("/api/proxmox/vms/{vmid}")
-async def api_proxmox_delete_vm(vmid: int) -> dict[str, Any]:
-    try:
-        args = _prepare_delete_vm_args({"vmid": vmid})
-    except HTTPException as exc:
-        if exc.status_code == 404:
-            # VM not in current Proxmox inventory — it may have been manually removed
-            # from Proxmox directly.  Queue the delete anyway with a safe default so the
-            # agent can confirm it is gone (idempotent) and update its state files.
-            args = {"vmid": vmid, "vm_type": "qemu"}
-        else:
-            raise
-    cmd = await _queue_proxmox_command("delete_vm", args, target=_resolve_proxmox_vm_target(vmid))
-    _pending_delete_vmids.add(vmid)
-    await _broadcast_proxmox_state()
-    return {
-        "queued": 1,
-        "ids": [cmd["id"]],
-        "vmid": vmid,
-        "vm_type": args.get("vm_type"),
-        "vm_name": args.get("vm_name"),
-    }
-
-
-@app.post("/api/proxmox/register")
-async def proxmox_register(request: Request, body: dict = Body(...)) -> JSONResponse:
-    """Called by agent with no key. Adds to pending if not approved."""
-    hostname = str(body.get("hostname", "") or request.headers.get("X-Hostname", "")).strip()
-    if not hostname:
-        return JSONResponse({"error": "hostname required"}, status_code=400)
-    client_ip = request.client.host if request.client else "unknown"
-
-    approved_hostname = _resolve_proxmox_agent_hostname(hostname, approved_proxmox_agents)
-    if approved_hostname is not None:
-        pending_hostname = _resolve_proxmox_agent_hostname(hostname, pending_proxmox_agents)
-        if pending_hostname is not None:
-            pending_proxmox_agents.pop(pending_hostname, None)
-            await broadcast({"type": "proxmox_pending_update", "pending": _pending_proxmox_payload()})
-        return JSONResponse({"approved": True, "key": approved_proxmox_agents[approved_hostname]})
-
-    now = time.time()
-    _upsert_pending_proxmox_agent(hostname, client_ip, now)
-    await broadcast({"type": "proxmox_pending_update", "pending": _pending_proxmox_payload()})
-    return JSONResponse({"pending": True}, status_code=202)
-
-
-@app.get("/api/proxmox/key")
-async def proxmox_get_key(hostname: str = Query(...)) -> JSONResponse:
-    """Agent polls this until approved. Returns key when ready."""
-    approved_hostname = _resolve_proxmox_agent_hostname(hostname, approved_proxmox_agents)
-    if approved_hostname is not None:
-        return JSONResponse({"approved": True, "key": approved_proxmox_agents[approved_hostname]})
-    if _resolve_proxmox_agent_hostname(hostname, pending_proxmox_agents) is not None:
-        return JSONResponse({"pending": True}, status_code=202)
-    return JSONResponse({"error": "unknown hostname"}, status_code=404)
-
-
-@app.get("/api/proxmox/pending")
-async def proxmox_pending_list() -> list[dict[str, Any]]:
-    return _pending_proxmox_payload()
-
-
-@app.post("/api/proxmox/approve/{hostname}")
-async def proxmox_approve(hostname: str) -> dict[str, Any]:
-    pending_payload: list[dict[str, Any]] | None = None
-    should_broadcast_state = False
-    async with state_lock:
-        pending_hostname = _resolve_proxmox_agent_hostname(hostname, pending_proxmox_agents)
-        approved_hostname = _resolve_proxmox_agent_hostname(hostname, approved_proxmox_agents)
-        if approved_hostname is not None:
-            if pending_hostname is not None:
-                pending_proxmox_agents.pop(pending_hostname, None)
-                pending_payload = _pending_proxmox_payload()
-                should_broadcast_state = True
-            result = {"approved": True, "hostname": approved_hostname, "key": approved_proxmox_agents[approved_hostname], "existing": True}
-        else:
-            resolved_hostname = pending_hostname or _normalize_proxmox_hostname(hostname)
-            if not resolved_hostname:
-                raise HTTPException(status_code=400, detail="hostname is required")
-
-            key = str(uuid.uuid4())
-            approved_proxmox_agents[resolved_hostname] = key
-            pending_proxmox_agents.pop(pending_hostname or resolved_hostname, None)
-            settings["proxmox_approved_agents"] = dict(approved_proxmox_agents)
-            _save_settings()
-            pending_payload = _pending_proxmox_payload()
-            should_broadcast_state = True
-            result = {"approved": True, "hostname": resolved_hostname, "key": key}
-
-    if pending_payload is not None:
-        await broadcast({"type": "proxmox_pending_update", "pending": pending_payload})
-    if should_broadcast_state:
-        await _broadcast_proxmox_state()
-    return result
-
-
-@app.post("/api/proxmox/reject/{hostname}")
-async def proxmox_reject(hostname: str) -> dict[str, Any]:
-    async with state_lock:
-        resolved_hostname = _resolve_proxmox_agent_hostname(hostname, pending_proxmox_agents) or _normalize_proxmox_hostname(hostname)
-        pending_proxmox_agents.pop(resolved_hostname, None)
-        pending_payload = _pending_proxmox_payload()
-    await broadcast({"type": "proxmox_pending_update", "pending": pending_payload})
-    await _broadcast_proxmox_state()
-    return {"rejected": True, "hostname": resolved_hostname}
-
-
-@app.delete("/api/proxmox/approved/{hostname}")
-async def proxmox_revoke(hostname: str) -> dict[str, Any]:
-    """Revoke an approved agent's key."""
-    async with state_lock:
-        resolved_hostname = _resolve_proxmox_agent_hostname(hostname, approved_proxmox_agents) or _normalize_proxmox_hostname(hostname)
-        approved_proxmox_agents.pop(resolved_hostname, None)
-        settings["proxmox_approved_agents"] = dict(approved_proxmox_agents)
-        _save_settings()
-    await _broadcast_proxmox_state()
-    return {"revoked": True, "hostname": resolved_hostname}
-
-
-@app.get("/api/proxmox/approved")
-async def proxmox_approved_list() -> list[dict[str, Any]]:
-    return _approved_proxmox_payload()
-
-
-# ── Aruba Central API endpoints ───────────────────────────────────────────────
-@app.post("/api/central/test-connection")
-async def api_central_test() -> dict[str, Any]:
-    mode = settings.get("central_api", {}).get("mode", "classic")
-    async with httpx.AsyncClient() as client:
-        if mode == "classic":
-            ok, detail_msg = await _test_classic_central_connection(client)
-            if ok:
-                return {"status": "ok", "message": detail_msg}
-            raise HTTPException(status_code=502 if "HTTP" in detail_msg or "rejected" in detail_msg else 422, detail=detail_msg)
-
-        if not _central_ready():
-            raise HTTPException(
-                status_code=422,
-                detail="Central API not configured — enter URL, Client ID, and Client Secret in Setup.",
-            )
-        ok, detail_msg = await _fetch_central_token(client)
-    if ok:
-        return {
-            "status": "ok",
-            "message": "Connected to Central API successfully.",
-        }
-    raise HTTPException(status_code=502, detail=detail_msg)
-
-
-@app.get("/api/central/available")
-async def api_central_available() -> dict[str, Any]:
-    """Return available alert types and insight categories from Central. Always returns 200."""
-    if not _central_ready():
-        return {"alerts": [], "insights": [], "warning": "Central not configured."}
-
-    # New Central v1alpha1 has no alerts/insights endpoints — return static synthetic checks.
-    # These correspond to the metrics _poll_central_once() derives from sites-health, /aps, and /devices.
-    # No live token is required to return this static list.
-    if _is_new_central_api():
-        return {
-            "alerts": [
-                {"id": "SITE_HEALTH",    "name": "Site Health Score (0–100)"},
-                {"id": "AP_COUNT",       "name": "Total AP Count"},
-                {"id": "AP_DOWN",        "name": "APs Down / Offline"},
-                {"id": "SWITCH_DOWN",    "name": "Switches Down / Offline"},
-                {"id": "GATEWAY_DOWN",   "name": "Gateways Down / Offline"},
-                {"id": "CLIENT_COUNT",   "name": "Connected Client Count"},
-            ],
-            "insights": [],
-            "warning": None,
-        }
-
-    if not central_token.get("access_token"):
-        return {"alerts": [], "insights": [], "warning": "No valid token — save & test connection first."}
-
-    # Static fallback list of well-known Aruba Central alert types (used when no live alerts exist)
-    KNOWN_ALERT_TYPES: dict[str, str] = {
-        "AP_DOWN": "AP Down",
-        "AP_UP": "AP Up",
-        "ACCESS_POINT_DOWN": "Access Point Down",
-        "CLIENT_ASSOCIATION_FAILURE": "Client Association Failure",
-        "CLIENT_DHCP_FAILURE": "Client DHCP Failure",
-        "CLIENT_DISCONNECTED": "Client Disconnected",
-        "DHCP_POOL_EXHAUSTED": "DHCP Pool Exhausted",
-        "IDS_AP_SPOOFED": "IDS AP Spoofed",
-        "PORTAL_DOWN": "Portal Down",
-        "RADIO_INTERFERENCE": "Radio Interference",
-        "ROGUE_AP_DETECTED": "Rogue AP Detected",
-        "SWITCH_DOWN": "Switch Down",
-        "SWITCH_PORT_DOWN": "Switch Port Down",
-        "TUNNEL_DOWN": "Tunnel Down",
-        "UPLINK_FAILURE": "Uplink Failure",
-        "VPN_TUNNEL_DOWN": "VPN Tunnel Down",
-        "WIRELESS_CLIENT_ROAM": "Wireless Client Roam",
-        "WIRELESS_INTERFERENCE": "Wireless Interference",
-    }
-    KNOWN_INSIGHT_CATEGORIES: dict[str, str] = {
-        "CONNECTIVITY": "Connectivity",
-        "PERFORMANCE": "Performance",
-        "RELIABILITY": "Reliability",
-        "SECURITY": "Security",
-    }
-
-    headers = _central_headers()
-    base_url = _central_cfg()["cluster_url"].rstrip("/")
-    alert_types: dict[str, str] = {}
-    insight_categories: dict[str, str] = {}
-    warnings: list[str] = []
-
-    # 30-day lookback window to catch historical alert types even when none are active now
-    thirty_days_ago = int(time.time()) - 30 * 86400
-
-    async with httpx.AsyncClient() as client:
-        # Alerts — try v1 then v2 (v2 is 404 on some clusters)
-        for alerts_path in ["/monitoring/v1/alerts", "/monitoring/v2/alerts"]:
-            try:
-                resp = await client.get(
-                    f"{base_url}{alerts_path}",
-                    headers=headers,
-                    params={"limit": 1000, "from_timestamp": thirty_days_ago},
-                    timeout=20,
-                )
-                logger.info("Central available alerts %s → %s", alerts_path, resp.status_code)
-                if resp.status_code == 200:
-                    for alert in resp.json().get("alerts", []):
-                        atype = alert.get("alert_type") or alert.get("type", "")
-                        aname = alert.get("alert_type_name") or atype.replace("_", " ").title()
-                        if atype:
-                            alert_types[atype] = aname
-                    break  # success — stop trying
-                if resp.status_code == 404:
-                    continue  # try next path
-                if resp.status_code == 401:
-                    warnings.append("Token rejected (401) fetching alerts.")
-                    break
-            except Exception as exc:
-                logger.warning("Could not fetch alert types from %s: %s", alerts_path, exc)
-                warnings.append(f"Network error fetching alerts: {exc}")
-                break
-
-        # Insights
-        try:
-            resp = await client.get(
-                f"{base_url}/aiops/v1/insights",
-                headers=headers,
-                params={"limit": 1000, "from_timestamp": thirty_days_ago},
-                timeout=20,
-            )
-            logger.info("Central available insights → %s", resp.status_code)
-            if resp.status_code == 200:
-                for insight in resp.json().get("insights", []):
-                    cat = insight.get("category") or insight.get("type", "")
-                    cat_name = insight.get("category_name") or cat.replace("_", " ").title()
-                    if cat:
-                        insight_categories[cat] = cat_name
-            elif resp.status_code not in (404,):
-                warnings.append(f"Insights endpoint returned HTTP {resp.status_code}.")
-        except Exception as exc:
-            logger.warning("Could not fetch insight categories: %s", exc)
-            warnings.append(f"Network error fetching insights: {exc}")
-
-    # If live API returned nothing, fall back to the known static list
-    using_fallback = False
-    if not alert_types:
-        alert_types = dict(KNOWN_ALERT_TYPES)
-        using_fallback = True
-    if not insight_categories:
-        insight_categories = dict(KNOWN_INSIGHT_CATEGORIES)
-        using_fallback = True
-    if using_fallback:
-        warnings.append("No live checks returned by Central — showing standard Aruba Central check types.")
-
-    return {
-        "alerts": [{"id": k, "name": v} for k, v in sorted(alert_types.items())],
-        "insights": [{"id": k, "name": v} for k, v in sorted(insight_categories.items())],
-        "warning": "; ".join(warnings) if warnings else None,
-    }
-
-
-@app.get("/api/central/status")
-async def api_central_status() -> dict[str, Any]:
-    """Current check status for all mapped sites."""
-    return {
-        "status": _central_status_payload(),
-        "wireless_clients": dict(central_wireless_clients),
-        "hardware_alerts": _hw_alerts_payload(),
-        "client_count_status": _client_count_payload(),
-        "site_mappings": settings.get("site_mappings", {}),
-        "monitored_checks": settings.get("monitored_checks", []),
-        "central_api": _public_central_api_settings(),
-        "token_valid": bool(central_token.get("access_token") and time.time() < central_token["expires_at"]),
-        "token_state": _central_token_state(),
-    }
-
-
-@app.get("/api/central/history")
-async def api_central_history(
-    site: str | None = Query(default=None),
-    hours: int = Query(default=24, ge=1, le=24),
-) -> dict[str, Any]:
-    """Return history records, optionally filtered by wsite."""
-    cutoff = time.time() - hours * 3600
-    async with history_lock:
-        records = [
-            r for r in central_history
-            if r["ts"] >= cutoff and (site is None or r["wsite"] == site)
-        ]
-    return {"records": records, "count": len(records)}
-
-
-@app.get("/api/central/site-alerts")
-async def api_central_site_alerts(site: str = Query(...)) -> dict[str, Any]:
-    """Fetch current alerts from Central for a specific site name. Always returns 200."""
-    if not _central_ready() or not central_token.get("access_token"):
-        return {"alerts": [], "warning": "Central not configured or no valid token."}
-
-    if _is_new_central_api():
-        # New Central has no alerts endpoint — derive device-status alerts from /sites-health + /devices
-        headers = _central_headers()
-        base_url = _central_cfg()["cluster_url"].rstrip("/")
-        alerts: list[dict[str, Any]] = []
-        warning: str | None = None
-        ts_now = int(time.time())
-
-        async with httpx.AsyncClient() as client:
-            # 1. Find site_id from sites-health so we can filter devices by site
-            site_id: str | None = None
-            health_score: int | None = None
-            try:
-                resp = await client.get(
-                    f"{base_url}/network-monitoring/v1alpha1/sites-health",
-                    headers=headers, timeout=20,
-                )
-                if resp.status_code == 200:
-                    for item in resp.json().get("items", []):
-                        sname = item.get("siteName") or item.get("site_name") or ""
-                        if sname.lower() == site.lower():
-                            site_id = item.get("siteId") or item.get("site_id")
-                            health_score = int(item.get("healthScore", item.get("health_score", 100)))
-                            break
-                elif resp.status_code == 401:
-                    warning = "Token rejected (401) — re-save settings."
-            except Exception as exc:
-                warning = f"Network error fetching site health: {exc}"
-
-            if warning:
-                return {"alerts": alerts, "count": 0, "warning": warning}
-
-            # 2. Add site health alert if score is degraded
-            if health_score is not None and health_score < 100:
-                severity = "CRITICAL" if health_score < 50 else "MAJOR" if health_score < 80 else "MINOR"
-                alerts.append({
-                    "type": "SITE_HEALTH",
-                    "name": "Site Health Score",
-                    "severity": severity,
-                    "state": "active",
-                    "site": site,
-                    "device": site,
-                    "ts": ts_now,
-                    "message": f"Site health score is {health_score}/100",
-                })
-
-            # 3. Fetch devices for this site and add down devices as alerts
-            try:
-                params: dict[str, Any] = {"limit": 500}
-                if site_id:
-                    params["filter"] = f"siteId eq '{site_id}'"
-                resp = await client.get(
-                    f"{base_url}/network-monitoring/v1alpha1/devices",
-                    headers=headers, params=params, timeout=20,
-                )
-                if resp.status_code == 200:
-                    _TYPE_MAP = {
-                        "ACCESS_POINT": ("AP_DOWN", "AP Down"),
-                        "SWITCH": ("SWITCH_DOWN", "Switch Down"),
-                        "GATEWAY": ("GATEWAY_DOWN", "Gateway Down"),
-                    }
-                    for dev in resp.json().get("items", []):
-                        # Post-filter by siteId in case the API ignored the OData filter param
-                        if site_id and dev.get("siteId") and dev.get("siteId") != site_id:
-                            continue
-                        status = (dev.get("status") or "").upper()
-                        if status in ("UP", "ONLINE"):
-                            continue
-                        dtype = (dev.get("deviceType") or "").upper()
-                        atype, aname = _TYPE_MAP.get(dtype, ("DEVICE_DOWN", "Device Down"))
-                        alerts.append({
-                            "type": atype,
-                            "name": aname,
-                            "severity": "CRITICAL",
-                            "state": "active",
-                            "site": site,
-                            "device": dev.get("deviceName") or dev.get("id") or "—",
-                            "ts": ts_now,
-                            "message": f"{dev.get('model', dtype)} — status: {dev.get('status', 'Unknown')} | IP: {dev.get('ipv4') or dev.get('ip', '—')}",
-                        })
-            except Exception as exc:
-                logger.warning("CNX devices fetch failed for site-alerts: %s", exc)
-                warning = f"Could not fetch device status: {exc}"
-
-        if not alerts and not warning:
-            warning = "All devices are up and site health is 100% — no issues detected."
-
-        return {"alerts": alerts, "count": len(alerts), "warning": warning}
-
-    headers = _central_headers()
-    base_url = _central_cfg()["cluster_url"].rstrip("/")
-    alerts: list[dict[str, Any]] = []
-    warning: str | None = None
-    thirty_days_ago = int(time.time()) - 30 * 86400
-
-    async with httpx.AsyncClient() as client:
-        for path in ["/monitoring/v1/alerts", "/monitoring/v2/alerts"]:
-            try:
-                resp = await client.get(
-                    f"{base_url}{path}",
-                    headers=headers,
-                    params={"site": site, "limit": 500, "from_timestamp": thirty_days_ago},
-                    timeout=20,
-                )
-                logger.info("site-alerts %s for '%s' → %s", path, site, resp.status_code)
-                if resp.status_code == 200:
-                    for alert in resp.json().get("alerts", []):
-                        alert_site = alert.get("site_name") or alert.get("site") or ""
-                        if alert_site and site and alert_site.lower() != site.lower():
-                            continue
-                        alerts.append({
-                            "type":     alert.get("alert_type") or alert.get("type", ""),
-                            "name":     alert.get("alert_type_name") or alert.get("alert_type", ""),
-                            "severity": alert.get("severity", ""),
-                            "state":    alert.get("state", ""),
-                            "site":     alert.get("site_name") or site,
-                            "device":   alert.get("device_name") or alert.get("hostname", ""),
-                            "ts":       alert.get("timestamp") or alert.get("raised_at", ""),
-                            "message":  alert.get("details") or alert.get("description", ""),
-                        })
-                    break
-                if resp.status_code == 404:
-                    continue
-                if resp.status_code == 401:
-                    warning = "Token rejected (401)."
-                    break
-            except Exception as exc:
-                logger.warning("site-alerts fetch error: %s", exc)
-                warning = str(exc)
-                break
-
-    if not alerts and not warning:
-        warning = "No alerts in the last 30 days for this site."
-
-    return {"alerts": alerts, "count": len(alerts), "warning": warning}
-
-
-@app.post("/api/central/poll")
-async def api_central_poll() -> dict[str, Any]:
-    """Trigger an immediate Central poll cycle."""
-    if not _central_ready():
-        raise HTTPException(status_code=422, detail="Central not configured.")
-    async def _poll_with_client() -> None:
-        async with httpx.AsyncClient() as client:
-            await _poll_central_once(client)
-    asyncio.create_task(_poll_with_client())
-    return {"status": "ok", "message": "Poll started."}
-
-
-@app.get("/api/central/sites")
-async def api_central_sites() -> dict[str, Any]:
-    """Fetch site list from Aruba Central API. Always returns 200 with sites[] and optional warning."""
-    if not _central_ready():
-        return {"sites": [], "warning": "Central not configured — enter Cluster URL and token in Setup first."}
-    if not central_token.get("access_token"):
-        return {"sites": [], "warning": "No valid token — click 'Save & Test Connection' in Setup first."}
-
-    headers = _central_headers()
-    base_url = _central_cfg()["cluster_url"].rstrip("/")
-    sites: list[str] = []
-    warning: str | None = None
-
-    # Classic Central — try multiple known site endpoints
-    CLASSIC_SITE_PATHS = [
-        ("/monitoring/v2/sites", {"limit": 1000, "offset": 0}),
-        ("/monitoring/v1/sites", {"limit": 1000, "offset": 0}),
-        ("/central/v2/sites", {"limit": 1000, "offset": 0}),
-    ]
-
-    async with httpx.AsyncClient() as client:
-        if _is_new_central_api():
-            # New Central: sites come from sites-health
-            try:
-                resp = await client.get(
-                    f"{base_url}/network-monitoring/v1alpha1/sites-health",
-                    headers=headers,
-                    timeout=20,
-                )
-                logger.info("New Central sites-health → %s", resp.status_code)
-                if resp.status_code == 200:
-                    for item in resp.json().get("items", []):
-                        name = item.get("siteName") or item.get("site_name") or item.get("name", "")
-                        if name:
-                            sites.append(name)
-                elif resp.status_code == 401:
-                    warning = "Token rejected (401) — re-save settings to refresh."
-                else:
-                    warning = f"sites-health returned HTTP {resp.status_code}."
-            except Exception as exc:
-                logger.warning("Could not fetch New Central sites-health: %s", exc)
-                warning = f"Network error fetching sites: {exc}"
-        else:
-            # Classic Central: try each known path, stop on first 200
-            last_status: int | None = None
-            tried: list[str] = []
-            for path, params in CLASSIC_SITE_PATHS:
-                tried.append(path)
-                try:
-                    resp = await client.get(
-                        f"{base_url}{path}",
-                        headers=headers,
-                        params=params,
-                        timeout=20,
-                    )
-                    last_status = resp.status_code
-                    logger.info("Classic Central sites %s → %s: %s", path, resp.status_code, resp.text[:200])
-                    if resp.status_code == 200:
-                        data = resp.json()
-                        # Response may use "sites", "items", or root list
-                        raw = data.get("sites") or data.get("items") or (data if isinstance(data, list) else [])
-                        for site in raw:
-                            if isinstance(site, str):
-                                sites.append(site)
-                            else:
-                                name = site.get("site_name") or site.get("siteName") or site.get("name", "")
-                                if name:
-                                    sites.append(name)
-                        break
-                    elif resp.status_code == 401:
-                        warning = "Token rejected (401) — re-save settings."
-                        break
-                    # 404 = path doesn't exist on this cluster, try next
-                except Exception as exc:
-                    logger.warning("Could not fetch Classic Central sites from %s: %s", path, exc)
-                    warning = f"Network error fetching sites: {exc}"
-                    break
-
-            if not sites and not warning:
-                warning = f"No sites found — tried {', '.join(tried)} (last HTTP {last_status}). Your cluster may not expose a sites list API."
-
-    return {"sites": sorted(set(sites)), "warning": warning}
-
-
-@app.get("/api/central/browse")
-async def api_central_browse(force: bool = False) -> dict[str, Any]:
-    """Return aggregated Central browse data for the spoke Central Monitoring tab.
-
-    Serves a 5-minute server-side cache (same TTL as the hub) to avoid hammering
-    the Central API on every tab open.  Pass ?force=true to bypass the cache.
-    If the background browse cache is empty (first load before any poll cycle),
-    trigger a live on-demand fetch so the caller always gets fresh data.
-    """
-    global _central_browse_response_cache, _central_browse_response_cached_at, _central_browse_fetching
-
-    now = time.time()
-    # Serve the cached response if it's still within TTL and not a forced refresh.
-    if not force and _central_browse_response_cache and (now - _central_browse_response_cached_at) < NC_BROWSE_SERVER_CACHE_TTL_S:
-        return _central_browse_response_cache
-
-    # If the background loop hasn't populated browse data yet, do an on-demand fetch.
-    # Guard with a flag so concurrent requests don't each spawn their own fetch.
-    if not central_browse_alerts and not central_browse_insights and not central_browse_clients and not central_browse_clients_by_site and _central_ready():
-        if not _central_browse_fetching:
-            _central_browse_fetching = True
-            try:
-                async with httpx.AsyncClient() as _browse_client:
-                    await _fetch_nc_browse_for_spoke(_browse_client)
-            except Exception as exc:
-                logger.warning("api_central_browse: on-demand fetch failed: %s", exc)
-            finally:
-                _central_browse_fetching = False
-
-    sites_resp = await api_central_sites()
-    site_names = list(sites_resp.get("sites") or [])
-    sites_with_health: list[dict[str, Any]] = []
-
-    for site_name in site_names:
-        site_alerts = [a for a in central_browse_alerts if str(a.get("site") or "").strip().lower() == str(site_name).strip().lower()]
-        severities = {str(a.get("severity") or "").strip().lower() for a in site_alerts}
-        critical = bool(severities & {"critical", "major", "poor", "red", "orange", "error"})
-        fair = bool(severities & {"minor", "warning", "yellow"})
-        health_label = "Poor" if critical else ("Fair" if fair else "Healthy")
-        health_score = 30 if critical else (60 if fair else 90)
-        clients_info = central_browse_clients_by_site.get(site_name, {}) or {}
-        wireless_count = clients_info.get("wireless_clients")
-        if wireless_count is None:
-            wireless_count = clients_info.get("wireless")
-        if wireless_count is None:
-            wireless_count = clients_info.get("count")
-        sites_with_health.append({
-            "name": site_name,
-            "health_label": health_label,
-            "health_score": health_score,
-            "wireless_clients": wireless_count,
-            "central_site": site_name,
-        })
-
-    result: dict[str, Any] = {
-        "mode": settings.get("central_api", {}).get("mode") or ("central" if _is_new_central_api() else "classic"),
-        "cached_at": now,
-        "sites": sites_with_health,
-        "alerts": list(central_browse_alerts),
-        "insights": list(central_browse_insights),
-        "clients": list(central_browse_clients),
-        "clients_by_site": dict(central_browse_clients_by_site),
-        "devices_by_site": dict(central_browse_devices_by_site),
-        "warning": sites_resp.get("warning"),
-    }
-    _central_browse_response_cache = result
-    _central_browse_response_cached_at = now
-    return result
-
-
-@app.post("/api/central/monitor-site")
-async def api_central_monitor_site(body: dict[str, Any] = Body(...), _user: SpokeUser = Depends(require_auth)) -> dict[str, Any]:
-    """Add or remove a Central site from the spoke site mappings."""
-    action = str(body.get("action") or "add").strip().lower()
-    central_site = str(body.get("central_site") or "").strip()
-    if not central_site:
-        raise HTTPException(status_code=422, detail="central_site required")
-
-    mappings = dict(settings.get("site_mappings") or {})
-    if action == "add":
-        wsite = str(body.get("wsite") or central_site).strip() or central_site
-        mappings[wsite] = central_site
-    elif action == "remove":
-        target = central_site.lower()
-        to_remove = [k for k, v in mappings.items() if str(v or "").strip().lower() == target or str(k or "").strip().lower() == target]
-        for key in to_remove:
-            mappings.pop(key, None)
-    else:
-        raise HTTPException(status_code=422, detail="action must be add or remove")
-
-    settings["site_mappings"] = mappings
-    _persisted["site_mappings"] = mappings
-    _save_settings()
-    await broadcast({"type": "settings_update", "settings": _get_cached_settings()})
-    return {"ok": True, "action": action, "central_site": central_site, "site_mappings": mappings}
-
-
-@app.post("/api/central/monitored-items")
-async def api_central_add_monitored_item(body: dict[str, Any] = Body(...), _user: SpokeUser = Depends(require_auth)) -> dict[str, Any]:
-    """Add an item to the spoke's local Central monitored-items list."""
-    item_type = str(body.get("type") or "").strip()
-    name = str(body.get("name") or "").strip()
-    identifier = str(body.get("identifier") or body.get("name") or "").strip()
-    if not item_type or not identifier:
-        raise HTTPException(status_code=422, detail="type and identifier required")
-
-    items = list(settings.get("spoke_monitored_items") or [])
-    site = str(body.get("site") or "").strip()
-    for existing in items:
-        if str(existing.get("type") or "") != item_type:
-            continue
-        if str(existing.get("identifier") or existing.get("name") or "").strip().lower() != identifier.lower():
-            continue
-        if str(existing.get("site") or "").strip().lower() != site.lower():
-            continue
-        return {"ok": True, "item": existing}
-
-    item = {
-        "id": str(uuid.uuid4()),
-        "type": item_type,
-        "name": name,
-        "site": site,
-        "identifier": identifier,
-        "ts": time.time(),
-    }
-    items.append(item)
-    settings["spoke_monitored_items"] = items
-    _persisted["spoke_monitored_items"] = items
-    _save_settings()
-    await broadcast({"type": "settings_update", "settings": _get_cached_settings()})
-    return {"ok": True, "item": item}
-
-
-@app.delete("/api/central/monitored-items/{item_id}")
-async def api_central_remove_monitored_item(item_id: str, _user: SpokeUser = Depends(require_auth)) -> dict[str, Any]:
-    """Remove an item from the spoke's local Central monitored-items list."""
-    items = list(settings.get("spoke_monitored_items") or [])
-    items = [item for item in items if str(item.get("id") or "") != item_id]
-    settings["spoke_monitored_items"] = items
-    _persisted["spoke_monitored_items"] = items
-    _save_settings()
-    await broadcast({"type": "settings_update", "settings": _get_cached_settings()})
-    return {"ok": True}
-
-
-@app.get("/api/central/devices")
-async def api_central_devices(site: str | None = Query(default=None)) -> dict[str, Any]:
-    """Return device inventory from New Central v1alpha1. Always returns 200.
-    Optional ?site= filters to a specific Central site name.
-    Classic Central: returns empty (use monitoring/v1/devices instead).
-    """
-    if not _central_ready() or not central_token.get("access_token"):
-        return {"devices": [], "count": 0, "warning": "Central not configured or no valid token."}
-    if not _is_new_central_api():
-        return {"devices": [], "count": 0, "warning": "Device inventory endpoint only available in Central (CNX) mode."}
-
-    headers = _central_headers()
-    base_url = _central_cfg()["cluster_url"].rstrip("/")
-    devices: list[dict[str, Any]] = []
-    warning: str | None = None
-
-    async with httpx.AsyncClient() as client:
-        # Resolve site_id if a site name was provided
-        site_id: str | None = None
-        if site:
-            try:
-                resp = await client.get(
-                    f"{base_url}/network-monitoring/v1alpha1/sites-health",
-                    headers=headers, timeout=20,
-                )
-                if resp.status_code == 200:
-                    for item in resp.json().get("items", []):
-                        sname = item.get("siteName") or item.get("site_name") or ""
-                        if sname.lower() == site.lower():
-                            site_id = item.get("siteId") or item.get("site_id")
-                            break
-            except Exception as exc:
-                logger.warning("CNX devices: sites-health lookup failed: %s", exc)
-
-        # Fetch devices, optionally filtered by site
-        try:
-            params: dict[str, Any] = {"limit": 500}
-            if site_id:
-                params["filter"] = f"siteId eq '{site_id}'"
-            resp = await client.get(
-                f"{base_url}/network-monitoring/v1alpha1/devices",
-                headers=headers, params=params, timeout=30,
-            )
-            if resp.status_code == 401 and _can_refresh():
-                ok, _ = await _refresh_central_token(client)
-                if ok:
-                    headers = _central_headers()
-                resp = await client.get(
-                    f"{base_url}/network-monitoring/v1alpha1/devices",
-                    headers=headers, params=params, timeout=30,
-                )
-            if resp.status_code == 200:
-                for dev in resp.json().get("items", []):
-                    devices.append({
-                        "id":         dev.get("id") or dev.get("deviceId") or dev.get("serialNumber", ""),
-                        "name":       dev.get("deviceName") or dev.get("name", "—"),
-                        "type":       dev.get("deviceType") or dev.get("type", "—"),
-                        "model":      dev.get("model", "—"),
-                        "serial":     dev.get("serialNumber", "—"),
-                        "mac":        dev.get("macAddress", "—"),
-                        "ip":         dev.get("ipv4") or dev.get("ip") or dev.get("ipAddress", "—"),
-                        "status":     dev.get("status", "—"),
-                        "site":       dev.get("siteId", "—"),
-                        "version":    dev.get("softwareVersion") or dev.get("firmwareVersion", "—"),
-                        "uptime_ms":  dev.get("uptimeInMillis"),
-                        "deployment": dev.get("deployment", "—"),
-                    })
-                # Post-filter by siteId in case the API ignored the OData filter param
-                if site_id:
-                    devices = [d for d in devices if d["site"] == site_id]
-            elif resp.status_code == 401:
-                warning = "Token rejected (401) — re-save settings to refresh."
-            else:
-                warning = f"Devices endpoint returned HTTP {resp.status_code}."
-        except Exception as exc:
-            logger.warning("CNX devices fetch failed: %s", exc)
-            warning = f"Network error fetching devices: {exc}"
-
-    return {"devices": devices, "count": len(devices), "warning": warning}
-
-
-@app.get("/api/central/wlans")
-async def api_central_wlans() -> dict[str, Any]:
-    """Return WLAN/SSID list from New Central v1alpha1. Always returns 200."""
-    if not _central_ready() or not central_token.get("access_token"):
-        return {"wlans": [], "count": 0, "warning": "Central not configured or no valid token."}
-    if not _is_new_central_api():
-        return {"wlans": [], "count": 0, "warning": "WLAN endpoint only available in Central (CNX) mode."}
-
-    headers = _central_headers()
-    base_url = _central_cfg()["cluster_url"].rstrip("/")
-    wlans: list[dict[str, Any]] = []
-    warning: str | None = None
-
-    async with httpx.AsyncClient() as client:
-        try:
-            resp = await client.get(
-                f"{base_url}/network-monitoring/v1alpha1/wlans",
-                headers=headers, params={"limit": 500}, timeout=20,
-            )
-            if resp.status_code == 401 and _can_refresh():
-                ok, _ = await _refresh_central_token(client)
-                if ok:
-                    headers = _central_headers()
-                resp = await client.get(
-                    f"{base_url}/network-monitoring/v1alpha1/wlans",
-                    headers=headers, params={"limit": 500}, timeout=20,
-                )
-            if resp.status_code == 200:
-                for w in resp.json().get("items", []):
-                    wlans.append({
-                        "id":       w.get("wlanId") or w.get("id", ""),
-                        "ssid":     w.get("ssid", "—"),
-                        "type":     w.get("type", "—"),
-                        "security": w.get("security", "—"),
-                        "enabled":  w.get("enabled", True),
-                        "band":     w.get("band") or w.get("radioType", "—"),
-                    })
-            elif resp.status_code == 401:
-                warning = "Token rejected (401) — re-save settings to refresh."
-            else:
-                warning = f"WLANs endpoint returned HTTP {resp.status_code}."
-        except Exception as exc:
-            logger.warning("CNX wlans fetch failed: %s", exc)
-            warning = f"Network error fetching WLANs: {exc}"
-
-    return {"wlans": wlans, "count": len(wlans), "warning": warning}
-
-
-@app.get("/api/central/clients-detail")
-async def api_central_clients_detail(site: str | None = Query(default=None)) -> dict[str, Any]:
-    """Return connected client list from New Central v1alpha1. Always returns 200.
-    Optional ?site= filters to a specific Central site name.
-    """
-    if not _central_ready() or not central_token.get("access_token"):
-        return {"clients": [], "count": 0, "warning": "Central not configured or no valid token."}
-    if not _is_new_central_api():
-        return {"clients": [], "count": 0, "warning": "Client detail endpoint only available in Central (CNX) mode."}
-
-    headers = _central_headers()
-    base_url = _central_cfg()["cluster_url"].rstrip("/")
-    result_clients: list[dict[str, Any]] = []
-    warning: str | None = None
-
-    async with httpx.AsyncClient() as client:
-        site_id: str | None = None
-        if site:
-            try:
-                resp = await client.get(
-                    f"{base_url}/network-monitoring/v1alpha1/sites-health",
-                    headers=headers, timeout=20,
-                )
-                if resp.status_code == 200:
-                    for item in resp.json().get("items", []):
-                        sname = item.get("siteName") or item.get("site_name") or ""
-                        if sname.lower() == site.lower():
-                            site_id = item.get("siteId") or item.get("site_id")
-                            break
-            except Exception as exc:
-                logger.warning("CNX clients-detail: sites-health lookup failed: %s", exc)
-
-        try:
-            params: dict[str, Any] = {}
-            if site_id:
-                params["site-id"] = site_id
-            resp = await client.get(
-                f"{base_url}/network-monitoring/v1alpha1/clients",
-                headers=headers, params=params, timeout=20,
-            )
-            if resp.status_code == 401 and _can_refresh():
-                ok, _ = await _refresh_central_token(client)
-                if ok:
-                    headers = _central_headers()
-                resp = await client.get(
-                    f"{base_url}/network-monitoring/v1alpha1/clients",
-                    headers=headers, params=params, timeout=20,
-                )
-            if resp.status_code == 200:
-                for c in resp.json().get("items", []):
-                    result_clients.append({
-                        "mac":             c.get("macAddress", "—"),
-                        "ip":              c.get("ipAddress", "—"),
-                        "username":        c.get("username") or c.get("name", "—"),
-                        "device":          c.get("deviceName") or c.get("hostname", "—"),
-                        "connection_type": c.get("connectionType", "—"),
-                        "ssid":            c.get("ssid", "—"),
-                        "ap":              c.get("apName") or c.get("accessPoint", "—"),
-                        "connected":       c.get("connected", True),
-                        "signal":          c.get("signalStrength") or c.get("signal"),
-                    })
-            elif resp.status_code == 401:
-                warning = "Token rejected (401) — re-save settings to refresh."
-            else:
-                warning = f"Clients endpoint returned HTTP {resp.status_code}."
-        except Exception as exc:
-            logger.warning("CNX clients-detail fetch failed: %s", exc)
-            warning = f"Network error fetching clients: {exc}"
-
-    return {"clients": result_clients, "count": len(result_clients), "warning": warning}
-
-
-@app.get("/api/local-wsites")
-async def api_local_wsites() -> dict[str, Any]:
-    """Extract unique wsite values from simulation.conf in the repo."""
-    import configparser
-    config_path = repo_path("configs", "simulation.conf")
-    if not config_path.exists():
-        return {"wsites": []}
-    parser = configparser.ConfigParser()
-    try:
-        parser.read_string(config_path.read_text(encoding="utf-8"))
-    except Exception as exc:
-        logger.warning("Could not parse simulation.conf: %s", exc)
-        return {"wsites": []}
-    wsites: set[str] = set()
-    for section in parser.sections():
-        if parser.has_option(section, "wsite"):
-            val = parser.get(section, "wsite").strip()
-            if val:
-                wsites.add(val)
-    return {"wsites": sorted(wsites)}
-
-
-@app.get("/api/simulations")
-async def api_simulations() -> dict[str, Any]:
-    """Return simulation groups with client membership and Central PASS/FAIL status.
-
-    Reads configs/simulation.conf for bucket profiles and proxmox/client-setup.conf
-    for VMID→username mappings. Matches configured clients against live heartbeats
-    and looks up Central alert status per simulation wsite + central_check.
-    """
-    sim_conf_path = REPO_DIR / "configs" / "simulation.conf"
-    client_conf_path = REPO_DIR / "proxmox" / "client-setup.conf"
-
-    sim_mtime = sim_conf_path.stat().st_mtime if sim_conf_path.exists() else -1.0
-    client_mtime = client_conf_path.stat().st_mtime if client_conf_path.exists() else -1.0
-
-    if (sim_mtime == _sim_conf_cache["sim_mtime"] and
-            client_mtime == _sim_conf_cache["client_mtime"]):
-        simulations: dict[str, dict[str, Any]] = copy.deepcopy(_sim_conf_cache["simulations"])
-    else:
-        simulations = {}
-
-        # ── Parse simulation.conf ─────────────────────────────────────
-        if sim_conf_path.exists():
-            try:
-                parser = configparser.ConfigParser()
-                parser.read_string(sim_conf_path.read_text(encoding="utf-8"))
-                # Apply hub-managed override on top (hub-connected mode only)
-                _merge_ini_override(parser, REPO_DIR / "configs" / "hub-sim-overrides.conf")
-
-                # Per-bucket test keys (read from [sN] sections)
-                _BUCKET_TEST_KEYS = [
-                    "dns_fail", "assoc_fail", "dhcp_fail", "port_flap",
-                    "iperf", "www_traffic", "download", "ping_test",
-                ]
-                # Global test keys (read from [simulation] section, applied to all buckets)
-                # WHY: ssidpw_fail and auth_fail are global settings in simulation.conf
-                # but simulation.sh/dashboard.sh include them in active_simulations POSTs.
-                _GLOBAL_TEST_KEYS = ["ssidpw_fail", "auth_fail"]
-                global_tests = {
-                    k: parser.get("simulation", k, fallback="off").strip().lower() == "on"
-                    for k in _GLOBAL_TEST_KEYS
-                }
-
-                sim_section_re = re.compile(r"^s\d$")
-                for section in parser.sections():
-                    if not sim_section_re.match(section):
-                        continue
-                    bucket_tests = {
-                        k: parser.get(section, k, fallback="off").strip().lower() == "on"
-                        for k in _BUCKET_TEST_KEYS
-                    }
-                    simulations[section] = {
-                        "id": section,
-                        "wsite": parser.get(section, "wsite", fallback=""),
-                        "central_check": parser.get(section, "central_check", fallback="").strip(),
-                        "tests": {**bucket_tests, **global_tests},
-                        "configured_clients": [],
-                        "active_client_count": 0,
-                        "central_pass_fail": None,
-                    }
-            except Exception as exc:
-                logger.warning("api_simulations: could not parse simulation.conf: %s", exc)
-
-        # ── Parse client-setup.conf — build VMID→hostname mapping ────
-        if client_conf_path.exists():
-            try:
-                client_parser = configparser.ConfigParser()
-                client_parser.read_string(client_conf_path.read_text(encoding="utf-8"))
-
-                vmid_section_re = re.compile(r"^c(\d+)$")
-                for section in client_parser.sections():
-                    m = vmid_section_re.match(section)
-                    if not m:
-                        continue
-                    vmid_str = m.group(1)
-                    vmid = int(vmid_str)
-                    vm_name = client_parser.get(section, "vm_name", fallback="").strip()
-                    if not vm_name:
-                        continue
-
-                    # Hash the vm_name to assign bucket — matches zlib.crc32 used by clients.
-                    sim_id = f"s{zlib.crc32(vm_name.encode()) % 10}"
-
-                    if sim_id in simulations:
-                        simulations[sim_id]["configured_clients"].append({
-                            "hostname": vm_name,
-                            "vmid": vmid,
-                            "username": vm_name,
-                            "reporting": False,
-                            "online": False,
-                            "last_seen": None,
-                        })
-            except Exception as exc:
-                logger.warning("api_simulations: could not parse client-setup.conf: %s", exc)
-
-        _sim_conf_cache.update({
-            "sim_mtime": sim_mtime,
-            "client_mtime": client_mtime,
-            "simulations": copy.deepcopy(simulations),
-        })
-
-    # ── Match active clients + compute Central PASS/FAIL ─────────
-    async with state_lock:
-        active_snap = {h: dict(c) for h, c in clients.items()}
-
-    for sim in simulations.values():
-        active_count = 0
-
-        # Primary: count any live client whose simulation_id matches this bucket
-        for h, c in active_snap.items():
-            if c.get("simulation_id", "") == sim["id"]:
-                online = compute_online(c.get("last_seen", datetime.min.replace(tzinfo=timezone.utc)))
-                if online:
-                    active_count += 1
-
-        # Secondary: update configured_clients reporting flags (for detail panel)
-        for client_info in sim["configured_clients"]:
-            h = client_info["hostname"]
-            if h in active_snap:
-                c = active_snap[h]
-                online = compute_online(c.get("last_seen", datetime.min.replace(tzinfo=timezone.utc)))
-                last_seen_dt = c.get("last_seen")
-                client_info["reporting"] = True
-                client_info["online"] = online
-                client_info["last_seen"] = last_seen_dt.isoformat() if last_seen_dt else None
-
-        sim["active_client_count"] = active_count
-        sim["central_client_count"] = central_wireless_clients.get(sim["wsite"], None)
-
-        # Central PASS/FAIL — look up wsite + central_check in polled status
-        wsite = sim["wsite"]
-        check_id = sim["central_check"]
-        if wsite and check_id:
-            site_checks = central_status.get(wsite, {})
-            if check_id in site_checks:
-                info = site_checks[check_id]
-                sim["central_pass_fail"] = {
-                    "firing": info["status"] == "OK",
-                    "count": info["count"],
-                    "check_name": info["check_name"],
-                    "ts": info["ts"],
-                }
-            else:
-                sim["central_pass_fail"] = {"firing": False, "count": 0, "check_name": check_id, "ts": None}
-
-    return {
-        "simulations": list(simulations.values()),
-    }
-
-
 # Cache: (wsite, central_site) → (timestamp, [client_name, ...])
 _central_client_cache: dict[str, tuple[float, list[str]]] = {}
 _CENTRAL_CLIENT_CACHE_TTL = 60  # seconds
-
-
-async def _fetch_central_client_names(wsite: str, central_site: str) -> list[str]:
-    """Fetch wireless client hostnames from Central for a given site (cached 60 s)."""
-    cache_key = f"{wsite}:{central_site}"
-    now = time.time()
-    if cache_key in _central_client_cache:
-        ts, names = _central_client_cache[cache_key]
-        if now - ts < _CENTRAL_CLIENT_CACHE_TTL:
-            return names
-
-    cfg = _central_cfg()
-    if not cfg.get("access_token") and not cfg.get("client_id"):
-        return []
-
-    base_url = cfg["cluster_url"].rstrip("/")
-    headers = _central_headers()
-    names: list[str] = []
-
-    async with httpx.AsyncClient() as client:
-        for path in ["/monitoring/v2/clients/wireless", "/monitoring/v1/clients/wireless"]:
-            for site_param in ["site", "site_name"]:
-                try:
-                    resp = await asyncio.wait_for(
-                        client.get(
-                            f"{base_url}{path}",
-                            headers=headers,
-                            params={site_param: central_site, "limit": 1000},
-                            timeout=10,
-                        ),
-                        timeout=12,
-                    )
-                    if resp.status_code == 401 and _can_refresh():
-                        ok, _ = await _refresh_central_token(client)
-                        if ok:
-                            headers = _central_headers()
-                        resp = await client.get(
-                            f"{base_url}{path}",
-                            headers=headers,
-                            params={site_param: central_site, "limit": 1000},
-                            timeout=10,
-                        )
-                    if resp.status_code == 200:
-                        body = resp.json()
-                        for c in body.get("clients", []):
-                            n = (c.get("name") or c.get("client_name") or
-                                 c.get("username") or "").strip().lower()
-                            if n:
-                                names.append(n)
-                        _central_client_cache[cache_key] = (now, names)
-                        return names
-                    if resp.status_code == 404:
-                        continue
-                except Exception:
-                    pass
-
-    return names
-
-
-@app.get("/api/simulations/{sim_id}/clients")
-async def api_sim_clients(sim_id: str) -> dict[str, Any]:
-    """Return per-client status for one simulation bucket.
-
-    Each client entry includes:
-      - api_online / api_last_seen — from live heartbeats
-      - central_connected — matched by hostname from Central wireless client list
-    """
-    import configparser as _cp
-
-    sim_conf_path = REPO_DIR / "configs" / "simulation.conf"
-    client_conf_path = REPO_DIR / "proxmox" / "client-setup.conf"
-
-    # --- Load simulation profile ---
-    wsite = ""
-    central_site = ""
-    if sim_conf_path.exists():
-        try:
-            p = _cp.ConfigParser()
-            p.read_string(sim_conf_path.read_text(encoding="utf-8"))
-            _merge_ini_override(p, REPO_DIR / "configs" / "hub-sim-overrides.conf")
-            if p.has_section(sim_id):
-                wsite = p.get(sim_id, "wsite", fallback="")
-        except Exception:
-            pass
-
-    central_site = settings.get("site_mappings", {}).get(wsite, "")
-
-    # --- Build configured client list from client-setup.conf ---
-    configured: dict[str, dict[str, Any]] = {}  # hostname → info
-    if client_conf_path.exists():
-        try:
-            cp = _cp.ConfigParser()
-            cp.read_string(client_conf_path.read_text(encoding="utf-8"))
-            vmid_re = re.compile(r"^c(\d+)$")
-            for section in cp.sections():
-                m = vmid_re.match(section)
-                if not m:
-                    continue
-                vmid_str = m.group(1)
-                vm_name = cp.get(section, "vm_name", fallback="").strip()
-                if not vm_name:
-                    continue
-                if f"s{zlib.crc32(vm_name.encode()) % 10}" != sim_id:
-                    continue
-                configured[vm_name] = {
-                    "hostname": vm_name,
-                    "vmid": int(vmid_str),
-                    "api_online": False,
-                    "api_last_seen": None,
-                    "central_connected": None,
-                    "source": "configured",
-                }
-        except Exception:
-            pass
-
-    # --- Overlay live heartbeat data ---
-    async with state_lock:
-        active_snap = {h: dict(c) for h, c in clients.items()}
-
-    for h, c in active_snap.items():
-        if c.get("simulation_id", "") != sim_id:
-            continue
-        online = compute_online(c.get("last_seen", datetime.min.replace(tzinfo=timezone.utc)))
-        last_seen_dt = c.get("last_seen")
-        active_sims = list(c.get("active_simulations", []))
-        if h in configured:
-            configured[h]["api_online"] = online
-            configured[h]["api_last_seen"] = last_seen_dt.isoformat() if last_seen_dt else None
-            configured[h]["active_simulations"] = active_sims
-        else:
-            configured[h] = {
-                "hostname": h,
-                "vmid": None,
-                "api_online": online,
-                "api_last_seen": last_seen_dt.isoformat() if last_seen_dt else None,
-                "active_simulations": active_sims,
-                "central_connected": None,
-                "source": "heartbeat",
-            }
-
-    # --- Match against Central client list ---
-    central_names: list[str] = []
-    if central_site:
-        try:
-            central_names = await asyncio.wait_for(
-                _fetch_central_client_names(wsite, central_site), timeout=15
-            )
-        except Exception:
-            pass
-
-    central_set = {n.lower() for n in central_names}
-    for info in configured.values():
-        if central_set:
-            info["central_connected"] = info["hostname"].lower() in central_set
-        # else leave None (not configured / fetch failed)
-
-    return {
-        "sim_id": sim_id,
-        "wsite": wsite,
-        "central_site": central_site,
-        "central_total": central_wireless_clients.get(wsite, None),
-        "clients": sorted(configured.values(), key=lambda x: x["hostname"]),
-    }
-
-
-@app.get("/api/hardware-alerts")
-async def api_hardware_alerts() -> dict[str, Any]:
-    """Return configured hardware checks merged with current alert device data."""
-    return {"hardware_alerts": _hw_alerts_payload()}
 
 
 
@@ -11884,145 +5230,6 @@ async def _api_health_payload() -> dict[str, Any]:
         "repo_error": repo_state["error"],
         "installer_version": INSTALLER_VERSION,
     }
-
-
-@app.post("/api/sync-now")
-async def api_sync_now() -> dict[str, Any]:
-    """Trigger an immediate GitHub sync outside the normal interval."""
-    if "sync_repo" in background_tasks:
-        background_tasks["sync_repo"].cancel()
-        with contextlib.suppress(asyncio.CancelledError):
-            await background_tasks["sync_repo"]
-    repo_state["synced"] = False
-    repo_state["error"] = None
-    background_tasks["sync_repo"] = asyncio.create_task(sync_repo())
-    await broadcast({"type": "repo_status", "synced": False, "error": None, "last_sync": repo_state["last_sync"]})
-    return {"status": "ok", "message": "GitHub sync started"}
-
-
-@app.get("/api/version")
-async def api_version() -> dict[str, Any]:
-    """Return installed and available installer versions."""
-    return {
-        "status": "ok",
-        "app_version": APP_VERSION,
-        "current_version": update_state["current_version"],
-        "available_version": update_state["available_version"],
-        "update_available": update_state["update_available"],
-        "last_checked": update_state["last_checked"],
-        "update_in_progress": update_state["update_in_progress"],
-        "cswebui_current": update_state.get("cswebui_current") or APP_VERSION,
-        "cswebui_available": update_state.get("cswebui_available"),
-    }
-
-
-@app.post("/api/update-all")
-async def api_update_all() -> dict[str, Any]:
-    """Queue the shared Proxmox update command, then self-update the WebUI."""
-    if update_all_state["running"]:
-        raise HTTPException(status_code=409, detail="Update All already in progress")
-    if update_state["update_in_progress"]:
-        raise HTTPException(status_code=409, detail="WebUI update already in progress")
-    has_approved_agents = bool(approved_proxmox_agents)
-    update_all_state.update({
-        "running": True,
-        "phase": "agents" if has_approved_agents else "webui",
-        "total_agents": 1 if has_approved_agents else 0,
-        "completed_agents": 0,
-        "failed_agents": 0,
-        "agent_cmds": [],
-        "started_at": time.time(),
-        "error": None,
-    })
-    await broadcast({"type": "update_all_progress", **update_all_state})
-    asyncio.create_task(_run_update_all())
-    return {"status": "ok", "message": "Update All started"}
-
-
-@app.post("/api/self-update")
-async def api_self_update() -> dict[str, Any]:
-    """Manually trigger a self-update check and apply if a new version is available."""
-    if update_state["update_in_progress"]:
-        raise HTTPException(status_code=409, detail="Update already in progress")
-    # Sync from GitHub first so version check reflects the latest repo state
-    try:
-        await _sync_repo_now()
-    except Exception as exc:
-        raise HTTPException(status_code=502, detail=f"GitHub sync failed: {exc}") from exc
-    # Now check version against freshly synced repo
-    available = await asyncio.to_thread(_get_repo_version)
-    import datetime
-    update_state["available_version"] = available
-    update_state["last_checked"] = datetime.datetime.now().isoformat(timespec="seconds")
-    update_state["update_available"] = (
-        available is not None and available != update_state["current_version"]
-    )
-    await _broadcast_update_state()
-    if not update_state["update_available"]:
-        return {"status": "ok", "message": f"Already up to date (v{update_state['current_version']})"}
-    asyncio.create_task(_run_self_update())
-    return {"status": "ok", "message": f"Update to v{available} started — service will restart shortly"}
-
-
-@app.post("/api/refresh-webui")
-async def api_refresh_webui() -> dict[str, Any]:
-    """Download and apply the latest cs-webui frontend files (app.js, style.css, index.html)
-    without a full reinstall or service restart.  The browser just needs a hard-refresh
-    (Ctrl+Shift+R) after this returns to pick up the new files."""
-    try:
-        await asyncio.wait_for(refresh_webui_frontend(), timeout=60)
-    except asyncio.TimeoutError:
-        raise HTTPException(status_code=504, detail="Frontend refresh timed out")
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=str(exc)) from exc
-    local_ver: str | None = None
-    try:
-        local_ver = (STATIC_DIR / "VERSION").read_text(encoding="utf-8").strip()
-    except Exception:
-        pass
-    return {"status": "ok", "version": local_ver, "message": f"Frontend updated to v{local_ver} — do a hard-refresh (Ctrl+Shift+R)"}
-
-
-
-
-@app.get("/api/acme")
-async def api_acme_get() -> dict[str, Any]:
-    cfg = spoke_acme.load_acme_config()
-    data = _public_acme_settings(cfg)
-    data["cert_info"] = spoke_acme.get_cert_info()
-    data["spoke_tls"] = settings.get("spoke_tls", "off")
-    return data
-
-
-@app.post("/api/acme")
-async def api_acme_update(payload: dict[str, Any]) -> dict[str, Any]:
-    existing = spoke_acme.load_acme_config()
-    incoming_credentials = payload.get("dns_credentials") or {}
-    merged_credentials = dict(existing.dns_credentials or {})
-    for key, value in incoming_credentials.items():
-        if value in (None, "***"):
-            continue
-        merged_credentials[key] = value
-    cfg = spoke_acme.AcmeConfig(
-        enabled=bool(payload.get("enabled", existing.enabled)),
-        domain=str(payload.get("domain", existing.domain) or "").strip(),
-        email=str(payload.get("email", existing.email) or "").strip(),
-        challenge=str(payload.get("challenge", existing.challenge) or existing.challenge),
-        ca=str(payload.get("ca", existing.ca) or existing.ca),
-        dns_provider=str(payload.get("dns_provider", existing.dns_provider) or "").strip(),
-        dns_credentials=merged_credentials,
-        last_renewed=existing.last_renewed,
-        last_error=existing.last_error,
-        cert_expiry=existing.cert_expiry,
-    )
-    spoke_acme.save_acme_config(cfg)
-    if "spoke_tls" in payload:
-        settings["spoke_tls"] = _normalize_toggle(payload.get("spoke_tls"))
-        _save_settings()
-    data = _public_acme_settings(cfg)
-    data["cert_info"] = spoke_acme.get_cert_info()
-    data["spoke_tls"] = settings.get("spoke_tls", "off")
-    return data
 
 
 async def _run_acme_request() -> None:
@@ -12049,265 +5256,8 @@ async def _run_acme_request() -> None:
         await broadcast({"type": "acme_status", **_acme_status})
 
 
-@app.post("/api/acme/request")
-async def api_acme_request() -> dict[str, Any]:
-    if _acme_status.get("running"):
-        return {"status": "running"}
-    asyncio.create_task(_run_acme_request())
-    return {"status": "started"}
-
-
-@app.get("/api/acme/status")
-async def api_acme_status() -> dict[str, Any]:
-    return dict(_acme_status)
-
-
-@app.get("/api/config", response_class=PlainTextResponse)
-async def api_config(hostname: str | None = Query(default=None)) -> str:
-    config_path = repo_path("configs", "simulation.conf")
-    config_text = config_path.read_text(encoding="utf-8")
-
-    # Apply hub-managed override (hub-connected mode) by serialising the merged parser back to text
-    hub_override_path = REPO_DIR / "configs" / "hub-sim-overrides.conf"
-    if hub_override_path.exists():
-        try:
-            parser = configparser.ConfigParser()
-            parser.optionxform = str
-            parser.read_string(config_text)
-            _merge_ini_override(parser, hub_override_path)
-            import io as _io
-            buf = _io.StringIO()
-            parser.write(buf)
-            config_text = buf.getvalue()
-        except Exception as exc:
-            logger.warning("Could not apply hub-sim-overrides for /api/config: %s", exc)
-
-    if not hostname:
-        return config_text
-
-    async with state_lock:
-        client = clients.get(hostname)
-        if not client or not client.get("overrides"):
-            return config_text
-        return apply_overrides(config_text, client)
-
-
-@app.get("/api/config/overrides", response_class=PlainTextResponse)
-async def api_config_overrides() -> str:
-    overrides_path = repo_path("configs", "user-overrides.conf")
-    base_text = overrides_path.read_text(encoding="utf-8") if overrides_path.exists() else ""
-    # Apply hub-managed user-overrides on top
-    hub_override_path = REPO_DIR / "configs" / "hub-user-overrides.conf"
-    if hub_override_path.exists():
-        try:
-            parser = configparser.ConfigParser()
-            parser.optionxform = str
-            parser.read_string(base_text)
-            _merge_ini_override(parser, hub_override_path)
-            import io as _io
-            buf = _io.StringIO()
-            parser.write(buf)
-            return buf.getvalue()
-        except Exception as exc:
-            logger.warning("Could not apply hub-user-overrides for /api/config/overrides: %s", exc)
-    return base_text
-
-
-@app.get("/api/config/parsed")
-async def api_config_parsed() -> dict[str, dict[str, str]]:
-    config_path = repo_path("configs", "simulation.conf")
-    parser = configparser.ConfigParser()
-    parser.optionxform = str
-    parser.read(config_path, encoding="utf-8")
-    _merge_ini_override(parser, REPO_DIR / "configs" / "hub-sim-overrides.conf")
-    return {section: dict(parser.items(section)) for section in parser.sections()}
-
-
-@app.post("/api/config/simulation")
-async def api_config_simulation(update: SimulationConfigUpdate) -> dict[str, Any]:
-    section = update.section.strip()
-    if section not in ALLOWED_CONFIG_SECTIONS:
-        raise HTTPException(status_code=422, detail="Invalid section name")
-
-    config_path = repo_path("configs", "simulation.conf")
-    updates = {str(key).strip(): str(value) for key, value in update.updates.items() if str(key).strip()}
-    await asyncio.to_thread(_update_ini_section, config_path, section, updates)
-
-    pushed = False
-    try:
-        async with _git_lock:
-            pushed = await asyncio.to_thread(
-                _push_to_github,
-                ["configs/simulation.conf"],
-                f"WebUI: update [{section}] settings",
-            )
-    except ValueError:
-        pushed = False
-
-    # When the kill switch is turned OFF, immediately push the change down to
-    # all clients via the command inbox so they don't stay stuck in the
-    # kill-switch loop waiting for their next exec-restart cycle (up to 5 min).
-    # IMPORTANT: expand "all" to per-client commands at creation time — the
-    # inbox filter matches exact hostname, so a single target="all" command
-    # would never be delivered to any client.
-    if section == "simulation" and updates.get("kill_switch") == "off":
-        async with state_lock:
-            known = list(clients.keys())
-            targets = known or ["all"]
-            for hostname in targets:
-                _enqueue_command_locked(hostname, "kill_switch", {"value": "off"})
-            serialized = _serialize_commands()
-        await broadcast({"type": "commands_update", "commands": serialized})
-        await _push_pending_commands_for_targets(targets)
-
-    return {"status": "ok", "pushed": pushed}
-
-
-@app.post("/api/config/overrides/save")
-async def api_config_overrides_save(update: OverridesSaveRequest) -> dict[str, Any]:
-    ensure_repo_ready()
-    username = update.username.strip()
-    if not username:
-        raise HTTPException(status_code=422, detail="Username is required")
-
-    overrides_path = REPO_DIR / "configs" / "user-overrides.conf"
-    section = "simulation" if username == "__global__" else username
-    flags = {str(key).strip(): str(value) for key, value in update.flags.items() if str(key).strip()}
-    await asyncio.to_thread(_update_ini_section, overrides_path, section, flags)
-
-    pushed = False
-    try:
-        async with _git_lock:
-            pushed = await asyncio.to_thread(
-                _push_to_github,
-                ["configs/user-overrides.conf"],
-                f"WebUI: update overrides for {username}",
-            )
-    except ValueError:
-        pushed = False
-
-    return {"status": "ok", "pushed": pushed}
-
-
-@app.get("/api/config/user-overrides-conf")
-async def api_get_user_overrides_conf() -> dict[str, str]:
-    """Return user-overrides.conf content as JSON {content, mode}."""
-    overrides_path = REPO_DIR / "configs" / "user-overrides.conf"
-    content = overrides_path.read_text(encoding="utf-8") if overrides_path.exists() else ""
-    return {
-        "content": content,
-        "mode": "local",
-        "fetched_at": datetime.now(timezone.utc).isoformat(),
-    }
-
-
 class ConfOverrideBody(BaseModel):
     content: str  # Raw INI text, same format as the target .conf file
-
-
-@app.put("/api/config/user-overrides-conf")
-async def api_put_user_overrides_conf(body: ConfOverrideBody) -> dict[str, Any]:
-    """Write the entire user-overrides.conf and push to GitHub."""
-    ensure_repo_ready()
-    overrides_path = REPO_DIR / "configs" / "user-overrides.conf"
-    overrides_path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = overrides_path.with_suffix(".tmp")
-    tmp.write_text(body.content, encoding="utf-8")
-    tmp.replace(overrides_path)
-    pushed = False
-    try:
-        async with _git_lock:
-            pushed = await asyncio.to_thread(
-                _push_to_github,
-                ["configs/user-overrides.conf"],
-                "WebUI: update user-overrides.conf",
-            )
-    except ValueError:
-        pushed = False
-    return {"ok": True, "pushed": pushed}
-
-
-@app.get("/api/config/hub-sim-override", response_class=PlainTextResponse)
-async def api_get_hub_sim_override() -> str:
-    """Return the current hub-managed simulation.conf override, or empty string."""
-    p = REPO_DIR / "configs" / "hub-sim-overrides.conf"
-    return p.read_text(encoding="utf-8") if p.exists() else ""
-
-
-@app.put("/api/config/hub-sim-override")
-async def api_set_hub_sim_override(body: ConfOverrideBody) -> dict[str, Any]:
-    """Write hub-managed simulation.conf override locally (standalone mode).
-
-    In hub-connected mode this file is managed by the hub via config_update;
-    this endpoint supports direct editing from the spoke UI when disconnected.
-    """
-    ensure_repo_ready()
-    p = REPO_DIR / "configs" / "hub-sim-overrides.conf"
-    p.parent.mkdir(parents=True, exist_ok=True)
-    tmp = p.with_suffix(".tmp")
-    tmp.write_text(body.content, encoding="utf-8")
-    tmp.replace(p)
-    _sim_conf_cache["sim_mtime"] = -1.0  # Invalidate cache
-    return {"ok": True}
-
-
-@app.delete("/api/config/hub-sim-override")
-async def api_clear_hub_sim_override() -> dict[str, Any]:
-    """Remove hub-managed simulation.conf override — reverts to GitHub file."""
-    p = REPO_DIR / "configs" / "hub-sim-overrides.conf"
-    if p.exists():
-        p.unlink()
-    _sim_conf_cache["sim_mtime"] = -1.0
-    return {"ok": True, "cleared": True}
-
-
-@app.get("/api/config/hub-user-override", response_class=PlainTextResponse)
-async def api_get_hub_user_override() -> str:
-    """Return the current hub-managed user-overrides.conf override, or empty string."""
-    p = REPO_DIR / "configs" / "hub-user-overrides.conf"
-    return p.read_text(encoding="utf-8") if p.exists() else ""
-
-
-@app.put("/api/config/hub-user-override")
-async def api_set_hub_user_override(body: ConfOverrideBody) -> dict[str, Any]:
-    """Write hub-managed user-overrides.conf override locally (standalone mode)."""
-    ensure_repo_ready()
-    p = REPO_DIR / "configs" / "hub-user-overrides.conf"
-    p.parent.mkdir(parents=True, exist_ok=True)
-    tmp = p.with_suffix(".tmp")
-    tmp.write_text(body.content, encoding="utf-8")
-    tmp.replace(p)
-    return {"ok": True}
-
-
-@app.delete("/api/config/hub-user-override")
-async def api_clear_hub_user_override() -> dict[str, Any]:
-    """Remove hub-managed user-overrides.conf override — reverts to GitHub file."""
-    p = REPO_DIR / "configs" / "hub-user-overrides.conf"
-    if p.exists():
-        p.unlink()
-    return {"ok": True, "cleared": True}
-
-
-@app.get("/api/scripts/list")
-async def api_scripts_list(platform: str = Query(...)) -> list[str]:
-    platform = validate_platform(platform)
-    scripts_dir = repo_path(platform)
-    if not scripts_dir.is_dir():
-        raise HTTPException(status_code=404, detail=f"Script directory not found for {platform}")
-    return sorted(path.name for path in scripts_dir.iterdir() if path.is_file())
-
-
-@app.get("/api/scripts/{platform}/{filename}")
-async def api_scripts_get(platform: str, filename: str) -> FileResponse:
-    platform = validate_platform(platform)
-    scripts_dir = repo_path(platform).resolve()
-    candidate = (scripts_dir / filename).resolve()
-
-    if candidate.parent != scripts_dir or not candidate.is_file():
-        raise HTTPException(status_code=404, detail="Script file not found")
-
-    return FileResponse(candidate)
 
 
 async def _apply_client_status(status: ClientStatus) -> tuple[dict[str, Any], bool, dict[str, Any] | None]:
@@ -12374,79 +5324,6 @@ async def _apply_client_status(status: ClientStatus) -> tuple[dict[str, Any], bo
         payload = serialize_client(status.hostname, clients[status.hostname])
 
     return payload, watchdog_changed, None
-
-
-@app.post("/api/status")
-async def api_status(status: ClientStatus) -> dict[str, Any]:
-    payload, watchdog_changed, ignored = await _apply_client_status(status)
-    if ignored is not None:
-        return ignored
-    await broadcast({"type": "status_update", "client": payload})
-    if watchdog_changed:
-        await _broadcast_proxmox_state()
-    asyncio.create_task(_sync_sim_tags_for_client(status.hostname))
-    return {"status": "ok", "client": payload, "throttle_interval": _server_pressure["throttle_interval"]}
-
-
-@app.get("/api/client/key")
-async def api_client_key() -> dict[str, str]:
-    """Return the shared client API key so agents can authenticate to /ws/client.
-    This endpoint is intentionally public — agents need the key before they can connect.
-    The spoke URL itself acts as the first factor of access control."""
-    return {"client_api_key": str(settings.get("client_api_key", "") or "")}
-
-
-@app.get("/api/clients")
-async def api_clients() -> list[dict[str, Any]]:
-    return await current_clients()
-
-
-@app.delete("/api/clients/history")
-async def api_purge_client_history() -> dict[str, Any]:
-    """Purge all persisted client records (in-memory and on disk)."""
-    async with state_lock:
-        clients.clear()
-    await asyncio.to_thread(_save_client_history)
-    await broadcast({"type": "clients_purged"})
-    logger.info("Client history purged by user request")
-    return {"status": "ok", "message": "Client history cleared"}
-
-
-@app.post("/api/clients/{hostname}/control", response_model=ClientControlResponse)
-async def api_client_control(hostname: str, overrides: dict[str, str]) -> dict[str, Any]:
-    normalized = {key: str(value) for key, value in overrides.items()}
-    async with state_lock:
-        if hostname not in clients:
-            raise HTTPException(status_code=404, detail="Client not found")
-        clients[hostname].setdefault("overrides", {}).update(normalized)
-        payload = serialize_client(hostname, clients[hostname])
-
-    await broadcast({"type": "overrides_update", "client": payload})
-    return {"hostname": hostname, "overrides": payload["overrides"], "client": payload}
-
-
-@app.delete("/api/clients/{hostname}/control", response_model=ClientControlResponse)
-async def api_client_control_clear(hostname: str) -> dict[str, Any]:
-    async with state_lock:
-        if hostname not in clients:
-            raise HTTPException(status_code=404, detail="Client not found")
-        clients[hostname]["overrides"] = {}
-        payload = serialize_client(hostname, clients[hostname])
-
-    await broadcast({"type": "overrides_cleared", "client": payload})
-    return {"hostname": hostname, "overrides": {}, "client": payload}
-
-
-@app.post("/api/clients/all/control")
-async def api_all_clients_control(overrides: dict[str, str]) -> dict[str, Any]:
-    normalized = {key: str(value) for key, value in overrides.items()}
-    async with state_lock:
-        for client in clients.values():
-            client.setdefault("overrides", {}).update(normalized)
-        updated = len(clients)
-
-    await broadcast_full_state()
-    return {"status": "ok", "updated": updated, "overrides": normalized}
 
 
 # ── Demo Scenario System ──────────────────────────────────────────────────────
@@ -12592,560 +5469,6 @@ async def _stream_keepalive() -> str:
     return ": keepalive\n\n"
 
 
-@app.get("/api/logs/history")
-async def api_logs_history(
-    lines: int = Query(default=300, ge=10, le=2000),
-    source: str = Query(default="journal"),
-):
-    """Return the last N lines from the selected log source."""
-    source = _normalize_log_source(source)
-    try:
-        if source == "agent":
-            log_lines = proxmox_log_buffer[-lines:]
-            if not log_lines:
-                log_lines = [_log_source_hint("agent")]
-            return PlainTextResponse("\n".join(log_lines))
-
-        if source in {"install", "watchdog"}:
-            log_path = INSTALL_LOG_PATH if source == "install" else WATCHDOG_LOG_PATH
-            if not log_path.exists():
-                return PlainTextResponse(_log_source_hint(source))
-            proc = await asyncio.create_subprocess_exec(
-                "tail", "-n", str(lines), str(log_path),
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.DEVNULL,
-            )
-        else:
-            proc = await asyncio.create_subprocess_exec(
-                "journalctl", "-u", JOURNAL_UNIT, "--no-pager", "-n", str(lines),
-                "--output=short-iso",
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-            )
-        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=10)
-        text = stdout.decode("utf-8", errors="replace").strip()
-        if proc.returncode != 0 and not text:
-            detail = stderr.decode("utf-8", errors="replace").strip() or None
-            return PlainTextResponse(_log_source_hint(source, detail))
-        return PlainTextResponse(text or _log_source_hint(source))
-    except HTTPException:
-        raise
-    except Exception as exc:
-        return PlainTextResponse(_log_source_hint(source, str(exc)))
-
-
-@app.get("/api/logs/stream")
-async def api_logs_stream(source: str = Query(default="journal")):
-    """Server-Sent Events stream of live log output."""
-    source = _normalize_log_source(source)
-
-    async def generate():
-        yield "retry: 5000\n\n"
-
-        if source == "agent":
-            last_index = len(proxmox_log_buffer)
-            hinted_empty = False
-            while True:
-                current_len = len(proxmox_log_buffer)
-                if current_len < last_index:
-                    last_index = 0
-                if current_len > last_index:
-                    for line in proxmox_log_buffer[last_index:current_len]:
-                        yield _encode_sse_line(str(line))
-                    last_index = current_len
-                    hinted_empty = False
-                    continue
-                if current_len == 0 and not hinted_empty:
-                    hinted_empty = True
-                    yield _encode_sse_line(_log_source_hint("agent"))
-                yield await _stream_keepalive()
-                await asyncio.sleep(LOG_STREAM_POLL_SECS)
-
-        if source == "install" and not INSTALL_LOG_PATH.exists():
-            yield _encode_sse_line(_log_source_hint("install"))
-
-        proc = None
-        idle_deadline = time.monotonic() + 30
-        try:
-            if source == "install":
-                proc = await asyncio.create_subprocess_exec(
-                    "tail", "-n", "0", "-F", str(INSTALL_LOG_PATH),
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.DEVNULL,
-                )
-            else:
-                proc = await asyncio.create_subprocess_exec(
-                    "journalctl", "-u", JOURNAL_UNIT, "-f", "--no-pager", "-n", "0",
-                    "--output=short-iso",
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.PIPE,
-                )
-        except Exception:
-            yield "event: error\ndata: Log stream failed\n\n"
-            return
-
-        try:
-            while True:
-                try:
-                    line = await asyncio.wait_for(proc.stdout.readline(), timeout=LOG_STREAM_KEEPALIVE_SECS)
-                except asyncio.TimeoutError:
-                    if time.monotonic() >= idle_deadline:
-                        yield "event: end\ndata: Log stream idle timeout\n\n"
-                        return
-                    yield ": keepalive\n\n"
-                    continue
-                if line:
-                    idle_deadline = time.monotonic() + 30
-                    text = line.decode("utf-8", errors="replace").rstrip("\n")
-                    if text:
-                        yield _encode_sse_line(text)
-                    continue
-                detail = None
-                if source == "journal" and proc.stderr is not None:
-                    detail = (await proc.stderr.read()).decode("utf-8", errors="replace").strip() or None
-                terminal = _log_source_hint(source, detail)
-                yield f"event: end\ndata: {terminal}\n\n"
-                return
-        finally:
-            if proc is not None and proc.returncode is None:
-                with contextlib.suppress(Exception):
-                    proc.kill()
-
-    return StreamingResponse(generate(), media_type="text/event-stream",
-                             headers={"Cache-Control": "no-cache",
-                                      "X-Accel-Buffering": "no"})
-
-
-@app.get("/api/init")
-async def api_init() -> dict[str, Any]:
-    """Single endpoint that returns all state needed for initial page render.
-    Replaces 5+ separate REST calls made on page load."""
-    cfg = dict(settings["central_config"])
-    for secret_key in ("client_secret", "access_token", "refresh_token"):
-        cfg.pop(secret_key, None)
-    cfg["access_token_configured"] = bool(settings["central_config"].get("access_token") or central_token.get("access_token"))
-    cfg["refresh_token_configured"] = bool(settings["central_config"].get("refresh_token") or central_token.get("refresh_token"))
-    cfg["client_secret_configured"] = bool(settings["central_config"].get("client_secret"))
-    return {
-        "mode": "spoke",
-        "proxmox": _proxmox_status_payload(),
-        "settings": {
-            "central_api": _public_central_api_settings(),
-            "central_config": cfg,
-            "relay_enabled": settings.get("relay_enabled", "off"),
-            "relay_server_url": settings.get("relay_server_url", ""),
-            "hub_tls_verify": settings.get("hub_tls_verify", "off"),
-            "hub_managed": bool(settings.get("hub_managed", False)),
-            "hub_isolation_timeout": int(settings.get("hub_isolation_timeout", 3600)),  # Include the timeout in init settings so the setup form has the correct safeguard value before a separate settings fetch finishes.
-            "proxmox_config": copy.deepcopy(settings.get("proxmox_config") or {}),
-        },
-        "reclone": dict(reclone_state),
-        "update_all": dict(update_all_state),
-        "central": {
-            "status": _central_status_payload(),
-            "wireless_clients": dict(central_wireless_clients),
-            "hardware_alerts": _hw_alerts_payload(),
-            "client_count_status": _client_count_payload(),
-            "token_valid": bool(central_token.get("access_token") and time.time() < central_token.get("expires_at", 0)),
-            "token_state": _central_token_state(),
-        },
-        "relay": _relay_status_payload(),
-        "installer_version": INSTALLER_VERSION,
-        "app_version": APP_VERSION,
-        "hostname": socket.gethostname(),
-        "kill_switch": gkill_switch_state["value"],
-        "local_kill_switch": _read_local_kill_switch(),
-    }
-
-
-@app.get("/api/health")
-async def api_health() -> dict[str, Any]:
-    return await _api_health_payload()
-
-
-@app.get("/api/debug")
-async def api_debug() -> dict[str, Any]:
-    """Server-side debug event log for diagnosing connectivity issues."""
-    import datetime as _dt
-    return {
-        "server_start": _server_start_time,
-        "server_uptime_s": round(time.time() - _server_start_time),
-        "proxmox_connected": proxmox_state.get("connected"),
-        "proxmox_last_seen": proxmox_state.get("last_seen"),
-        "relay_connected": relay_state.get("connected"),
-        "relay_last_sync": relay_state.get("last_sync"),
-        "relay_error": relay_state.get("error"),
-        "events": list(reversed(_debug_log)),
-    }
-
-
-@app.get("/api/debug/command-trace")
-async def api_debug_command_trace() -> dict[str, Any]:
-    """Returns the last 300 command relay events for diagnosing hub→spoke→agent pipeline issues."""
-    async with state_lock:
-        cmds_snapshot = list(_serialize_commands())
-    agent_connected = proxmox_ws_connection is not None
-    return {
-        "agent_connected": agent_connected,
-        "agent_hostname": proxmox_ws_hostname,
-        "command_queue": cmds_snapshot,
-        "trace": list(reversed(_command_trace)),
-    }
-
-
-@app.get("/api/services/status")
-async def api_services_status() -> dict[str, Any]:
-    return {
-        "tasks": service_health,
-        "task_names": list(background_tasks.keys()),
-    }
-
-
-# ── System health & service control ───────────────────────────────────────────
-
-@app.get("/api/system/health")
-async def api_system_health(request: Request) -> dict[str, Any]:
-    """LXC host resource snapshot + service status + Proxmox install command."""
-    import shutil as _shutil
-
-    # Disk
-    try:
-        disk = _shutil.disk_usage(BASE_DIR)
-        disk_info = {"total": disk.total, "used": disk.used, "free": disk.free}
-    except Exception:
-        disk_info = {"total": 0, "used": 0, "free": 0}
-
-    # Memory via /proc/meminfo
-    mem: dict[str, int] = {}
-    try:
-        for line in Path("/proc/meminfo").read_text(encoding="utf-8").splitlines():
-            if ":" in line:
-                k, v = line.split(":", 1)
-                try:
-                    mem[k.strip()] = int(v.strip().split()[0])
-                except (ValueError, IndexError):
-                    pass
-    except Exception:
-        pass
-    mem_total = mem.get("MemTotal", 0)
-    mem_avail = mem.get("MemAvailable", 0)
-    mem_info = {"total_kb": mem_total, "available_kb": mem_avail,
-                "used_kb": mem_total - mem_avail}
-
-    # Load average
-    try:
-        load_parts = Path("/proc/loadavg").read_text(encoding="utf-8").split()
-        load = load_parts[:3]
-    except Exception:
-        load = ["?", "?", "?"]
-
-    # Uptime seconds
-    try:
-        uptime_secs = float(Path("/proc/uptime").read_text(encoding="utf-8").split()[0])
-    except Exception:
-        uptime_secs = 0.0
-
-    # Service active state
-    try:
-        proc = await asyncio.create_subprocess_shell(
-            "systemctl is-active client-sim-dashboard 2>/dev/null || echo inactive",
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.DEVNULL,
-        )
-        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=5)
-        svc_status = stdout.decode().strip()
-    except Exception:
-        svc_status = "unknown"
-
-    # Pre-built Proxmox agent install command
-    base = str(request.base_url).rstrip("/")
-    raw_base = REPO_URL.replace(".git", "").replace(
-        "github.com", "raw.githubusercontent.com"
-    )
-    branch = os.environ.get("REPO_BRANCH", "main")
-    install_cmd = (
-        f"bash <(curl -sSL {raw_base}/{branch}/proxmox/install-proxmox-agent.sh)"
-        f" --server {base}"
-    )
-
-    return {
-        "disk": disk_info,
-        "memory": mem_info,
-        "load": load,
-        "uptime_secs": uptime_secs,
-        "service_status": svc_status,
-        "proxmox_install_cmd": install_cmd,
-    }
-
-
-@app.get("/api/qa/summary")
-async def api_qa_summary() -> dict[str, Any]:
-    """Spoke-level QA summary: dongles, VMs, reporting clients, and pass/fail.
-
-    Cross-references USB dongle count against provisioned VMs and actively
-    reporting clients so Copilot (or any automated check) can assert the full
-    auto-provisioning pipeline is healthy on this spoke.
-    """
-    async with state_lock:
-        proxmox_connected = bool(proxmox_state.get("connected", False))
-        present_usb: list[Any] = list(proxmox_state.get("present_usb") or [])
-        usb_state: list[Any] = list(proxmox_state.get("usb_state") or [])
-        vms: list[Any] = list(proxmox_state.get("vms") or [])
-        reporting_clients = len(clients)
-
-    dongle_count = len(present_usb) if present_usb else len(usb_state)
-    # Only count sim-client VMs — those with a USB dongle assigned (in usb_state).
-    # Templates, IoT VMs, and other non-sim VMs must not be included in this total.
-    usb_vmids = {str(e.get("vmid")) for e in usb_state if e.get("vmid") is not None}
-    sim_vm_count = sum(1 for vm in vms if str(vm.get("vmid", "")) in usb_vmids)
-    auto_provision = _normalize_toggle(settings.get("usb_auto_provision", "off")) == "on"
-
-    issues: list[str] = []
-    if not proxmox_connected:
-        issues.append("Proxmox agent is not connected")
-    if auto_provision and dongle_count > 0 and sim_vm_count != dongle_count:
-        issues.append(
-            f"VM count ({sim_vm_count}) does not match dongle count ({dongle_count})"
-        )
-    if dongle_count > 0 and reporting_clients != dongle_count:
-        issues.append(
-            f"reporting clients ({reporting_clients}) does not match dongle count ({dongle_count})"
-        )
-
-    return {
-        "proxmox_agent_connected": proxmox_connected,
-        "dongle_count": dongle_count,
-        "vm_count": sim_vm_count,
-        "total_vm_count": len(vms),
-        "reporting_clients": reporting_clients,
-        "auto_provision": auto_provision,
-        "pass": len(issues) == 0,
-        "issues": issues,
-    }
-
-
-@app.post("/api/service/{action}")
-async def api_service_control(action: str) -> dict[str, Any]:
-    """Start, stop, or restart the client-sim-dashboard service."""
-    if action not in ("start", "stop", "restart"):
-        raise HTTPException(status_code=400, detail="action must be start, stop, or restart")
-    try:
-        proc = await asyncio.create_subprocess_shell(
-            f"sudo -n systemctl {action} client-sim-dashboard",
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=15)
-        rc = proc.returncode or 0
-    except asyncio.TimeoutError:
-        return {"status": "timeout",
-                "message": f"systemctl {action} timed out — service may be restarting"}
-    except Exception as exc:
-        return {"status": "error", "message": str(exc)}
-
-    if rc != 0:
-        return {"status": "error",
-                "message": stderr.decode().strip() or f"exit code {rc}"}
-    return {"status": "ok", "message": f"Service {action} sent"}
-
-
-# ── Cache-clear endpoints ──────────────────────────────────────────────────────
-
-@app.post("/api/server/clear-cache")
-async def api_server_clear_cache() -> dict[str, Any]:
-    """Reset all server-side in-memory state (Proxmox, reclone, commands, update-all).
-    Does not restart the service — the UI will receive fresh empty state via WS broadcast."""
-    global _prev_usb_by_vmid
-    async with state_lock:
-        proxmox_state.update({
-            "connected": False, "last_seen": None, "node": {}, "vms": [],
-            "unknown_usb": [], "usb_state": [], "present_usb": [],
-            "agent_version": None, "pve_version": None, "template_lock": "",
-            "prov_summary": None, "prov_run": _default_provision_run_state(),
-        })
-        _prev_usb_by_vmid = {}  # clear transition-detection snapshot so no phantom "failed" on next telemetry
-        proxmox_log_buffer.clear()
-        pending_proxmox_agents.clear()
-        commands.clear()
-        await _async_save_commands()
-        reclone_state.update({
-            "status": "idle", "type": None, "total": 0, "completed": 0,
-            "failed": 0, "current_vm": None, "log": [], "auto_recovery_log": [],
-            "last_run": None, "started_at": None,
-        })
-        update_all_state.update({
-            "running": False, "phase": "idle", "total_agents": 0,
-            "completed_agents": 0, "failed_agents": 0, "agent_cmds": [],
-            "started_at": None, "error": None,
-        })
-
-    await broadcast({"type": "proxmox_update", **_proxmox_status_payload()})
-    await _broadcast_reclone_state()
-    await broadcast({"type": "update_all_progress", **update_all_state})
-    await broadcast({"type": "commands_update", "commands": []})
-    logger.info("Server cache cleared by user request")
-    return {"status": "ok", "message": "Server cache cleared"}
-
-
-@app.post("/api/proxmox/autoprov/reset")
-async def api_autoprov_reset() -> dict[str, Any]:
-    """Reset auto-provisioning run state and summary without clearing all server state.
-    Use when the provisioning panel is stuck showing in-progress after completion."""
-    async with state_lock:
-        proxmox_state["prov_run"] = _default_provision_run_state()
-        proxmox_state["prov_summary"] = None
-    logger.info("Auto-provisioning status manually reset via API")
-    return {"ok": True}
-
-
-@app.post("/api/setup/clear-cache")
-async def api_setup_clear_cache() -> dict[str, Any]:
-    """Wipe all cached files, re-clone the repo, clear in-memory client/central state,
-    then restart the WebUI service so it starts completely fresh."""
-    import shutil
-
-    # 1. Delete cached data files
-    for path in [
-        CLIENT_HISTORY_FILE,
-        STATE_CACHE_FILE,
-        COMMAND_QUEUE_FILE,
-        RECLONE_STATE_FILE,
-        RELAY_STATE_FILE,
-        UPDATE_STATE_FILE,
-        HISTORY_FILE,
-        CLIENT_COUNT_BASELINE_FILE,
-    ]:
-        try:
-            path.unlink(missing_ok=True)
-        except Exception:
-            pass
-
-    # 2. Clear in-memory state
-    async with state_lock:
-        clients.clear()
-    async with history_lock:
-        central_history.clear()
-    central_wireless_clients.clear()
-
-    # 3. Remove any stale git lock and wipe + re-clone the repo
-    async with _git_lock:
-        lock_file = REPO_DIR / ".git" / "index.lock"
-        lock_file.unlink(missing_ok=True)
-        try:
-            shutil.rmtree(REPO_DIR, ignore_errors=True)
-        except Exception as exc:
-            logger.warning("clear-cache: could not remove REPO_DIR: %s", exc)
-        try:
-            await asyncio.to_thread(sync_repo_once)
-            repo_state["synced"] = True
-            repo_state["error"] = None
-            repo_state["last_sync"] = time.time()
-        except Exception as exc:
-            logger.warning("clear-cache: re-clone failed: %s", exc)
-            repo_state["error"] = str(exc)
-
-    logger.info("Setup cache cleared by user request — restarting service")
-    await broadcast({"type": "notification", "level": "info",
-                     "message": "Cache cleared — service restarting in 2 seconds…"})
-
-    # 4. Restart the service after a short delay so the response can be sent
-    async def _delayed_restart() -> None:
-        await asyncio.sleep(2)
-        try:
-            await asyncio.create_subprocess_shell(
-                "sudo -n systemctl restart client-sim-dashboard",
-                stdout=asyncio.subprocess.DEVNULL,
-                stderr=asyncio.subprocess.DEVNULL,
-            )
-        except Exception as exc:
-            logger.error("clear-cache: restart failed: %s", exc)
-
-    asyncio.create_task(_delayed_restart())
-    return {"status": "ok", "message": "Cache cleared — service restarting"}
-
-
-@app.get("/api/kill-switch", response_class=PlainTextResponse)
-async def api_kill_switch() -> str:
-    """Return the current global kill switch value ('on' or 'off').
-    Clients should poll this as their primary source — always fetched from
-    solutions-hpe/main so no fork can override it."""
-    return gkill_switch_state["value"]
-
-
-@app.get("/api/kill-switch/status")
-async def api_kill_switch_status() -> dict[str, Any]:
-    """Return full gkill_switch state for the WebUI dashboard."""
-    return {
-        "value": gkill_switch_state["value"],
-        "last_fetched": gkill_switch_state["last_fetched"],
-        "error": gkill_switch_state["error"],
-    }
-
-
-@app.post("/api/commands")
-async def create_command(body: dict[str, Any] = Body(...)) -> dict[str, Any]:
-    """Queue a command for one device, all clients, or the proxmox agent."""
-    target = str(body.get("target", "")).strip()
-    action = _normalize_command_action(body.get("action", ""))
-    args = body.get("args", {})
-    command_type = _normalize_command_type(body.get("type"))
-
-    if not target or not action:
-        raise HTTPException(status_code=422, detail="target and action are required")
-    if args is None:
-        args = {}
-    if not isinstance(args, dict):
-        raise HTTPException(status_code=422, detail="args must be an object")
-
-    new_cmds: list[dict[str, Any]] = []
-    deduped = 0
-
-    async with state_lock:
-        expired, purged = _cleanup_commands_locked()
-        if target == "all":
-            known = list(clients.keys())
-            if not known:
-                raise HTTPException(status_code=400, detail="No clients registered yet")
-            for hostname in known:
-                cmd, created, _expired, _purged = _enqueue_command_locked(hostname, action, args, command_type=command_type)
-                if created:
-                    new_cmds.append(cmd)
-                else:
-                    deduped += 1
-        elif target == "proxmox":
-            cmd, created, _expired, _purged = _enqueue_command_locked(target, action, args, command_type=command_type)
-            if created:
-                new_cmds.append(cmd)
-            else:
-                deduped += 1
-        else:
-            if target not in clients:
-                raise HTTPException(status_code=404, detail="Client not found")
-            cmd, created, _expired, _purged = _enqueue_command_locked(target, action, args, command_type=command_type)
-            if created:
-                new_cmds.append(cmd)
-            else:
-                deduped += 1
-        serialized = _serialize_commands()
-
-    if new_cmds or expired or purged:
-        await broadcast({"type": "commands_update", "commands": serialized})
-    if new_cmds:
-        await _push_pending_commands_for_targets([cmd["target"] for cmd in new_cmds])
-    return {"queued": len(new_cmds), "deduped": deduped, "ids": [c["id"] for c in new_cmds]}
-
-
-@app.get("/api/commands")
-async def list_commands() -> list[dict[str, Any]]:
-    """Return the current in-memory command queue plus short-lived terminal results."""
-    async with state_lock:
-        expired, purged = _cleanup_commands_locked()
-        serialized = _serialize_commands()
-    if expired or purged:
-        await broadcast({"type": "commands_update", "commands": serialized})
-    return serialized
-
-
 async def _poll_agent_inbox(hostname: str, approved_hostname: str | None = None) -> list[dict[str, Any]]:
     async with state_lock:
         # Reset stale 'delivered' commands to 'pending' so they are re-sent if the agent
@@ -13187,191 +5510,6 @@ async def _poll_agent_inbox(hostname: str, approved_hostname: str | None = None)
     if pending or expired or purged or reset:
         await broadcast({"type": "commands_update", "commands": serialized})
     return payload
-
-
-@app.get("/api/inbox")
-async def poll_inbox(request: Request, hostname: str) -> list[dict[str, Any]]:
-    """Device polls for pending commands addressed to it. Marks them delivered."""
-    if not hostname:
-        raise HTTPException(status_code=422, detail="hostname is required")
-    # Accept either a valid simulation client key OR a valid proxmox agent key.
-    # Proxmox agents send X-API-Key; simulation clients send X-Client-Key.
-    api_key = request.headers.get("X-API-Key", "")
-    approved_hostname = _resolve_proxmox_agent_hostname(hostname, approved_proxmox_agents)
-    is_approved_proxmox = (
-        approved_hostname is not None
-        and api_key == approved_proxmox_agents[approved_hostname]
-    )
-    if not is_approved_proxmox:
-        _require_shared_client_key(request.headers.get("X-Client-Key", ""), "/api/inbox")
-    elif api_key != approved_proxmox_agents[approved_hostname]:
-        raise HTTPException(status_code=401, detail="invalid key")
-    return await _poll_agent_inbox(hostname, approved_hostname)
-
-
-async def _ack_command_internal(body: dict[str, Any]) -> dict[str, bool]:
-    cmd_id = str(body.get("id", "")).strip()
-    status = str(body.get("status", "completed")).strip().lower()
-    message = body.get("message", "")
-
-    if status not in ("completed", "failed"):
-        raise HTTPException(status_code=422, detail="status must be 'completed' or 'failed'")
-
-    async with state_lock:
-        expired, purged = _cleanup_commands_locked()
-        cmd = next((c for c in commands if c["id"] == cmd_id), None)
-        if not cmd:
-            raise HTTPException(status_code=404, detail="Command not found")
-
-        cmd["status"] = status
-        cmd["message"] = str(message) if message is not None else ""
-        cmd["updated_at"] = time.time()
-        cmd["purge_after"] = cmd["updated_at"] + COMMAND_RESULT_RETENTION_SECS
-        _trace("agent_ack", cmd_id=cmd_id, action=cmd.get("action"), target=cmd.get("target"),
-               args={k: v for k, v in (cmd.get("args") or {}).items() if k in {"vmid", "vm_type"}},
-               status=status, message=str(message)[:200] if message else "")
-        await _async_save_commands()
-        serialized = _serialize_commands()
-
-    await broadcast({"type": "commands_update", "commands": serialized})
-    return {"ok": True}
-
-
-@app.post("/api/inbox/ack")
-async def ack_command(request: Request, body: dict[str, Any] = Body(...)) -> dict[str, bool]:
-    """Device reports command result."""
-    # Accept either a valid simulation client key OR a valid proxmox agent key.
-    api_key = request.headers.get("X-API-Key", "")
-    ack_hostname = request.headers.get("X-Hostname", "") or body.get("hostname", "")
-    is_approved_proxmox = any(
-        api_key == v for v in approved_proxmox_agents.values()
-    ) if api_key else False
-    if not is_approved_proxmox:
-        _require_shared_client_key(request.headers.get("X-Client-Key", ""), "/api/inbox/ack")
-        ack_hostname = ack_hostname or "(sim-client)"
-    result = await _ack_command_internal(body)
-    _trace("inbox_ack_received", hostname=ack_hostname or "(unknown)",
-           cmd_id=str(body.get("id", "")), status=body.get("status", ""),
-           message=str(body.get("message", ""))[:200])
-    return result
-
-
-@app.delete("/api/commands/pending")
-async def expire_pending_for_target(target: str = Query(...)) -> dict[str, int]:
-    """Expire active commands for a given target hostname before replacing a VM."""
-    count = 0
-    now = time.time()
-    async with state_lock:
-        expired, purged = _cleanup_commands_locked(now)
-        for cmd in commands:
-            if cmd["target"] == target and cmd["status"] in {"pending", "delivered"}:
-                cmd["status"] = "expired"
-                cmd["updated_at"] = now
-                cmd["purge_after"] = now + COMMAND_RESULT_RETENTION_SECS
-                count += 1
-        if count:
-            await _async_save_commands()
-        serialized = _serialize_commands()
-    if count:
-        logger.info("Expired %d active command(s) for target %s before VM destroy", count, target)
-        await broadcast({"type": "commands_update", "commands": serialized})
-    elif expired or purged:
-        await broadcast({"type": "commands_update", "commands": serialized})
-    return {"expired": count}
-
-
-@app.post("/api/commands/cancel-all")
-async def cancel_all_queued_commands() -> dict[str, int]:
-    """Cancel all pending/delivered commands (troubleshooting — stops queued work without deleting history)."""
-    now = time.time()
-    count = 0
-    async with state_lock:
-        for cmd in commands:
-            if cmd.get("status") in {"pending", "delivered"}:
-                cmd["status"] = "cancelled"
-                cmd["updated_at"] = now
-                cmd["error"] = "Manually cancelled via Cancel All"
-                count += 1
-        if count:
-            await _async_save_commands()
-        serialized = _serialize_commands()
-    if count:
-        logger.info("Cancel-all: %d queued command(s) cancelled by user", count)
-        await broadcast({"type": "commands_update", "commands": serialized})
-    return {"cancelled": count}
-
-
-@app.delete("/api/commands/{cmd_id}")
-async def delete_command(cmd_id: str) -> dict[str, bool]:
-    """Remove a command from history."""
-    async with state_lock:
-        before = len(commands)
-        commands[:] = [c for c in commands if c["id"] != cmd_id]
-        if len(commands) == before:
-            raise HTTPException(status_code=404, detail="Command not found")
-        await _async_save_commands()
-        serialized = _serialize_commands()
-    await broadcast({"type": "commands_update", "commands": serialized})
-    return {"ok": True}
-
-
-@app.post("/api/notifications/test")
-async def api_notifications_test(body: dict[str, Any]) -> dict[str, Any]:
-    """Send a test notification via email or Teams."""
-    channel = body.get("channel", "")  # "email" | "teams"
-    notif = dict(settings.get("notifications", {}))
-    # Allow overriding with posted values (for unsaved fields)
-    notif.update({k: v for k, v in body.items() if k != "channel"})
-
-    test_transition = [{
-        "check_type": "sim",
-        "check_id": "test",
-        "check_name": "Test Notification",
-        "site": "test-site",
-        "old": "ok",
-        "new": "error",
-        "ts": time.time(),
-    }]
-
-    try:
-        if channel == "email":
-            if not notif.get("smtp_host") or not notif.get("smtp_to"):
-                raise HTTPException(status_code=422, detail="smtp_host and smtp_to are required")
-            await asyncio.to_thread(_send_email_notifications, notif, test_transition)
-        elif channel == "teams":
-            url = notif.get("teams_webhook_url", "")
-            if not url:
-                raise HTTPException(status_code=422, detail="teams_webhook_url is required")
-            await _send_teams_notifications(url, test_transition)
-        else:
-            raise HTTPException(status_code=422, detail="channel must be 'email' or 'teams'")
-    except HTTPException:
-        raise
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=str(exc)) from exc
-
-    return {"status": "ok", "channel": channel}
-
-
-@app.get("/.well-known/acme-challenge/{token}", include_in_schema=False)
-async def acme_challenge(token: str):
-    key_authorization = _acme_challenges.get(token)
-    if not key_authorization:
-        raise HTTPException(404)
-    return PlainTextResponse(key_authorization)
-
-
-async def _proxmox_disconnect_grace(expected_hostname: str | None) -> None:
-    await asyncio.sleep(PROXMOX_WS_GRACE_SECS)
-    if proxmox_ws_connection is not None:
-        return
-    if expected_hostname and proxmox_ws_hostname and _proxmox_hostnames_match(expected_hostname, proxmox_ws_hostname):
-        return
-    if proxmox_state.get("last_seen") and (time.time() - float(proxmox_state.get("last_seen") or 0)) <= PROXMOX_WS_GRACE_SECS:
-        return
-    proxmox_state["connected"] = False
-    proxmox_state["vms"] = []
-    await _broadcast_proxmox_state()
 
 
 @app.websocket("/ws/client")
@@ -13432,7 +5570,6 @@ async def ws_proxmox_endpoint(
     hostname: str = Query(""),
     api_key: str = Query(""),
 ) -> None:
-    global proxmox_ws_connection, proxmox_ws_hostname, proxmox_ws_disconnect_task
     if not hostname:
         await websocket.close(code=4400, reason="hostname is required")
         return
@@ -13442,11 +5579,11 @@ async def ws_proxmox_endpoint(
         await websocket.close(code=4401, reason=detail[:120])
         return
     await websocket.accept()
-    proxmox_ws_connection = websocket
-    proxmox_ws_hostname = approved_hostname
-    if proxmox_ws_disconnect_task is not None:
-        proxmox_ws_disconnect_task.cancel()
-        proxmox_ws_disconnect_task = None
+    state.proxmox_ws_connection = websocket
+    state.proxmox_ws_hostname = approved_hostname
+    if state.proxmox_ws_disconnect_task is not None:
+        state.proxmox_ws_disconnect_task.cancel()
+        state.proxmox_ws_disconnect_task = None
     _trace("agent_ws_connect", hostname=approved_hostname)
     try:
         # Reset any 'delivered' commands back to 'pending' so they are re-sent.
@@ -13496,11 +5633,11 @@ async def ws_proxmox_endpoint(
     except WebSocketDisconnect:
         pass
     finally:
-        if proxmox_ws_connection is websocket:
-            proxmox_ws_connection = None
-            proxmox_ws_hostname = approved_hostname
+        if state.proxmox_ws_connection is websocket:
+            state.proxmox_ws_connection = None
+            state.proxmox_ws_hostname = approved_hostname
             _trace("agent_ws_disconnect", hostname=approved_hostname)
-            proxmox_ws_disconnect_task = asyncio.create_task(_proxmox_disconnect_grace(approved_hostname))
+            state.proxmox_ws_disconnect_task = asyncio.create_task(_proxmox_disconnect_grace(approved_hostname))
 
 
 @app.websocket("/ws")
@@ -13520,9 +5657,8 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
     except Exception as exc:  # noqa: BLE001
         logger.error("WS on-connect full_state error: %s", exc)
     try:
-        global _repo_ver
-        _repo_ver = await asyncio.to_thread(_get_repo_version)
-        await websocket.send_text(json.dumps({"type": "repo_status", "synced": repo_state["synced"], "error": repo_state["error"], "last_sync": repo_state["last_sync"], "repo_version": _repo_ver}, default=str))
+        state._repo_ver = await asyncio.to_thread(_get_repo_version)
+        await websocket.send_text(json.dumps({"type": "repo_status", "synced": repo_state["synced"], "error": repo_state["error"], "last_sync": repo_state["last_sync"], "repo_version": state._repo_ver}, default=str))
     except Exception as exc:  # noqa: BLE001
         logger.error("WS on-connect repo_status error: %s", exc)
     try:
@@ -13550,11 +5686,11 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
     except Exception as exc:  # noqa: BLE001
         logger.error("WS on-connect reclone_update error: %s", exc)
     try:
-        await websocket.send_text(json.dumps({"type": "update_all_progress", **dict(update_all_state)}, default=str))
+        await websocket.send_text(json.dumps({"type": "update_all_progress", **dict(state.update_all_state)}, default=str))
     except Exception as exc:  # noqa: BLE001
         logger.error("WS on-connect update_all_progress error: %s", exc)
     try:
-        await websocket.send_text(json.dumps({"type": "central_update", "status": _central_status_payload(), "wireless_clients": dict(central_wireless_clients), "hardware_alerts": _hw_alerts_payload(), "client_count_status": _client_count_payload(), "ts": time.time(), "token_state": _central_token_state()}, default=str))
+        await websocket.send_text(json.dumps({"type": "central_update", "status": _central_status_payload(), "wireless_clients": dict(state.central_wireless_clients), "hardware_alerts": _hw_alerts_payload(), "client_count_status": _client_count_payload(), "ts": time.time(), "token_state": _central_token_state()}, default=str))
     except Exception as exc:  # noqa: BLE001
         logger.error("WS on-connect central_update error: %s", exc)
     try:
@@ -13670,6 +5806,213 @@ async def root(request: Request):
 
 
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
+
+# === extracted service rebinds (must precede router includes below) ===
+
+# state_cache helpers moved to services/state_cache.py
+from services.state_cache import (  # noqa: E402,F401 (re-export for internal callers)
+    _load_state_cache,
+    _save_state_cache,
+)
+
+# notifications helpers moved to services/notifications.py
+from services.notifications import (  # noqa: E402,F401 (re-export for internal callers)
+    _check_transitions_and_notify,
+    _public_notification_settings,
+    _send_email_notifications,
+    _send_teams_notifications,
+)
+
+# proxmox_agent helpers moved to services/proxmox_agent.py
+from services.proxmox_agent import (  # noqa: E402,F401 (re-export for internal callers)
+    _ack_command_internal,
+    _apply_proxmox_telemetry_state,
+    _approved_proxmox_payload,
+    _async_save_commands,
+    _async_save_reclone_state,
+    _async_save_vm_watchdog,
+    _authorize_proxmox_agent,
+    _broadcast_proxmox_state,
+    _broadcast_reclone_state,
+    _broadcast_update_state,
+    _cleanup_commands_locked,
+    _command_args_signature,
+    _command_matches_agent,
+    _enqueue_command_locked,
+    _find_active_duplicate_command_locked,
+    _find_proxmox_vm,
+    _forward_hub_passthrough_to_proxmox,
+    _get_proxmox_host_config,
+    _get_proxmox_token_for_host,
+    _guest_supports_reclone,
+    _handle_command_trace_request,
+    _handle_provision_proxmox_token,
+    _handle_vnc_proxy_request,
+    _has_any_proxmox_token,
+    _has_pending_reclone,
+    _hub_check_approval,
+    _hub_command_blocked_by_reseed,
+    _hub_config_isolation_result,
+    _hub_isolated,
+    _hub_reseed_block_result,
+    _hub_self_register,
+    _hub_targets_proxmox_agent,
+    _hub_tls_verify,
+    _load_commands,
+    _load_reclone_state,
+    _load_update_state,
+    _load_vm_watchdog,
+    _make_command,
+    _mark_commands_delivered_locked,
+    _normalize_command_action,
+    _normalize_command_type,
+    _normalize_proxmox_hostname,
+    _normalize_proxmox_usb_state,
+    _parse_reclone_schedule,
+    _peek_pending_agent_commands_locked,
+    _pending_proxmox_payload,
+    _proxmox_disconnect_grace,
+    _proxmox_hostname_aliases,
+    _proxmox_hostnames_match,
+    _proxmox_status_payload,
+    _proxmox_unassigned_present_usb,
+    _proxmox_update_args,
+    _proxmox_update_branch,
+    _proxmox_usb_config_payload,
+    _push_pending_agent_commands,
+    _push_pending_commands_for_target,
+    _push_pending_commands_for_targets,
+    _push_to_github,
+    _queue_command,
+    _queue_proxmox_agent_update,
+    _queue_proxmox_command,
+    _queue_unlock_template_command,
+    _reclone_command_args,
+    _reclone_targets_for_run,
+    _record_vm_watchdog_clone_completed,
+    _relay_hub_base_url,
+    _relay_proxmox_progress_to_hub,
+    _relay_vnc_to_hub,
+    _reset_delivered_commands_locked,
+    _resolve_proxmox_agent_hostname,
+    _resolve_proxmox_update_target,
+    _resolve_proxmox_vm_target,
+    _revert_hub_managed_if_auth_failure,
+    _run_hub_repo_sync,
+    _run_rolling_reclone,
+    _run_self_update,
+    _run_update_all,
+    _sanitize_proxmox_tag,
+    _save_commands,
+    _save_proxmox_host_config,
+    _save_proxmox_token_for_host,
+    _save_reclone_state,
+    _save_update_state,
+    _save_vm_watchdog,
+    _serialize_command_for_agent,
+    _serialize_commands,
+    _trim_commands_locked,
+    _update_ini_section,
+    _update_provision_run_state,
+    _update_reclone_log,
+    _update_service_health,
+    _upsert_pending_proxmox_agent,
+    _vm_watchdog_key,
+    check_for_update,
+    expire_commands,
+    hub_isolation_monitor,
+    vm_watchdog_loop,
+)
+
+# aruba_poller helpers moved to services/aruba_poller.py
+from services.aruba_poller import (  # noqa: E402,F401 (re-export for internal callers)
+    _apply_central_feed,
+    _central_cfg,
+    _central_headers,
+    _central_ready,
+    _central_status_payload,
+    _central_token_state,
+    _fetch_central_client_names,
+    _fetch_central_token,
+    _fetch_new_central_token,
+    _hw_alerts_payload,
+    _is_new_central_api,
+    _poll_central_once,
+    _probe_central_token,
+    _public_central_api_settings,
+    _refresh_central_token,
+    _reset_central_runtime_tokens,
+    _sim_clients_per_wsite,
+    _sync_central_runtime_config,
+    _telemetry_filtered_browse_dict,
+    _telemetry_filtered_browse_list,
+    _test_classic_central_connection,
+    central_poller,
+    central_token_manager,
+)
+
+# settings helpers moved to services/settings.py
+from services.settings import (  # noqa: E402,F401 (re-export for internal callers)
+    _get_cached_settings,
+    _public_acme_settings,
+    _public_settings,
+)
+
+# === end service rebinds ===
+
+
+# auth routes moved to routers/auth.py
+from routers import auth as _auth_router  # noqa: E402
+app.include_router(_auth_router.router)
+
+# aruba routes moved to routers/aruba.py
+from routers import aruba as _aruba_router  # noqa: E402
+app.include_router(_aruba_router.router)
+
+# proxmox routes moved to routers/proxmox.py
+from routers import proxmox as _proxmox_router  # noqa: E402
+app.include_router(_proxmox_router.router)
+
+# config routes moved to routers/config.py
+from routers import config as _config_router  # noqa: E402
+app.include_router(_config_router.router)
+
+# commands routes moved to routers/commands.py
+from routers import commands as _commands_router  # noqa: E402
+app.include_router(_commands_router.router)
+
+# relay routes moved to routers/relay.py
+from routers import relay as _relay_router  # noqa: E402
+app.include_router(_relay_router.router)
+
+# logs routes moved to routers/logs.py
+from routers import logs as _logs_router  # noqa: E402
+app.include_router(_logs_router.router)
+
+# settings routes moved to routers/settings.py
+from routers import settings as _settings_router  # noqa: E402
+app.include_router(_settings_router.router)
+from routers.settings import api_settings_get  # noqa: E402,F401 (re-export for internal callers)
+
+# simulations routes moved to routers/simulations.py
+from routers import simulations as _simulations_router  # noqa: E402
+app.include_router(_simulations_router.router)
+
+# system routes moved to routers/system.py
+from routers import system as _system_router  # noqa: E402
+app.include_router(_system_router.router)
+
+# updates routes moved to routers/updates.py
+from routers import updates as _updates_router  # noqa: E402
+app.include_router(_updates_router.router)
+
+# clients routes moved to routers/clients.py
+from routers import clients as _clients_router  # noqa: E402
+app.include_router(_clients_router.router)
+
+# misc routes moved to routers/misc.py
+from routers import misc as _misc_router  # noqa: E402
+app.include_router(_misc_router.router)
 
 # Demo scenario routes moved to routers/demo.py
 from routers import demo as _demo_router  # noqa: E402
