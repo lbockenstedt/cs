@@ -263,7 +263,13 @@ class CSControlPlane(AgentHostingControlPlane):
                     for hn, c in registry.get_all().items():
                         ls = c.get("last_seen")
                         vmid = name_to_vmid.get(str(hn).strip().lower())
-                        has_usb = bool(vmid and vmid in usb_vmids)
+                        # Client-reported has_usb (standalone clients detect their
+                        # own USB WiFi adapter) wins; else fall back to the
+                        # VM→dongle join. Mirrors the original classifyClient,
+                        # which checks client.has_usb before the vmid/usb_state set.
+                        reported = c.get("has_usb")
+                        has_usb = bool(reported) if reported is not None \
+                            else bool(vmid and vmid in usb_vmids)
                         clients.append({
                             "hostname": hn, "id": hn,
                             "platform": c.get("platform") or "—",

@@ -249,6 +249,28 @@ if client_api_key:
     ws_url += f"&api_key={urllib.parse.quote(client_api_key)}"
 
 
+def detect_has_usb():
+    """True if this client has a USB WiFi adapter (→ a T2 sim client). Detects a
+    wireless netdev whose sysfs device path resolves through ``/usb/``. Live
+    hardware fact, so it's stamped on every status frame (the hub's
+    csClassifyClient reads has_usb first). Best-effort: any error → False."""
+    try:
+        import glob
+        import os as _os
+        for path in glob.glob("/sys/class/net/*"):
+            iface = _os.path.basename(path)
+            if iface == "lo":
+                continue
+            if not (_os.path.isdir(_os.path.join(path, "wireless")) or
+                    _os.path.isdir(_os.path.join(path, "phy80211"))):
+                continue  # not a wireless interface
+            if "/usb" in _os.path.realpath(path):
+                return True
+        return False
+    except Exception:
+        return False
+
+
 def fallback_status():
     return {
         "hostname": hostname,
@@ -260,6 +282,7 @@ def fallback_status():
         "active_simulations": [],
         "errors": [],
         "config": {},
+        "has_usb": detect_has_usb(),
     }
 
 
@@ -279,6 +302,9 @@ def load_status():
     payload.setdefault("active_simulations", [])
     payload.setdefault("errors", [])
     payload.setdefault("config", {})
+    # Live-detected each frame (hardware fact, not from the status file) so the
+    # hub can classify this client T1 (no USB WiFi) vs T2 (USB WiFi dongle).
+    payload["has_usb"] = detect_has_usb()
     return payload
 
 

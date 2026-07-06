@@ -79,6 +79,26 @@ except ImportError:
 ws_url = server_url.rstrip('/').replace('https://', 'wss://').replace('http://', 'ws://')
 ws_url += f"/ws/client?hostname={hostname}&platform=t3"
 
+def detect_has_usb():
+    """True if this client has a USB WiFi adapter (→ a T2 sim client). Detects a
+    wireless netdev whose sysfs device path resolves through ``/usb/``.
+    Best-effort: any error → False."""
+    try:
+        import glob, os
+        for path in glob.glob("/sys/class/net/*"):
+            iface = os.path.basename(path)
+            if iface == "lo":
+                continue
+            if not (os.path.isdir(os.path.join(path, "wireless")) or
+                    os.path.isdir(os.path.join(path, "phy80211"))):
+                continue  # not a wireless interface
+            if "/usb" in os.path.realpath(path):
+                return True
+        return False
+    except Exception:
+        return False
+
+
 def collect_status():
     ssid = ""
     try:
@@ -101,6 +121,7 @@ def collect_status():
         "active_simulations": [],
         "errors": [],
         "config": {},
+        "has_usb": detect_has_usb(),
     }
 
 async def handle_command(ws, command):
