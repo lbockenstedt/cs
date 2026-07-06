@@ -245,9 +245,15 @@ if [[ "$DHCP_SKIP" != "1" ]]; then
 
     if [[ -n "$DHCP_IFACE" ]]; then
         echo "   Configuring DHCP on ${DHCP_IFACE} (${DHCP_GATEWAY}/${DHCP_PREFIX})"
-        DEBIAN_FRONTEND=noninteractive apt-get install -y -q kea-dhcp4-server kea-ctrl-agent \
-            -o Dpkg::Options::="--force-confdef" \
-            -o Dpkg::Options::="--force-confold"
+        # Sim DHCP is OPTIONAL (single-NIC hosts skip it). A kea apt failure must
+        # NOT abort the whole cs spoke install under `set -e` — bail the DHCP
+        # branch and continue so the spoke unit still gets written/started.
+        if ! DEBIAN_FRONTEND=noninteractive apt-get install -y -q kea-dhcp4-server kea-ctrl-agent \
+                -o Dpkg::Options::="--force-confdef" \
+                -o Dpkg::Options::="--force-confold"; then
+            warn "kea install failed — skipping sim DHCP (cs spoke will still install)"
+            return 0
+        fi
         ok "Kea (kea-dhcp4-server + kea-ctrl-agent) installed"
 
         # ── Static IP on the internal interface ───────────────────────────────
