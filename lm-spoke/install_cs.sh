@@ -342,6 +342,17 @@ EOF
 EOF
         ok "kea-ctrl-agent-sim config written (127.0.0.1:8002 → -sim socket)"
 
+        # The spoke runs as $SVC_USER (non-root) and reads the sim Kea config +
+        # lease CSV every 10s for the Simulations "DHCP Server" card
+        # (dhcp_status.collect_dhcp_status). The Kea package ships /etc/kea as
+        # 0750 root:_kea, so svc_lm can't even traverse it — the collector then
+        # logs "Permission denied: '/etc/kea/kea-dhcp4-sim.conf'" every telemetry
+        # cycle. The sim config holds no secrets (a plain 169.253.1.0/24 pool),
+        # so make /etc/kea traversable and both files world-readable (this is the
+        # "only reads world-readable files" contract dhcp_status.py documents).
+        chmod 0755 /etc/kea /var/lib/kea 2>/dev/null || true
+        chmod 0644 "$KEA_DHCP4_CONF" "$KEA_CA_CONF" 2>/dev/null || true
+
         # ── Custom systemd units (independent of the distro default kea units) ─
         # kea-dhcp4-sim waits for the DHCP interface to appear before it binds —
         # without this it fails with "no such interface" on reboot when the NIC

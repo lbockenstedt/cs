@@ -39,6 +39,14 @@ KEA_SERVICE = "kea-dhcp4-sim"
 DEFAULT_LEASE_FILE = "/var/lib/kea/kea-leases4-sim.csv"
 _MAX_LEASE_ROWS = 50
 
+# Dedupe the hot-path failure log: this runs every 10s on the CS_TELEMETRY frame,
+# so a persistent condition (e.g. /etc/kea not readable by svc_lm — a permission
+# drift the installer is supposed to prevent) must NOT re-log at WARNING every
+# tick. Log WARNING once when the error first appears (and again when it changes
+# or clears), DEBUG while it's steady. Mirrors the level discipline the polled
+# CS_* handlers already follow (cs_spoke.handle_command).
+_last_collect_error: Optional[str] = None
+
 
 def collect_dhcp_status() -> Dict[str, Any]:
     """Return the cs-owned Kea (kea-dhcp4-sim) DHCP-server status for the spoke.
@@ -52,11 +60,25 @@ def collect_dhcp_status() -> Dict[str, Any]:
     "Not configured"). On an unexpected error → ``{"installed": True,
     "running": False, "error": ...}``.
     """
+    global _last_collect_error
     try:
-        return _collect()
+        result = _collect()
     except Exception as exc:  # noqa: BLE001 — telemetry hot path; never propagate
-        logger.warning("dhcp_status collection failed: %s", exc)
-        return {"installed": True, "running": False, "error": str(exc) or repr(exc)}
+        msg = str(exc) or repr(exc)
+        # Throttle: WARNING only when the error is new/changed (so a broken box is
+        # loud once), DEBUG while it persists (so the 10s loop doesn't flood the
+        # log — the original code logged WARNING every tick).
+        if msg != _last_collect_error:
+            logger.warning("dhcp_status collection failed: %s", exc)
+            _last_collect_error = msg
+        else:
+            logger.debug("dhcp_status collection still failing: %s", exc)
+        return {"installed": True, "running": False, "error": msg}
+    # Recovered — announce the clear so the log shows the transition.
+    if _last_collect_error is not None:
+        logger.info("dhcp_status collection recovered")
+        _last_collect_error = None
+    return result
 
 
 def _collect() -> Dict[str, Any]:
