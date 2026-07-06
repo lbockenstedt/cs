@@ -153,6 +153,25 @@ git config --global --add safe.directory "$LM_DIR/core" 2>/dev/null || true
 # lm/install_all.sh + agent/install_agent.sh, which both do this.)
 mkdir -p /var/log/lm
 chmod 755 /var/log/lm
+
+# Circular logging: cap /var/log/lm/*.log (+ legacy client-sim logs) so they
+# can't fill the disk. copytruncate keeps the same inode so the running spoke's
+# FileHandler + systemd StandardError=append: writers keep appending (both
+# O_APPEND → no sparse files). Belt-and-suspenders alongside the app's
+# RotatingFileHandler (LM_LOG_MAX_BYTES) in logging_setup.py.
+cat > /etc/logrotate.d/lm <<'LOGROTATE'
+/var/log/lm/*.log /var/log/client-sim-*.log {
+    su root root
+    size 50M
+    rotate 5
+    missingok
+    notifempty
+    compress
+    delaycompress
+    copytruncate
+}
+LOGROTATE
+
 INSTALL_LOG="/var/log/lm/lm-cs-install.log"
 exec > >(tee -a "$INSTALL_LOG") 2>&1
 echo "══ $(date -u '+%Y-%m-%dT%H:%M:%SZ') install_cs.sh start ══"
