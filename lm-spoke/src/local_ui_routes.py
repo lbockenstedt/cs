@@ -25,6 +25,7 @@ locally and applied via the SAME _apply_hub_config path CS_CONFIG_UPDATE uses.
 """
 from __future__ import annotations
 
+import logging
 import time
 from pathlib import Path
 from typing import Any, Dict, Optional
@@ -32,6 +33,8 @@ from typing import Any, Dict, Optional
 from fastapi import APIRouter, Request
 
 import sim_config
+
+logger = logging.getLogger("CSLocalUI")
 
 # Matches client_api.py's CONFIGS_DIR / cs_spoke.py's inline equivalent — kept
 # as a separate constant (not imported from client_api.py) to avoid a circular
@@ -65,6 +68,7 @@ def build_local_ui_router(spoke) -> APIRouter:
             tier_index = deploy.vm_tier_index()
         else:
             usb_vmids, name_to_vmid, tier_index = set(), {}, {}
+        tier_updates: Dict[str, Dict[str, Any]] = {}
         for hostname, c in spoke.registry.get_all().items():
             last_seen = c.get("last_seen")
             online = bool(last_seen and (now - last_seen) < 300)
@@ -74,6 +78,15 @@ def build_local_ui_router(spoke) -> APIRouter:
             else:
                 vmid, has_usb = None, False
             tier = tier_index.get(str(vmid)) if vmid else None
+            if vmid and tier:
+                tier_updates[hostname] = {"tier": tier, "has_usb": has_usb}
+            if vmid is None:
+                # Host/agent offline or VM aged out: fall back to the last-known
+                # authoritative tier/has_usb persisted while it WAS reporting, so
+                # the row keeps T2 (etc.) instead of dropping to T1. Mirrors
+                # control_plane.py's hub-telemetry path.
+                tier = tier or c.get("tier")
+                has_usb = has_usb or bool(c.get("last_known_has_usb"))
             rows.append({
                 "spoke_id": spoke.spoke_id, "spoke_name": spoke.spoke_id,
                 "spoke_online": True,
@@ -98,6 +111,11 @@ def build_local_ui_router(spoke) -> APIRouter:
                 "config": c.get("config") or {},
                 "overrides": c.get("overrides") or {},
             })
+        if tier_updates:
+            try:
+                await spoke.registry.record_tiers_batch(tier_updates)
+            except Exception as e:  # noqa: BLE001
+                logger.debug("record_tiers_batch failed: %s", e)
         return {"tenant_id": "default", "clients": rows}
 
     # ── Simulations tab (Checks/Hardware/Client Count sub-tabs) ─────────────

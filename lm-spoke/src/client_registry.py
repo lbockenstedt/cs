@@ -152,6 +152,38 @@ class ClientRegistry:
                 return dict(entry)
             return {}
 
+    async def record_tiers_batch(self, updates: Dict[str, Dict[str, Any]]) -> None:
+        """Persist the last-known *authoritative* tier/has_usb per hostname.
+
+        Called from the telemetry builder (control_plane.py + local_ui_routes)
+        for clients whose Proxmox VM is currently reporting, so that later,
+        when the host/agent goes offline and ``vmid`` no longer resolves, the
+        builder can fall back to this cached tier instead of dropping the row
+        to T1 (the "offline clients lose their T2" bug). ``tier`` is the
+        hypervisor-truth join from the agent's ``compute_vm_tiers`` — NOT the
+        client's own ``has_usb`` self-report, which is unreliable for T2.
+
+        Single lock + single persist, change-gated so a steady-state tick
+        (no tier transitions) writes nothing. Only updates clients already in
+        the registry — the join is meaningless for an unknown host.
+        """
+        if not updates:
+            return
+        async with self._lock:
+            changed = False
+            for hn, upd in updates.items():
+                entry = self.clients.get(hn)
+                if entry is None:
+                    continue
+                tier = upd.get("tier")
+                has_usb = upd.get("has_usb")
+                if entry.get("tier") != tier or entry.get("last_known_has_usb") != has_usb:
+                    entry["tier"] = tier
+                    entry["last_known_has_usb"] = bool(has_usb) if has_usb is not None else None
+                    changed = True
+            if changed:
+                await self._apersist()
+
     async def purge(self) -> Dict[str, Any]:
         """Drop every registered client from memory AND delete ``clients.json``
         on disk, restoring a fresh-empty registry. This is the lm-spoke

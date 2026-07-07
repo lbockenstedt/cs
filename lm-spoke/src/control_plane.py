@@ -249,10 +249,28 @@ class CSControlPlane(AgentHostingControlPlane):
                     usb_vmids, name_to_vmid = deploy.usb_vmid_index()
                     tier_index = deploy.vm_tier_index()
                     clients = []
+                    # Collect authoritative tier/has_usb for clients whose VM is
+                    # currently reporting, then batch-persist once after the loop
+                    # (single lock + single persist, change-gated in the registry).
+                    # On a later tick where the host/agent is offline (vmid is
+                    # None), the builder falls back to this cached tier so the row
+                    # keeps T2 instead of dropping to T1.
+                    tier_updates: Dict[str, Dict[str, Any]] = {}
                     for hn, c in registry.get_all().items():
                         ls = c.get("last_seen")
                         vmid, has_usb = deploy.client_has_usb(
                             hn, c, usb_vmids, name_to_vmid)
+                        cur_tier = tier_index.get(str(vmid)) if vmid else None
+                        if vmid and cur_tier:
+                            tier_updates[hn] = {"tier": cur_tier, "has_usb": has_usb}
+                        if vmid is None:
+                            # Host/agent offline or VM aged out of proxmox_states:
+                            # the live join can't classify it. Fall back to the
+                            # last-known authoritative tier/has_usb persisted while
+                            # it WAS reporting, so csClassifyClient (which prefers
+                            # c.tier) keeps it T2 instead of dropping to T1.
+                            cur_tier = cur_tier or c.get("tier")
+                            has_usb = has_usb or bool(c.get("last_known_has_usb"))
                         clients.append({
                             "hostname": hn, "id": hn,
                             "platform": c.get("platform") or "—",
@@ -269,7 +287,7 @@ class CSControlPlane(AgentHostingControlPlane):
                             # Authoritative tier (t1/t2/t3) from the agent's per-VM
                             # passthrough classification; csClassifyClient prefers
                             # this over has_usb. Absent → falls back to has_usb.
-                            "tier": tier_index.get(str(vmid)) if vmid else None,
+                            "tier": cur_tier,
                             # Carry the persisted per-client sim overrides + config
                             # up so the WebUI's per-sim override buttons reflect
                             # what's SET (not just what's running) and STAY across
@@ -279,6 +297,11 @@ class CSControlPlane(AgentHostingControlPlane):
                             "overrides": c.get("overrides") or {},
                         })
                     payload["clients"] = clients
+                    if tier_updates:
+                        try:
+                            await registry.record_tiers_batch(tier_updates)
+                        except Exception as e:  # noqa: BLE001
+                            logger.debug("record_tiers_batch failed: %s", e)
                 msg = {
                     "header": {
                         "message_id": str(uuid.uuid4()),
