@@ -171,7 +171,20 @@ def build_client_api_app(spoke) -> FastAPI:
     # ── config delivery ────────────────────────────────────────────────────
     @app.get("/api/config")
     async def api_config(hostname: str = Query("")) -> PlainTextResponse:
-        sim_conf, _user = sim_config.load_configs(CONFIGS_DIR)
+        sim_conf, user_conf = sim_config.load_configs(CONFIGS_DIR)
+        # Merge the file-based user-overrides.conf [username] sections INTO the
+        # served config. The client parses ONLY simulation.conf, and its
+        # apply_override() reads per-user overrides via `get_value $username`
+        # from those [username] sections — so they must be present in the
+        # delivered config. The port loaded user-overrides.conf (user_conf) but
+        # never included it in the rendered output, silently dropping every
+        # file-based per-user override (site/phy/sim_id/ssid/…). Later keys win
+        # (user-overrides is authoritative over the base bucket).
+        for section in user_conf.sections():
+            if not sim_conf.has_section(section):
+                sim_conf.add_section(section)
+            for k, v in user_conf.items(section):
+                sim_conf.set(section, k, v)
         overrides: Dict[str, str] = {}
         if hostname and spoke.registry is not None:
             entry = spoke.registry.get(hostname)
