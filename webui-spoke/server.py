@@ -2592,7 +2592,12 @@ def compute_online(last_seen: datetime) -> bool:
 
 
 def _hostname_has_usb(hostname: str) -> bool:
-    """Return True if the VM for this hostname has a USB dongle assigned in Proxmox config or usb_state."""
+    """Return True if the VM for this hostname has a USB dongle assigned in Proxmox config or usb_state.
+
+    Single-hostname query — scans ``vms`` + ``usb_state`` each call. For bulk
+    paths that classify every client (current_clients / telemetry relay), use
+    ``_build_usb_index()`` once + ``_has_usb_from_index()`` per client instead,
+    which turns O(clients × vms) into O(clients + vms)."""
     vms: list[dict[str, Any]] = proxmox_state.get("vms") or []
     usb_state: list[dict[str, Any]] = proxmox_state.get("usb_state") or []
     norm = hostname.strip().lower()
@@ -2625,7 +2630,54 @@ def _hostname_has_usb(hostname: str) -> bool:
     return norm in usb_hostnames
 
 
-def serialize_client(hostname: str, client: dict[str, Any]) -> dict[str, Any]:
+def _build_usb_index() -> dict[str, bool]:
+    """One-pass ``{hostname_norm: has_usb}`` over ``proxmox_state`` vms +
+    usb_state. Built once per bulk-serialize call (under ``state_lock``) and
+    consulted via ``_has_usb_from_index`` per client — the per-client
+    ``_hostname_has_usb`` rescanned the whole VM/USB list for every client,
+    making ``current_clients()`` / the telemetry relay O(clients × vms)."""
+    vms: list[dict[str, Any]] = proxmox_state.get("vms") or []
+    usb_state: list[dict[str, Any]] = proxmox_state.get("usb_state") or []
+    index: dict[str, bool] = {}
+    name_to_vmid: dict[str, str] = {}
+    for vm in vms:
+        name = str(vm.get("name") or "").strip().lower()
+        if not name:
+            continue
+        raw = vm.get("vmid")
+        if raw is not None:
+            vmid_s = str(raw).strip()
+            if vmid_s:
+                name_to_vmid[name] = vmid_s
+        if vm.get("has_usb_config") or vm.get("reclone_bus_path"):
+            index[name] = True
+        elif name not in index:
+            index[name] = False
+    if usb_state:
+        usb_vmids = {
+            str(d.get("vmid")).strip()
+            for d in usb_state
+            if isinstance(d, dict) and d.get("vmid") is not None and str(d.get("vmid")).strip()
+        }
+        for name, vmid in name_to_vmid.items():
+            if vmid in usb_vmids:
+                index[name] = True
+        for d in usb_state:
+            if not isinstance(d, dict):
+                continue
+            h = str(d.get("hostname") or d.get("vm_name") or "").strip().lower()
+            if h:
+                index[h] = True
+    return index
+
+
+def _has_usb_from_index(hostname: str, index: dict[str, bool]) -> bool:
+    """Fast per-client USB lookup against a prebuilt index (see _build_usb_index)."""
+    return bool(index.get(hostname.strip().lower(), False))
+
+
+def serialize_client(hostname: str, client: dict[str, Any],
+                     usb_index: dict[str, bool] | None = None) -> dict[str, Any]:
     config = {key: str(value) for key, value in client.get("config", {}).items()}
     overrides = {key: str(value) for key, value in client.get("overrides", {}).items()}
     effective_config = {**config, **overrides}
@@ -2634,7 +2686,10 @@ def serialize_client(hostname: str, client: dict[str, Any]) -> dict[str, Any]:
 
     return {
         "hostname": hostname,
-        "has_usb": _hostname_has_usb(hostname),
+        # Bulk paths pass a prebuilt usb_index (O(clients+vms)); single-client
+        # callers leave it None and fall back to the per-host scan.
+        "has_usb": (_has_usb_from_index(hostname, usb_index) if usb_index is not None
+                    else _hostname_has_usb(hostname)),
         "simulation_id": client.get("simulation_id", ""),
         "platform": client.get("platform", ""),
         "hw_type": client.get("hw_type") or "",
@@ -2656,7 +2711,11 @@ def serialize_client(hostname: str, client: dict[str, Any]) -> dict[str, Any]:
 
 async def current_clients() -> list[dict[str, Any]]:
     async with state_lock:
-        return [serialize_client(hostname, clients[hostname]) for hostname in sorted(clients)]
+        # Build the USB index once (one pass over vms+usb_state) and reuse it
+        # for every client — was O(clients × vms), now O(clients + vms).
+        usb_index = _build_usb_index()
+        return [serialize_client(hostname, clients[hostname], usb_index=usb_index)
+                for hostname in sorted(clients)]
 
 
 def _normalize_toggle(value: Any) -> str:
@@ -3074,7 +3133,12 @@ async def _build_relay_telemetry_payload(spoke_id: str) -> dict[str, Any]:
     async with state_lock:
         proxmox_vms = list(proxmox_state.get("vms") or [])
         usb_state = list(proxmox_state.get("usb_state", []))
-        clients_snapshot = [serialize_client(hostname, clients[hostname]) for hostname in sorted(clients)]
+        # Build the USB index once and reuse for every client (was O(clients ×
+        # vms) per telemetry tick — _hostname_has_usb rescanned all VMs per
+        # client; now O(clients + vms)).
+        usb_index = _build_usb_index()
+        clients_snapshot = [serialize_client(hostname, clients[hostname], usb_index=usb_index)
+                            for hostname in sorted(clients)]
     present_usb = list(proxmox_state.get("present_usb", []))
     unknown_usb = list(proxmox_state.get("unknown_usb", []))
 
