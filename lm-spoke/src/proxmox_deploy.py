@@ -275,6 +275,23 @@ class ProxmoxDeploy:
                     name_to_vmid.setdefault(nm, str(v))
         return usb_vmids, name_to_vmid
 
+    def vm_tier_index(self) -> Dict[str, str]:
+        """``{str(vmid): 't1'|'t2'|'t3'}`` from the agent-computed per-VM ``tier``
+        (pxmx ``compute_vm_tiers`` stamps it on each ``vms`` entry, classified by
+        PASSTHROUGH — the authoritative signal). The client-row builders map a
+        client's hostname → vmid (via name_to_vmid) → this tier and stamp it on the
+        row so csClassifyClient renders the correct badge (T3 especially, which has
+        no USB dongle). VMs the agent couldn't classify are absent → the row keeps
+        the has_usb-derived default (T2 for a dongle, else T1)."""
+        tiers: Dict[str, str] = {}
+        for st in self.proxmox_states.values():
+            for vm in (st.get("vms") or []):
+                v = vm.get("vmid")
+                t = vm.get("tier")
+                if v not in (None, "") and t in ("t1", "t2", "t3"):
+                    tiers[str(v)] = t
+        return tiers
+
     @staticmethod
     def client_has_usb(hostname: str, client: Dict[str, Any],
                        usb_vmids: set, name_to_vmid: Dict[str, str]) -> Tuple[Optional[str], bool]:

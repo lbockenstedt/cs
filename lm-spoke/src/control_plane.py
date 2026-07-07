@@ -247,6 +247,7 @@ class CSControlPlane(AgentHostingControlPlane):
                     # so match hostname→vm→vmid and test membership in the
                     # USB-assigned vmid set. has_usb is what csClassifyClient reads.
                     usb_vmids, name_to_vmid = deploy.usb_vmid_index()
+                    tier_index = deploy.vm_tier_index()
                     clients = []
                     for hn, c in registry.get_all().items():
                         ls = c.get("last_seen")
@@ -265,6 +266,10 @@ class CSControlPlane(AgentHostingControlPlane):
                             "recent_errors": c.get("recent_errors") or [],
                             "vmid": vmid,
                             "has_usb": has_usb,
+                            # Authoritative tier (t1/t2/t3) from the agent's per-VM
+                            # passthrough classification; csClassifyClient prefers
+                            # this over has_usb. Absent → falls back to has_usb.
+                            "tier": tier_index.get(str(vmid)) if vmid else None,
                             # Carry the persisted per-client sim overrides + config
                             # up so the WebUI's per-sim override buttons reflect
                             # what's SET (not just what's running) and STAY across

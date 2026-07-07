@@ -62,8 +62,9 @@ def build_local_ui_router(spoke) -> APIRouter:
         deploy = getattr(spoke, "deploy", None)
         if deploy is not None:
             usb_vmids, name_to_vmid = deploy.usb_vmid_index()
+            tier_index = deploy.vm_tier_index()
         else:
-            usb_vmids, name_to_vmid = set(), {}
+            usb_vmids, name_to_vmid, tier_index = set(), {}, {}
         for hostname, c in spoke.registry.get_all().items():
             last_seen = c.get("last_seen")
             online = bool(last_seen and (now - last_seen) < 300)
@@ -72,6 +73,7 @@ def build_local_ui_router(spoke) -> APIRouter:
                     hostname, c, usb_vmids, name_to_vmid)
             else:
                 vmid, has_usb = None, False
+            tier = tier_index.get(str(vmid)) if vmid else None
             rows.append({
                 "spoke_id": spoke.spoke_id, "spoke_name": spoke.spoke_id,
                 "spoke_online": True,
@@ -87,6 +89,7 @@ def build_local_ui_router(spoke) -> APIRouter:
                 "recent_errors": c.get("recent_errors") or [],
                 "vmid": vmid,
                 "has_usb": has_usb,
+                "tier": tier,
                 # Carry the persisted per-client sim overrides + config so the
                 # local dashboard's per-sim override buttons reflect what's SET
                 # (not just what's running) and STAY across refreshes — mirrors
