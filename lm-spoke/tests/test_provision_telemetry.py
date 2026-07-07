@@ -56,3 +56,41 @@ def test_ingest_telemetry_defaults_missing_provision_to_empty():
     # must default to {} and never KeyError.
     entry = d.ingest_telemetry("h1", {"node": {"hostname": "h1"}, "vms": []})
     assert entry["provision"] == {}
+
+
+def test_prov_run_relayed_and_per_vm_status_stamped():
+    d = proxmox_deploy.ProxmoxDeploy()
+    body = _body(
+        vms=[
+            {"vmid": 90014, "name": "amoran-90014", "status": "running"},   # provisioning
+            {"vmid": 90020, "name": "bsmith-90020", "status": "running"},   # deleting
+            {"vmid": 90021, "name": "idle-90021", "status": "stopped"},     # neither
+        ],
+        prov_run={"running": True, "total": 2, "completed": 0, "failed": 0,
+                  "items": [{"vmid": 90014, "status": "provisioning"},
+                            {"vmid": 90099, "status": "done"}]},
+        deleting_vmids=[90020],
+    )
+    entry = d.ingest_telemetry("h1", body)
+    by_vmid = {v["vmid"]: v for v in entry["vms"]}
+    # prov_run item with status 'provisioning' → 🔵 provisioning on that VM
+    assert by_vmid[90014]["prov_status"] == "provisioning"
+    # deleting_vmids wins → 🔴 tearing_down
+    assert by_vmid[90020]["prov_status"] == "tearing_down"
+    # untouched VM keeps the default empty prov_status
+    assert by_vmid[90021]["prov_status"] == ""
+    # prov_run relays for the live panel + rides the per-host summary
+    assert entry["prov_run"]["total"] == 2
+    payload = d.relay_payload("cs-spoke-1", "CS Spoke 1")
+    assert payload["proxmox"]["prov_run"]["running"] is True
+
+
+def test_deleting_wins_over_provisioning():
+    d = proxmox_deploy.ProxmoxDeploy()
+    body = _body(
+        vms=[{"vmid": 90014, "name": "amoran-90014", "status": "running"}],
+        prov_run={"running": True, "items": [{"vmid": 90014, "status": "provisioning"}]},
+        deleting_vmids=[90014],
+    )
+    entry = d.ingest_telemetry("h1", body)
+    assert entry["vms"][0]["prov_status"] == "tearing_down"

@@ -88,7 +88,7 @@ class ProxmoxDeploy:
         "connected", "last_seen", "node", "vm_count", "running_count", "vms",
         "usb_state", "present_usb", "unknown_usb", "usb_count", "agent_version",
         "pve_version", "provision_halt", "template_lock", "vmid_range",
-        "vm_set_override", "effective_vm_set", "provision",
+        "vm_set_override", "effective_vm_set", "provision", "prov_run",
         # Rolling 1h averages (computed from per-host sample rings); the VM
         # Server Details header renders px.cpu_1h_avg / px.mem_1h_avg, falling
         # back to "—" when None. Projected via _SUMMARY_KEYS so they relay to
@@ -131,6 +131,22 @@ class ProxmoxDeploy:
         present_usb = body.get("present_usb", []) or []
         unknown_usb = body.get("unknown_usb", []) or []
 
+        # Live per-VM transient state for the WebUI VM list (🔵 provisioning /
+        # 🔴 deleting). The agent reports these separately from `vms`; join them
+        # onto each VM here, matching the original hub's usb_state→vm prov_status
+        # join. `prov_run.items[].status == "provisioning"` marks VMs being
+        # cloned/configured; `deleting_vmids` marks VMs the delete gate is
+        # tearing down.
+        prov_run = body.get("prov_run") or {}
+        provisioning_vmids = {
+            int(it["vmid"]) for it in (prov_run.get("items") or [])
+            if isinstance(it, dict) and it.get("vmid") is not None
+            and str(it.get("status", "")).lower() == "provisioning"
+        }
+        deleting_vmids = {
+            int(x) for x in (body.get("deleting_vmids") or []) if x is not None
+        }
+
         enriched_vms: List[Dict[str, Any]] = []
         for v in raw_vms:
             v = dict(v or {})
@@ -143,6 +159,15 @@ class ProxmoxDeploy:
             v.setdefault("reclone_bus_path", None)
             v.setdefault("pci_passthrough_addrs", [])
             v.setdefault("prov_status", "")
+            # Stamp the live transient state (deleting wins over provisioning).
+            try:
+                _vmid = int(v.get("vmid")) if v.get("vmid") is not None else None
+            except (TypeError, ValueError):
+                _vmid = None
+            if _vmid is not None and _vmid in deleting_vmids:
+                v["prov_status"] = "tearing_down"
+            elif _vmid is not None and _vmid in provisioning_vmids:
+                v["prov_status"] = "provisioning"
             enriched_vms.append(v)
 
         non_template = [v for v in enriched_vms if not v.get("is_template")]
@@ -181,6 +206,10 @@ class ProxmoxDeploy:
             # _SUMMARY_KEYS so the hub cache → /usb-provisioning-status → WebUI
             # Auto-Provisioning card can show WHY nothing provisions.
             "provision":        body.get("provision") or {},
+            # Authoritative live provision-run state (running/total/completed/
+            # failed/items[]) for the WebUI live auto-provisioning panel
+            # (progress bar + per-item Cloning/Configuring/Done/Failed feed).
+            "prov_run":         prov_run,
         }
         # Roll a CPU + mem sample from this frame's node block, then read the
         # 1h averages back into the entry so they ride the relay payload's
