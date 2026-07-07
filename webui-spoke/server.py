@@ -395,6 +395,14 @@ _sim_conf_cache: dict[str, Any] = {
     "simulations": {},
 }
 
+# mtime-keyed cache for api_sim_clients' conf-derived view (wsite, central_site,
+# and the configured-client dict) — api_sim_clients re-reads + re-parses both
+# simulation.conf and client-setup.conf on every call. The live heartbeat
+# overlay + Central fetch stay live (not cached); only the parts derived purely
+# from the conf files are memoized, invalidated when either conf's mtime moves.
+# Keyed by sim_id; entries: {sim_id: (sim_mtime, client_mtime, {wsite, central_site, configured})}.
+_sim_clients_cache: dict[str, Any] = {}
+
 # Raw text cache for sim_conf_content sent in telemetry.
 # Refreshed by _sim_conf_content_refresh_loop every 30s in a thread-pool worker
 # so reads never block the event loop or the telemetry_loop task.

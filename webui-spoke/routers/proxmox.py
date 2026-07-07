@@ -72,6 +72,20 @@ from server import (
 
 router = APIRouter()
 
+# Shared keep-alive httpx client for outbound Proxmox API calls (the VNC
+# vncproxy POST in api_create_console_session). A fresh AsyncClient per
+# console-open paid a new connection pool + TLS handshake each time; a single
+# process-lifetime client reuses the pool. Created lazily so a missing httpx
+# (the `httpx is None` guard below) doesn't crash import.
+_console_http_client = None
+
+
+def _console_client():
+    global _console_http_client
+    if _console_http_client is None and httpx is not None:
+        _console_http_client = httpx.AsyncClient(verify=False)
+    return _console_http_client
+
 
 
 
@@ -520,8 +534,8 @@ async def api_create_console_session(
     if httpx is None:
         raise HTTPException(status_code=503, detail="httpx not installed")
     try:
-        async with httpx.AsyncClient(verify=False) as client:
-            resp = await client.post(vncproxy_url, headers=auth_header, json={"websocket": 1}, timeout=10)
+        client = _console_client()
+        resp = await client.post(vncproxy_url, headers=auth_header, json={"websocket": 1}, timeout=10)
         if resp.status_code != 200:
             raise HTTPException(status_code=502, detail=f"Proxmox vncproxy returned {resp.status_code}: {resp.text[:200]}")
         body = resp.json()

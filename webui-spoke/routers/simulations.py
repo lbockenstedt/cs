@@ -8,6 +8,7 @@ from server import (
     _fetch_central_client_names,
     _merge_ini_override,
     _sim_conf_cache,
+    _sim_clients_cache,
     asyncio,
     clients,
     compute_online,
@@ -192,48 +193,66 @@ async def api_sim_clients(sim_id: str) -> dict[str, Any]:
     sim_conf_path = REPO_DIR / "configs" / "simulation.conf"
     client_conf_path = REPO_DIR / "proxmox" / "client-setup.conf"
 
-    # --- Load simulation profile ---
-    wsite = ""
-    central_site = ""
-    if sim_conf_path.exists():
-        try:
-            p = _cp.ConfigParser()
-            p.read_string(sim_conf_path.read_text(encoding="utf-8"))
-            _merge_ini_override(p, REPO_DIR / "configs" / "hub-sim-overrides.conf")
-            if p.has_section(sim_id):
-                wsite = p.get(sim_id, "wsite", fallback="")
-        except Exception:
-            pass
+    sim_mtime = sim_conf_path.stat().st_mtime if sim_conf_path.exists() else -1.0
+    client_mtime = client_conf_path.stat().st_mtime if client_conf_path.exists() else -1.0
 
-    central_site = settings.get("site_mappings", {}).get(wsite, "")
+    # The wsite/central_site + configured-client dict are derived purely from
+    # the two conf files + the static site_mappings setting — re-parsing them
+    # on every call was wasted work. Memoize keyed on (sim_id, mtimes); the
+    # live heartbeat overlay + Central fetch below stay uncached. A deepcopy of
+    # `configured` is returned so the per-call overlay mutations don't leak
+    # into the cached entry.
+    cached = _sim_clients_cache.get(sim_id)
+    if (cached and cached[0] == sim_mtime and cached[1] == client_mtime):
+        wsite = cached[2]["wsite"]
+        central_site = cached[2]["central_site"]
+        configured: dict[str, dict[str, Any]] = copy.deepcopy(cached[2]["configured"])
+    else:
+        # --- Load simulation profile ---
+        wsite = ""
+        central_site = ""
+        if sim_conf_path.exists():
+            try:
+                p = _cp.ConfigParser()
+                p.read_string(sim_conf_path.read_text(encoding="utf-8"))
+                _merge_ini_override(p, REPO_DIR / "configs" / "hub-sim-overrides.conf")
+                if p.has_section(sim_id):
+                    wsite = p.get(sim_id, "wsite", fallback="")
+            except Exception:
+                pass
 
-    # --- Build configured client list from client-setup.conf ---
-    configured: dict[str, dict[str, Any]] = {}  # hostname → info
-    if client_conf_path.exists():
-        try:
-            cp = _cp.ConfigParser()
-            cp.read_string(client_conf_path.read_text(encoding="utf-8"))
-            vmid_re = re.compile(r"^c(\d+)$")
-            for section in cp.sections():
-                m = vmid_re.match(section)
-                if not m:
-                    continue
-                vmid_str = m.group(1)
-                vm_name = cp.get(section, "vm_name", fallback="").strip()
-                if not vm_name:
-                    continue
-                if f"s{zlib.crc32(vm_name.encode()) % 10}" != sim_id:
-                    continue
-                configured[vm_name] = {
-                    "hostname": vm_name,
-                    "vmid": int(vmid_str),
-                    "api_online": False,
-                    "api_last_seen": None,
-                    "central_connected": None,
-                    "source": "configured",
-                }
-        except Exception:
-            pass
+        central_site = settings.get("site_mappings", {}).get(wsite, "")
+
+        # --- Build configured client list from client-setup.conf ---
+        configured = {}  # hostname → info
+        if client_conf_path.exists():
+            try:
+                cp = _cp.ConfigParser()
+                cp.read_string(client_conf_path.read_text(encoding="utf-8"))
+                vmid_re = re.compile(r"^c(\d+)$")
+                for section in cp.sections():
+                    m = vmid_re.match(section)
+                    if not m:
+                        continue
+                    vmid_str = m.group(1)
+                    vm_name = cp.get(section, "vm_name", fallback="").strip()
+                    if not vm_name:
+                        continue
+                    if f"s{zlib.crc32(vm_name.encode()) % 10}" != sim_id:
+                        continue
+                    configured[vm_name] = {
+                        "hostname": vm_name,
+                        "vmid": int(vmid_str),
+                        "api_online": False,
+                        "api_last_seen": None,
+                        "central_connected": None,
+                        "source": "configured",
+                    }
+            except Exception:
+                pass
+        _sim_clients_cache[sim_id] = (sim_mtime, client_mtime, {
+            "wsite": wsite, "central_site": central_site, "configured": configured,
+        })
 
     # --- Overlay live heartbeat data ---
     async with state_lock:
