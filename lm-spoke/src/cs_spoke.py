@@ -146,15 +146,38 @@ class CSSpoke(BaseSpoke):
         # lm-spoke/VERSION path. Try repo-root first, then lm-spoke/ as a
         # fallback for any layout that places VERSION beside the spoke.
         here = Path(__file__).resolve().parent  # .../lm-spoke/src
-        for p in (
+        paths = (
             here.parent.parent / "VERSION",   # <repo>/VERSION  (dev + /opt/lm/cs/VERSION)
             here.parent / "VERSION",          # <repo>/lm-spoke/VERSION (fallback)
-        ):
+        )
+        # mtime-keyed cache. /ws/client connects (client_api.py:298) call this
+        # per connect on the cs spoke's shared event loop; reading the VERSION
+        # file every connect is a sync open/read/close that stalls the loop
+        # (contributes to the hub's "Request Timeout"). The file only changes on
+        # an autobump release, so re-read only when the first existing path's
+        # mtime changes; otherwise one inode-cached stat returns the cached
+        # string. Mirrors command_queue._sim_phy_cached.
+        vp = None
+        for p in paths:
             try:
                 if p.exists():
-                    v = p.read_text().strip()
-                    if v:
-                        return v
+                    vp = p
+                    break
+            except Exception:  # noqa: BLE001
+                pass
+        if vp is not None:
+            try:
+                mtime = vp.stat().st_mtime_ns
+            except OSError:
+                mtime = 0
+            cache = getattr(self, "_version_cache", None)
+            if cache is not None and cache[0] == mtime:
+                return cache[1]
+            try:
+                v = vp.read_text(encoding="utf-8").strip()
+                if v:
+                    self._version_cache = (mtime, v)
+                    return v
             except Exception:  # noqa: BLE001
                 pass
         return "unknown"

@@ -79,3 +79,60 @@ def test_kill_switch_accepts_legacy_kill_switch_key(spoke_loop):
     resp = _run(loop, spoke.handle_command("CS_KILL_SWITCH", {"kill_switch": True}))
     assert resp["status"] == "SUCCESS"
     assert resp["kill_switch"] is True
+
+
+# ── kill_switch_active mtime cache (Request-Timeout fix) ──────────────────────
+# kill_switch_active runs on the cs spoke's shared event loop (engine every ~5 s
+# + /api/kill-switch). It's mtime-cached so the sync open/read/close of
+# kill_switch.txt doesn't stall the loop. set_kill_switch writes the file → mtime
+# changes → cache misses → re-reads, so toggles never return a stale cached value.
+
+
+def test_kill_switch_active_cache_picks_up_external_file_toggle(spoke_loop):
+    """An external edit to kill_switch.txt (mtime change) must invalidate the
+    cache — simulating an operator toggling the file directly."""
+    spoke, loop = spoke_loop
+    ks = spoke.engine.config_dir / "kill_switch.txt"
+    # Cold read: file absent → False; cache populated with (mtime=-1, False).
+    assert spoke.engine.kill_switch_active() is False
+    # External toggle on.
+    ks.write_text("on\n", encoding="utf-8")
+    assert spoke.engine.kill_switch_active() is True
+    # External toggle off.
+    ks.write_text("off\n", encoding="utf-8")
+    assert spoke.engine.kill_switch_active() is False
+
+
+def test_kill_switch_active_in_memory_override_short_circuits(spoke_loop):
+    """CS_KILL_SWITCH sets an in-memory _kill_switch that short-circuits the
+    file read entirely (and stays correct regardless of cache state)."""
+    spoke, loop = spoke_loop
+    _run(loop, spoke.handle_command("CS_KILL_SWITCH", {"on": True}))
+    # File says "on" too, but the override is what makes it deterministic.
+    assert spoke.engine.kill_switch_active() is True
+    spoke.engine._kill_switch = True
+    ks = spoke.engine.config_dir / "kill_switch.txt"
+    if ks.exists():
+        ks.write_text("off\n", encoding="utf-8")  # file says off
+    assert spoke.engine.kill_switch_active() is True  # override wins
+
+
+# ── get_version mtime cache (Request-Timeout fix) ─────────────────────────────
+# /ws/client connects call spoke.get_version() per connect on the shared event
+# loop; it's mtime-cached so the VERSION read only happens on an autobump
+# release. Verify it returns the tracked VERSION content, populates the cache,
+# and is stable across calls (cache hit).
+
+
+def test_get_version_returns_tracked_version_and_caches(spoke_loop):
+    spoke, loop = spoke_loop
+    v1 = spoke.get_version()
+    assert v1 and v1 != "unknown", "repo VERSION file should be present + tracked"
+    cache = getattr(spoke, "_version_cache", None)
+    assert cache is not None, "cache must be populated after first read"
+    mtime, cached_v = cache
+    assert cached_v == v1
+    # Second call is a cache hit (same mtime) → same value, no re-read.
+    v2 = spoke.get_version()
+    assert v2 == v1
+    assert spoke._version_cache[0] == mtime

@@ -24,6 +24,7 @@ resolver loads both files directly — the canonical behaviour the webui-local h
 from __future__ import annotations
 
 import configparser
+import copy
 import io
 import logging
 import os
@@ -113,6 +114,24 @@ def sections_dict(parser: configparser.ConfigParser) -> Dict[str, Dict[str, str]
     return {s: dict(parser.items(s)) for s in parser.sections()}
 
 
+# mtime-keyed cache for load_configs. Keyed by (str(config_dir), mtime-tuple of
+# the 4 input files). The cached pair holds the CANONICAL merged parsers; callers
+# that mutate the returned object (/api/config merges user_conf into sim_conf
+# then render_ini_for_client bakes per-client [sX] overrides) get a deepcopy so
+# the cache can't be corrupted across requests. Bounded: only the latest mtime
+# tuple per config_dir is retained.
+_LOAD_CACHE: Dict[Tuple[str, Tuple[int, int, int, int]],
+                  Tuple[configparser.ConfigParser, configparser.ConfigParser]] = {}
+
+
+def _mtime_ns(path: Path) -> int:
+    """Best-effort mtime in ns; 0 if the path is absent/unreadable."""
+    try:
+        return path.stat().st_mtime_ns
+    except OSError:
+        return 0
+
+
 def load_configs(config_dir: os.PathLike | str) -> Tuple[configparser.ConfigParser, configparser.ConfigParser]:
     """Load ``(simulation.conf, user-overrides.conf)`` from *config_dir*.
 
@@ -123,13 +142,39 @@ def load_configs(config_dir: os.PathLike | str) -> Tuple[configparser.ConfigPars
     takes effect everywhere this loader is used: the engine's per-iteration
     ``resolve_profile``, the ``/api/config`` client route, and ``CS_GET_CONFIG``.
     Mirrors the legacy webui-spoke, which merged the override before serving.
+
+    The 4-file read+parse is mtime-cached. ``load_configs`` runs on the cs spoke's
+    SINGLE shared event loop (the engine calls it every iteration ~5 s, and
+    ``/api/config`` calls it per client fetch); under disk contention the 6+
+    synchronous ``stat``/``open``/``read``/``close`` syscalls per call stalled
+    the loop long enough to trip the hub's "Request Timeout after 5.0 s". The
+    cache collapses a repeated load to one ``stat`` per file (inode-cached) and a
+    deepcopy (pure CPU, no I/O). Callers mutate the returned parsers, so hits
+    return deep copies of the canonical merged pair; a miss returns the fresh
+    objects and caches independent copies.
     """
     d = Path(config_dir)
-    sim_conf = load_ini(d / "simulation.conf")
-    user_conf_path = d / "user-overrides.conf"
-    user_conf = load_ini(user_conf_path) if user_conf_path.exists() else _new_parser()
-    merge_override(sim_conf, d / "hub-sim-overrides.conf")
-    merge_override(user_conf, d / "hub-user-overrides.conf")
+    sim_path = d / "simulation.conf"
+    user_path = d / "user-overrides.conf"
+    hsim_path = d / "hub-sim-overrides.conf"
+    huser_path = d / "hub-user-overrides.conf"
+    key = (str(d), (_mtime_ns(sim_path), _mtime_ns(user_path),
+                    _mtime_ns(hsim_path), _mtime_ns(huser_path)))
+    cached = _LOAD_CACHE.get(key)
+    if cached is not None:
+        return copy.deepcopy(cached[0]), copy.deepcopy(cached[1])
+
+    sim_conf = load_ini(sim_path)
+    user_conf = load_ini(user_path) if user_path.exists() else _new_parser()
+    merge_override(sim_conf, hsim_path)
+    merge_override(user_conf, huser_path)
+    # Cache independent copies so a caller mutating the returned objects can't
+    # corrupt the canonical pair held here.
+    _LOAD_CACHE[key] = (copy.deepcopy(sim_conf), copy.deepcopy(user_conf))
+    # Bounded: drop stale keys for this dir (old mtime tuple after a write).
+    for k in list(_LOAD_CACHE):
+        if k[0] == key[0] and k != key:
+            _LOAD_CACHE.pop(k, None)
     return sim_conf, user_conf
 
 

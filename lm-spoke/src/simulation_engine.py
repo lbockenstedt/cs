@@ -92,10 +92,30 @@ class SimulationEngine:
     def kill_switch_active(self) -> bool:
         if self._kill_switch:
             return True
-        ks = (self.config_dir / "kill_switch.txt")
-        if ks.exists():
-            return ks.read_text(encoding="utf-8").strip().lower() == "on"
-        return False
+        # mtime-keyed cache. run_iteration calls this every ~5 s and /api/kill-switch
+        # calls it on the cs spoke's shared event loop; reading kill_switch.txt
+        # each time is a sync open/read/close that stalls the loop (contributes
+        # to the hub's "Request Timeout"). Re-read only when the file's mtime
+        # changes (set_kill_switch writes the file → mtime changes → miss →
+        # re-read); otherwise one inode-cached stat returns the cached bool.
+        ks = self.config_dir / "kill_switch.txt"
+        try:
+            mtime = ks.stat().st_mtime_ns
+            exists = True
+        except OSError:
+            mtime = -1
+            exists = False
+        cache = getattr(self, "_ks_cache", None)
+        if cache is not None and cache[0] == mtime:
+            return cache[1]
+        active = False
+        if exists:
+            try:
+                active = ks.read_text(encoding="utf-8").strip().lower() == "on"
+            except Exception:  # noqa: BLE001
+                active = False
+        self._ks_cache = (mtime, active)
+        return active
 
     def set_kill_switch(self, on: bool) -> None:
         self._kill_switch = bool(on)

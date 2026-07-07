@@ -194,3 +194,84 @@ def test_deep_merge_replaces_vidpids_list_whole_on_real_usb_push():
     bridge = {"client_simulation": {"usb_config": {"vidpids": [{"vidpid": "1234:5678"}]}}}
     merged = _deep_merge_cfg(cached, bridge)
     assert merged["client_simulation"]["usb_config"]["vidpids"] == [{"vidpid": "1234:5678"}]
+
+
+# ── load_configs mtime cache (Request-Timeout fix) ────────────────────────────
+# load_configs runs on the cs spoke's shared event loop (engine every ~5 s,
+# /api/config per client fetch). The 4-file read+parse is mtime-cached so the
+# sync disk syscalls don't stall the loop. /api/config MUTATES the returned
+# sim_conf (merges user_conf + render_ini_for_client bakes [sX] overrides), so
+# the cache MUST hand out deep copies — a live-object cache would leak per-
+# client / per-request mutations into the canonical pair. These lock that in.
+
+
+def test_load_configs_cache_hit_returns_equivalent_merged_content(tmp_path):
+    base = tmp_path / "configs"
+    base.mkdir()
+    _write(base / "simulation.conf", SIM_CONF)
+    _write(base / "hub-sim-overrides.conf", "[simulation]\nkill_switch=on\n")
+    a_sim, _ = sim_config.load_configs(base)
+    b_sim, _ = sim_config.load_configs(base)  # cache hit (no file changed)
+    assert b_sim.get("simulation", "kill_switch") == "on"   # override still merged
+    assert b_sim.get("simulation", "sim_load") == "100"     # base key preserved
+    # Different objects (deepcopy), same content.
+    assert a_sim is not b_sim
+
+
+def test_load_configs_cache_isolated_from_caller_mutation(tmp_path):
+    """The critical safety property: a caller mutating its returned parser
+    (exactly what /api/config does — add_section/set + render_ini_for_client)
+    must NOT corrupt the cached canonical pair handed to the next caller."""
+    base = tmp_path / "configs"
+    base.mkdir()
+    _write(base / "simulation.conf", SIM_CONF)
+    first, _ = sim_config.load_configs(base)
+    # /api/config-style mutation: add a section + bake a per-client override.
+    if not first.has_section("s7"):
+        first.add_section("s7")
+    first.set("s7", "ssid", "LEAKED")
+    first.set("simulation", "kill_switch", "on")  # base had "off"
+
+    second, _ = sim_config.load_configs(base)  # cache hit — must be pristine
+    assert not second.has_section("s7"), "caller mutation leaked into cache"
+    assert second.get("simulation", "kill_switch") == "off", \
+        "caller mutation leaked into cached canonical parser"
+    assert second.get("s0", "wsite") == "MIA"
+
+
+def test_load_configs_cache_invalidates_on_file_mtime_change(tmp_path):
+    base = tmp_path / "configs"
+    base.mkdir()
+    _write(base / "simulation.conf", SIM_CONF)
+    _, _ = sim_config.load_configs(base)
+    # Rewrite the base file with a new value → mtime changes → cache misses.
+    _write(base / "simulation.conf",
+           SIM_CONF.replace("kill_switch=off", "kill_switch=on"))
+    sim_conf, _ = sim_config.load_configs(base)
+    assert sim_conf.get("simulation", "kill_switch") == "on"
+
+
+def test_load_configs_cache_invalidates_on_override_change(tmp_path):
+    base = tmp_path / "configs"
+    base.mkdir()
+    _write(base / "simulation.conf", SIM_CONF)
+    _write(base / "hub-sim-overrides.conf", "[simulation]\nkill_switch=on\n")
+    sim_conf, _ = sim_config.load_configs(base)
+    assert sim_conf.get("simulation", "kill_switch") == "on"
+    # Hub pushes a new override flipping it back off → mtime change → miss.
+    _write(base / "hub-sim-overrides.conf", "[simulation]\nkill_switch=off\n")
+    sim_conf, _ = sim_config.load_configs(base)
+    assert sim_conf.get("simulation", "kill_switch") == "off"
+
+
+def test_load_configs_cache_bounded_per_dir(tmp_path):
+    """Only the latest mtime tuple per config_dir is retained — repeated writes
+    must not grow the cache unbounded."""
+    base = tmp_path / "configs"
+    base.mkdir()
+    _write(base / "simulation.conf", SIM_CONF)
+    for i in range(5):
+        _write(base / "simulation.conf", f"[simulation]\nsim_load={i}\n")
+        sim_config.load_configs(base)
+    same_dir_keys = [k for k in sim_config._LOAD_CACHE if k[0] == str(base)]
+    assert len(same_dir_keys) == 1

@@ -81,6 +81,46 @@ def test_client_key_default_empty(client):
     assert r.json() == {"client_api_key": ""}
 
 
+def test_apersist_round_trips_to_disk(tmp_path):
+    """_apersist does json.dumps + write in a worker thread (off the event loop
+    so neither the O(N) serialization nor the disk I/O stalls the shared loop).
+    Verify it still lands valid JSON on disk that a fresh ClientRegistry loads
+    back — the offload refactor must not change the on-disk contract."""
+    import asyncio
+    # Earlier tests (test_kill_switch) call asyncio.set_event_loop(None), which
+    # on Py3.9 poisons the process so the TestClient-based tests later in this
+    # file can't get a loop. Save/restore like test_sim_config_merge's
+    # CS_GET_CONFIG test: leave a usable loop behind no matter what.
+    try:
+        prev_loop = asyncio.get_event_loop()
+        if prev_loop.is_closed():
+            prev_loop = None
+    except RuntimeError:
+        prev_loop = None
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    try:
+        data = tmp_path / "data"
+        data.mkdir()
+        reg = ClientRegistry(data)
+        loop.run_until_complete(reg.apply_status("sim-1", {
+            "hostname": "sim-1", "platform": "linux", "iteration": 7,
+            "connected_ssid": "corp", "gateway_reachable": True,
+            "active_simulations": ["www_traffic"], "errors": ["boom"]}))
+        # The persist file exists and round-trips through a fresh instance.
+        assert (data / "clients.json").exists()
+        reloaded = ClientRegistry(data)
+        assert "sim-1" in reloaded.clients
+        assert reloaded.clients["sim-1"]["connected_ssid"] == "corp"
+        assert reloaded.clients["sim-1"]["recent_errors"] == ["boom"]
+    finally:
+        if prev_loop is not None:
+            asyncio.set_event_loop(prev_loop)
+        else:
+            asyncio.set_event_loop(asyncio.new_event_loop())
+        loop.close()
+
+
 # ── config delivery ──────────────────────────────────────────────────────────
 def test_config_renders_host_bucket(client):
     hostname = "sim-host-9"

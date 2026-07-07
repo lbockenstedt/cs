@@ -68,11 +68,19 @@ class ClientRegistry:
         """Persist off the event loop. apply_status runs on every client beacon
         (~20 sim clients), on the SAME loop as the hub connection + uvicorn API,
         so a synchronous write here contributed to the hub's Request Timeouts.
-        Snapshot on the loop (consistent under the caller's lock), offload the
-        write. Drops indent to shrink serialization + file size."""
+        The caller (apply_status) holds ``self._lock`` across this await, so
+        ``self.clients`` cannot mutate while the worker runs — do BOTH the
+        O(N) ``json.dumps`` AND the file write in the worker thread so neither
+        the serialization CPU nor the disk I/O blocks the shared event loop.
+        Drops indent to shrink serialization + file size."""
         try:
-            text = json.dumps(self.clients, sort_keys=True)
-            await asyncio.to_thread(self._path.write_text, text, encoding="utf-8")
+            clients = self.clients  # stable: caller holds self._lock
+
+            def _write() -> None:
+                self._path.write_text(
+                    json.dumps(clients, sort_keys=True), encoding="utf-8")
+
+            await asyncio.to_thread(_write)
         except Exception as exc:  # noqa: BLE001
             logger.warning("could not persist %s: %s", self._path, exc)
 
