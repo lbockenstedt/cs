@@ -35,9 +35,12 @@ from sim_primitives import PRIMITIVES, SimCtx
 logger = logging.getLogger("SimulationEngine")
 
 # Subset of the profile emitted in the status beacon (CLIENT_API.md "config" obj).
+# wsite (the Site) + sim_phy (PHY) are surfaced so the hub Clients view can show
+# Site / PHY per client — the bash client's status write omits both, so the
+# resolved profile is the only source (mirrors the original hub effective_config).
 _BEACON_CONFIG_KEYS = (
     "kill_switch", "dns_fail", "iperf", "www_traffic", "download", "ping_test",
-    "ssidpw_fail", "auth_fail", "dhcp_fail", "sim_phy",
+    "ssidpw_fail", "auth_fail", "dhcp_fail", "sim_phy", "wsite",
 )
 
 
