@@ -87,6 +87,13 @@ def build_local_ui_router(spoke) -> APIRouter:
                 "recent_errors": c.get("recent_errors") or [],
                 "vmid": vmid,
                 "has_usb": has_usb,
+                # Carry the persisted per-client sim overrides + config so the
+                # local dashboard's per-sim override buttons reflect what's SET
+                # (not just what's running) and STAY across refreshes — mirrors
+                # the hub-telemetry path (control_plane.py) so the local Clients
+                # view and the hub's agree.
+                "config": c.get("config") or {},
+                "overrides": c.get("overrides") or {},
             })
         return {"tenant_id": "default", "clients": rows}
 

@@ -161,18 +161,56 @@ def _parse_kea_conf(conf_path: Path):
     return iface, pool_start, pool_end, lease_time, lease_file
 
 
-def _is_running() -> bool:
-    """True iff the cs kea-dhcp4-sim unit is active under systemd (non-privileged)."""
-    if not shutil.which("systemctl"):
+# Process-probe fallback pattern: matches the SIM kea-dhcp4 instance by its
+# conf path — only the -sim instance uses kea-dhcp4-sim.conf, so the lm/dhcp
+# module's kea-dhcp4 (a different conf) is never counted. [.] is a literal dot
+# in ERE, so this is precise without needing the re module.
+_KEA_SIM_PROC_RE = "kea-dhcp4-sim[.]conf"
+
+
+def _kea_sim_running_pgrep() -> bool:
+    """Fallback liveness probe for hosts where systemctl can't reach systemd
+    (e.g. a container without systemd as PID 1). Matches the SIM instance by
+    its conf path. Only called when systemctl is absent or reports 'not booted
+    with systemd' — NEVER to override a real inactive/failed, which would mask
+    a genuine crash-loop (e.g. the Kea >= 2.6.3 /run/kea permission failure)."""
+    if not shutil.which("pgrep"):
         return False
     try:
         r = subprocess.run(
-            ["systemctl", "is-active", KEA_SERVICE],
+            ["pgrep", "-f", _KEA_SIM_PROC_RE],
             capture_output=True, text=True, timeout=3,
         )
-        return r.returncode == 0 and r.stdout.strip() == "active"
+        return r.returncode == 0 and bool(r.stdout.strip())
     except Exception:
         return False
+
+
+def _is_running() -> bool:
+    """True iff the cs kea-dhcp4-sim unit is active.
+
+    Primary signal is ``systemctl is-active`` (authoritative when systemd is
+    PID 1). We only fall back to the process probe when systemctl is absent or
+    can't reach systemd (container without init) — NEVER to override a real
+    inactive/failed/activating, which would mask a genuine crash-loop such as
+    the Kea >= 2.6.3 control-socket permission failure (/run/kea must be 0750)."""
+    if shutil.which("systemctl"):
+        try:
+            r = subprocess.run(
+                ["systemctl", "is-active", KEA_SERVICE],
+                capture_output=True, text=True, timeout=3,
+            )
+            out = r.stdout.strip()
+            # systemctl reached systemd and reported a unit state — trust it.
+            # 'activating' (auto-restart), 'failed', 'inactive' are NOT running.
+            if out in ("active", "inactive", "failed", "activating",
+                       "deactivating", "reloading"):
+                return out == "active"
+            # "System has not been booted with systemd as init system" or
+            # "Unit ... could not be found" → fall through to the process probe.
+        except Exception:
+            pass
+    return _kea_sim_running_pgrep()
 
 
 def _read_leases(lease_file: str, now: float) -> List[Dict[str, Any]]:

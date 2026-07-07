@@ -60,6 +60,21 @@ BOLD   = lambda t: _c("1",  t)
 DIM    = lambda t: _c("2",  t)
 
 
+# ── Helpers ───────────────────────────────────────────────────────────────────
+
+def _host_halt(host: dict) -> dict:
+    """The auto-provision halt dict for a ``/api/aggregate/proxmox`` host entry.
+
+    The spoke publishes TWO related keys under ``host['proxmox']``:
+      * ``provision_halt`` — a flat BOOL (legacy liveness flag), and
+      * ``provision``      — the nested auto-prov block whose ``halt`` sub-dict
+        carries ``{halted, reason, cpu_pct, cpu_threshold, mem_pct, mem_threshold}``.
+    The WebUI AUTO-PROV cell reads the nested ``provision.halt`` path; the flat
+    bool has no per-field data, so reading ``provision_halt['cpu_pct']`` etc.
+    raises ``AttributeError`` on a bool. Always go through ``provision.halt``."""
+    return (host.get("proxmox") or {}).get("provision", {}).get("halt") or {}
+
+
 # ── Result tracking ───────────────────────────────────────────────────────────
 
 @dataclass
@@ -1645,9 +1660,9 @@ class QARunner:
                 per_spoke = "; ".join(
                     f"{h.get('spoke_name', h.get('spoke_id', '?'))}: vms={h.get('vm_count', '?')}/{h.get('usb_count', '?')} dongles"
                     + (
-                        f" CPU-pacing({h['proxmox']['provision_halt']['cpu_pct']}%≥{h['proxmox']['provision_halt']['cpu_threshold']}%)"
-                        if h.get("proxmox", {}).get("provision_halt", {}).get("halted")
-                        and h["proxmox"]["provision_halt"].get("reason") == "pacing"
+                        f" CPU-pacing({_host_halt(h).get('cpu_pct', '?')}%≥{_host_halt(h).get('cpu_threshold', '?')}%)"
+                        if _host_halt(h).get("halted")
+                        and _host_halt(h).get("reason") == "pacing"
                         else ""
                     )
                     for h in with_dongles
@@ -1675,16 +1690,16 @@ class QARunner:
             else:
                 pacing = [
                     h for h in online
-                    if h.get("proxmox", {}).get("provision_halt", {}).get("halted")
-                    and h["proxmox"]["provision_halt"].get("reason") == "pacing"
+                    if _host_halt(h).get("halted")
+                    and _host_halt(h).get("reason") == "pacing"
                 ]
                 per_spoke = "; ".join(
                     (
                         f"{h.get('spoke_name', h.get('spoke_id', '?'))}: PACING "
-                        f"cpu_pct={h['proxmox']['provision_halt'].get('cpu_pct', '?')}% "
-                        f"thr={h['proxmox']['provision_halt'].get('cpu_threshold', '?')}% "
-                        f"1h_avg={float(h['proxmox'].get('cpu_1h_avg', 0) or 0):.1f}%"
-                        if h.get("proxmox", {}).get("provision_halt", {}).get("halted")
+                        f"cpu_pct={_host_halt(h).get('cpu_pct', '?')}% "
+                        f"thr={_host_halt(h).get('cpu_threshold', '?')}% "
+                        f"1h_avg={float((h.get('proxmox') or {}).get('cpu_1h_avg', 0) or 0):.1f}%"
+                        if _host_halt(h).get("halted")
                         else f"{h.get('spoke_name', h.get('spoke_id', '?'))}: ok "
                         f"cpu_1h_avg={float(h.get('proxmox', {}).get('cpu_1h_avg', 0) or 0):.1f}%"
                     )
@@ -1718,8 +1733,12 @@ class QARunner:
                 for h in online:
                     name = h.get("spoke_name", h.get("spoke_id", "?"))
                     cpu_avg = (h.get("proxmox") or {}).get("cpu_1h_avg")
-                    ph = (h.get("proxmox") or {}).get("provision_halt") or {}
-                    del_thr = float(ph.get("cpu_threshold") or 90)
+                    # The delete threshold isn't published in the proxmox telemetry
+                    # (only the provision threshold is, via provision.halt.cpu_threshold),
+                    # so use the documented cs default (cpu_delete_threshold=90) for the
+                    # teardown comparison. Reading provision.halt.cpu_threshold here would
+                    # report the PROVISION threshold (80), mislabeled as the delete thr.
+                    del_thr = 90.0
                     cpu_str = f"{float(cpu_avg):.1f}%" if cpu_avg is not None else "n/a"
                     lines.append(f"{name}: cpu_1h_avg={cpu_str} (delete_thr={del_thr:.0f}%)")
                     if cpu_avg is not None and float(cpu_avg) >= del_thr:

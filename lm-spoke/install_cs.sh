@@ -388,6 +388,13 @@ EOF
         # "only reads world-readable files" contract dhcp_status.py documents).
         chmod 0755 /etc/kea /var/lib/kea 2>/dev/null || true
         chmod 0644 "$KEA_DHCP4_CONF" "$KEA_CA_CONF" 2>/dev/null || true
+        # Kea >= 2.6.3 (CVE-2025-32801/32802/32803 hardening) REJECTS a control-socket
+        # dir more permissive than 0750 — RuntimeDirectory=kea defaults to 0755, which
+        # makes kea-dhcp4-sim crash-loop on config-set: "socket path:/run/kea does
+        # not exist or does not have permissions = 750". Force 0750 here so the
+        # install-time `kea-dhcp4 -t` validation passes; the units below set
+        # RuntimeDirectoryMode=0750 so the runtime dir is also 0750 after every start.
+        chmod 0750 /run/kea 2>/dev/null || true
 
         # Fail loudly at install if the generated Kea config is invalid, instead of
         # discovering it later via a silently-inactive unit (kea-dhcp4 -t is the
@@ -413,6 +420,10 @@ StartLimitIntervalSec=0
 Type=simple
 RuntimeDirectory=kea
 RuntimeDirectoryPreserve=yes
+# Kea >= 2.6.3 requires the control-socket dir to be 0750 (CVE-2025-32801/32802/32803
+# hardening); the default 0755 makes config-set fail ("permissions = 750") and the
+# unit crash-loops. RuntimeDirectory recreates /run/kea at this mode every start.
+RuntimeDirectoryMode=0750
 # Bounded wait for the sim NIC, then force it up and idempotently re-apply the
 # sim address (a reboot that did not process /etc/network/interfaces.d otherwise
 # leaves the link down/unaddressed so Kea cannot bind). Never hard-fail here: on
@@ -437,6 +448,7 @@ Wants=kea-dhcp4-sim.service
 Type=simple
 RuntimeDirectory=kea
 RuntimeDirectoryPreserve=yes
+RuntimeDirectoryMode=0750
 ExecStart=${KEA_CA_BIN} -c ${KEA_CA_CONF}
 Restart=on-failure
 RestartSec=5
