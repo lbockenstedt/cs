@@ -109,10 +109,20 @@ copy_local_files() {
         cp --remove-destination "$src_dir/user-overrides.conf" /usr/local/scripts/user-overrides.conf
     fi
 
-    # System config files — these dirs are root-owned, sudo required
+    # System config files — these dirs are root-owned, sudo required.
+    # Reload rsyslog only when the file actually changed, so the newly
+    # distributed config takes effect immediately instead of waiting for the
+    # next reboot (imfile tail of sim.log → syslog forwarding).
     if [[ -f "$src_dir/10-rsyslog.conf" ]]; then
-        sudo -n cp "$src_dir/10-rsyslog.conf" /etc/rsyslog.d/10-rsyslog.conf 2>/dev/null || \
-            echo "WARNING: could not update rsyslog.conf (no sudo)" | tee -a "$debug"
+        if ! cmp -s "$src_dir/10-rsyslog.conf" /etc/rsyslog.d/10-rsyslog.conf 2>/dev/null; then
+            if sudo -n cp "$src_dir/10-rsyslog.conf" /etc/rsyslog.d/10-rsyslog.conf 2>/dev/null; then
+                sudo -n systemctl restart rsyslog 2>/dev/null || \
+                    sudo -n pkill -HUP rsyslogd 2>/dev/null || \
+                    echo "WARNING: rsyslog.conf updated but reload failed (no sudo)" | tee -a "$debug"
+            else
+                echo "WARNING: could not update rsyslog.conf (no sudo)" | tee -a "$debug"
+            fi
+        fi
     fi
     # Deploy polkit rule to suppress NM graphical auth dialogs
     if [[ -f "$src_dir/50-client-sim-nm.rules" ]]; then
@@ -424,7 +434,10 @@ if [[ "$source_found" == false && "$github_repo" == "on" ]]; then
                 desktop_files=( *.desktop )
                 sh_files=( *.sh )
                 txt_files=( *.txt )
-                [[ -f "10-rsyslog.conf" ]] && sudo -n cp 10-rsyslog.conf /etc/rsyslog.d/10-rsyslog.conf 2>/dev/null || true
+                if [[ -f "10-rsyslog.conf" ]] && ! cmp -s "10-rsyslog.conf" /etc/rsyslog.d/10-rsyslog.conf 2>/dev/null; then
+                    sudo -n cp 10-rsyslog.conf /etc/rsyslog.d/10-rsyslog.conf 2>/dev/null && \
+                        { sudo -n systemctl restart rsyslog 2>/dev/null || sudo -n pkill -HUP rsyslogd 2>/dev/null || true; }
+                fi
                 # Deploy .desktop files to user autostart dir (no sudo needed)
                 _user_autostart="$HOME/.config/autostart"
                 mkdir -p "$_user_autostart"
