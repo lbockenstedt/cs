@@ -613,6 +613,22 @@ if [ -z "$SPOKE_SECRET" ]; then
     fi
 fi
 
+# ── Install UUID (preserve on re-run) ─────────────────────────────────────────
+# Keep the minted INSTALL_UUID across re-runs so the hub-side fingerprint
+# (install_uuid) stays stable. The cat > .env below truncates the file, so
+# without this the UUID line is wiped and the spoke mints a fresh one on next
+# start → hub records a `reimaged` (fingerprint-changed) event for a box that
+# was only updated. _ensure_install_uuid mints on first start only when this
+# line is absent, so a fresh install is unchanged.
+INSTALL_UUID_LINE=""
+if [ -f "$LM_DIR/cs/.env" ] && grep -q "^INSTALL_UUID=" "$LM_DIR/cs/.env"; then
+    EXISTING_UUID=$(grep "^INSTALL_UUID=" "$LM_DIR/cs/.env" | cut -d= -f2-)
+    if [ -n "$EXISTING_UUID" ]; then
+        INSTALL_UUID_LINE="INSTALL_UUID=$EXISTING_UUID"
+        ok "Preserving existing install UUID (hub fingerprint)"
+    fi
+fi
+
 # ── Clone / update ────────────────────────────────────────────────────────────
 step "Installing Generic Agent"
 mkdir -p "$LM_DIR"
@@ -752,6 +768,7 @@ CS_API_HOST=$CS_API_HOST
 ${TLS_VERIFY_LINE}
 ${TLS_CA_LINE}
 ${CS_AGENT_LISTENER_LINES}
+${INSTALL_UUID_LINE}
 DOTENV
 chmod 600 "$LM_DIR/cs/.env"
 
