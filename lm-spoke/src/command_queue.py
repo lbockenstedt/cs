@@ -148,6 +148,14 @@ class CSSettings:
     _DEFAULTS: Dict[str, Any] = {
         "usb_vidpids": "[]",
         "usb_ignored_vidpids": "[]",
+        # PCI-passthrough VID:PID lists that classify a VM's tier: a VM whose
+        # hostpciN device matches one of these IDs is that tier. T1 and T3 are
+        # PCI passthrough (T2 is the USB-passthrough tier). JSON array of bare
+        # "vvvv:pppp" strings, mirroring usb_ignored_vidpids. Defaults match the
+        # solutions-hpe originals (T1 1912:0015, T3 Atheros 168c:0034); editable
+        # in Setup → Proxmox so the classifier gates on configured values.
+        "t1_pci_vidpids": "[\"1912:0015\"]",
+        "t3_pci_vidpids": "[\"168c:0034\"]",
         "usb_missing_timeout": 60,
         "usb_auto_provision": "off",
         "use_all_dongles": False,
@@ -346,6 +354,8 @@ class CSSettings:
             "vmid_end": int(self.get("vmid_end", 99999) or 99999),
             "vm_set_override": vm_set_override,
             "ignored_vidpids": _parse_json_list(self.get("usb_ignored_vidpids", "[]")),
+            "t1_pci_vidpids": _parse_json_list(self.get("t1_pci_vidpids", "[]")),
+            "t3_pci_vidpids": _parse_json_list(self.get("t3_pci_vidpids", "[]")),
             "sim_phy": sim_phy,
             "reclone_concurrency": max(1, int(self.get("reclone_concurrency", 1) or 1)),
             "l1_vlan_start": max(1, min(4094, int(self.get("l1_vlan_start", 100) or 100))),
