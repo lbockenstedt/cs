@@ -140,22 +140,39 @@ class CentralPoller:
     async def test_connection(self) -> Dict[str, Any]:
         """Best-effort connectivity check for the Setup → Central API tab's
         "Test Central" button. Mirrors the hub's test_central route shape
-        ({"spokes": [...]}) with a single entry describing this spoke."""
+        ({"spokes": [...]}) with a single entry describing this spoke.
+
+        Logs every outcome to the cs spoke log (CentralPoller logger) so a
+        failed/missing-creds test is diagnosable from /var/log/lm/cs-spoke.log
+        instead of only surfacing in the UI's one-line ``status=`` field. The
+        hub's /sim/api/{tenant}/test-central route reads RELAYED telemetry (not a
+        live probe), so when a row shows all-— it means the spoke hasn't relayed
+        a populated central block yet — check this log for the real reason."""
         if not self._client or not self._client.is_configured():
+            logger.info("test_connection [%s]: Central not configured (no cluster_url)",
+                        self.spoke.spoke_id)
             return {"status": "SUCCESS", "spokes": [{
                 "spoke_id": self.spoke.spoke_id, "spoke_name": self.spoke.spoke_id,
                 "token_state": None, "token_valid": False,
                 "status": "Central not configured.",
             }]}
+        chash = getattr(self._client, "_config_hash", "?")
+        mode = getattr(self._client, "api_version", "?")
         try:
             import httpx
             async with httpx.AsyncClient(timeout=15) as client:
                 await self._client._ensure_token(client)
             token_valid = True
             msg = "Connected."
-        except Exception as exc:  # noqa: BLE001
+            logger.info("test_connection [%s] mode=%s cfg=%s: connected to Central",
+                        self.spoke.spoke_id, mode, chash)
+        except Exception as exc:  # noqa: BLE001 — surface any token/transport error
             token_valid = False
             msg = f"Connection failed: {exc}"
+            # The full exception (incl. underlying httpx ConnectError / HTTPStatusError
+            # response body) lands in the log; the UI only gets the one-line str(exc).
+            logger.warning("test_connection [%s] mode=%s cfg=%s FAILED: %r",
+                           self.spoke.spoke_id, mode, chash, exc)
         return {"status": "SUCCESS", "spokes": [{
             "spoke_id": self.spoke.spoke_id, "spoke_name": self.spoke.spoke_id,
             "token_state": self._client._token_state() if self._client else None,
