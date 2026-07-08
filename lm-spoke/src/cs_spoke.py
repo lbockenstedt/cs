@@ -293,6 +293,51 @@ class CSSpoke(BaseSpoke):
                 return await self.control_plane.send_to_agent(command, inner, agent_id=target)
             return {"status": "ERROR", "error": "Unknown relay command"}
 
+        # ── VNC console relay (agent-terminates-WSS) ────────────────────────
+        # PORT of ProxmoxSpoke.VNC_START/FRAME_DOWN/DISCONNECT. In the all-cs-
+        # hosted topology the pxmx agents dial THIS cs spoke, so the cs spoke —
+        # not a pxmx spoke — must relay VNC to them. Without these handlers a
+        # request_response(cs_spoke, "VNC_START") hit no branch and fell through
+        # to a generic error, which the hub surfaced as "agent refused
+        # VNC_START". VNC_START is sync (returns the Proxmox ticket = the RFB
+        # password noVNC must present); frames/disconnect are fire-and-forget.
+        if cmd == "VNC_START":
+            if not hasattr(self, "vnc_sessions"):
+                self.vnc_sessions = {}
+            session_id = d.get("session_id") or ""
+            agent_id = d.get("agent_id") or d.get("target_agent_id")
+            if not agent_id and session_id:
+                agent_id = self.vnc_sessions.get(session_id)
+            if not agent_id and self.control_plane:
+                node = str(d.get("node") or "")
+                uid = str(d.get("unique_id") or "")
+                cluster = uid.split("/")[0] if "/" in uid else ""
+                for aid, info in self.control_plane.connected_agents.items():
+                    hosts = {info.get("hostname"), info.get("cluster_name")}
+                    if (node and node in hosts) or (cluster and cluster in hosts):
+                        agent_id = aid
+                        break
+                if not agent_id and len(self.control_plane.connected_agents) == 1:
+                    agent_id = next(iter(self.control_plane.connected_agents))
+            if not agent_id:
+                return {"status": "ERROR", "message": "No agent resolved for VNC_START"}
+            if session_id:
+                self.vnc_sessions[session_id] = agent_id
+            return await self.control_plane.send_to_agent(
+                "VNC_START", d, agent_id=agent_id, timeout=25.0)
+
+        if cmd == "VNC_FRAME_DOWN":
+            aid = getattr(self, "vnc_sessions", {}).get(d.get("session_id") or "")
+            if aid and self.control_plane:
+                await self.control_plane.send_raw_to_agent(aid, "VNC_FRAME_DOWN", d)
+            return {"status": "OK"}
+
+        if cmd == "VNC_DISCONNECT":
+            aid = getattr(self, "vnc_sessions", {}).pop(d.get("session_id") or "", None)
+            if aid and self.control_plane:
+                await self.control_plane.send_raw_to_agent(aid, "VNC_DISCONNECT", d)
+            return {"status": "OK"}
+
         # ── simulation execution ────────────────────────────────────────────
         if cmd in ("CS_TRIGGER_ITERATION", "TRIGGER_ITERATION"):
             result = await self.engine.run_iteration()
