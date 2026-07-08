@@ -50,6 +50,41 @@ from fastapi.staticfiles import StaticFiles
 from starlette.responses import FileResponse, JSONResponse, PlainTextResponse
 
 import sim_config
+import resource_pressure
+
+# Client's normal status-report interval (s); throttle scales UP from here.
+_CLIENT_BASE_INTERVAL_S = 15.0
+
+
+def _client_throttle_interval(spoke) -> Optional[int]:
+    """Back-pressure: when the Proxmox host the sim VMs run on is under load,
+    tell clients to report LESS often so the loaded host + spoke can recover.
+
+    Derives pressure from the freshest per-host node CPU/mem the pxmx agent
+    already relays (no extra agent plumbing) via the shared resource_pressure
+    scorer, and scales the client report interval. Returns an int > base when
+    throttling, else None (calm → clients keep their normal cadence). Best-effort:
+    None on any error."""
+    try:
+        deploy = getattr(spoke, "deploy", None)
+        states = getattr(deploy, "proxmox_states", None) or {}
+        cpu = mem = None
+        for st in states.values():
+            node = (st or {}).get("node") or {}
+            c = node.get("cpu_percent")
+            if c is not None:
+                cpu = max(cpu or 0.0, float(c))
+            mu, mt = node.get("mem_used_kb"), node.get("mem_total_kb")
+            if mu is not None and mt:
+                try:
+                    mem = max(mem or 0.0, float(mu) / float(mt) * 100.0)
+                except (TypeError, ValueError, ZeroDivisionError):
+                    pass
+        pressure = resource_pressure.pressure_score(cpu_pct=cpu, mem_pct=mem)
+        interval = resource_pressure.throttle_interval(_CLIENT_BASE_INTERVAL_S, pressure)
+        return int(round(interval)) if interval > _CLIENT_BASE_INTERVAL_S else None
+    except Exception:  # noqa: BLE001
+        return None
 from local_ui_routes import build_local_ui_router
 
 logger = logging.getLogger("CSClientAPI")
@@ -160,8 +195,11 @@ def build_client_api_app(spoke) -> FastAPI:
     async def api_status(body: Dict[str, Any]) -> Dict[str, Any]:
         hostname = str(body.get("hostname") or "").strip()
         entry = await spoke.registry.apply_status(hostname or "__unknown__", body)
+        # Back-pressure: return a throttle interval (s) when the Proxmox host is
+        # under load so the client's HTTP heartbeat backs off (dashboard.sh reads
+        # throttle_interval). None = normal cadence. Was hard-coded None (dead).
         return {"status": "ok", "client": entry.get("hostname"),
-                "throttle_interval": None}
+                "throttle_interval": _client_throttle_interval(spoke)}
 
     # ── client key (auth bootstrap) ────────────────────────────────────────
     @app.get("/api/client/key")
@@ -302,6 +340,12 @@ def build_client_api_app(spoke) -> FastAPI:
         try:
             await ws.send_json({"type": "hello", "hostname": hn,
                                 "version": spoke.get_version()})
+            # Back-pressure: if the Proxmox host is loaded, tell the agent to
+            # widen its WS send interval (agent.sh honours {type:throttle}). Sent
+            # on connect + refreshed after each status report so it tracks load.
+            _thr = _client_throttle_interval(spoke)
+            if _thr:
+                await ws.send_json({"type": "throttle", "interval": _thr})
             # Push any pending commands immediately (marks them delivered).
             await push_pending(spoke, hn)
 
@@ -311,6 +355,9 @@ def build_client_api_app(spoke) -> FastAPI:
                 if mtype == "status":
                     await spoke.registry.apply_status(hn, msg.get("payload") or {})
                     await ws.send_json({"type": "status_ack"})
+                    _thr = _client_throttle_interval(spoke)
+                    if _thr:
+                        await ws.send_json({"type": "throttle", "interval": _thr})
                 elif mtype == "ack":
                     p = msg.get("payload") or {}
                     res = await spoke.queue.ack_command(
