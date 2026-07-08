@@ -267,7 +267,8 @@ function unescape_string()
 function process_ini_file()
 {
     # Reset all section data from any previous call to prevent value accumulation
-    for _reset_s in "${sections[@]}"; do
+    for _reset_s in "${sections[@]:-}"; do
+        [[ -n "$_reset_s" ]] || continue
         eval "unset ${_reset_s}_keys ${_reset_s}_values"
     done
     sections=()
@@ -277,9 +278,15 @@ function process_ini_file()
 
     setup_global_variables
 
+    # If the config file is missing/unreadable, return without populating so the
+    # redirect below does not error out (fatal under a 'set -e'/'set -u' caller).
+    if [[ ! -r "$1" ]]; then
+        return
+    fi
+
     shopt -s extglob
 
-    while IFS= read -r line || [ -n "$line" ]; do
+    while IFS= read -r line || [ -n "${line:-}" ]; do
         line=$(echo "$line" | tr -d '\r')  # Remove carriage return if present
         line_number=$((line_number+1))
 
@@ -339,8 +346,15 @@ function get_value()
     section=$(handle_default_case "${section}")
     key=$(handle_default_case "${key}")
 
-    eval "keys=( \"\${${section}_keys[@]}\" )"
-    eval "values=( \"\${${section}_values[@]}\" )"
+    # nounset-safe: section arrays only exist if that section was present in
+    # the parsed file. Under a caller running 'set -u' referencing an undefined
+    # array aborts, so bail out early if the section was never populated.
+    if ! declare -p "${section}_keys" >/dev/null 2>&1; then
+        return
+    fi
+
+    eval "keys=( \"\${${section}_keys[@]:-}\" )"
+    eval "values=( \"\${${section}_values[@]:-}\" )"
 
     for i in "${!keys[@]}"; do
         if [[ "${keys[${i}]}" = "${key}" ]]; then

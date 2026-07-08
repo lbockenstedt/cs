@@ -6,7 +6,7 @@ debug="/usr/local/scripts/debug-update.log"
 # Ensure log files exist and are writable by the running user.
 # /usr/local/scripts/ is root-owned; files created there by sudo are root-owned
 # and unwritable by the simulation user.  Touch + chmod once here before any tee.
-sudo touch "$log" "$debug" 2>/dev/null && sudo chmod a+w "$log" "$debug" 2>/dev/null || true
+sudo -n touch "$log" "$debug" 2>/dev/null && sudo -n chmod a+w "$log" "$debug" 2>/dev/null || true
 echo "Update Script Version $version" | tee "$debug"
 echo "$(date)" | tee -a "$debug"
 source '/usr/local/scripts/ini-parser.sh'
@@ -32,6 +32,32 @@ _return_or_exit() {
     else
         exit "${1:-0}"
     fi
+}
+
+#------------------------------------------------------------
+# Compare two dotted-numeric versions ($1=remote, $2=local).
+# A leading dot means an implicit 0 major (".103" → 0.103, "1.50" → 1.50).
+# Echoes "newer", "equal" or "older" describing remote relative to local.
+# Used to gate syncs so we only pull when remote is STRICTLY NEWER — an equal
+# version is up-to-date and an older remote is never applied (no downgrade).
+#------------------------------------------------------------
+_version_cmp() {
+    local a="$1" b="$2"
+    [[ "$a" == .* ]] && a="0$a"
+    [[ "$b" == .* ]] && b="0$b"
+    local IFS=.
+    local -a av=($a) bv=($b)
+    local i max=${#av[@]}
+    (( ${#bv[@]} > max )) && max=${#bv[@]}
+    for (( i=0; i<max; i++ )); do
+        local ai="${av[i]:-0}" bi="${bv[i]:-0}"
+        ai="${ai//[^0-9]/}"; bi="${bi//[^0-9]/}"
+        ai=$((10#${ai:-0})); bi=$((10#${bi:-0}))
+        if (( ai > bi )); then echo "newer"; return 0; fi
+        if (( ai < bi )); then echo "older"; return 0; fi
+    done
+    echo "equal"
+    return 0
 }
 
 #------------------------------------------------------------
@@ -130,25 +156,31 @@ copy_local_files() {
         sudo -n cp "$src_dir/50-client-sim-nm.rules" /etc/polkit-1/rules.d/50-client-sim-nm.rules 2>/dev/null || \
             echo "WARNING: could not update polkit rules (no sudo)" | tee -a "$debug"
     fi
-    # Only commit VERSION if all .sh copies succeeded — ensures next update cycle
-    # retries the full sync rather than treating a partial copy as complete.
+    # update.sh: atomic inode swap (cp to .new + mv) instead of cp-in-place.
+    # cp truncates the existing file in place (same inode); bash has that inode
+    # open and reads garbled content as the new bytes stream in. mv replaces
+    # the directory entry atomically — bash keeps the old fd and finishes reading
+    # the old content cleanly, then the next `source update.sh` gets the new file.
+    # This runs BEFORE the VERSION commit and folds its result into _copy_ok so a
+    # failed update.sh copy blocks the VERSION bump — otherwise the box would be
+    # stuck on the old update.sh while claiming the new version.
+    if [[ -f "$src_dir/update.sh" ]]; then
+        if ! { cp "$src_dir/update.sh" /usr/local/scripts/update.sh.new \
+                && chmod a+rx /usr/local/scripts/update.sh.new \
+                && mv -f /usr/local/scripts/update.sh.new /usr/local/scripts/update.sh; }; then
+            echo "ERROR: failed to copy update.sh — aborting VERSION commit" | tee -a "$debug" "$log"
+            _copy_ok=false
+        fi
+    fi
+    # Only commit VERSION if all .sh copies (including update.sh) succeeded —
+    # ensures next update cycle retries the full sync rather than treating a
+    # partial copy as complete.
     if [[ "$_copy_ok" == true && -f "$src_dir/VERSION" ]]; then
         cp "$src_dir/VERSION" /usr/local/scripts/VERSION.new \
             && mv -f /usr/local/scripts/VERSION.new /usr/local/scripts/VERSION \
             || echo "ERROR: VERSION commit failed" | tee -a "$debug" "$log"
     elif [[ -f "$src_dir/VERSION" ]]; then
         echo "Skipping VERSION commit — one or more script copies failed" | tee -a "$debug" "$log"
-    fi
-    # update.sh: atomic inode swap (cp to .new + mv) instead of cp-in-place.
-    # cp truncates the existing file in place (same inode); bash has that inode
-    # open and reads garbled content as the new bytes stream in. mv replaces
-    # the directory entry atomically — bash keeps the old fd and finishes reading
-    # the old content cleanly, then the next `source update.sh` gets the new file.
-    if [[ -f "$src_dir/update.sh" ]]; then
-        cp "$src_dir/update.sh" /usr/local/scripts/update.sh.new \
-            && chmod a+rx /usr/local/scripts/update.sh.new \
-            && mv -f /usr/local/scripts/update.sh.new /usr/local/scripts/update.sh \
-            || true
     fi
     chmod a+rx /usr/local/scripts/*.sh 2>/dev/null || true
     chmod a+rw "$log" "$debug" 2>/dev/null || true
@@ -210,7 +242,13 @@ if [[ "$web_server" == "on" && -n "$server_url" ]]; then
         remote_ver=$(curl -sS --max-time 5 \
             "$server_url/api/scripts/linux/VERSION" 2>/dev/null | tr -d '[:space:]')
         echo "Version check: local=$local_ver remote=$remote_ver" | tee -a "$debug"
-        if [[ -n "$remote_ver" && "$remote_ver" == "$local_ver" ]]; then
+        _vcmp=""
+        [[ -n "$remote_ver" ]] && _vcmp=$(_version_cmp "$remote_ver" "$local_ver")
+        if [[ -z "$remote_ver" ]]; then
+            echo "remote VERSION empty — skipping sync" | tee -a "$debug" "$log"
+        elif [[ "$_vcmp" == "older" ]]; then
+            echo "remote older ($remote_ver < $local_ver) — skipping (no downgrade)" | tee -a "$debug" "$log"
+        elif [[ "$_vcmp" == "equal" ]]; then
             echo "Already up to date (v$local_ver) — checking for config changes..." | tee -a "$debug" "$log"
             # Scripts are current, but simulation.conf may have changed independently.
             # Always fetch and apply it so kill_switch / other config tweaks propagate
@@ -313,9 +351,13 @@ if [[ "$web_server" == "on" && -n "$server_url" ]]; then
                 API_CACHE="/usr/local/scripts/.api-cache"
                 mkdir -p "$API_CACHE"
                 cp -r "$tmp_web"/. "$API_CACHE/"
-                chmod a+rwx "$API_CACHE"
+                # Cached scripts get executed later — never leave them
+                # world-writable. Dir 755; .sh readable+executable, others
+                # readable; strip group/other write from every cached file.
+                chmod 755 "$API_CACHE"
                 find "$API_CACHE" -type f -name "*.sh" -exec chmod a+rx {} +
-                find "$API_CACHE" -type f ! -name "*.sh" -exec chmod a+rw {} +
+                find "$API_CACHE" -type f ! -name "*.sh" -exec chmod a+r {} +
+                find "$API_CACHE" -type f -exec chmod go-w {} +
                 echo "API cache updated at $API_CACHE" | tee -a "$debug"
                 # Also copy API files into the local git repo clone so that the
                 # GitHub fallback tier finds the latest version already in place
@@ -415,11 +457,34 @@ if [[ "$source_found" == false && "$github_repo" == "on" ]]; then
 
         git reset --hard "origin/$repo_branch"
 
+        # git reset --hard wipes any files Tier 1 seeded into this clone from the
+        # API cache (latest scripts + per-device configs). Re-apply the cached
+        # copies over the freshly reset repo so the GitHub fallback uses the
+        # API-current versions and doesn't clobber per-device simulation.conf
+        # with the repo template.
+        API_CACHE="/usr/local/scripts/.api-cache"
+        if [[ -d "$API_CACHE" ]]; then
+            echo "Re-seeding repo from API cache after reset..." | tee -a "$debug"
+            [[ -f "$API_CACHE/simulation.conf" && -d configs ]] && \
+                cp "$API_CACHE/simulation.conf" configs/simulation.conf 2>/dev/null || true
+            if [[ -d linux ]]; then
+                cp "$API_CACHE"/*.sh  linux/ 2>/dev/null || true
+                cp "$API_CACHE"/*.txt linux/ 2>/dev/null || true
+                [[ -f "$API_CACHE/VERSION" ]] && cp "$API_CACHE/VERSION" linux/VERSION 2>/dev/null || true
+            fi
+        fi
+
         # Version check before copying — skip if already at this version
         local_ver=$(cat /usr/local/scripts/VERSION 2>/dev/null | tr -d '[:space:]')
         remote_ver=$(cat linux/VERSION 2>/dev/null | tr -d '[:space:]')
         echo "Version check: local=$local_ver remote=$remote_ver" | tee -a "$debug"
-        if [[ -n "$remote_ver" && "$remote_ver" == "$local_ver" ]]; then
+        _vcmp=""
+        [[ -n "$remote_ver" ]] && _vcmp=$(_version_cmp "$remote_ver" "$local_ver")
+        if [[ -z "$remote_ver" ]]; then
+            echo "remote VERSION empty — skipping sync" | tee -a "$debug" "$log"
+        elif [[ "$_vcmp" == "older" ]]; then
+            echo "remote older ($remote_ver < $local_ver) — skipping (no downgrade)" | tee -a "$debug" "$log"
+        elif [[ "$_vcmp" == "equal" ]]; then
             echo "Already up to date (v$local_ver) — checking for config changes..." | tee -a "$debug" "$log"
             # Scripts are current but configs/ may have changed. Always apply
             # simulation.conf (and user-overrides.conf) so config tweaks like

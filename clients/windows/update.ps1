@@ -175,7 +175,9 @@ if ($web_server -eq 'on' -and $server_url) {
         # ── simulation.conf ──────────────────────────────────────────────────
         try {
             $tmpConf = Join-Path $env:TEMP 'simulation.conf.webserver'
-            Invoke-WebRequest -Uri "$server_url/api/config" `
+            # Send this host's name so the server merges per-host + demo overrides
+            # (mirrors Linux update.sh which fetches ?hostname=$(hostname)).
+            Invoke-WebRequest -Uri "$server_url/api/config?hostname=$([uri]::EscapeDataString($env:COMPUTERNAME))" `
                 -OutFile $tmpConf -TimeoutSec 15 -UseBasicParsing -ErrorAction Stop
             Copy-Item $tmpConf (Join-Path $scriptRoot 'simulation.conf') -Force
             Remove-Item $tmpConf -ErrorAction SilentlyContinue
