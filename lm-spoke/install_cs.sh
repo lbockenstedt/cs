@@ -158,13 +158,16 @@ fi
 
 [ "$(id -u)" -eq 0 ] || { echo "❌ Must be run as root."; exit 1; }
 
-# A successful install chowns $LM_DIR/cs to $SVC_USER (see chown -R near the end
-# of this script), but every run — including re-runs/updates — executes entirely
-# as root. Root then running `git pull`/`git clone` against a directory owned by
-# a different user trips git's dubious-ownership safety check (CVE-2022-24765
-# mitigation): "fatal: detected dubious ownership in repository at ...". Whitelist
-# both git-managed paths for root's git config up front so clone/pull always
-# work regardless of who currently owns them.
+# A successful install chowns $LM_DIR (the whole lm checkout, incl. .git + cs/)
+# to $SVC_USER (see chown -R near the end of this script), but every run —
+# including re-runs/updates — executes entirely as root. Root then running
+# `git pull`/`git clone` against a directory owned by a different user trips
+# git's dubious-ownership safety check (CVE-2022-24765 mitigation):
+# "fatal: detected dubious ownership in repository at ...". Whitelist the
+# git-managed paths for root's git config up front so clone/pull always work
+# regardless of who currently owns them. $LM_DIR covers the new all-in-one
+# lm checkout (.git at /opt/lm); $LM_DIR/cs is the separate cs clone.
+git config --global --add safe.directory "$LM_DIR" 2>/dev/null || true
 git config --global --add safe.directory "$LM_DIR/cs" 2>/dev/null || true
 git config --global --add safe.directory "$LM_DIR/core" 2>/dev/null || true
 
@@ -665,31 +668,51 @@ mkdir -p "$LM_DIR"
 # "ModuleNotFoundError: No module named 'base_spoke'" (a prior install only
 # worked because a hub install had already laid /opt/lm/core).
 #
-# Mirror install_all.sh: clone lm to a temp dir and extract ONLY its core/
-# subdir to $LM_DIR/core. Cloning the WHOLE lm repo to $LM_DIR/core nests it one
-# level deep — base_spoke lands at $LM_DIR/core/core/src/base_spoke.py and the
-# PYTHONPATH path ($LM_DIR/core/src) misses it, so the spoke still crash-loops.
-# Extracting just core/ puts base_spoke at $LM_DIR/core/src/base_spoke.py.
+# Provision /opt/lm as a REAL lm.git checkout (the all-in-one layout
+# install_agent.sh uses) — NOT a vendored core/ extraction. The whole repo
+# clones to $LM_DIR, so /opt/lm/.git exists and base_spoke lands at the correct
+# $LM_DIR/core/src/base_spoke.py (cloning into $LM_DIR/core would nest core/ one
+# level deep — base_spoke at $LM_DIR/core/core/src/base_spoke.py — and break the
+# PYTHONPATH). A real checkout means the spoke can `git pull` /opt/lm to pick up
+# lm/core changes via the WebUI Update button / auto-update (SPOKE_UPDATE pulls
+# the shared core too) — no CLI `git -C /opt/lm pull` + restart required.
 LM_CORE_URL="https://github.com/lbockenstedt/lm.git"
+LM_CORE_BRANCH="main"
 _lm_core_refresh() {
-    # $1 = reason. Fresh clone to a temp dir, then swap only the core/ subdir in
-    # place. rm -rf the existing /opt/lm/core first so updates — and recovery
-    # from a half-written or wrong-layout prior run (e.g. an older installer that
-    # cloned the whole lm repo here) — are clean and idempotent.
+    # $1 = reason. Idempotent: an existing real checkout (/.git present) is just
+    # fetched + hard-reset to origin/$LM_CORE_BRANCH. A fresh box — or an OLD
+    # cs install with a non-git vendored /opt/lm/core (no /opt/lm/.git) — gets a
+    # one-time conversion: the co-located /opt/lm/cs clone is moved aside, /opt/lm
+    # is wiped + re-cloned from lm.git, and /opt/lm/cs is restored.
     warn "LM core refresh ($1)"
-    local tmp="$LM_DIR/.lm-core-tmp"
-    rm -rf "$tmp" "$LM_DIR/core"
-    if ! git clone -q "$LM_CORE_URL" "$tmp"; then
-        rm -rf "$tmp"
+    if [ -d "$LM_DIR/.git" ]; then
+        local cur_origin
+        cur_origin="$(git -C "$LM_DIR" config --get remote.origin.url 2>/dev/null || true)"
+        [ "$cur_origin" = "$LM_CORE_URL" ] || \
+            git -C "$LM_DIR" remote set-url origin "$LM_CORE_URL" 2>/dev/null || true
+        git -C "$LM_DIR" fetch -q origin 2>/dev/null || true
+        git -C "$LM_DIR" reset --hard "origin/$LM_CORE_BRANCH" >/dev/null 2>&1 || true
+        return 0
+    fi
+    # No /opt/lm/.git → fresh checkout or conversion from the old vendored
+    # layout. Preserve any existing /opt/lm/cs clone across the wipe so a
+    # re-run on an already-installed box doesn't strand the cs repo.
+    local cs_bak=""
+    if [ -d "$LM_DIR/cs" ]; then
+        cs_bak="$LM_DIR/.lm-cs-bak.$$"
+        mv "$LM_DIR/cs" "$cs_bak"
+    fi
+    rm -rf "$LM_DIR"
+    if ! git clone -q --branch "$LM_CORE_BRANCH" "$LM_CORE_URL" "$LM_DIR"; then
+        if [ -n "$cs_bak" ]; then
+            mkdir -p "$LM_DIR" 2>/dev/null || true
+            mv "$cs_bak" "$LM_DIR/cs" 2>/dev/null || true
+        fi
         return 1
     fi
-    if [ ! -d "$tmp/core" ]; then
-        warn "LM core clone has no core/ subdir — unexpected lm repo layout"
-        rm -rf "$tmp"
-        return 1
+    if [ -n "$cs_bak" ]; then
+        mv "$cs_bak" "$LM_DIR/cs"
     fi
-    mv "$tmp/core" "$LM_DIR/core"
-    rm -rf "$tmp"
 }
 if [ -f "$LM_DIR/core/src/base_spoke.py" ]; then
     echo "   Updating LM core (base_spoke)"
@@ -846,7 +869,10 @@ systemctl enable lm-cs
 systemctl restart lm-cs
 ok "Generic Agent service started"
 
-chown -R "$SVC_USER:$SVC_USER" "$LM_DIR/cs" 2>/dev/null || true
+# chown the WHOLE lm checkout to the spoke user so the spoke process can
+# `git pull` /opt/lm itself during a hub-driven SPOKE_UPDATE (the shared core
+# now lives in a real git checkout at $LM_DIR). Covers $LM_DIR/cs too.
+chown -R "$SVC_USER:$SVC_USER" "$LM_DIR" 2>/dev/null || true
 
 # The per-spoke recovery state dir lives under /var/lib/lm/ but the spoke runs
 # as $SVC_USER (non-root) and CANNOT create a dir under /var/lib/lm itself — so
@@ -887,13 +913,22 @@ cat > /usr/local/bin/lm-component-update-restart <<'HELPER'
 # rolling back a good update during a hub outage would strand the component on
 # old code and mark a good commit/version bad.
 #
+# Dual-repo rollback: when the spoke update ALSO pulled the shared /opt/lm core
+# checkout (--core-repo-root + core_from_commit/core_to_commit in the pending
+# manifest), a boot failure resets BOTH repos — the spoke first, then core.
+# The core to_commit is marked bad so the next SPOKE_UPDATE skips a crash-
+# looping core. v1 is NON-ATOMIC across the two repos: a watchdog crash between
+# the two `git reset --hard`s leaves the spoke rolled back but core forward —
+# recoverable via the on-disk manifest + the `writefailed` marker. Atomic
+# two-repo rollback is deferred.
+#
 # State-file ops delegate to the Python CLI update_recovery.py (SINGLE SOURCE OF
 # TRUTH for the on-disk recovery state machine). Only poll/systemd/git logic
 # lives here. This file is the canonical source; install_cs.sh / install_pxmx.sh
 # / install_agent.sh embed it verbatim via here-doc — keep them in sync.
 set -uo pipefail
 
-UNIT="" STATE_DIR="" REPO_ROOT="" INSTALL_DIR="" DEADLINE=90
+UNIT="" STATE_DIR="" REPO_ROOT="" INSTALL_DIR="" DEADLINE=90 CORE_REPO_ROOT=""
 RECOVERY_PY="/opt/lm/core/src/update_recovery.py"
 
 # Re-exec under a transient systemd unit outside the component's cgroup so this
@@ -913,6 +948,7 @@ while [ $# -gt 0 ]; do
         --unit) UNIT="$2"; shift 2;;
         --state-dir) STATE_DIR="$2"; shift 2;;
         --repo-root) REPO_ROOT="$2"; shift 2;;
+        --core-repo-root) CORE_REPO_ROOT="$2"; shift 2;;
         --install-dir) INSTALL_DIR="$2"; shift 2;;
         --deadline) DEADLINE="$2"; shift 2;;
         --recovery-py) RECOVERY_PY="$2"; shift 2;;
@@ -963,6 +999,8 @@ bdir="$(printf '%s' "$pending" | jq -r '.backup_dir // empty' 2>/dev/null)"
 from_commit="$(printf '%s' "$pending" | jq -r '.from_commit // empty' 2>/dev/null)"
 to_commit="$(printf '%s' "$pending" | jq -r '.to_commit // empty' 2>/dev/null)"
 to_v="$(printf '%s' "$pending" | jq -r '.to_version // empty' 2>/dev/null)"
+core_from="$(printf '%s' "$pending" | jq -r '.core_from_commit // empty' 2>/dev/null)"
+core_to="$(printf '%s' "$pending" | jq -r '.core_to_commit // empty' 2>/dev/null)"
 
 echo "lm-component-update-restart: $UNIT failed to boot (crash-loop/failed); rolling back." >&2
 
@@ -983,6 +1021,21 @@ elif [ -n "$INSTALL_DIR" ]; then
     fi
     if [ -n "$to_v" ]; then
         python3 "$RECOVERY_PY" markbad "$to_v" --state-dir "$STATE_DIR" >/dev/null 2>&1 || true
+    fi
+fi
+
+# Dual-repo rollback: reset the shared /opt/lm core checkout AFTER the spoke
+# repo so a crash-looping core (e.g. a bad BaseControlPlane change) is rolled
+# back too. The core to_commit is marked bad so the next SPOKE_UPDATE skips it
+# (the spoke's _is_known_bad_commit guard) instead of re-pulling it. Skipped
+# entirely when no --core-repo-root / core fields were recorded — single-repo
+# behavior is unchanged.
+if [ -n "$CORE_REPO_ROOT" ] && [ -n "$core_from" ]; then
+    echo "lm-component-update-restart: rolling back shared core at $CORE_REPO_ROOT to $core_from." >&2
+    git -C "$CORE_REPO_ROOT" reset --hard "$core_from" >/dev/null 2>&1 || true
+    git -C "$CORE_REPO_ROOT" clean -fd >/dev/null 2>&1 || true
+    if [ -n "$core_to" ]; then
+        python3 "$RECOVERY_PY" markbadcommit "$core_to" --state-dir "$STATE_DIR" >/dev/null 2>&1 || true
     fi
 fi
 
