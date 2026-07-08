@@ -143,7 +143,7 @@ def test_config_overrides_and_parsed(client):
 def test_scripts_list_and_get(client):
     r = client.get("/api/scripts/list", params={"platform": "linux"})
     assert r.status_code == 200
-    assert "agent.sh" in r.json()["scripts"]
+    assert "agent.sh" in r.json()  # bare array (linux/windows clients iterate it directly)
 
     r = client.get("/api/scripts/linux/agent.sh")
     assert r.status_code == 200

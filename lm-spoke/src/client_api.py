@@ -33,7 +33,7 @@ import asyncio
 import logging
 import secrets
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 from fastapi import (
     Depends,
@@ -216,12 +216,18 @@ def build_client_api_app(spoke) -> FastAPI:
         return (CLIENTS_DIR / platform).resolve()
 
     @app.get("/api/scripts/list")
-    async def api_scripts_list(platform: str = Query(...)) -> Dict[str, Any]:
+    async def api_scripts_list(platform: str = Query(...)) -> List[str]:
+        # MUST return a BARE JSON ARRAY (["agent.sh", ...]), NOT
+        # {"platform":.., "scripts":[..]}. The linux update.sh
+        # (tr -d '[]"' | tr ',') and windows update.ps1
+        # (ConvertFrom-Json | foreach) both iterate the top-level array
+        # directly; wrapping it in an object made them parse bogus tokens like
+        # "{platform:linux" and fail EVERY script sync ("sync incomplete").
+        # Matches the original webui-spoke endpoint (list[str]).
         sd = _scripts_dir(platform)
         if not sd.is_dir():
-            return {"platform": platform, "scripts": []}
-        scripts = sorted(p.name for p in sd.iterdir() if p.is_file())
-        return {"platform": platform, "scripts": scripts}
+            return []
+        return sorted(p.name for p in sd.iterdir() if p.is_file())
 
     @app.get("/api/scripts/{platform}/{filename:path}")
     async def api_scripts_get(platform: str, filename: str) -> FileResponse:
