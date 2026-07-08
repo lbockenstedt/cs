@@ -424,13 +424,17 @@ class ProxmoxDeploy:
             # second NIC). Cheap, defensive probe — never raises; degrades to
             # {installed: False} when Kea isn't configured. Read by the hub's
             # /sim/api/superadmin/dhcp-status route → Setup → Simulations card.
-            # ``collect_dhcp_status`` runs a ``systemctl is-active`` subprocess
-            # (blocking, up to 3s). The 10s telemetry relay loop offloads it via
-            # asyncio.to_thread and passes the result in as ``dhcp`` so it never
-            # stalls the event loop (that recurring stall cascaded hub requests
-            # into 5s/30s Request Timeouts). Fall back to an inline probe for any
-            # other (non-hot-path) caller that doesn't pre-compute it.
-            "dhcp":        dhcp if dhcp is not None else collect_dhcp_status(),
+            # ``collect_dhcp_status`` runs ``pgrep`` + ``systemctl is-active``
+            # subprocesses (blocking, up to ~6s — and can hang PAST the 3s
+            # timeout if systemd/Kea is wedged in D-state, stalling the shared
+            # event loop for 90s+ → the hub closes the WS with 1011 keepalive
+            # ping timeout and the spoke enters the 5→300s reconnect flap seen on
+            # ALL cs spokes). The 10s relay loop pre-computes it via
+            # asyncio.to_thread and passes it as ``dhcp``. NEVER call it inline
+            # here — a caller that forgets to offload would reintroduce the
+            # stall. Absent a pre-computed value, emit an empty block; a caller
+            # that needs live status must offload it itself.
+            "dhcp":        dhcp if dhcp is not None else {},
         }
         return payload
 
