@@ -21,6 +21,11 @@ export DEBIAN_FRONTEND=noninteractive
 #   curl -sSL https://raw.githubusercontent.com/lbockenstedt/cs/main/install_cs.sh \
 #     | sudo bash -s -- --hub ws://HUB_IP:8765
 #
+# Re-running preserves the spoke secret + INSTALL_UUID (same identity). To
+# reset identity in one shot (regenerate secret + UUID → spoke re-registers,
+# needs hub approval) add --purge-env (alias --reset-identity):
+#   … | sudo bash -s -- --hub wss://172.16.1.31:443 --purge-env
+#
 # Environment variable overrides (set before running):
 #   DHCP_IFACE, DHCP_SUBNET, DHCP_PREFIX, DHCP_GATEWAY, DHCP_RANGE_START,
 #   DHCP_RANGE_END, DHCP_LEASE_TIME, DHCP_SKIP (1 to skip DHCP entirely)
@@ -100,6 +105,13 @@ CS_AGENT_LISTENER=1
 # gets its runtime config from the hub push, so it only needs the host-level
 # infra this installer would otherwise lay down. Idempotent + non-interactive.
 INFRA_ONLY=0
+# --purge-env: delete the existing spoke .env BEFORE install so the secret +
+# INSTALL_UUID are regenerated from scratch (a fresh identity). Normally the
+# installer preserves both across re-runs; this flag opts into a clean-slate
+# reset without a full uninstall. The spoke then reconnects with a NEW UUID +
+# no pre-shared secret → it lands in "pending admin approval" on the hub (pass
+# --secret alongside to keep it authenticated).
+PURGE_ENV=0
 while [[ "$#" -gt 0 ]]; do
     case $1 in
         --hub)                HUB_URL="$2"; HUB_URL_PINNED=1; shift ;;
@@ -113,6 +125,7 @@ while [[ "$#" -gt 0 ]]; do
         --agent-listener)     CS_AGENT_LISTENER=1 ;;  # default already; kept as a harmless no-op
         --no-agent-listener)  CS_AGENT_LISTENER=0 ;;
         --infra-only)         INFRA_ONLY=1 ;;
+        --purge-env|--reset-identity) PURGE_ENV=1 ;;
         --admin-token) ;; # deprecated
         --all-prereqs) ;;
         *) echo "Unknown argument: $1"; exit 1 ;;
@@ -597,6 +610,16 @@ setup_sim_dhcp
 if ! id "$SVC_USER" &>/dev/null; then
     useradd -r -s /bin/false -M "$SVC_USER"
     ok "Created service user $SVC_USER"
+fi
+
+# ── Optional identity reset (--purge-env) ────────────────────────────────────
+# Delete the existing .env BEFORE the preserve-on-re-run reads below, so the
+# spoke secret + INSTALL_UUID are regenerated fresh instead of being carried
+# forward. Done here (not at arg-parse) so $LM_DIR is set and it lands right
+# before the reads it must precede.
+if [ "$PURGE_ENV" = "1" ] && [ -f "$LM_DIR/cs/.env" ]; then
+    rm -f "$LM_DIR/cs/.env"
+    warn "--purge-env: removed $LM_DIR/cs/.env — secret + INSTALL_UUID will be regenerated (spoke re-registers on the hub → needs approval)."
 fi
 
 # ── Spoke secret (preserve on re-run) ────────────────────────────────────────
