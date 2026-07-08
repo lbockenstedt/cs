@@ -324,7 +324,7 @@ class CSSpoke(BaseSpoke):
             if session_id:
                 self.vnc_sessions[session_id] = agent_id
             return await self.control_plane.send_to_agent(
-                "VNC_START", d, agent_id=agent_id, timeout=25.0)
+                "VNC_START", d, agent_id=agent_id, timeout=45.0)
 
         if cmd == "VNC_FRAME_DOWN":
             aid = getattr(self, "vnc_sessions", {}).get(d.get("session_id") or "")
