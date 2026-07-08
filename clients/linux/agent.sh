@@ -90,16 +90,21 @@ run_command() {
   echo "Executing command: $cmd_id action=$action" | tee -a "$debug" "$log"
   case "$action" in
     restart_sim)
-      _sim_pid=$(pgrep -f '[/]simulation.sh' | head -1)
-      if [[ -n "$_sim_pid" ]]; then
-        kill -USR1 "$_sim_pid" 2>/dev/null || true
-        message="Restart signal sent (PID $_sim_pid)"
+      # simulation.sh is sourced by startup.sh (argv is startup.sh), so pgrep
+      # can't find it — read the PID it wrote instead.
+      sim_pid=$(cat /usr/local/scripts/simulation.pid 2>/dev/null)
+      if [[ -n "$sim_pid" ]] && kill -0 "$sim_pid" 2>/dev/null; then
+        # Sourced loop can't be cleanly re-exec'd — USR1 triggers a config
+        # reload as best-effort; a full restart requires a reboot.
+        kill -USR1 "$sim_pid" 2>/dev/null || true
+        message="Reload signal sent (PID $sim_pid); full restart requires a reboot"
       else
         message="simulation.sh not running — no action taken"
       fi
       ;;
     reboot)
-      if ! pgrep -f '[/]simulation.sh' >/dev/null 2>&1; then
+      sim_pid=$(cat /usr/local/scripts/simulation.pid 2>/dev/null)
+      if [[ -z "$sim_pid" ]] || ! kill -0 "$sim_pid" 2>/dev/null; then
         echo "Early-boot guard: skipping reboot command — simulation not yet running" | tee -a "$debug"
         message="Skipped — early-boot protection (simulation not running)"
       else
@@ -120,9 +125,9 @@ run_command() {
       ks_val="${arg_value:-on}"
       if [[ "$ks_val" != "on" && "$ks_val" != "off" ]]; then ks_val="on"; fi
       sed -i "s/^kill_switch=.*/kill_switch=${ks_val}/" /usr/local/scripts/simulation.conf
-      _sim_pid=$(pgrep -f '[/]simulation.sh' | head -1)
-      if [[ -n "$_sim_pid" ]]; then
-        kill -USR1 "$_sim_pid" 2>/dev/null || true
+      sim_pid=$(cat /usr/local/scripts/simulation.pid 2>/dev/null)
+      if [[ -n "$sim_pid" ]] && kill -0 "$sim_pid" 2>/dev/null; then
+        kill -USR1 "$sim_pid" 2>/dev/null || true
       fi
       if [[ "$ks_val" == "on" ]]; then
         message="Kill switch activated"
@@ -145,7 +150,10 @@ run_command() {
       --arg reboot  "$reboot_now" \
       '{id:$id, status:$status, message:$message, reboot:$reboot}'
   else
-    python3 -c "import json; print(json.dumps({'id':'$cmd_id','status':'$status','message':'$message','reboot':'$reboot_now'}))"
+    # Pass values via the environment so server-supplied $cmd_id/$message
+    # can't break out of the python program string.
+    CMD_ID="$cmd_id" CMD_STATUS="$status" CMD_MESSAGE="$message" CMD_REBOOT="$reboot_now" \
+      python3 -c 'import json,os; print(json.dumps({"id":os.environ["CMD_ID"],"status":os.environ["CMD_STATUS"],"message":os.environ["CMD_MESSAGE"],"reboot":os.environ["CMD_REBOOT"]}))'
   fi
 }
 

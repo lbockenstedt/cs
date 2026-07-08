@@ -1,6 +1,6 @@
 #!/bin/bash
 version=.95
-LOG_FILE=/tmp/sim.log
+LOG_FILE=/usr/local/scripts/sim.log
 
 echo $(date) | tee -a ${LOG_FILE}
 echo ------------------------------| tee -a ${LOG_FILE}
@@ -9,6 +9,18 @@ echo Simulation Script Version $version | tee -a ${LOG_FILE}
 #DO NOT EDIT BELOW THIS LINE UNLESS YOU KNOW WHAT YOU ARE DOING
 #------------------------------------------------------------
 source '/usr/local/scripts/ini-parser.sh'
+
+#------------------------------------------------------------
+# Remote-control support — let agent.sh find and signal this loop.
+# startup.sh runs `source .../simulation.sh`, so $$ here is the process
+# actually running the sim loop (argv is startup.sh, so pgrep can't match).
+# Writing our own PID lets agent.sh signal us via the PID file.
+#------------------------------------------------------------
+echo $$ > /usr/local/scripts/simulation.pid 2>/dev/null || true
+_sim_reload=0
+# USR1 (from agent.sh restart_sim / kill_switch) triggers a config re-read
+# on the next outer-loop iteration instead of default-terminating the process.
+trap '_sim_reload=1' USR1
 
 require_config_value() {
   local name="$1" value="${2:-}"
@@ -48,6 +60,15 @@ init_simulation_context() {
 }
 
 while true; do
+  #------------------------------------------------------------
+  # If a USR1 arrived (agent.sh restart_sim/kill_switch), note the
+  # reload and clear the flag; init_simulation_context + the get_value
+  # reads below re-read simulation.conf (kill_switch, simulation_id, etc.).
+  #------------------------------------------------------------
+  if [[ "${_sim_reload:-0}" == 1 ]]; then
+    echo "USR1 received — reloading simulation config" | tee -a ${LOG_FILE}
+    _sim_reload=0
+  fi
   init_simulation_context
 #------------------------------------------------------------
 #Finding adapter names and setting usable variables for interfaces
@@ -302,15 +323,27 @@ mac_id=$(python3 -c "import zlib; h=zlib.crc32('${username}'.encode())&0xFFFFFF;
 wladapter=$(ip -br a | grep "wlx\|wlan" | cut -d ' ' -f '1')
 sudo rfkill unblock wifi; sudo rfkill unblock all
 dfgw=$(ip route | grep -oP 'default via \K\S+')
-if ping -c2 "$dfgw" && [[ "$sim_phy" == "wireless" ]] && [[ -n "${wladapter}" ]]; then
- echo Successful network connection | tee -a ${LOG_FILE}
+if ping -c2 "$dfgw"; then gw_ok=true; else gw_ok=false; fi
+if [[ "$sim_phy" == "wireless" ]]; then
+  # Wireless still requires the wlan adapter to be present; on failure
+  # reconnect the WiFi as before.
+  if [[ "$gw_ok" == true && -n "${wladapter}" ]]; then
+    echo Successful network connection | tee -a ${LOG_FILE}
+  else
+    echo Network connection failed | tee -a ${LOG_FILE}
+    sleep 15
+    wladapter=$(ip -br a | grep "wlx\|wlan" | cut -d ' ' -f '1')
+    connect_wifi 180
+    sleep 15
+    dfgw=$(ip route | grep -oP 'default via \K\S+')
+  fi
 else
-  echo Network connection failed | tee -a ${LOG_FILE}
-  sleep 15
-  wladapter=$(ip -br a | grep "wlx\|wlan" | cut -d ' ' -f '1')
-  connect_wifi 180
-  sleep 15
-  dfgw=$(ip route | grep -oP 'default via \K\S+')
+  # Ethernet just needs the gateway ping to succeed — no WiFi fallback.
+  if [[ "$gw_ok" == true ]]; then
+    echo Successful network connection | tee -a ${LOG_FILE}
+  else
+    echo Network connection failed | tee -a ${LOG_FILE}
+  fi
 fi
 #------------------------------------------------------------
 #Begin Setting up simulation load
