@@ -89,6 +89,9 @@ class ProxmoxDeploy:
         "usb_state", "present_usb", "unknown_usb", "usb_count", "agent_version",
         "pve_version", "provision_halt", "template_lock", "vmid_range",
         "vm_set_override", "effective_vm_set", "provision", "prov_run",
+        # Delete-gate decision trace + the 1h averages the gate acts on, so the
+        # WebUI can show WHAT auto-prov decides on and WHY it did/didn't shed.
+        "delete_gate", "gate_averages",
         # Rolling 1h averages (computed from per-host sample rings); the VM
         # Server Details header renders px.cpu_1h_avg / px.mem_1h_avg, falling
         # back to "—" when None. Projected via _SUMMARY_KEYS so they relay to
@@ -210,6 +213,11 @@ class ProxmoxDeploy:
             # failed/items[]) for the WebUI live auto-provisioning panel
             # (progress bar + per-item Cloning/Configuring/Done/Failed feed).
             "prov_run":         prov_run,
+            # Delete-gate decision trace (cpu_avg vs delete threshold, cooldown,
+            # eligible candidates, human reason) + the 1h averages the gate acts
+            # on — surfaced so the WebUI shows what auto-prov decides on and why.
+            "delete_gate":      body.get("delete_gate") or {},
+            "gate_averages":    body.get("gate_averages") or {},
         }
         # Roll a CPU + mem sample from this frame's node block, then read the
         # 1h averages back into the entry so they ride the relay payload's
