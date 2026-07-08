@@ -227,12 +227,12 @@ class SimulationEngine:
         phy = str(profile.get("sim_phy", "wireless")).lower()
         try:
             if phy == "ethernet":
-                wl = _find_iface(("wlx", "wlan"))
+                wl = await _find_iface(("wlx", "wlan"))
                 if wl:
                     await _ip_link(wl, "down")
             else:  # wireless → disable wired (mgmt-guarded)
-                ea = _find_iface(("enp", "eno", "eth"))
-                if ea and not _is_mgmt_iface(ea):
+                ea = await _find_iface(("enp", "eno", "eth"))
+                if ea and not await _is_mgmt_iface(ea):
                     await _ip_link(ea, "down")
         except Exception as exc:  # noqa: BLE001
             logger.debug("sim_phy setup failed: %s", exc)
@@ -246,17 +246,21 @@ class SimulationEngine:
             "simulation_id": resolved["simulation_id"],
             "platform": "linux",
             "iteration": self.iteration,
-            "connected_ssid": _connected_ssid(),
-            "gateway_reachable": _gateway_reachable(),
+            "connected_ssid": await _connected_ssid(),
+            "gateway_reachable": await _gateway_reachable(),
             "active_simulations": ran,
             "errors": errors,
             "config": {k: profile.get(k, "off") for k in _BEACON_CONFIG_KEYS},
             "status": self.status,
             "timestamp": time.time(),
         }
+        # Offload the json.dumps + write off the loop (mirrors client_registry
+        # _apersist) so neither the O(N) serialization nor the file I/O can
+        # stall the hub WS receive on a contended disk.
         try:
-            (self.data_dir / "client-status.json").write_text(
-                json.dumps(payload, indent=2), encoding="utf-8")
+            await asyncio.to_thread(
+                lambda: (self.data_dir / "client-status.json").write_text(
+                    json.dumps(payload, indent=2), encoding="utf-8"))
         except Exception as exc:  # noqa: BLE001
             logger.debug("beacon write failed: %s", exc)
 
@@ -309,14 +313,43 @@ class SimulationEngine:
 
 
 # ── host helpers (best-effort, degrade when tools/adapters absent) ───────────
-def _find_iface(prefixes) -> Optional[str]:
-    import subprocess
+#
+# ALL of these run via ``asyncio.create_subprocess_exec`` + ``communicate`` so a
+# hung ``ip``/``nmcli``/``ping`` (or just a slow one under load) CANNOT stall the
+# cs spoke's shared event loop. The prior synchronous ``subprocess.run`` here
+# was the root cause of the hub's "Request Timeout from cs-svr-02-spoke after
+# 30.0s": ``_beacon`` runs every iteration (including the SKIPPED sim-load
+# path), and ``_connected_ssid`` + ``_gateway_reachable`` together blocked the
+# loop for up to ~9s per iteration, starving the in-flight hub WS receive.
+async def _run_capture(argv, timeout: float = 3.0):
+    """Async capture-stdout helper. Returns ``(stdout_text, returncode)``;
+    ``("", None)`` on any failure or timeout (process is killed + reaped)."""
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *argv,
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL)
+    except Exception:  # noqa: BLE001 — tool missing / exec error → degrade
+        return "", None
+    try:
+        out, _ = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+        text = out.decode("utf-8", "replace") if isinstance(out, bytes) else (out or "")
+        return text, proc.returncode
+    except Exception:  # noqa: BLE001 — timeout or read error; kill + reap
+        try:
+            proc.kill()
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            await proc.wait()
+        except Exception:  # noqa: BLE001
+            pass
+        return "", None
+
+
+async def _find_iface(prefixes) -> Optional[str]:
     if not shutil.which("ip"):
         return None
-    try:
-        out = subprocess.run(["ip", "-br", "a"], capture_output=True, text=True, timeout=3).stdout
-    except Exception:  # noqa: BLE001
-        return None
+    out, _ = await _run_capture(["ip", "-br", "a"], timeout=3.0)
     for line in out.splitlines():
         name = line.split()[0] if line.split() else ""
         if name.startswith(prefixes):
@@ -324,15 +357,10 @@ def _find_iface(prefixes) -> Optional[str]:
     return None
 
 
-def _is_mgmt_iface(iface: str) -> bool:
-    import subprocess
+async def _is_mgmt_iface(iface: str) -> bool:
     if not iface or not shutil.which("ip"):
         return False
-    try:
-        out = subprocess.run(["ip", "-4", "addr", "show", "dev", iface],
-                             capture_output=True, text=True, timeout=3).stdout
-    except Exception:  # noqa: BLE001
-        return False
+    out, _ = await _run_capture(["ip", "-4", "addr", "show", "dev", iface], timeout=3.0)
     return "169.253." in out
 
 
@@ -344,8 +372,10 @@ async def _ip_link(iface: str, state: str) -> None:
 
 
 async def _bounce_all_ifaces(down: bool) -> None:
-    for iface in (a for a in [_find_iface(("wlx", "wlan")), _find_iface(("enp", "eno", "eth"))] if a):
-        if down and _is_mgmt_iface(iface):
+    wl = await _find_iface(("wlx", "wlan"))
+    ea = await _find_iface(("enp", "eno", "eth"))
+    for iface in (a for a in [wl, ea] if a):
+        if down and await _is_mgmt_iface(iface):
             continue
         try:
             await _ip_link(iface, "down" if down else "up")
@@ -353,37 +383,28 @@ async def _bounce_all_ifaces(down: bool) -> None:
             pass
 
 
-def _connected_ssid() -> str:
-    import subprocess
+async def _connected_ssid() -> str:
     if not shutil.which("nmcli"):
         return ""
-    try:
-        out = subprocess.run(["nmcli", "-t", "-f", "active,ssid", "dev", "wifi"],
-                             capture_output=True, text=True, timeout=3).stdout
-    except Exception:  # noqa: BLE001
-        return ""
+    out, _ = await _run_capture(["nmcli", "-t", "-f", "active,ssid", "dev", "wifi"],
+                                timeout=3.0)
     for line in out.splitlines():
         if line.startswith("yes"):
             return line.split(":", 1)[1] if ":" in line else ""
     return ""
 
 
-def _gateway_reachable() -> Optional[bool]:
+async def _gateway_reachable() -> Optional[bool]:
     """Quick ping of the default gateway; None if undeterminable."""
-    import subprocess
     if not shutil.which("ip") or not shutil.which("ping"):
         return None
-    try:
-        rt = subprocess.run(["ip", "route"], capture_output=True, text=True, timeout=3).stdout
-        gw = None
-        for line in rt.splitlines():
-            if line.startswith("default via "):
-                gw = line.split()[2]
-                break
-        if not gw:
-            return None
-        p = subprocess.run(["ping", "-c", "1", "-W", "1", gw],
-                           capture_output=True, text=True, timeout=3)
-        return p.returncode == 0
-    except Exception:  # noqa: BLE001
+    out, _ = await _run_capture(["ip", "route"], timeout=3.0)
+    gw = None
+    for line in out.splitlines():
+        if line.startswith("default via "):
+            gw = line.split()[2]
+            break
+    if not gw:
         return None
+    _, rc = await _run_capture(["ping", "-c", "1", "-W", "1", gw], timeout=3.0)
+    return rc == 0

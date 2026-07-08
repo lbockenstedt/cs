@@ -324,12 +324,41 @@ async def sim_auth_fail(profile: Dict[str, str], ctx: SimCtx) -> PrimResult:
 
 
 # ── port_flap (wired) ─────────────────────────────────────────────────────────
-def _find_wired_adapter() -> Optional[str]:
+#
+# These two run via ``create_subprocess_exec`` + ``communicate`` with a timeout
+# so a hung ``ip`` (which previously had NO timeout) can't stall the cs spoke's
+# shared event loop and trigger a hub "Request Timeout". Sync ``subprocess.run``
+# without a timeout was an unbounded blocker on the loop.
+async def _run_capture(argv, timeout: float = 3.0):
+    """Async capture-stdout helper. Returns ``(stdout_text, returncode)``;
+    ``("", None)`` on any failure or timeout (process is killed + reaped)."""
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *argv,
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL)
+    except Exception:  # noqa: BLE001
+        return "", None
+    try:
+        out, _ = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+        text = out.decode("utf-8", "replace") if isinstance(out, bytes) else (out or "")
+        return text, proc.returncode
+    except Exception:  # noqa: BLE001
+        try:
+            proc.kill()
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            await proc.wait()
+        except Exception:  # noqa: BLE001
+            pass
+        return "", None
+
+
+async def _find_wired_adapter() -> Optional[str]:
     """Best-effort wired interface name (``enp*/eno*/eth*``) via ``ip -br a``."""
     if not shutil.which("ip"):
         return None
-    import subprocess
-    out = subprocess.run(["ip", "-br", "a"], capture_output=True, text=True).stdout
+    out, _ = await _run_capture(["ip", "-br", "a"], timeout=3.0)
     for line in out.splitlines():
         name = line.split()[0] if line.split() else ""
         if name.startswith(("enp", "eno", "eth")):
@@ -337,13 +366,11 @@ def _find_wired_adapter() -> Optional[str]:
     return None
 
 
-def _is_mgmt_iface(iface: str) -> bool:
+async def _is_mgmt_iface(iface: str) -> bool:
     """Management-IP guard: never bounce the 169.253.x mgmt interface."""
     if not iface or not shutil.which("ip"):
         return False
-    import subprocess
-    out = subprocess.run(["ip", "-4", "addr", "show", "dev", iface],
-                         capture_output=True, text=True).stdout
+    out, _ = await _run_capture(["ip", "-4", "addr", "show", "dev", iface], timeout=3.0)
     return "169.253." in out
 
 
@@ -351,10 +378,10 @@ async def sim_port_flap(profile: Dict[str, str], ctx: SimCtx) -> PrimResult:
     """Wired port link flap: bounce the wired interface up/down (ip link), mgmt-guarded."""
     if not shutil.which("ip"):
         return _degraded("port_flap", "ip", "install iproute2 (ip)")
-    iface = _find_wired_adapter()
+    iface = await _find_wired_adapter()
     if not iface:
         return _degraded("port_flap", "eth-iface", "no wired interface found")
-    if _is_mgmt_iface(iface):
+    if await _is_mgmt_iface(iface):
         return _ok("port_flap", f"skipped — {iface} is the mgmt interface", "ip")
     for _ in range(ctx.port_flap_iters):
         p = await asyncio.create_subprocess_exec(
