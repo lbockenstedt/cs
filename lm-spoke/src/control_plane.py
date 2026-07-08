@@ -235,6 +235,19 @@ class CSControlPlane(AgentHostingControlPlane):
                 # overlay this spoke's real CentralPoller output so a
                 # hub-connected deployment's Simulations tab gets live data too.
                 payload["central"] = getattr(cs_mod, "central_status", {}) or {}
+                # Command queue → telemetry so the hub's VM Server → Command
+                # Queue view serves from its CS_TELEMETRY cache (instant) instead
+                # of a live 15s request_response that stalls when this spoke is
+                # busy. ≤10s staleness is fine for a queue view; mutations
+                # (Send/Delete/Clear) still hit the live spoke and the WebUI
+                # forces a live re-fetch afterward. Best-effort: never break
+                # telemetry over a queue read.
+                try:
+                    _q = getattr(cs_mod, "queue", None)
+                    if _q is not None:
+                        payload["command_queue"] = await _q.list_commands()
+                except Exception as e:  # noqa: BLE001
+                    logger.debug("command_queue telemetry overlay failed: %s", e)
                 # Client registry → telemetry so the hub's Simulations "Clients"
                 # tab shows this spoke's connected sim clients. The hub reads
                 # data["clients"] (service.get_clients_data); relay_payload never
