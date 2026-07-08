@@ -275,3 +275,42 @@ def test_load_configs_cache_bounded_per_dir(tmp_path):
         sim_config.load_configs(base)
     same_dir_keys = [k for k in sim_config._LOAD_CACHE if k[0] == str(base)]
     assert len(same_dir_keys) == 1
+
+
+# ── effective_client_fields (server-resolved Site/PHY/Sim-ID) ────────────────
+# The bash client omits wsite/sim_phy and may report a stale simulation_id (old
+# character-position hashing → letters like "sl"); the relay must override it
+# with the crc32 bucket and fill Site/PHY from the resolved profile.
+
+# Every bucket present so whichever s0-s9 the hostname hashes to resolves.
+_ECF_SIM = "[simulation]\nsim_load=100\n" + "".join(
+    f"\n[s{i}]\nwsite=MIA\nsim_phy=wireless\n" for i in range(10))
+
+
+def test_effective_client_fields_overrides_stale_simid_and_fills_site_phy():
+    sim_conf = _parser(_ECF_SIM)
+    user_conf = sim_config._new_parser()
+    # Client reported the bogus "sl" (old hashing) and no wsite/sim_phy.
+    sid, cfg = sim_config.effective_client_fields(
+        "kbell-01", sim_conf, user_conf, reported_sim_id="sl", reported_config={})
+    assert sid.startswith("s") and sid[1:].isdigit(), f"expected s0-s9, got {sid!r}"
+    assert sid != "sl"                # stale value overridden with the hash bucket
+    assert cfg["wsite"] == "MIA"      # Site filled from the bucket
+    assert cfg["sim_phy"] == "wireless"
+
+
+def test_effective_client_fields_honors_user_pin_and_override():
+    sim_conf = _parser(_ECF_SIM)
+    user_conf = _parser("[kbell]\nsimulation_id=s1\nwsite=LHR\n")
+    sid, cfg = sim_config.effective_client_fields(
+        "kbell-01", sim_conf, user_conf, reported_sim_id="sl", reported_config={})
+    assert sid == "s1"          # pinned bucket wins
+    assert cfg["wsite"] == "LHR"  # per-user override wins over the bucket's DFW
+
+
+def test_effective_client_fields_falls_back_when_no_config():
+    # Config unavailable → keep whatever the client reported (never crash).
+    sid, cfg = sim_config.effective_client_fields(
+        "kbell-01", None, None, reported_sim_id="s4", reported_config={"wsite": "MIA"})
+    assert sid == "s4"
+    assert cfg == {"wsite": "MIA"}

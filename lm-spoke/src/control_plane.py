@@ -275,23 +275,13 @@ class CSControlPlane(AgentHostingControlPlane):
                     tier_updates: Dict[str, Dict[str, Any]] = {}
                     for hn, c in registry.get_all().items():
                         ls = c.get("last_seen")
-                        # Resolve the authoritative bucket profile for this
-                        # hostname → correct Sim-ID (fixes stale "sl"), plus
-                        # Site (wsite) and PHY (sim_phy) which the client never
-                        # reports. Falls back to whatever the client reported.
-                        eff_sim_id = c.get("simulation_id") or ""
-                        eff_cfg = dict(c.get("config") or {})
-                        if _sim_conf is not None:
-                            try:
-                                _r = sim_config.resolve_profile(hn, _sim_conf, _user_conf)
-                                eff_sim_id = _r["simulation_id"] or eff_sim_id
-                                _prof = _r.get("profile") or {}
-                                if _prof.get("wsite"):
-                                    eff_cfg["wsite"] = _prof["wsite"]
-                                if _prof.get("sim_phy"):
-                                    eff_cfg["sim_phy"] = _prof["sim_phy"]
-                            except Exception as _e:  # noqa: BLE001
-                                logger.debug("client relay: resolve %s failed: %s", hn, _e)
+                        # Resolve authoritative Sim-ID (fixes stale "sl") + Site
+                        # + PHY from the hostname's bucket profile — the original
+                        # hub's effective_config. Shared helper so this and the
+                        # local dashboard (local_ui_routes) never diverge.
+                        eff_sim_id, eff_cfg = sim_config.effective_client_fields(
+                            hn, _sim_conf, _user_conf,
+                            c.get("simulation_id") or "", c.get("config"))
                         vmid, has_usb = deploy.client_has_usb(
                             hn, c, usb_vmids, name_to_vmid)
                         cur_tier = tier_index.get(str(vmid)) if vmid else None

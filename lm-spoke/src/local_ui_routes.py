@@ -68,9 +68,20 @@ def build_local_ui_router(spoke) -> APIRouter:
             tier_index = deploy.vm_tier_index()
         else:
             usb_vmids, name_to_vmid, tier_index = set(), {}, {}
+        # Load sim configs once (mtime-cached) so each client's authoritative
+        # Site/PHY/Sim-ID resolves from its hostname — mirrors control_plane's
+        # hub-telemetry path so the local and hub Clients views agree.
+        try:
+            _sim_conf, _user_conf = sim_config.load_configs(_CONFIGS_DIR)
+        except Exception as _e:  # noqa: BLE001 — degrade to reported values
+            _sim_conf = _user_conf = None
+            logger.debug("aggregate_clients: config load failed: %s", _e)
         tier_updates: Dict[str, Dict[str, Any]] = {}
         for hostname, c in spoke.registry.get_all().items():
             last_seen = c.get("last_seen")
+            eff_sim_id, eff_cfg = sim_config.effective_client_fields(
+                hostname, _sim_conf, _user_conf,
+                c.get("simulation_id") or "", c.get("config"))
             online = bool(last_seen and (now - last_seen) < 300)
             if deploy is not None:
                 vmid, has_usb = deploy.client_has_usb(
@@ -95,7 +106,7 @@ def build_local_ui_router(spoke) -> APIRouter:
                 "hw_type": c.get("platform") or "",
                 "online": online,
                 "connected_ssid": c.get("connected_ssid") or "—",
-                "simulation_id": c.get("simulation_id") or "",
+                "simulation_id": eff_sim_id,
                 "active_simulations": c.get("active_simulations") or [],
                 "last_seen": last_seen if last_seen is not None else "—",
                 "error_count": len(c.get("recent_errors") or []),
@@ -108,7 +119,7 @@ def build_local_ui_router(spoke) -> APIRouter:
                 # (not just what's running) and STAY across refreshes — mirrors
                 # the hub-telemetry path (control_plane.py) so the local Clients
                 # view and the hub's agree.
-                "config": c.get("config") or {},
+                "config": eff_cfg,
                 "overrides": c.get("overrides") or {},
             })
         if tier_updates:

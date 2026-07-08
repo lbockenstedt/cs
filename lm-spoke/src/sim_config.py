@@ -232,6 +232,43 @@ def resolve_profile(
     }
 
 
+def effective_client_fields(
+    hostname: str,
+    sim_conf: Optional[configparser.ConfigParser],
+    user_conf: Optional[configparser.ConfigParser],
+    reported_sim_id: str = "",
+    reported_config: Optional[Dict[str, str]] = None,
+) -> Tuple[str, Dict[str, str]]:
+    """Server-resolved Sim-ID / Site / PHY for a client — the original hub's
+    ``effective_config``.
+
+    The bash client's status write omits ``wsite`` and ``sim_phy`` entirely and
+    may report a stale ``simulation_id`` (old character-position hashing →
+    letters like ``"sl"``). Resolve the authoritative bucket profile from the
+    hostname so the Clients view always shows the correct ``s0``–``s9`` bucket +
+    Site + PHY, regardless of what the (possibly un-updated) client reported.
+
+    Returns ``(simulation_id, config)``. Falls back to the reported values on any
+    resolve error or when ``sim_conf`` is None. Shared by both the hub-telemetry
+    relay (``control_plane``) and the local dashboard (``local_ui_routes``) so
+    the two Clients views never diverge."""
+    sim_id = reported_sim_id or ""
+    cfg = dict(reported_config or {})
+    if sim_conf is None:
+        return sim_id, cfg
+    try:
+        resolved = resolve_profile(hostname, sim_conf, user_conf)
+        sim_id = resolved.get("simulation_id") or sim_id
+        prof = resolved.get("profile") or {}
+        if prof.get("wsite"):
+            cfg["wsite"] = prof["wsite"]
+        if prof.get("sim_phy"):
+            cfg["sim_phy"] = prof["sim_phy"]
+    except Exception:  # noqa: BLE001 — degrade to reported values
+        pass
+    return sim_id, cfg
+
+
 def flag_on(profile: Dict[str, str], key: str) -> bool:
     """Truthy helper: a flag is "on" iff its value lowercased == ``"on"``."""
     return str(profile.get(key, "")).strip().lower() == "on"
