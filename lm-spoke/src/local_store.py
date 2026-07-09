@@ -18,11 +18,123 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import threading
 from pathlib import Path
 from typing import Any, Dict
 
 logger = logging.getLogger("LocalStore")
+
+# Setup/Proxmox hub-config list fields. The local Setup UI (sim-views.js)
+# collects these as comma/space-delimited text (no raw JSON); the spoke
+# normalizes a delimited string into a list here, at the storage boundary, so
+# downstream _parse_json_list / _apply_hub_config read a real list. Already-list
+# or already-JSON values pass through. usb_vidpids is a list of {vidpid,type,
+# label}; type/label are preserved from the currently-stored entry when the same
+# vidpid already exists, so editing the field as a plain vidpid list does NOT
+# discard metadata set via another UI. Mirrors normalize_hub_config_lists in
+# lm/core/src/simulations/routes.py — keep the two in sync.
+_HUB_CONFIG_LIST_KEYS = (
+    "usb_ignored_vidpids",   # list of "vid:pid"
+    "t1_pci_vidpids",        # list of "vid:pid"
+    "t3_pci_vidpids",        # list of "vid:pid"
+    "ignored_hostnames",     # list of str
+)
+_HUB_CONFIG_VIDPID_OBJ_KEY = "usb_vidpids"  # list of {vidpid,type,label}
+_USB_VIDPID_RE = re.compile(r"^[0-9a-f]{4}:[0-9a-f]{4}$")
+
+
+def _split_delim(s: str) -> list:
+    return [p.strip() for p in re.split(r"[,\s]+", s) if p.strip()]
+
+
+def _coerce_to_list(raw: Any) -> list:
+    """Best-effort raw → list: an already-parsed list, a JSON array string, or a
+    delimited string. Returns [] for empty/None."""
+    if raw is None:
+        return []
+    if isinstance(raw, list):
+        return raw
+    s = str(raw).strip()
+    if not s:
+        return []
+    if s.startswith("["):
+        try:
+            parsed = json.loads(s)
+            return parsed if isinstance(parsed, list) else []
+        except (json.JSONDecodeError, ValueError):
+            pass
+    return _split_delim(s)
+
+
+def _hub_config_list_value(key: str, raw: Any, stored_raw: Any = None) -> list:
+    """Normalize one Setup/Proxmox list field for storage. vidpid string-list
+    keys → deduped list of lowercased ``vid:pid`` (invalid tokens dropped);
+    ``ignored_hostnames`` → deduped list of non-empty strings (order kept);
+    ``usb_vidpids`` → deduped list of ``{vidpid,type,label}`` dicts, reusing the
+    stored entry's type/label for an existing vidpid (else type ``"wireless"``,
+    label = vidpid) — or the input object's own type/label when it's already a
+    dict."""
+    if key == _HUB_CONFIG_VIDPID_OBJ_KEY:
+        items = _coerce_to_list(raw)
+        prev: Dict[str, Dict[str, str]] = {}
+        for it in _coerce_to_list(stored_raw):
+            if isinstance(it, dict) and it.get("vidpid"):
+                vp = str(it["vidpid"]).strip().lower()
+                if _USB_VIDPID_RE.match(vp):
+                    prev[vp] = {"type": str(it.get("type") or "wireless"),
+                                "label": str(it.get("label") or vp)}
+        out, seen = [], set()
+        for it in items:
+            vp = str(it.get("vidpid", "") if isinstance(it, dict) else it).strip().lower()
+            if not _USB_VIDPID_RE.match(vp) or vp in seen:
+                continue
+            seen.add(vp)
+            if isinstance(it, dict):
+                out.append({"vidpid": vp,
+                            "type": str(it.get("type") or "wireless"),
+                            "label": str(it.get("label") or vp)})
+            else:
+                p = prev.get(vp)
+                out.append({"vidpid": vp,
+                            "type": p["type"] if p else "wireless",
+                            "label": p["label"] if p else vp})
+        return out
+    items = _coerce_to_list(raw)
+    if key == "ignored_hostnames":
+        out, seen = [], set()
+        for it in items:
+            s = str(it).strip()
+            if s and s not in seen:
+                seen.add(s)
+                out.append(s)
+        return out
+    out, seen = [], set()
+    for it in items:
+        vp = str(it.get("vidpid", "") if isinstance(it, dict) else it).strip().lower()
+        if _USB_VIDPID_RE.match(vp) and vp not in seen:
+            seen.add(vp)
+            out.append(vp)
+    return out
+
+
+def normalize_hub_config_lists(hc: Any, stored_hc: Any = None) -> dict:
+    """Return a copy of ``hc`` with the Setup/Proxmox list fields normalized to
+    lists. Fields not present are left untouched. Called by
+    ``LocalStore.set_hub_config`` so the local Setup UI may send comma/space-
+    delimited strings instead of raw JSON."""
+    if not isinstance(hc, dict):
+        return hc
+    out = dict(hc)
+    stored_hc = stored_hc or {}
+    for k in _HUB_CONFIG_LIST_KEYS:
+        if k in out:
+            out[k] = _hub_config_list_value(k, out[k], stored_hc.get(k))
+    if _HUB_CONFIG_VIDPID_OBJ_KEY in out:
+        out[_HUB_CONFIG_VIDPID_OBJ_KEY] = _hub_config_list_value(
+            _HUB_CONFIG_VIDPID_OBJ_KEY, out[_HUB_CONFIG_VIDPID_OBJ_KEY],
+            stored_hc.get(_HUB_CONFIG_VIDPID_OBJ_KEY))
+    return out
 
 # Mirror of lm/core/src/simulations/store.py's _DEFAULT_HUB_CONFIG. Keep in
 # sync if the hub's knob set changes — this is what seeds a fresh standalone
@@ -120,10 +232,18 @@ class LocalStore:
         Callers that edit a subset (``csSaveHubConfig`` and
         ``csSaveAutoProvConfig`` in ``sim-views.js``) must GET-merge-PUT or
         the two Setup cards wipe each other's keys. ``enabled`` toggles
-        ``hub_config_enabled`` independently of the knob dict."""
+        ``hub_config_enabled`` independently of the knob dict.
+
+        List fields (``usb_vidpids`` / ``usb_ignored_vidpids`` /
+        ``t1_pci_vidpids`` / ``t3_pci_vidpids`` / ``ignored_hostnames``) are
+        normalized from comma/space-delimited text into lists (see
+        ``normalize_hub_config_lists``) — the Setup UI no longer requires raw
+        JSON. ``usb_vidpids`` type/label are preserved from the prior stored
+        entry for an existing vidpid."""
         with self._lock:
+            stored_hc = self._data.get("hub_config") or {}
             self._data["hub_config_enabled"] = bool(enabled)
-            self._data["hub_config"] = hub_config or {}
+            self._data["hub_config"] = normalize_hub_config_lists(hub_config or {}, stored_hc)
             self._save()
 
     def reset_hub_config(self) -> Dict[str, Any]:
