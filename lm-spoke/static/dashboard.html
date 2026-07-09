@@ -86,6 +86,10 @@
     <main class="flex-1 overflow-y-auto p-6">
         <div id="cs-add-toolbar" class="flex gap-2 mb-4 hidden"></div>
         <div id="cs-content" class="hpe-card p-5 shadow-sm"></div>
+        <div class="flex justify-end items-center gap-3 pt-2">
+            <span id="cs-autorefresh-slot"></span>
+            <button onclick="loadCSData(currentSubView, currentSubChild, true)" class="bg-slate-100 hover:bg-slate-200 text-slate-700 px-3 py-1 rounded-md text-xs font-medium transition-all border border-slate-200">↻ Refresh</button>
+        </div>
     </main>
 
     <div id="cs-toast-region"></div>
@@ -175,7 +179,16 @@
             if (label && d && d.spoke_id) label.textContent = d.spoke_id;
         }).catch(() => {});
 
-        window.addEventListener('DOMContentLoaded', () => activateTab('Dashboard'));
+        window.addEventListener('DOMContentLoaded', () => {
+            // Populate the auto-refresh throttle knob (sim-views.js is loaded
+            // by now since it's a blocking script above DOMContentLoaded).
+            try {
+                const slot = document.getElementById('cs-autorefresh-slot');
+                if (slot && typeof csAutoRefreshControl === 'function')
+                    slot.innerHTML = csAutoRefreshControl();
+            } catch (e) { /* best-effort */ }
+            activateTab('Dashboard');
+        });
     </script>
     <script src="/static/sim-views.js"></script>
 </body>
