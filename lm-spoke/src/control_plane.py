@@ -364,13 +364,14 @@ class CSControlPlane(AgentHostingControlPlane):
                     },
                     "payload": {"type": "CS_TELEMETRY", "data": payload},
                 }
-                msg["signature"] = self._sign(msg)
-                await websocket.send(json.dumps(msg, separators=(",", ":")))
+                await websocket.send(self._encode_frame(msg))
             except asyncio.CancelledError:
                 raise
             except Exception as e:
                 logger.debug("CS telemetry relay send failed: %s", e)
-            await asyncio.sleep(interval)
+            # Honor the hub's LM_BACKPRESSURE slow-down: send no faster than the
+            # requested interval (base _bp_send_interval = max(base, _bp_min_interval)).
+            await asyncio.sleep(self._bp_send_interval(interval))
 
     def run_standalone_mode(self):
         """Standalone FastAPI server: the full client API surface on
