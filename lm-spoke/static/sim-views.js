@@ -315,6 +315,21 @@ function csOnlineBadge(online) {
         : `<span class="inline-flex items-center gap-1 px-2 py-0.5 rounded-full bg-slate-100 text-slate-500 text-[10px] font-bold uppercase tracking-wider"><span class="w-1.5 h-1.5 rounded-full bg-slate-400"></span>Offline</span>`;
 }
 
+// Backpressure badge for a spoke tile (and, contextually, the clients it owns).
+// Reads the hub's per-spoke throttle level from the shared status metrics stash
+// (window.__lmHubMetrics, populated by main.js updateStatus). Defensive: returns
+// '' when metrics aren't present (e.g. the standalone cs spoke WebUI) or the
+// spoke isn't throttled. level 1 = offending, 2 = fleet-throttled.
+function csThrottleBadge(spokeId) {
+    try {
+        const bp = (window.__lmHubMetrics || {}).backpressure || {};
+        const lvl = (bp.spoke_levels || {})[spokeId] || 0;
+        if (lvl === 1) return `<span class="inline-flex items-center gap-1 px-2 py-0.5 rounded-full bg-red-100 text-red-700 text-[10px] font-bold uppercase tracking-wider animate-pulse" title="Offending — over its message rate; coalescing updates locally at the hub's request">\u26a0 Offending</span>`;
+        if (lvl >= 2) return `<span class="inline-flex items-center gap-1 px-2 py-0.5 rounded-full bg-orange-100 text-orange-700 text-[10px] font-bold uppercase tracking-wider" title="Throttled — fleet-wide slow-down active; coalescing updates locally">\u23f3 Throttled</span>`;
+    } catch (e) { /* metrics not available — no badge */ }
+    return '';
+}
+
 function csStatusBadge(status) {
     const s = String(status || 'unknown').toLowerCase();
     const map = {
@@ -706,7 +721,7 @@ async function csRenderSimHardware() {
         }
         return `<details class="hpe-card rounded-lg p-0 shadow-sm overflow-hidden">
           <summary class="flex items-center justify-between px-5 py-3 cursor-pointer hover:bg-slate-50">
-            <span class="font-bold text-slate-700">${csEscape(s.spoke_name || s.spoke_id)}</span>${csOnlineBadge(s.spoke_online)}
+            <span class="font-bold text-slate-700">${csEscape(s.spoke_name || s.spoke_id)}</span>${csOnlineBadge(s.spoke_online)}${csThrottleBadge(s.spoke_id)}
           </summary>
           <div class="px-5 pb-5 border-t border-slate-100">${html}</div>
         </details>`;
@@ -745,7 +760,7 @@ async function csRenderSimClientCount() {
         }
         return `<details class="hpe-card rounded-lg p-0 shadow-sm overflow-hidden">
           <summary class="flex items-center justify-between px-5 py-3 cursor-pointer hover:bg-slate-50">
-            <span class="font-bold text-slate-700">${csEscape(s.spoke_name || s.spoke_id)}</span>${csOnlineBadge(s.spoke_online)}
+            <span class="font-bold text-slate-700">${csEscape(s.spoke_name || s.spoke_id)}</span>${csOnlineBadge(s.spoke_online)}${csThrottleBadge(s.spoke_id)}
           </summary>
           <div class="px-5 pb-5 border-t border-slate-100">${html}</div>
         </details>`;
