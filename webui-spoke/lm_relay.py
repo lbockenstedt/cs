@@ -352,8 +352,7 @@ class LMControlPlane(BaseControlPlane):
                     },
                     "payload": {"type": "CS_TELEMETRY", "data": payload},
                 }
-                msg["signature"] = self._sign(msg)
-                await websocket.send(json.dumps(msg, separators=(",", ":")))
+                await websocket.send(self._encode_frame(msg))
                 await asyncio.sleep(self.telemetry_interval)
             except asyncio.CancelledError:
                 raise
