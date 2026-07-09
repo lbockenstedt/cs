@@ -286,11 +286,23 @@ class CSSpoke(BaseSpoke):
                 return {"status": "SUCCESS", "message": f"Agent {target} disconnected"}
             # Generic forward: relay an arbitrary command (e.g. CS_COMMAND from
             # the hub's CSBridgePoller) to a specific cs-dialed agent. The
-            # agent's AGENT_RESPONSE data is returned to the hub. send_to_agent
-            # enforces the 15s sync window — only fast commands belong here.
+            # agent's AGENT_RESPONSE data is returned to the hub.
             if command and target and self.control_plane:
                 inner = d.get("data") or {}
-                return await self.control_plane.send_to_agent(command, inner, agent_id=target)
+                # Long ops (delete/reclone/snapshot/clone/provision) ack ACCEPTED
+                # immediately and stream the real result via CS_COMMAND_RESULT,
+                # but that ACCEPTED can slip past the default 15s window when the
+                # agent is busy (e.g. auto-prov cloning clients during a bulk
+                # delete) — producing a false "Agent response timeout" and a
+                # FAILED queue entry even though the op runs. Give long ops a
+                # wider sync window; fast commands keep the 15s fail-fast. Match
+                # on the relay command OR the inner action (path-agnostic).
+                _LONG = {"delete_vm", "reclone_vm", "snapshot_vm", "clone_lxc",
+                         "provision_unassigned", "reclone_all", "proxmox_reclone_all"}
+                _act = command if command in _LONG else (
+                    inner.get("action") if isinstance(inner, dict) else None)
+                _to = 60.0 if _act in _LONG else 15.0
+                return await self.control_plane.send_to_agent(command, inner, agent_id=target, timeout=_to)
             return {"status": "ERROR", "error": "Unknown relay command"}
 
         # ── VNC console relay (agent-terminates-WSS) ────────────────────────
