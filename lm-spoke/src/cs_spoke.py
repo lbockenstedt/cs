@@ -301,7 +301,10 @@ class CSSpoke(BaseSpoke):
                          "provision_unassigned", "reclone_all", "proxmox_reclone_all"}
                 _act = command if command in _LONG else (
                     inner.get("action") if isinstance(inner, dict) else None)
-                _to = 60.0 if _act in _LONG else 15.0
+                # Timeouts are hub-configurable (Setup → General, pushed via
+                # CS_CONFIG_UPDATE) so WAN / busy-agent sites can tune them.
+                _to = (getattr(self, "_relay_timeout_long", 60.0) if _act in _LONG
+                       else getattr(self, "_relay_timeout_fast", 15.0))
                 return await self.control_plane.send_to_agent(command, inner, agent_id=target, timeout=_to)
             return {"status": "ERROR", "error": "Unknown relay command"}
 
@@ -806,6 +809,17 @@ class CSSpoke(BaseSpoke):
             if hub_key in patch:
                 update[settings_key] = patch[hub_key]
                 applied.append(f"{hub_key}->{settings_key}")
+        # Spoke-side relay timeouts (send_to_agent long-op / fast windows) —
+        # hub-configurable via Setup → General. Not a CSSettings/agent key: stored
+        # on the spoke and read by the SPOKE_RELAY forward (send_to_agent).
+        for _k, _attr in (("agent_relay_timeout_long_s", "_relay_timeout_long"),
+                          ("agent_relay_timeout_fast_s", "_relay_timeout_fast")):
+            if _k in patch:
+                try:
+                    setattr(self, _attr, max(1.0, float(patch[_k])))
+                    applied.append(_k)
+                except (TypeError, ValueError):
+                    pass
         # Optional simulation.conf / user-overrides.conf INI text overrides.
         # None = clear the local override file so the GitHub-pulled file applies;
         # a string = write it to configs/hub-*-overrides.conf (merged on top of
