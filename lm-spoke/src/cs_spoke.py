@@ -127,6 +127,12 @@ class CSSpoke(BaseSpoke):
 
     # ── BaseSpoke: status (fallback for *_GET_STATUS) ───────────────────────
     async def get_status(self) -> Dict[str, Any]:
+        """BaseSpoke override: snapshot of the sim engine + kill switch.
+
+        Used as the fallback reply for ``*_GET_STATUS`` when the hub polls a
+        spoke that has no command-specific status handler. Returns the spoke
+        id, ``module="simulation"``, the current simulation_id/iteration, the
+        active-sim count, and the global kill-switch state."""
         state = self.engine.get_current_state()
         return {
             "spoke_id": self.spoke_id,
@@ -140,6 +146,12 @@ class CSSpoke(BaseSpoke):
         }
 
     def get_version(self) -> str:
+        """BaseSpoke override: the cs repo's autobumped VERSION string.
+
+        Reads ``<repo>/VERSION`` (deployed at ``/opt/lm/cs/VERSION`` by
+        ``install_cs.sh``) with an mtime-keyed cache so the frequent
+        ``/ws/client``-connect calls don't re-open the file on the shared
+        event loop. Returns ``"unknown"`` only if no VERSION file is found."""
         # cs_spoke.py lives at <repo>/lm-spoke/src/cs_spoke.py; the tracked,
         # autobumped VERSION file is at the REPO ROOT (<repo>/VERSION, deployed
         # at /opt/lm/cs/VERSION per install_cs.sh), one dir above the legacy
@@ -227,6 +239,17 @@ class CSSpoke(BaseSpoke):
 
     # ── command dispatch ───────────────────────────────────────────────────
     async def handle_command(self, command_type: str, data: Dict[str, Any]) -> Dict[str, Any]:
+        """Dispatch a ``CS_*`` command from the LM hub (or local API) to the sim modules.
+
+        Thin dispatcher over the plain modules: ``SimulationEngine`` (sim
+        state/profile/kill switch), ``ClientRegistry`` (per-client control
+        panel), ``DemoManager`` (ephemeral fault scenarios), ``CommandQueue``
+        (VM actions for the pxmx agent), ``ProxmoxDeploy`` (telemetry ingest +
+        ``relay_payload``), ``LocalStore`` (auto-prov/Aruba config), and the
+        cs-dialed agent registry (``GET_AGENTS``/``SET_AGENT_CONFIG``/
+        ``SPOKE_RELAY``). Returns a ``{"status": "SUCCESS"|"ERROR", ...}`` dict
+        so the spoke is drivable identically from a hub WS command or an HTTP
+        client. See the module docstring for the full command contract."""
         # DEBUG, not INFO: the hub polls GET_AGENTS / CS_POLL_AGENT_INBOX /
         # CS_GET_USB_CONFIG every ~5s, so logging every command at INFO floods
         # the steady-state log. Meaningful commands emit their own INFO line in

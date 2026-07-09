@@ -75,6 +75,9 @@ _HUB_CONFIG_PRESERVE_ON_RESET = (
 
 
 class LocalStore:
+    """Single-tenant JSON config store for the cs spoke's own Setup knobs
+    (``data/local_store.json``). See the module docstring for the shape."""
+
     def __init__(self, data_dir: os.PathLike | str) -> None:
         self._path = Path(data_dir) / "local_store.json"
         self._path.parent.mkdir(parents=True, exist_ok=True)
@@ -112,6 +115,12 @@ class LocalStore:
                 "hub_config": merged}
 
     def set_hub_config(self, enabled: bool, hub_config: Dict[str, Any]) -> None:
+        """REPLACES the stored hub_config wholesale (not a merge).
+
+        Callers that edit a subset (``csSaveHubConfig`` and
+        ``csSaveAutoProvConfig`` in ``sim-views.js``) must GET-merge-PUT or
+        the two Setup cards wipe each other's keys. ``enabled`` toggles
+        ``hub_config_enabled`` independently of the knob dict."""
         with self._lock:
             self._data["hub_config_enabled"] = bool(enabled)
             self._data["hub_config"] = hub_config or {}

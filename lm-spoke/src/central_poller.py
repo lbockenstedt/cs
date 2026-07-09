@@ -39,6 +39,11 @@ def _build_config(central_config: Dict[str, Any]) -> Dict[str, Any]:
 
 
 class CentralPoller:
+    """Drives ``ArubaClient`` on a 5-minute loop, writing
+    ``spoke.central_status`` in the shape ``sim-views.js``'s Checks/Hardware/
+    Client-Count tabs expect. No-op (empty ``central_status``) when Central
+    is not configured. See the module docstring."""
+
     def __init__(self, spoke) -> None:
         self.spoke = spoke
         self._client: Optional[ArubaClient] = None
@@ -51,6 +56,9 @@ class CentralPoller:
         self._client = ArubaClient(cfg) if cfg.get("cluster_url") else None
 
     def start(self) -> None:
+        """Spawn the 5-min poll loop on the running event loop. Cancels any
+        prior task first (idempotent). No-op with a warning when no loop is
+        running yet (callers without a loop use the FastAPI ``startup`` hook)."""
         if self._task and not self._task.done():
             self._task.cancel()
         try:

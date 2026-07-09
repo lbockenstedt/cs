@@ -77,10 +77,12 @@ class CSControlPlane(AgentHostingControlPlane):
     Subclasses ``AgentHostingControlPlane`` (shared with pxmx) so it can host
     inbound pxmx agents directly in the split (per-module-LXC) topology — a
     cs-dialed agent connects to this spoke's ``/ws/agent`` and is managed via
-    the cs WebUI. The agent listener is OPT-IN (``LM_CS_AGENT_LISTENER=1``, set
-    by ``install_cs.sh --agent-listener``): an all-in-one / relay-only cs spoke
-    never binds ``:443`` and co-located cs agents keep going through the hub
-    ``/ws/agent`` byte-proxy → pxmx → ``CSBridgePoller`` path.
+    the cs WebUI. The listener starts only when ``LM_CS_AGENT_LISTENER=1``;
+    ``install_cs.sh`` writes that env by DEFAULT (the agent listener is ON for
+    a standalone cs spoke), and ``--no-agent-listener`` opts out for the rare
+    all-in-one / relay-only cs spoke that must never bind ``:443`` (co-located
+    cs agents then keep going through the hub ``/ws/agent`` byte-proxy → pxmx
+    → ``CSBridgePoller`` path).
     """
 
     # cs-specific tuning of the mixin's class attrs.
@@ -147,6 +149,11 @@ class CSControlPlane(AgentHostingControlPlane):
             logger.warning(f"Failed to re-push config to agent '{agent_id}': {e}")
 
     async def run(self):
+        """Boot the cs spoke: register ``CSSpoke``, (conditionally) start the
+        cs-dialed agent listener, start the demo TTL sweep + Aruba Central
+        poller, launch the client-API uvicorn server, then enter the hub WS
+        loop (``super().run()``). The client API is a long-lived task that
+        survives hub reconnects; it is torn down in ``finally`` on shutdown."""
         logger.info(f"Starting CS (Client Simulator) -> {self.hub_url}")
         cs_spoke = CSSpoke(self.spoke_id, self.startup_config)
         # Wire the control-plane reference so CSSpoke's GET_AGENTS / SPOKE_RELAY
@@ -154,14 +161,15 @@ class CSControlPlane(AgentHostingControlPlane):
         # (mirrors ProxmoxSpoke(control_plane=self)).
         cs_spoke.control_plane = self
         self.register_module("cs", cs_spoke)
-        # Start the agent listener ONLY when opted in (LM_CS_AGENT_LISTENER=1,
-        # set by install_cs.sh --agent-listener). An all-in-one / relay-only cs
-        # spoke skips this entirely so it never binds :443 on the hub box.
+        # Start the agent listener when LM_CS_AGENT_LISTENER=1. install_cs.sh
+        # writes that env by DEFAULT (standalone cs accepts cs-dialed pxmx
+        # agents); --no-agent-listener opts out so an all-in-one / relay-only cs
+        # spoke never binds :443 on the hub box.
         if self._agent_listener_enabled():
             self._start_agent_server_task()
             logger.info("CS agent listener enabled (cs-dialed agents accepted)")
         else:
-            logger.info("CS agent listener disabled (relay-only; --agent-listener to enable)")
+            logger.info("CS agent listener disabled (relay-only; --no-agent-listener was passed)")
         # Start the demo-scenario TTL expiry sweep (no-op without a loop).
         cs_spoke.demo.start()
         # Start the Aruba Central poll loop (see central_poller.py). Runs
@@ -202,6 +210,14 @@ class CSControlPlane(AgentHostingControlPlane):
         return [asyncio.create_task(self._cs_telemetry_relay_loop(websocket))]
 
     async def _cs_telemetry_relay_loop(self, websocket) -> None:
+        """Re-emit a signed ``CS_TELEMETRY`` frame to the hub every
+        ``CS_TELEMETRY_INTERVAL_S`` (default 10s). The payload is
+        ``ProxmoxDeploy.relay_payload`` (per-host VM state + the ``provision``
+        diagnostic) with the ``central`` field overlaid from
+        ``CentralPoller`` and the command-queue snapshot inlined so the hub's
+        VM Server / Command Queue views read from cache. ``collect_dhcp_status``
+        is offloaded to a thread so its ``systemctl`` call can't stall the
+        shared event loop."""
         interval = 10
         try:
             interval = max(2, int(os.environ.get("CS_TELEMETRY_INTERVAL_S", "10")))

@@ -45,6 +45,12 @@ _BEACON_CONFIG_KEYS = (
 
 
 class SimulationEngine:
+    """Owns the sim engine loop + the effective-profile resolver
+    (``sim_config.resolve``: ``[simulation]`` → ``[address/server]`` → the
+    ``[sX]`` bucket chosen by ``crc32(hostname) % 10`` → per-``[username]``
+    override). Drives ``sim_primitives`` per active flag. See the module
+    docstring."""
+
     def __init__(
         self,
         hostname: str,

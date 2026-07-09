@@ -35,6 +35,12 @@ _STATE_FILE = "clients.json"
 
 
 class ClientRegistry:
+    """Per-sim-client registry persisted to ``data/clients.json``: last-seen,
+    SSID, gateway reachability, running sims, recent errors, and the
+    per-client persisted override flags (the Control Panel writes here).
+    Upserted on every ``POST /api/status``; read by ``/api/config`` to bake
+    a client's overrides into its profile. See the module docstring."""
+
     def __init__(self, data_dir: Path) -> None:
         self.data_dir = Path(data_dir)
         self.data_dir.mkdir(parents=True, exist_ok=True)

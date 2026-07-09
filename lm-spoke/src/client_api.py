@@ -171,6 +171,16 @@ async def push_pending(spoke, hostname: str) -> bool:
 
 # ── app builder ──────────────────────────────────────────────────────────────
 def build_client_api_app(spoke) -> FastAPI:
+    """Build the cs client-API FastAPI app — the single route layer used by
+    BOTH hub mode (``CSControlPlane.run``) and standalone (``run_standalone_mode``).
+
+    Sim VMs phone home here: ``GET /api/config?hostname=`` (effective profile =
+    bucket + persisted overrides + any live demo flags), ``POST /api/status``
+    (registry upsert), ``ws /ws/client`` (live command push), plus the
+    operator surface (kill switch, clients/control panel, commands, inbox,
+    script download). The local dashboard at ``/`` (``local_ui_routes.py``) and
+    ``/static/*`` are mounted here too. A client-API key (``_require_key_dep``)
+    gates mutating routes when set; absent = open (the t3 agent path)."""
     app = FastAPI(title="cs spoke client API", docs_url=None, redoc_url=None)
     require_key = _require_key_dep(spoke)
 
