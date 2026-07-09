@@ -9,4 +9,7 @@ The **full canonical doc set** (all modules, the env-var reference, the install-
 
 ## Also in this repo
 
-- [CLIENT_SIM_CHANGELOG.md](CLIENT_SIM_CHANGELOG.md), [CLIENT_SIM_VERSION.md](CLIENT_SIM_VERSION.md), [DEBIAN_COMPATIBILITY.md](DEBIAN_COMPATIBILITY.md), [SECURITY.md](SECURITY.md), [terminal-layout.md](terminal-layout.md) — pre-existing cs-specific notes.
+- [CLIENT_SIM_CHANGELOG.md](CLIENT_SIM_CHANGELOG.md), [CLIENT_SIM_VERSION.md](CLIENT_SIM_VERSION.md) — **historical/legacy** notes covering the pre-reset standalone `webui-spoke` + per-script `MAJOR.MINOR` versioning era; version labels here do not reflect the repo's current autobumped `.NN` `VERSION`. Each carries a top-of-file notice.
+- [DEBIAN_COMPATIBILITY.md](DEBIAN_COMPATIBILITY.md) — legacy Debian-readiness analysis of the `clients/linux/` scripts (some recommended fixes have since shipped).
+- [SECURITY.md](SECURITY.md) — generic security-policy template for the legacy client-sim scripts.
+- [terminal-layout.md](terminal-layout.md) — GNOME-terminal autostart layout for the `clients/linux/` sim VMs.

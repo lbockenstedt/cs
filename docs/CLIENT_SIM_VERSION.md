@@ -1,5 +1,16 @@
 # Version Management
 
+> **Historical note (2026-07):** This document captures the **pre-reset
+> standalone client-sim scripts** era and its `MAJOR.MINOR` per-script
+> versioning scheme. The repo has since moved to an **autobumped `VERSION`
+> file** (`.NN` scheme — a `version-bump.yml` bot handles the last segment;
+> never bump manually) shared across the LM fleet; the per-script version
+> lines below no longer track the live `clients/linux/*.sh` / `clients/windows/*.ps1`
+> files. Read this as a snapshot of the legacy scripts' version history, not a
+> current source of truth. The canonical repo version is the root `VERSION` file.
+> **`vhconnect.sh` / `vhconnect.ps1` are listed below but do NOT exist in this
+> repo** (VirtualHere handling was removed); disregard those two entries.
+
 **Last Updated**: May 16, 2026
 **Format**: SemVer-inspired (MAJOR.MINOR format)
 

@@ -1,5 +1,17 @@
 # Changelog
 
+> **Historical scope (2026-07):** This changelog covers the **legacy
+> `webui-spoke` / standalone client-sim** era (the `installers/install-lxc.sh`
+> + `proxmox/install-proxmox-agent.sh` deployment). It predates the LM-native
+> `lm-spoke/` (`CSSpoke`) spoke and the move of the auto-provisioning brain to
+> the **pxmx agent**. Version labels below (`v1.0`, `v1.07`, per-script `0.x`)
+> reflect the pre-reset `MAJOR.MINOR` scheme, not the repo's current autobumped
+> `.NN` `VERSION`. "Files changed" paths use `linux/`/`windows/` shorthand for
+> what is now `clients/linux/`/`clients/windows/`. The "Documentation
+> deliverables" / "References" list near the end names `.md` files
+> (`OPTIMIZATION_SUMMARY.md`, `VERSION.md`, etc.) that were never committed to
+> this repo. Read this as a record of the legacy path's history.
+
 ## [1.0.1] — 2026-05-30
 
 ### Added

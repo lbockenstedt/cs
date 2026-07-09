@@ -1,5 +1,12 @@
 # Debian Linux Compatibility Analysis
 
+> **Status note (2026-07):** This is a point-in-time compatibility analysis of
+> the legacy `clients/linux/` simulation scripts. Some recommended fixes have
+> since been applied — notably **Critical Issue #2** (`sys_mon.sh` now falls
+> back across `/var/log/messages`, `/var/log/syslog`, `/var/log/kern.log`
+> rather than hardcoding one path). The analysis remains a useful Debian-readiness
+> checklist; treat the "Recommended Fixes" as partly already shipped.
+
 **Analysis Date**: March 19, 2026  
 **Debian Version Tested**: Debian 11 (Bullseye) and Debian 12 (Bookworm)  
 **Status**: ✅ Compatible with minor adjustments
