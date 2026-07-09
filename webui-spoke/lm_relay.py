@@ -330,7 +330,17 @@ class LMControlPlane(BaseControlPlane):
         return [asyncio.create_task(self._telemetry_loop(websocket))]
 
     async def _telemetry_loop(self, websocket) -> None:
-        """Push CS_TELEMETRY frames on an interval until the connection closes."""
+        """Push CS_TELEMETRY frames on a FIXED interval until the connection closes.
+
+        Backpressure gap: unlike the cs ``lm-spoke`` relay
+        (``cs/lm-spoke/src/control_plane.py``), this loop sleeps a fixed
+        ``self.telemetry_interval`` and does NOT consult
+        ``self._bp_send_interval(...)`` — so an ``LM_BACKPRESSURE`` slow-down from
+        the hub does not stretch its send cadence; it keeps emitting at the same
+        rate under load. Wiring it to honor the signal (for parity with lm-spoke,
+        which pushes the coalesce/merge work down to the spoke) is a deliberate
+        follow-up left to a separate change — do NOT "fix" it inline here.
+        See lm/docs/backpressure-throttling.md §6 ("Gap to note")."""
         # Short initial delay so the first frame lands after the handshake/approval
         # race rather than mid-handshake.
         await asyncio.sleep(2.0)
@@ -353,6 +363,11 @@ class LMControlPlane(BaseControlPlane):
                     "payload": {"type": "CS_TELEMETRY", "data": payload},
                 }
                 await websocket.send(self._encode_frame(msg))
+                # FIXED cadence — intentionally does NOT call
+                # self._bp_send_interval(), so this relay does not slow under an
+                # LM_BACKPRESSURE signal (backpressure gap; see the method
+                # docstring). Behavioral parity with the cs lm-spoke relay is a
+                # separate follow-up — do not change this line here.
                 await asyncio.sleep(self.telemetry_interval)
             except asyncio.CancelledError:
                 raise

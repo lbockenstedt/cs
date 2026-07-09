@@ -217,7 +217,15 @@ class CSControlPlane(AgentHostingControlPlane):
         ``CentralPoller`` and the command-queue snapshot inlined so the hub's
         VM Server / Command Queue views read from cache. ``collect_dhcp_status``
         is offloaded to a thread so its ``systemctl`` call can't stall the
-        shared event loop."""
+        shared event loop.
+
+        Backpressure: this is the spoke-side of the hub's throttling ladder. The
+        per-tick sleep is gated by ``self._bp_send_interval(interval)`` (bottom of
+        the loop), so an ``LM_BACKPRESSURE`` slow-down from the hub stretches the
+        send interval. Because each frame already carries the latest full snapshot,
+        sending less often is latest-wins coalescing done ON THE SPOKE — the hub
+        pushes the merge work down here rather than shedding our telemetry. See
+        lm/docs/backpressure-throttling.md §6 (spoke-side cooperation)."""
         interval = 10
         try:
             interval = max(2, int(os.environ.get("CS_TELEMETRY_INTERVAL_S", "10")))
@@ -370,7 +378,11 @@ class CSControlPlane(AgentHostingControlPlane):
             except Exception as e:
                 logger.debug("CS telemetry relay send failed: %s", e)
             # Honor the hub's LM_BACKPRESSURE slow-down: send no faster than the
-            # requested interval (base _bp_send_interval = max(base, _bp_min_interval)).
+            # requested interval (_bp_send_interval = max(base, _bp_min_interval),
+            # a no-op when not throttled). Stretching the interval slows our send
+            # cadence locally so the hub distributes the merge work down to the
+            # spoke rather than shedding our frames (see the loop docstring and
+            # lm/docs/backpressure-throttling.md §6).
             await asyncio.sleep(self._bp_send_interval(interval))
 
     def run_standalone_mode(self):
