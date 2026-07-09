@@ -3469,8 +3469,8 @@ function csShedBadge(v) {
     if (!v || !v._shed_at) return '';
     const secs = Number(v._shed_at) - Date.now() / 1000;
     if (secs <= 0) return '';
-    return `<span class="inline-flex items-center gap-1 px-2 py-0.5 rounded text-[10px] font-bold uppercase tracking-wider bg-orange-100 text-orange-700" title="Dongle removed — VM will be shed when the missing-dongle timer expires">`
-        + `<span class="w-1.5 h-1.5 rounded-full bg-orange-500 animate-pulse"></span>🔌 Sheds in `
+    return `<span class="inline-flex items-center gap-1 px-2 py-0.5 rounded text-[10px] font-bold uppercase tracking-wider bg-red-100 text-red-700" title="Dongle removed — VM will be shed when the missing-dongle timer expires">`
+        + `<span class="w-1.5 h-1.5 rounded-full bg-red-500 animate-pulse"></span>🗑️ Sheds in `
         + `<span class="cs-shed-countdown" data-shed-at="${Number(v._shed_at)}">${csFmtDuration(secs)}</span></span>`;
 }
 
