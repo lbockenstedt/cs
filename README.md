@@ -1,15 +1,17 @@
 # client-sim
 
-![Release](https://img.shields.io/badge/release-v1.0.0-success)
+![Version](https://img.shields.io/badge/version-autobump%20.NN-blue)
 
-`client-sim` contains the spoke-side runtime for the HPE Client-Sim platform. Version **v1.0.0** on `main` is the production release for spoke services, the Proxmox agent, and the shared installer flow:
+> **Current architecture — read this first.** The active LM spoke is **`lm-spoke/`** (`CSSpoke`, `module_type="simulation"`), **relay-only** for Proxmox. It runs mainly as the **`simulation`** role hosted by the generic agent (unit `lm-agent`, sub-spoke `{agent}-simulation`); the dedicated `lm-cs.service` / `lm-spoke/install_cs.sh` path is the legacy/standalone alternative. The installer is **`install_cs.sh`** (top-level wrapper → `lm-spoke/install_cs.sh`), which provisions a **cs-owned Kea** DHCP4 instance (`kea-dhcp4-sim`) on the 2nd NIC — not dnsmasq. The auto-provisioning **brain** lives in the **pxmx agent** (`pxmx/agent/src/usb_provision.py`), not in this repo's `proxmox/`. The full, canonical feature reference (ports, env vars, handlers, the two-flag auto-provisioning trap, troubleshooting) lives in **[`docs/cs.md`](docs/cs.md)** and the canonical **[`lm/docs/cs.md`](../lm/docs/cs.md)**. The rest of this README documents the **legacy `webui-spoke`** path and is preserved for operators of that standalone deployment.
 
-- the **spoke backend** (`webui-spoke/`)
-- the **Proxmox host agent** (`proxmox/`)
-- the **Linux simulation scripts** (`clients/linux/`)
-- related configs, Windows equivalents (`clients/windows/`), T3 (`clients/t3/`), and installer assets
+`client-sim` contains the spoke-side runtime for the HPE Client-Sim platform. The repo version is the autobumped `VERSION` file (`.NN` scheme — a version-bump bot handles the last segment; do not bump manually). The runtime surfaces:
 
-This repo is the local execution plane. It can run standalone, or relay telemetry and commands to Hub. In v1.0 it also carries the Azure-backed VM backup/reseed path used by hub-managed Proxmox environments.
+- the **active LM-native spoke** (`lm-spoke/` — `CSSpoke`, `CSControlPlane`, the client API, sim engine, registry, command queue, relay-only Proxmox deploy, cs-owned Kea DHCP)
+- the **legacy/standalone spoke backend** (`webui-spoke/`) and its `installers/install-lxc.sh`
+- the **legacy Proxmox host agent** (`proxmox/`) — the auto-provisioning brain has moved to the pxmx repo; this bundle remains for the legacy/Azure-backup deployment
+- the **Linux simulation scripts** (`clients/linux/`), Windows equivalents (`clients/windows/`), T3 (`clients/t3/`), and installer assets
+
+This repo is the local execution plane. It can run standalone, or relay telemetry and commands to Hub. The legacy `proxmox/` bundle also carries the Azure-backed VM backup/reseed path used by hub-managed Proxmox environments.
 
 ---
 
@@ -101,6 +103,8 @@ sudo bash install-lxc.sh --branch main
 ```
 
 #### What to verify after install
+
+> **Port note:** `install-lxc.sh` defaults to **port 8000** (override with `--port`). The `:8080` examples below assume you passed `--port 8080` (which is the canonical `lm-spoke` `CS_API_PORT` default). Adjust the port to match your install.
 
 ```bash
 systemctl status client-sim-dashboard
@@ -513,12 +517,22 @@ curl -X POST http://localhost:8080/api/update-all
 
 ```text
 cs/
+├── lm-spoke/        # ACTIVE LM-native spoke: CSSpoke/CSControlPlane, client API,
+│                    # sim engine, registry, command queue, relay-only Proxmox
+│                    # deploy, cs-owned Kea DHCP, install_cs.sh, tests, static/
 ├── clients/         # platform clients: linux/, windows/, t3/
-├── configs/         # simulation.conf and user-overrides.conf
-├── proxmox/         # Proxmox host agent, watchdog, units, installers
-├── webui-spoke/     # FastAPI spoke backend, installer, watchdog, docs
-├── lm-spoke/        # Lab Manager spoke glue (src/, installer, Dockerfile)
-└── kill_switch.txt  # Global kill switch source file
+├── configs/         # simulation.conf, user-overrides.conf, kill_switch.txt, etc.
+├── proxmox/         # LEGACY Proxmox host agent, watchdog, units, installers
+│                    # (auto-provisioning brain now lives in the pxmx repo)
+├── webui-spoke/     # LEGACY/standalone FastAPI spoke backend, installer, watchdog
+├── webui-local/     # local standalone dashboard assets
+├── svr-mgmt/        # server-management helpers
+├── installers/      # legacy install-lxc.sh + proxmox LXC helpers
+├── docs/            # cs.md + architecture-topology.md + legacy notes
+├── logs/            # local log capture
+├── install_cs.sh    # ACTIVE installer wrapper (execs lm-spoke/install_cs.sh)
+├── uninstall_cs.sh  # cs uninstaller
+└── VERSION          # autobumped .NN version (do not bump manually)
 ```
 
 ### `webui-spoke/server.py` architecture
