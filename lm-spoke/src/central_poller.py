@@ -8,7 +8,10 @@ Simulations Checks/Hardware/Client-Count tabs already expect:
 
     {"status": {site: {check_id: {status, message}}},
      "hardware_alerts": [{id, name, device_type, total}],
-     "client_count_status": {site: {current: N}}}
+     "client_count_status": {site: {current, hourly_avg, drop_pct, status, ...}}}
+
+The client-count entry carries the rolling 1h average + drop %% (the "average
+client count" dashboard) — see _client_count_entry / the _CLIENT_* constants.
 
 This closes the gap flagged when the Simulations tab first landed (Central
 integration didn't exist in lm-spoke at all) — real polling now runs, sourced
@@ -27,6 +30,14 @@ from aruba import ArubaClient
 logger = logging.getLogger("CentralPoller")
 
 _POLL_INTERVAL_S = 300  # 5 min — matches aruba.py's own cache TTLs
+
+# Rolling client-count baseline (ported from webui-hub tasks.py): keep the last
+# hour of per-site counts, report current + hourly_avg + a drop % that flags a
+# DEGRADED site when the live count falls ≥25% below the hour's average. This is
+# the "average client count" the original dashboards showed.
+_CLIENT_WINDOW_SECS = 3600
+_CLIENT_MIN_SAMPLES = 3
+_CLIENT_DROP_PCT = 25.0
 
 
 def _build_config(central_config: Dict[str, Any]) -> Dict[str, Any]:
@@ -48,7 +59,31 @@ class CentralPoller:
         self.spoke = spoke
         self._client: Optional[ArubaClient] = None
         self._task: Optional[asyncio.Task] = None
+        # Rolling per-wsite client-count samples [(ts, count), ...] for hourly_avg.
+        self._client_samples: Dict[str, list] = {}
         self.reload()
+
+    def _client_count_entry(self, wsite: str, central_site: str, current: int) -> Dict[str, Any]:
+        """Append the current count to the wsite's rolling 1h window and return
+        {current, hourly_avg, drop_pct, status}. DEGRADED when the live count is
+        ≥25% below the hour's average (needs _CLIENT_MIN_SAMPLES first → NO_DATA).
+        Ported from webui-hub tasks._hub_client_count_payload (minus cross-restart
+        baseline persistence)."""
+        now = time.time()
+        samples = self._client_samples.setdefault(wsite, [])
+        samples.append((now, current))
+        cutoff = now - _CLIENT_WINDOW_SECS
+        while samples and samples[0][0] < cutoff:
+            samples.pop(0)
+        if len(samples) >= _CLIENT_MIN_SAMPLES:
+            avg = sum(s[1] for s in samples) / len(samples)
+            drop_pct = max(0.0, (avg - current) / avg * 100.0) if avg >= 1 else 0.0
+            status = "DEGRADED" if drop_pct >= _CLIENT_DROP_PCT else "OK"
+        else:
+            avg, drop_pct, status = float(current), 0.0, "NO_DATA"
+        return {"site_name": central_site, "current": current,
+                "hourly_avg": round(avg, 1), "drop_pct": round(drop_pct, 1),
+                "status": status, "ts": now}
 
     # ── (re)build the ArubaClient from the current stored config ───────────
     def reload(self) -> None:
@@ -119,7 +154,8 @@ class CentralPoller:
                     "message": f"Site health {data.get('site_health')}",
                 }
             status[wireless_site] = checks
-            client_count_status[wireless_site] = {"current": data.get("client_count", 0)}
+            client_count_status[wireless_site] = self._client_count_entry(
+                wireless_site, central_site, int(data.get("client_count", 0) or 0))
             for alert_id, devices in (data.get("hw_devices") or {}).items():
                 hw_totals[alert_id] = hw_totals.get(alert_id, 0) + sum(devices.values())
 
