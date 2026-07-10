@@ -27,7 +27,10 @@ import hmac
 import json
 import logging
 import traceback
-import xml.etree.ElementTree as ET
+# defusedxml forbids DTD/entity resolution — the Namecheap API response is
+# third-party XML fetched over HTTP; a malicious/MITM response with an external
+# entity could otherwise read local files (XXE) or cause DoS.
+import defusedxml.ElementTree as ET
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path

@@ -6,7 +6,10 @@ from email.utils import parsedate_to_datetime
 import os
 from typing import Any, Optional
 from uuid import uuid4
-import xml.etree.ElementTree as ET
+# defusedxml forbids DTD/entity resolution — the Azure Blob list response is
+# third-party XML fetched over HTTPS; a crafted response with an external
+# entity could otherwise read local files / SSRF (XXE).
+import defusedxml.ElementTree as ET
 
 import httpx
 from fastapi import APIRouter, Depends, HTTPException, Request
