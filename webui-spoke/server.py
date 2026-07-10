@@ -1731,6 +1731,7 @@ def _ldap_authenticate_sync(username: str, password: str) -> "SpokeUser | None":
     """Blocking LDAP auth — call via asyncio.to_thread."""
     try:
         from ldap3 import ALL, Connection, Server
+        from ldap3.utils.conv import escape_filter_chars
 
         s = settings
         if not s.get("auth_ldap_url") or not s.get("auth_ldap_bind_dn"):
@@ -1738,8 +1739,14 @@ def _ldap_authenticate_sync(username: str, password: str) -> "SpokeUser | None":
 
         srv = Server(s["auth_ldap_url"], get_info=ALL)
 
+        # Escape the unauthenticated username before interpolating it into the
+        # LDAP search filter — otherwise a login body like "x)(sAMAccountName=*)"
+        # broadens the filter into unauthenticated directory enumeration /
+        # attribute disclosure (LDAP filter injection).
+        safe_user = escape_filter_chars(str(username or ""))
+
         with Connection(srv, user=s["auth_ldap_bind_dn"], password=s["auth_ldap_bind_password"], auto_bind=True) as conn:
-            search_filter = str(s.get("auth_ldap_user_filter") or "(&(objectClass=user)(sAMAccountName={username}))").format(username=username)
+            search_filter = str(s.get("auth_ldap_user_filter") or "(&(objectClass=user)(sAMAccountName={username}))").format(username=safe_user)
             conn.search(
                 search_base=s["auth_ldap_user_base"],
                 search_filter=search_filter,

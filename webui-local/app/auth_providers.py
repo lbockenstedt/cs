@@ -90,6 +90,7 @@ def _ldap_authenticate_sync(
 ) -> Optional[User]:
     try:
         from ldap3 import ALL, Connection, Server
+        from ldap3.utils.conv import escape_filter_chars
     except ImportError:
         logger.warning("ldap3 not installed — LDAP auth unavailable")
         return None
@@ -100,7 +101,12 @@ def _ldap_authenticate_sync(
             return None
 
         server = Server(config.auth_ldap_url, get_info=ALL)
-        search_filter = str(config.auth_ldap_user_filter or "(&(objectClass=user)(sAMAccountName={username}))").format(username=username)
+        # Escape the unauthenticated username before interpolating it into the
+        # LDAP search filter — otherwise a login body like "x)(sAMAccountName=*)"
+        # broadens the filter into unauthenticated directory enumeration /
+        # attribute disclosure (LDAP filter injection).
+        safe_user = escape_filter_chars(str(username or ""))
+        search_filter = str(config.auth_ldap_user_filter or "(&(objectClass=user)(sAMAccountName={username}))").format(username=safe_user)
         with Connection(server, user=config.auth_ldap_bind_dn, password=bind_password, auto_bind=True) as conn:
             conn.search(
                 search_base=config.auth_ldap_user_base,
