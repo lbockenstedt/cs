@@ -27,9 +27,16 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import re
 from pathlib import Path
 from typing import Any, Dict, List, Optional
+
+# Proxmox API port for sim-tag PUTs. Default 8006 (Proxmox VE stock), overridable
+# per-deployment via CS_PROXMOX_API_PORT (e.g. a proxied/non-stock port). A wrong
+# port just means the PUTs fail → the sweep reports failures and the cs spoke
+# backs off (see cs_spoke._maybe_sync_sim_tags), never re-storming per frame.
+_PROXMOX_API_PORT = (os.environ.get("CS_PROXMOX_API_PORT") or "8006").strip() or "8006"
 
 # httpx is only needed for sim-tag sync (apply_sim_tags_for_vm), which is a
 # no-op until the client registry lands (CSSpoke.registry is None in Phase 2/3).
@@ -154,37 +161,37 @@ def _client_sim_map(registry: Any) -> Dict[str, List[str]]:
 async def apply_sim_tags_for_vm(hostname: str, node: str, vmid: int,
                                   desired_sim_tags: List[str],
                                   current_tags: str, token: str, *,
-                                  applied_cache: Dict[tuple, set]) -> bool:
+                                  applied_cache: Dict[tuple, set],
+                                  client: "httpx.AsyncClient") -> bool:
     """PUT ``tags=`` to the VM config via the Proxmox API (legacy 3752-3764).
     ``node`` is the Proxmox node name (short host label) owning the VM; the
     PUT path is ``/nodes/{node}/qemu/{vmid}/config`` and requires the real node
     name (a ``_`` placeholder would 404). Skips when the desired set is
-    unchanged from the last apply. Returns True on success. Best-effort: never
-    raises."""
+    unchanged from the last apply. Uses the caller's SHARED ``client`` (one per
+    sweep — not one per VM, which recreated an SSL context every call and burned
+    CPU on the event loop). Returns True on success (incl. a no-op cache hit),
+    False on a real PUT failure. Best-effort: never raises."""
     if not token:
-        return False
-    if not _HAS_HTTPX:
-        logger.debug("sim-tag apply skipped for VM %s: httpx not installed", vmid)
         return False
     cache_key = (hostname, int(vmid))
     desired_set = set(desired_sim_tags)
     if applied_cache.get(cache_key) == desired_set:
         return True
     merged = merge_sim_tags(current_tags, desired_sim_tags)
-    url = f"https://{hostname}:8006/api2/json/nodes/{node}/qemu/{int(vmid)}/config"
+    url = f"https://{hostname}:{_PROXMOX_API_PORT}/api2/json/nodes/{node}/qemu/{int(vmid)}/config"
     headers = {"Authorization": f"PVEAPIToken={token}"}
     try:
-        async with httpx.AsyncClient(verify=False, timeout=8) as hc:
-            resp = await hc.put(url, headers=headers, data={"tags": merged})
+        resp = await client.put(url, headers=headers, data={"tags": merged})
         if resp.status_code == 200:
             applied_cache[cache_key] = desired_set
             logger.debug("VM %s tags updated on %s/%s", vmid, hostname, node)
             return True
-        logger.debug("VM %s tag update on %s/%s failed: HTTP %s",
-                     vmid, hostname, node, resp.status_code)
+        logger.debug("VM %s tag update on %s/%s:%s failed: HTTP %s",
+                     vmid, hostname, node, _PROXMOX_API_PORT, resp.status_code)
         return False
     except Exception as e:  # noqa: BLE001
-        logger.debug("VM %s tag update on %s/%s error: %s", vmid, hostname, node, e)
+        logger.debug("VM %s tag update on %s/%s:%s error: %s",
+                     vmid, hostname, node, _PROXMOX_API_PORT, e)
         return False
 
 
@@ -195,35 +202,45 @@ async def sync_all_sim_tags(deploy: Any, token_store: TokenStore,
     """Sweep every non-template, non-LXC VM across all known Proxmox hosts and
     apply the matching client's ``sim-`` tags (legacy ``_sync_all_vm_sim_tags``
     3794-3819). VMs whose ``name`` matches no client are left untouched. Returns
-    the count of VMs updated. No-op when no registry is wired."""
+    ``(updated, failures)`` so the caller can back off when a target is
+    unreachable/misconfigured. No-op when no registry / no httpx."""
     client_map = _client_sim_map(registry)
     if not client_map:
-        return 0  # nothing to sync until the client registry lands
+        return 0, 0  # nothing to sync until the client registry lands
+    if not _HAS_HTTPX:
+        logger.debug("sim-tag sweep skipped: httpx not installed")
+        return 0, 0
     cache = applied_cache if applied_cache is not None else {}
-    updated = 0
+    updated = failures = 0
     states = getattr(deploy, "proxmox_states", {}) or {}
-    for agent_hn, st in states.items():
-        token = token_store.get(agent_hn)
-        if not token:
-            continue
-        node_hostname = str((st.get("node") or {}).get("hostname") or agent_hn)
-        node = node_hostname.split(".")[0]
-        for vm in (st.get("vms") or []):
-            try:
-                vmid = vm.get("vmid")
-                vm_name = str(vm.get("name") or "").strip().lower()
-                if not vmid or not vm_name:
-                    continue
-                if vm.get("is_template") or vm.get("type") == "lxc":
-                    continue
-                desired = client_map.get(vm_name)
-                if desired is None:
-                    continue  # not a managed client VM — don't touch tags
-                ok = await apply_sim_tags_for_vm(
-                    agent_hn, node, int(vmid), desired, str(vm.get("tags") or ""),
-                    token, applied_cache=cache)
-                if ok:
-                    updated += 1
-            except Exception:  # noqa: BLE001
+    # ONE client for the whole sweep (was one per VM — each rebuilt an SSL
+    # context, synchronous CPU on the event loop, once per VM per telemetry frame).
+    async with httpx.AsyncClient(verify=False, timeout=8) as client:
+        for agent_hn, st in states.items():
+            token = token_store.get(agent_hn)
+            if not token:
                 continue
-    return updated
+            node_hostname = str((st.get("node") or {}).get("hostname") or agent_hn)
+            node = node_hostname.split(".")[0]
+            for vm in (st.get("vms") or []):
+                try:
+                    vmid = vm.get("vmid")
+                    vm_name = str(vm.get("name") or "").strip().lower()
+                    if not vmid or not vm_name:
+                        continue
+                    if vm.get("is_template") or vm.get("type") == "lxc":
+                        continue
+                    desired = client_map.get(vm_name)
+                    if desired is None:
+                        continue  # not a managed client VM — don't touch tags
+                    ok = await apply_sim_tags_for_vm(
+                        agent_hn, node, int(vmid), desired, str(vm.get("tags") or ""),
+                        token, applied_cache=cache, client=client)
+                    if ok:
+                        updated += 1
+                    else:
+                        failures += 1
+                except Exception:  # noqa: BLE001
+                    failures += 1
+                    continue
+    return updated, failures

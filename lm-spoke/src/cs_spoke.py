@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from pathlib import Path
 from typing import Any, Dict
 
@@ -108,6 +109,13 @@ class CSSpoke(BaseSpoke):
         self.demo = DemoManager()
         self._sim_tag_cache: Dict[tuple, set] = {}
         self._sim_tag_sync_lock = asyncio.Lock()
+        # Sim-tag sweep is DEBOUNCED off the per-frame telemetry hot path: at most
+        # once per _SIM_TAG_MIN_INTERVAL, and it backs off hard when a sweep has
+        # PUT failures (Proxmox unreachable / wrong host:port / bad token) so a
+        # misconfigured target can't re-storm every 10s telemetry frame — the
+        # regression behind the recurring CS_INGEST_TELEMETRY Request Timeouts.
+        self._sim_tag_last_ts = 0.0
+        self._sim_tag_backoff_until = 0.0
         # Control-plane back-reference, set by CSControlPlane.run() so the
         # GET_AGENTS / SPOKE_RELAY / SET_AGENT_CONFIG handlers can reach
         # connected_agents / approve_pending_agent / send_to_agent (mirrors
@@ -221,20 +229,41 @@ class CSSpoke(BaseSpoke):
         return {"status": "SUCCESS", "agents": agents, "pending_agents": pending}
 
     # ── Phase F: sim-tag sync (driven off CS_INGEST_TELEMETRY / token store) ──
-    async def _maybe_sync_sim_tags(self) -> None:
-        """Best-effort sim-tag sweep (legacy ``_sync_all_vm_sim_tags``).
+    _SIM_TAG_MIN_INTERVAL = 60.0    # at most one sweep per minute
+    _SIM_TAG_FAIL_BACKOFF = 600.0   # 10 min after a sweep with PUT failures
 
-        Re-entrant via a lock so overlapping telemetry frames / token stores
-        don't double-run. No-op until the client registry is wired
-        (``registry=None`` → ``_client_sim_map`` returns ``{}``). Never raises —
-        a failure here must not break telemetry ingest."""
+    async def _maybe_sync_sim_tags(self) -> None:
+        """Best-effort sim-tag sweep — DEBOUNCED off the telemetry hot path.
+
+        Runs at most once per ``_SIM_TAG_MIN_INTERVAL``; a sweep with PUT
+        failures (Proxmox unreachable / wrong host:port / bad token) backs off
+        for ``_SIM_TAG_FAIL_BACKOFF`` so a misconfigured target can't re-storm
+        every telemetry frame (each old call also rebuilt an SSL context per VM,
+        burning loop CPU — the cause of the CS_INGEST Request Timeouts). No-op
+        until the client registry is wired. Never raises."""
         if self.registry is None:
             return  # nothing to sync until the client registry lands
+        now = time.time()
+        if now < self._sim_tag_backoff_until:
+            return  # in failure back-off — a target is unreachable/misconfigured
+        if now - self._sim_tag_last_ts < self._SIM_TAG_MIN_INTERVAL:
+            return  # debounced — already swept within the interval
+        if self._sim_tag_sync_lock.locked():
+            return  # a sweep is already running — don't pile another on
         try:
             async with self._sim_tag_sync_lock:
-                await sync_all_sim_tags(self.deploy, self.tokens, self.registry,
-                                         applied_cache=self._sim_tag_cache)
+                self._sim_tag_last_ts = time.time()
+                _updated, failures = await sync_all_sim_tags(
+                    self.deploy, self.tokens, self.registry,
+                    applied_cache=self._sim_tag_cache)
+                if failures:
+                    self._sim_tag_backoff_until = time.time() + self._SIM_TAG_FAIL_BACKOFF
+                    logger.warning(
+                        "sim-tag sync: %d VM(s) failed to tag (Proxmox unreachable / "
+                        "wrong host:port / bad token?) — backing off %.0fm",
+                        failures, self._SIM_TAG_FAIL_BACKOFF / 60)
         except Exception as e:  # noqa: BLE001
+            self._sim_tag_backoff_until = time.time() + self._SIM_TAG_FAIL_BACKOFF
             logger.debug("sim-tag sync skipped: %s", e)
 
     # ── command dispatch ───────────────────────────────────────────────────
@@ -617,6 +646,11 @@ class CSSpoke(BaseSpoke):
                 return {"status": "ERROR",
                         "message": "missing 'hostname' or 'token'"}
             self.tokens.save(hostname, token)
+            # A fresh token may fix the very auth failure that put us in back-off
+            # — clear it (and the debounce) so the sync retries now with the new
+            # token instead of waiting out the 10-min penalty.
+            self._sim_tag_backoff_until = 0.0
+            self._sim_tag_last_ts = 0.0
             asyncio.create_task(self._maybe_sync_sim_tags())
             return {"status": "SUCCESS", "stored": True, "hostname": hostname,
                     "token_set": True}
