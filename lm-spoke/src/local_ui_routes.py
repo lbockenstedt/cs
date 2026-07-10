@@ -161,6 +161,14 @@ def build_local_ui_router(spoke) -> APIRouter:
             data["mode"] = cc["mode"]
         return data
 
+    @router.get("/aggregate/central-browse")
+    async def aggregate_central_browse():
+        """Full Central inventory (all sites/alerts/insights/clients) for the
+        standalone spoke webui — parity with the hub's
+        /sim/api/aggregate/central-browse. Calls the spoke's browse directly (this
+        IS the spoke), independent of site_mappings."""
+        return await spoke.central_poller.browse()
+
     # ── Kill switch ──────────────────────────────────────────────────────────
 
     @router.get("/{tenant}/kill-switch")
