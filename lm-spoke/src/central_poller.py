@@ -145,6 +145,26 @@ class CentralPoller:
         result = await self._client.available_checks()
         return {"status": "SUCCESS", **result}
 
+    async def browse(self) -> Dict[str, Any]:
+        """On-demand FULL Central inventory for the Central → Sites/Alerts/Clients
+        tabs — every site, alert, insight and client from Central, independent of
+        site_mappings (which only scope the background Checks poller). Mirrors the
+        original webui-hub browse (ArubaClient.browse_all). Cached inside the
+        client (5–15 min per endpoint), so repeated tab opens don't hammer Central.
+        """
+        if not self._client or not self._client.is_configured():
+            return {"status": "SUCCESS", "sites": [], "alerts": [], "insights": [],
+                    "clients": [], "devices_by_site": {}, "clients_by_site": {},
+                    "warning": "Central not configured."}
+        try:
+            data = await self._client.browse_all()
+            return {"status": "SUCCESS", **data}
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Central browse failed [%s]: %s",
+                           self.spoke.spoke_id, exc)
+            return {"status": "ERROR", "message": str(exc),
+                    "sites": [], "alerts": [], "insights": [], "clients": []}
+
     async def test_connection(self) -> Dict[str, Any]:
         """Best-effort connectivity check for the Setup → Central API tab's
         "Test Central" button. Mirrors the hub's test_central route shape

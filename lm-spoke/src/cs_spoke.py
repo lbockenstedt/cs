@@ -801,6 +801,9 @@ class CSSpoke(BaseSpoke):
         if cmd in ("CS_TEST_CENTRAL",):
             return await self.central_poller.test_connection()
 
+        if cmd in ("CS_CENTRAL_BROWSE",):
+            return await self.central_poller.browse()
+
         # Phase 2/3 commands (queue/proxmox/clients) return NotImplemented until
         # those modules land, so the LM hub sees a clear "not yet" rather than a
         # silent error.
