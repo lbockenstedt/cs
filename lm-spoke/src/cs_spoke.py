@@ -768,22 +768,7 @@ class CSSpoke(BaseSpoke):
             return {"status": "SUCCESS", "central_config": self.local_store.get_central_config()}
 
         if cmd in ("CS_SET_CENTRAL_CONFIG",):
-            cfg = d.get("central_config") or {}
-            # Sentinel-merge: an empty secret field means "keep the stored
-            # value" (the Setup UI never round-trips secrets back to the
-            # browser as plaintext-on-load... it does here, since this is a
-            # local-only dashboard with no separate viewer/editor trust
-            # boundary, but the merge-not-clobber behavior still matters for
-            # partial saves, e.g. Save Connection after only changing Mode).
-            current = self.local_store.get_central_config()
-            merged = dict(current)
-            for k, v in cfg.items():
-                if v not in (None, ""):
-                    merged[k] = v
-                elif k not in current:
-                    merged[k] = v
-            self.local_store.set_central_config(merged)
-            self.central_poller.reload()
+            self._merge_central_config(d.get("central_config") or {})
             return {"status": "SUCCESS"}
 
         if cmd in ("CS_GET_CENTRAL_SITES_CONFIG",):
@@ -847,6 +832,28 @@ class CSSpoke(BaseSpoke):
         "vm_image_2_template_spec": "image2_template_spec",
     }
 
+    def _merge_central_config(self, cfg: Dict[str, Any]) -> Dict[str, Any]:
+        """Sentinel-merge a Central API config patch into local_store and rebuild
+        the poller's ArubaClient. Shared by CS_SET_CENTRAL_CONFIG (standalone
+        local UI) and the hub-pushed CS_CONFIG_UPDATE path (_apply_hub_config) so
+        BOTH entry points persist creds AND reload the client — mirrors the source
+        webui-spoke _apply_hub_config central_config handling (server.py).
+
+        Sentinel rule: an empty/None value KEEPS the stored value (so a partial
+        save — e.g. changing only Mode, or a hub push that omits unchanged
+        secrets — never wipes creds). A new key with an empty value is still
+        written (first-time provisioning of a placeholder field)."""
+        current = self.local_store.get_central_config()
+        merged = dict(current)
+        for k, v in (cfg or {}).items():
+            if v not in (None, ""):
+                merged[k] = v
+            elif k not in current:
+                merged[k] = v
+        self.local_store.set_central_config(merged)
+        self.central_poller.reload()
+        return merged
+
     def _apply_hub_config(self, patch: Dict[str, Any]) -> list:
         """Apply a hub-pushed CS_CONFIG_UPDATE patch to the cs settings store.
 
@@ -861,6 +868,16 @@ class CSSpoke(BaseSpoke):
             return []
         update: Dict[str, Any] = {"hub_managed": True}
         applied: list = []
+        # Aruba Central creds pushed from the hub (Setup -> Central API -> Save).
+        # WITHOUT this branch the push is silently dropped: local_store never gets
+        # the creds and the poller keeps _client=None, so browse() returns zero
+        # sites and the Central-site dropdown / Sites-Alerts-Clients tabs stay
+        # empty. The source webui-spoke applies central_config in _apply_hub_config
+        # too (server.py) — this mirrors it via the shared sentinel-merge helper.
+        if "central_config" in patch:
+            cc = patch.get("central_config")
+            self._merge_central_config(cc if isinstance(cc, dict) else {})
+            applied.append("central_config")
         for key in self._HUB_DIRECT_KEYS:
             if key in patch:
                 update[key] = patch[key]
