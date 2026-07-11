@@ -86,10 +86,10 @@
     <main class="flex-1 overflow-y-auto p-6">
         <div class="flex justify-end items-center gap-3 mb-4">
             <span id="cs-autorefresh-slot"></span>
-            <button onclick="loadCSData(currentSubView, currentSubChild, true)" class="bg-slate-100 hover:bg-slate-200 text-slate-700 px-3 py-1 rounded-md text-xs font-medium transition-all border border-slate-200">↻ Refresh</button>
         </div>
         <div id="cs-add-toolbar" class="flex gap-2 mb-4 hidden"></div>
         <div id="cs-content" class="hpe-card p-5 shadow-sm"></div>
+        <button onclick="loadCSData(currentSubView, currentSubChild, true)" title="Refresh" class="fixed bottom-4 right-4 z-40 bg-slate-100 hover:bg-slate-200 text-slate-700 px-3 py-2 rounded-md text-xs font-medium transition-all border border-slate-200 shadow-sm">↻ Refresh</button>
     </main>
 
     <div id="cs-toast-region"></div>
