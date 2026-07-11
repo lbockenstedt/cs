@@ -359,6 +359,13 @@ class CSControlPlane(AgentHostingControlPlane):
                             await registry.record_tiers_batch(tier_updates)
                         except Exception as e:  # noqa: BLE001
                             logger.debug("record_tiers_batch failed: %s", e)
+                # Draining flag: True while a self-update is running (git pull +
+                # about to os._exit+relaunch). The hub reads this and, while set,
+                # queues CS_CONFIG_UPDATE (and other request/reply) pushes to the
+                # mailbox instead of firing a 5s request_response that would time
+                # out when we exit mid-reply. A fresh process starts False, so
+                # the first post-restart frame tells the hub to clear drain.
+                payload["draining"] = bool(getattr(self, "_draining", False))
                 msg = {
                     "header": {
                         "message_id": str(uuid.uuid4()),
