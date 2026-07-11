@@ -940,6 +940,22 @@ class CSSpoke(BaseSpoke):
             if override_key not in patch:
                 continue
             text = patch[override_key]
+            if _source == "github" and text is not None and not _gh_token:
+                # Source=GitHub but this spoke has NO token in memory. The token
+                # is held in-memory only (never persisted), so a spoke restart
+                # (hourly self-update / reboot / crash) wipes it until the hub
+                # re-delivers github_config. The hub accepted the save (its store
+                # has the token), but we can't push — warn LOUDLY so the operator
+                # catches it, instead of seeing a silent revert on the next repo
+                # sync (the "old GitHub version on sync" symptom). Fall through to
+                # the hub-override write so the edit at least applies locally.
+                logger.warning(
+                    "CS_CONFIG_UPDATE[%s]: %s received with source=github but no "
+                    "github_token in memory (spoke restarted since the key was "
+                    "delivered?) — will NOT push; the repo file reverts on the next "
+                    "sync. Re-save the GitHub credentials (Setup → Sim Config → "
+                    "GitHub) to re-deliver the token.",
+                    self.spoke_id, repo_filename)
             if _source == "github" and _gh_token and text is not None:
                 repo_path = _cfg_dir / repo_filename
                 try:
@@ -953,8 +969,8 @@ class CSSpoke(BaseSpoke):
                     _push_map[f"configs/{repo_filename}"] = str(text)
                     applied.append(f"{repo_filename}:github")
                 except Exception as exc:  # noqa: BLE001
-                    logger.warning("CS_CONFIG_UPDATE: %s (github) write failed: %s",
-                                   repo_filename, exc)
+                    logger.warning("CS_CONFIG_UPDATE[%s]: %s (github) write failed: %s",
+                                   self.spoke_id, repo_filename, exc)
                 continue
             override_path = _cfg_dir / hub_filename
             try:
@@ -977,9 +993,21 @@ class CSSpoke(BaseSpoke):
                 _t = asyncio.get_event_loop().create_task(
                     self._push_files_to_github(_push_map, "WebUI: update simulation config"))
                 self._gh_push_tasks.add(_t)
-                _t.add_done_callback(self._gh_push_tasks.discard)
+                def _push_done(t, _set=self._gh_push_tasks) -> None:
+                    _set.discard(t)
+                    if t.cancelled():
+                        logger.warning("github push[%s]: task cancelled before completion",
+                                       self.spoke_id)
+                        return
+                    exc = t.exception()  # defensive — _push_files_to_github catches its own
+                    if exc:
+                        logger.warning("github push[%s]: task raised %r", self.spoke_id, exc)
+                _t.add_done_callback(_push_done)
+                logger.info("CS_CONFIG_UPDATE[%s]: scheduled github push for %s",
+                            self.spoke_id, list(_push_map))
             except Exception as exc:  # noqa: BLE001
-                logger.warning("CS_CONFIG_UPDATE: github push schedule failed: %s", exc)
+                logger.warning("CS_CONFIG_UPDATE[%s]: github push schedule failed: %s",
+                               self.spoke_id, exc)
         # Config Source of Truth ('hub' | 'github'). In 'hub' mode sim_config.
         # load_configs uses the hub override files as the WHOLE config and ignores
         # the repo base (so a repo pull can never revert hub edits). Persisted as a
@@ -1025,20 +1053,30 @@ class CSSpoke(BaseSpoke):
         edited files from ``file_map`` and commit on top — so the push always
         fast-forwards. Untracked files (hub-*-overrides.conf, hub-config-source)
         are gitignored/untracked and survive the reset. Serialised on _git_lock;
-        never raises."""
+        never raises (a failure is logged at WARNING so it surfaces in the hub
+        Logs view via the relay handler — the operator can catch it)."""
         import os
         import uuid as _uuid
+        sid = self.spoke_id
         gc = self._github_config or {}
         token = str(gc.get("github_token") or "").strip()
         repo_url = str(gc.get("repo_url") or "").strip()
         branch = str(gc.get("repo_branch") or "").strip() or "main"
         repo_dir = self.settings.config_dir.parent
-        if not token or not repo_url:
-            logger.warning("github push: no token/repo configured — skipping")
+        if not token:
+            logger.warning("github push[%s]: no github_token in memory — skipping "
+                           "(spoke restarted since the key was delivered? re-save the "
+                           "GitHub credentials to re-deliver it)", sid)
+            return False
+        if not repo_url:
+            logger.warning("github push[%s]: no repo_url configured — skipping", sid)
             return False
         if not (repo_dir / ".git").exists():
-            logger.warning("github push: %s is not a git repo — skipping", repo_dir)
+            logger.warning("github push[%s]: %s is not a git repo — skipping",
+                           sid, repo_dir)
             return False
+        logger.info("github push[%s]: starting — repo=%s branch=%s files=%s",
+                    sid, repo_url, branch, list(file_map))
         askpass = repo_dir / f".git-askpass-{_uuid.uuid4().hex}.sh"
         try:
             async with self._git_lock:
@@ -1059,10 +1097,12 @@ class CSSpoke(BaseSpoke):
                 push_env = {"GIT_ASKPASS": str(askpass), "GIT_TERMINAL_PROMPT": "0",
                             "GITHUB_TOKEN": token}
                 await self._git("remote", "set-url", "origin", repo_url)
+                logger.debug("github push[%s]: fetched origin", sid)
                 # Sync onto origin/branch so the commit fast-forwards, then re-apply
                 # the edits (the reset discarded the local working-tree write).
                 await self._git("fetch", "--prune", "origin", env=push_env)
                 await self._git("checkout", "-B", branch, f"origin/{branch}")
+                logger.debug("github push[%s]: reset to origin/%s", sid, branch)
                 for rel, content in file_map.items():
                     p = repo_dir / rel
                     p.parent.mkdir(parents=True, exist_ok=True)
@@ -1074,14 +1114,17 @@ class CSSpoke(BaseSpoke):
                 except RuntimeError:
                     staged = True
                 if not staged:
-                    logger.info("github push: no changes vs origin for %s", list(file_map))
+                    logger.info("github push[%s]: no changes vs origin for %s — nothing to push",
+                                sid, list(file_map))
                     return False
                 await self._git("commit", "-m", commit_message)
                 await self._git("push", "origin", f"HEAD:{branch}", env=push_env)
-                logger.info("github push: pushed %s to %s @ %s", list(file_map), repo_url, branch)
+                new_head = await self._git("rev-parse", "HEAD")
+                logger.info("github push[%s]: pushed %s to %s @ %s — HEAD=%s",
+                            sid, list(file_map), repo_url, branch, new_head[:12])
                 return True
         except Exception as exc:  # noqa: BLE001 — never let a push crash the loop
-            logger.warning("github push failed: %s", exc)
+            logger.warning("github push[%s]: FAILED — %s", sid, exc)
             return False
         finally:
             try:
