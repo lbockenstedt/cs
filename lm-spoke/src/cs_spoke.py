@@ -102,6 +102,14 @@ class CSSpoke(BaseSpoke):
         self.settings = CSSettings(data_dir, config_dir)
         self.queue = CommandQueue(data_dir, self.settings)
         self.deploy = ProxmoxDeploy()
+        # GitHub push (Source of Truth = GitHub): repo/token pushed by the hub via
+        # CS_CONFIG_UPDATE(github_config); held in memory only (never persisted).
+        # _git_lock serialises git ops on REPO_DIR so a config push + a repo sync
+        # can't race on .git/index.lock. _gh_push_tasks retains fire-and-forget
+        # push tasks so they aren't GC'd mid-flight.
+        self._github_config: Dict[str, Any] = {}
+        self._git_lock = asyncio.Lock()
+        self._gh_push_tasks: set = set()
         # Phase F: per-host Proxmox token store + sim-tag sync (registry=None in
         # Phase 2/3, so sim-tag sync is a no-op until the client registry lands).
         self.tokens = TokenStore(data_dir)
@@ -900,18 +908,55 @@ class CSSpoke(BaseSpoke):
                     applied.append(_k)
                 except (TypeError, ValueError):
                     pass
-        # Optional simulation.conf / user-overrides.conf INI text overrides.
-        # None = clear the local override file so the GitHub-pulled file applies;
-        # a string = write it to configs/hub-*-overrides.conf (merged on top of
-        # simulation.conf by usb_config_payload's sim_phy read).
-        for override_key, filename in (
-            ("sim_conf_override", "hub-sim-overrides.conf"),
-            ("user_conf_override", "hub-user-overrides.conf"),
+        # GitHub repo/token (Source of Truth = GitHub) — held in memory only.
+        if "github_config" in patch:
+            gc = patch.get("github_config")
+            self._github_config = dict(gc) if isinstance(gc, dict) else {}
+            applied.append("github_config")
+
+        # Effective Source of Truth for this write: prefer the patch value, else
+        # the persisted flag, else 'github'.
+        _cfg_dir = self.settings.config_dir
+        if "config_source" in patch:
+            _source = "hub" if str(patch.get("config_source")).lower() == "hub" else "github"
+        else:
+            try:
+                _source = (_cfg_dir / "hub-config-source").read_text(encoding="utf-8").strip().lower()
+            except Exception:  # noqa: BLE001
+                _source = "github"
+        _gh_token = bool(str((self._github_config or {}).get("github_token") or "").strip())
+
+        # Optional simulation.conf / user-overrides.conf INI text.
+        #  - Source=GitHub WITH a token: write the REPO file and commit+push it so
+        #    GitHub stays authoritative (edit survives the next repo sync); the
+        #    stale hub override is removed so load_configs doesn't double-apply it.
+        #  - otherwise: write configs/hub-*-overrides.conf (hub-managed override).
+        #    None = clear the override so the base file applies.
+        _push_map = {}  # repo-relative path -> content, for the fetch+reset+push
+        for override_key, hub_filename, repo_filename in (
+            ("sim_conf_override", "hub-sim-overrides.conf", "simulation.conf"),
+            ("user_conf_override", "hub-user-overrides.conf", "user-overrides.conf"),
         ):
             if override_key not in patch:
                 continue
             text = patch[override_key]
-            override_path = self.settings.config_dir / filename
+            if _source == "github" and _gh_token and text is not None:
+                repo_path = _cfg_dir / repo_filename
+                try:
+                    repo_path.parent.mkdir(parents=True, exist_ok=True)
+                    tmp = repo_path.with_suffix(".tmp")
+                    tmp.write_text(str(text), encoding="utf-8")
+                    tmp.replace(repo_path)   # immediate local effect
+                    hub_path = _cfg_dir / hub_filename  # drop stale hub override
+                    if hub_path.exists():
+                        hub_path.unlink()
+                    _push_map[f"configs/{repo_filename}"] = str(text)
+                    applied.append(f"{repo_filename}:github")
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("CS_CONFIG_UPDATE: %s (github) write failed: %s",
+                                   repo_filename, exc)
+                continue
+            override_path = _cfg_dir / hub_filename
             try:
                 if text is None:
                     if override_path.exists():
@@ -926,6 +971,15 @@ class CSSpoke(BaseSpoke):
             except Exception as exc:  # noqa: BLE001
                 logger.warning("CS_CONFIG_UPDATE: %s write failed: %s",
                                override_path, exc)
+        # Fire-and-forget the git commit+push (async; _apply_hub_config is sync).
+        if _push_map:
+            try:
+                _t = asyncio.get_event_loop().create_task(
+                    self._push_files_to_github(_push_map, "WebUI: update simulation config"))
+                self._gh_push_tasks.add(_t)
+                _t.add_done_callback(self._gh_push_tasks.discard)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("CS_CONFIG_UPDATE: github push schedule failed: %s", exc)
         # Config Source of Truth ('hub' | 'github'). In 'hub' mode sim_config.
         # load_configs uses the hub override files as the WHOLE config and ignores
         # the repo base (so a repo pull can never revert hub edits). Persisted as a
@@ -942,4 +996,96 @@ class CSSpoke(BaseSpoke):
         logger.info("CS_CONFIG_UPDATE: applied %s",
                     ", ".join(applied) if applied else "no changes")
         return applied
+
+    # ── GitHub push (Source of Truth = GitHub) ───────────────────────────────
+    async def _git(self, *args: str, timeout: float = 120.0,
+                   env: "Dict[str, str] | None" = None) -> str:
+        """Run a git command in REPO_DIR (config_dir's parent). Raises on failure.
+        GIT_TERMINAL_PROMPT=0 so git never blocks on a credential prompt."""
+        import os
+        repo_dir = self.settings.config_dir.parent
+        git_env = {**os.environ, "GIT_TERMINAL_PROMPT": "0",
+                   "GIT_ASKPASS": "/bin/echo", **(env or {})}
+        proc = await asyncio.create_subprocess_exec(
+            "git", *args, cwd=str(repo_dir),
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE, env=git_env)
+        out, err = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+        if proc.returncode != 0:
+            raise RuntimeError(f"git {' '.join(args)} failed: {err.decode().strip()}")
+        return out.decode().strip()
+
+    async def _push_files_to_github(self, file_map: "Dict[str, str]", commit_message: str) -> bool:
+        """Commit + push ``{repo-relative-path: content}`` to the tenant's GitHub
+        repo using the hub-delivered token. Ports cs/webui-spoke proxmox_agent.
+        _push_to_github: the token is fed via a temp GIT_ASKPASS script (never
+        written into the remote URL / .git/config).
+
+        To avoid a non-fast-forward rejection (the cs repo gets frequent CI VERSION
+        bumps), we fetch + hard-reset onto origin/branch FIRST, then re-write the
+        edited files from ``file_map`` and commit on top — so the push always
+        fast-forwards. Untracked files (hub-*-overrides.conf, hub-config-source)
+        are gitignored/untracked and survive the reset. Serialised on _git_lock;
+        never raises."""
+        import os
+        import uuid as _uuid
+        gc = self._github_config or {}
+        token = str(gc.get("github_token") or "").strip()
+        repo_url = str(gc.get("repo_url") or "").strip()
+        branch = str(gc.get("repo_branch") or "").strip() or "main"
+        repo_dir = self.settings.config_dir.parent
+        if not token or not repo_url:
+            logger.warning("github push: no token/repo configured — skipping")
+            return False
+        if not (repo_dir / ".git").exists():
+            logger.warning("github push: %s is not a git repo — skipping", repo_dir)
+            return False
+        askpass = repo_dir / f".git-askpass-{_uuid.uuid4().hex}.sh"
+        try:
+            async with self._git_lock:
+                try:
+                    await self._git("config", "user.name")
+                except Exception:  # noqa: BLE001
+                    await self._git("config", "user.name", "Client Simulator")
+                try:
+                    await self._git("config", "user.email")
+                except Exception:  # noqa: BLE001
+                    await self._git("config", "user.email", "client-sim@localhost")
+                askpass.write_text(
+                    "#!/bin/sh\ncase \"$1\" in\n"
+                    "  *Username*) printf '%s\\n' 'x-access-token' ;;\n"
+                    "  *) printf '%s\\n' \"$GITHUB_TOKEN\" ;;\nesac\n",
+                    encoding="utf-8")
+                os.chmod(askpass, 0o700)
+                push_env = {"GIT_ASKPASS": str(askpass), "GIT_TERMINAL_PROMPT": "0",
+                            "GITHUB_TOKEN": token}
+                await self._git("remote", "set-url", "origin", repo_url)
+                # Sync onto origin/branch so the commit fast-forwards, then re-apply
+                # the edits (the reset discarded the local working-tree write).
+                await self._git("fetch", "--prune", "origin", env=push_env)
+                await self._git("checkout", "-B", branch, f"origin/{branch}")
+                for rel, content in file_map.items():
+                    p = repo_dir / rel
+                    p.parent.mkdir(parents=True, exist_ok=True)
+                    p.write_text(str(content), encoding="utf-8")
+                await self._git("add", *list(file_map.keys()))
+                staged = False
+                try:
+                    await self._git("diff", "--cached", "--quiet")
+                except RuntimeError:
+                    staged = True
+                if not staged:
+                    logger.info("github push: no changes vs origin for %s", list(file_map))
+                    return False
+                await self._git("commit", "-m", commit_message)
+                await self._git("push", "origin", f"HEAD:{branch}", env=push_env)
+                logger.info("github push: pushed %s to %s @ %s", list(file_map), repo_url, branch)
+                return True
+        except Exception as exc:  # noqa: BLE001 — never let a push crash the loop
+            logger.warning("github push failed: %s", exc)
+            return False
+        finally:
+            try:
+                askpass.unlink()
+            except Exception:  # noqa: BLE001
+                pass
 
