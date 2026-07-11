@@ -232,6 +232,28 @@ def resolve_profile(
     }
 
 
+def pure_bucket_profile(
+    hostname: str,
+    config_dir: os.PathLike | str,
+) -> Dict[str, str]:
+    """The ``simulation.conf`` bucket default for *hostname* WITHOUT the
+    ``[username]`` overlay from ``user-overrides.conf``.
+
+    Used by :meth:`ClientRegistry.set_overrides` to prune redundant per-client
+    registry overrides: when an override's on/off value matches this pure
+    bucket default, the override entry is DROPPED so the client falls back to
+    the bucket (overrides stay a true diff over the bucket). The ``[username]``
+    overlay is deliberately excluded — the WebUI mirrors each toggle into
+    ``user-overrides.conf`` (best-effort sync for the Config/User-Overrides
+    card), so including it would make the "bucket default" reflect the mirror's
+    own prior writes and defeat the prune. Comparing against the pure
+    ``simulation.conf`` bucket is the user's intent: "turn off → revert to the
+    bucket default".
+    """
+    sim_conf, _ = load_configs(config_dir)
+    return resolve_profile(hostname, sim_conf, _new_parser())["profile"]
+
+
 def effective_client_fields(
     hostname: str,
     sim_conf: Optional[configparser.ConfigParser],

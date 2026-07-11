@@ -95,7 +95,10 @@ class CSSpoke(BaseSpoke):
         # payload) is wired (D1), and the persisted command queue + cs settings
         # store are wired (D2). The client registry (Phase 2) backs the client
         # API status/control surface.
-        self.registry = ClientRegistry(data_dir)
+        self.registry = ClientRegistry(
+            data_dir,
+            bucket_resolver=lambda hn: sim_config.pure_bucket_profile(hn, config_dir),
+        )
         self.settings = CSSettings(data_dir, config_dir)
         self.queue = CommandQueue(data_dir, self.settings)
         self.deploy = ProxmoxDeploy()

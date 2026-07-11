@@ -25,7 +25,7 @@ import json
 import logging
 import time
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 logger = logging.getLogger("ClientRegistry")
 
@@ -41,12 +41,20 @@ class ClientRegistry:
     Upserted on every ``POST /api/status``; read by ``/api/config`` to bake
     a client's overrides into its profile. See the module docstring."""
 
-    def __init__(self, data_dir: Path) -> None:
+    def __init__(self, data_dir: Path,
+                 bucket_resolver: Optional[Callable[[str], Dict[str, Any]]] = None
+                 ) -> None:
         self.data_dir = Path(data_dir)
         self.data_dir.mkdir(parents=True, exist_ok=True)
         self.clients: Dict[str, Dict[str, Any]] = {}
         self._lock = asyncio.Lock()
         self._path = self.data_dir / _STATE_FILE
+        # Optional pure-bucket resolver (hostname -> profile dict) used by
+        # set_overrides to prune overrides that match the simulation.conf bucket
+        # default, so overrides stay a true diff over the bucket and a toggled-
+        # off sim reverts to the bucket instead of accumulating a redundant
+        # `flag:"off"` entry. None = no pruning (tests / standalone registry).
+        self._bucket_resolver = bucket_resolver
         self._load()
 
     # ── persistence ────────────────────────────────────────────────────────
@@ -151,6 +159,33 @@ class ClientRegistry:
             cur = dict(entry.get("overrides") or {})
             if isinstance(overrides, dict):
                 cur.update(overrides)
+            # PRUNE redundant overrides: drop any key whose on/off value matches
+            # the pure simulation.conf bucket default for this hostname. This is
+            # the "turn off a sim → it reverts to the bucket default → remove the
+            # override entry" behaviour: without it, every toggle-off leaves a
+            # `flag:"off"` entry that masks the bucket, so the override object
+            # grows to mirror the bucket instead of being a diff. An override that
+            # genuinely deviates from the bucket (e.g. turning OFF a sim the
+            # bucket has ON) is kept. Best-effort: a resolver failure leaves the
+            # merged overrides intact (never blocks a toggle).
+            if self._bucket_resolver and cur:
+                profile = None
+                try:
+                    profile = self._bucket_resolver(hostname) or {}
+                except Exception as exc:  # noqa: BLE001 — never block a toggle
+                    logger.warning("bucket resolve failed for %s: %s — skip prune",
+                                   hostname, exc)
+                # Only prune when we actually resolved the bucket; a failed
+                # resolve MUST leave the merged overrides intact (an empty
+                # profile would treat every key as "off" and wrongly prune
+                # "off" overrides — a toggle must never be silently dropped on
+                # an I/O hiccup).
+                if profile is not None:
+                    for flag in list(cur.keys()):
+                        bucket_on = str(profile.get(flag, "")).strip().lower() == "on"
+                        ov_on = str(cur[flag]).strip().lower() == "on"
+                        if bucket_on == ov_on:
+                            del cur[flag]
             entry["overrides"] = cur
             self.clients[hostname] = entry
             await self._apersist()
