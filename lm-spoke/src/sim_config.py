@@ -297,10 +297,16 @@ def effective_client_fields(
         resolved = resolve_profile(hostname, sim_conf, user_conf)
         sim_id = resolved.get("simulation_id") or sim_id
         prof = resolved.get("profile") or {}
-        if prof.get("wsite"):
-            cfg["wsite"] = prof["wsite"]
-        if prof.get("sim_phy"):
-            cfg["sim_phy"] = prof["sim_phy"]
+        # Surface the FULL resolved profile (simulation+address+server+bucket+
+        # [username] overlay), not just wsite/sim_phy — so the Clients view's
+        # per-sim buttons reflect the bucket's default-on flags (s1 → ping_test/
+        # www_traffic on, s2 → assoc_fail on). Without this a client with no
+        # per-client override shipped a config with NO flags, so the UI showed
+        # "no simulations" even though its bucket has sims on. The profile is the
+        # authoritative default layer; the UI still applies the client's live
+        # active_simulations + per-client registry overrides on top.
+        if prof:
+            cfg.update(prof)
     except Exception:  # noqa: BLE001 — degrade to reported values
         pass
     return sim_id, cfg
