@@ -926,6 +926,17 @@ class CSSpoke(BaseSpoke):
             except Exception as exc:  # noqa: BLE001
                 logger.warning("CS_CONFIG_UPDATE: %s write failed: %s",
                                override_path, exc)
+        # Config Source of Truth ('hub' | 'github'). In 'hub' mode sim_config.
+        # load_configs uses the hub override files as the WHOLE config and ignores
+        # the repo base (so a repo pull can never revert hub edits). Persisted as a
+        # flag file the loader reads. Default 'github' preserves the repo-base merge.
+        if "config_source" in patch:
+            src = "hub" if str(patch.get("config_source")).lower() == "hub" else "github"
+            try:
+                (self.settings.config_dir / "hub-config-source").write_text(src, encoding="utf-8")
+                applied.append(f"config_source:{src}")
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("CS_CONFIG_UPDATE: config_source write failed: %s", exc)
         if applied:
             self.settings.update(update)
         logger.info("CS_CONFIG_UPDATE: applied %s",

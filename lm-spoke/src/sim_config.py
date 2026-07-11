@@ -158,16 +158,31 @@ def load_configs(config_dir: os.PathLike | str) -> Tuple[configparser.ConfigPars
     user_path = d / "user-overrides.conf"
     hsim_path = d / "hub-sim-overrides.conf"
     huser_path = d / "hub-user-overrides.conf"
+    src_path = d / "hub-config-source"
     key = (str(d), (_mtime_ns(sim_path), _mtime_ns(user_path),
-                    _mtime_ns(hsim_path), _mtime_ns(huser_path)))
+                    _mtime_ns(hsim_path), _mtime_ns(huser_path), _mtime_ns(src_path)))
     cached = _LOAD_CACHE.get(key)
     if cached is not None:
         return copy.deepcopy(cached[0]), copy.deepcopy(cached[1])
 
-    sim_conf = load_ini(sim_path)
-    user_conf = load_ini(user_path) if user_path.exists() else _new_parser()
-    merge_override(sim_conf, hsim_path)
-    merge_override(user_conf, huser_path)
+    # Source of Truth: 'hub' = the hub override files ARE the whole config (the
+    # repo base is ignored, so a repo pull can never revert hub edits); 'github'
+    # (default) = repo base with the hub override merged on top. In hub mode we
+    # fall back to the repo base only until the hub file is first written (the
+    # seed gap), so the config is never empty.
+    try:
+        source = src_path.read_text(encoding="utf-8").strip().lower()
+    except Exception:  # noqa: BLE001
+        source = "github"
+    if source == "hub":
+        sim_conf = load_ini(hsim_path) if hsim_path.exists() else load_ini(sim_path)
+        user_conf = (load_ini(huser_path) if huser_path.exists()
+                     else (load_ini(user_path) if user_path.exists() else _new_parser()))
+    else:
+        sim_conf = load_ini(sim_path)
+        user_conf = load_ini(user_path) if user_path.exists() else _new_parser()
+        merge_override(sim_conf, hsim_path)
+        merge_override(user_conf, huser_path)
     # Cache independent copies so a caller mutating the returned objects can't
     # corrupt the canonical pair held here.
     _LOAD_CACHE[key] = (copy.deepcopy(sim_conf), copy.deepcopy(user_conf))
