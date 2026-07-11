@@ -270,7 +270,7 @@ class CentralPoller:
             # monitored" shows on the dashboard Checks view. Direct (NOT inverted)
             # semantics: a DROP means the sim clients died -> warning (>20% below
             # the hour average) / error (>50%). See ClientCountTracker.
-            checks["client_count"] = {
+            checks["Steady Client Count 1hr Average"] = {
                 "status": cc_entry["status"],
                 "message": f"{cc_entry['current']} clients vs {cc_entry['hourly_avg']} hr-avg (down {cc_entry['drop_pct']}%)",
             }
