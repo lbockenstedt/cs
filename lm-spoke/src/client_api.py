@@ -29,7 +29,6 @@ agent fetches ``/api/client/key`` first when a key is set.
 
 from __future__ import annotations
 
-import asyncio
 import logging
 import secrets
 from pathlib import Path

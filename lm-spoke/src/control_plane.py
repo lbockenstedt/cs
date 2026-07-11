@@ -18,13 +18,10 @@ _ensure_requirements(_req)
 del _os, _sys, _ensure_requirements, _req
 
 import asyncio
-import json
 import uuid
 import time
 import websockets
 import logging
-import hmac
-import hashlib
 import argparse
 import sys
 import os
@@ -41,7 +38,6 @@ import uvicorn
 # regardless of how the process is started (-m, direct script, or import).
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from simulation_engine import SimulationEngine
 from cs_spoke import CSSpoke
 from client_api import build_client_api_app
 import sim_config

@@ -280,12 +280,6 @@ def _effective_ssid(profile: Dict[str, str]) -> str:
     return ssid
 
 
-async def _wifi_cycle(ctx: SimCtx) -> None:
-    await _nmcli("radio", "wifi", "off")
-    await _nmcli("radio", "wifi", "on")
-    await asyncio.sleep(min(15.0, ctx.wifi_iters * 2))
-
-
 async def sim_assoc_fail(profile: Dict[str, str], ctx: SimCtx) -> PrimResult:
     """802.11 assoc failure: cycle the WLAN interface up/down repeatedly (nmcli)."""
     if not shutil.which("nmcli"):

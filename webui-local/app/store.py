@@ -18,9 +18,7 @@ import fcntl
 import hashlib
 import json
 import logging
-import os
 import shutil
-import tempfile
 import threading
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -28,7 +26,7 @@ from typing import Any, Optional
 
 from .config import get_settings
 from .crypto import decrypt_dict, decrypt_str, encrypt_str, generate_api_key
-from .data_models import AuditEntry, BackupConfig, Command, HubAuthConfig, MacProfile, MacProfileEntry, OuiPoolEntry, QAApiKey, Spoke, PendingSpoke, Tenant, User
+from .data_models import AuditEntry, BackupConfig, Command, HubAuthConfig, MacProfile, OuiPoolEntry, QAApiKey, Spoke, PendingSpoke, Tenant, User
 
 _lock = threading.RLock()
 

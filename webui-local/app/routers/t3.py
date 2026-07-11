@@ -15,13 +15,13 @@ from __future__ import annotations
 import csv
 import io
 from datetime import datetime, timedelta, timezone
-from typing import Any, Optional
+from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, UploadFile, File
-from pydantic import BaseModel, Field
+from pydantic import BaseModel
 
 from .. import auth, store
-from ..data_models import Command, MacProfile, MacProfileEntry, OuiPoolEntry, User
+from ..data_models import Command, MacProfile, MacProfileEntry, User
 from ..ws import ws_broadcast
 
 router = APIRouter()

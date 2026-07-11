@@ -22,17 +22,15 @@ import struct
 import subprocess
 import termios
 import time
-import traceback
 import uuid
-import zlib
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass
 
 import acme as spoke_acme
 import state
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Awaitable, Callable, Mapping
+from typing import Any
 
 try:
     import httpx
@@ -50,8 +48,8 @@ except ImportError:
     WebSocketInvalidStatus = Exception
     _WEBSOCKETS_AVAILABLE = False
 
-from fastapi import Body, Depends, FastAPI, HTTPException, Query, Request, WebSocket, WebSocketDisconnect
-from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, PlainTextResponse, StreamingResponse
+from fastapi import FastAPI, HTTPException, Query, Request, WebSocket, WebSocketDisconnect
+from fastapi.responses import HTMLResponse, JSONResponse
 from starlette.middleware.base import BaseHTTPMiddleware
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
