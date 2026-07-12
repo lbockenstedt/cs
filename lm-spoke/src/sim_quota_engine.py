@@ -67,6 +67,11 @@ class SimQuotaEngine:
         self._ledger_path: Optional[Path] = None
         self._loop_task: Optional[asyncio.Task] = None
         self._reconcile_lock = asyncio.Lock()
+        # Per-sweep hosting-server index + pxmx_site_map, refreshed at the top
+        # of each reconcile so _effective_site can resolve a client's site via
+        # its hosting pxmx server without rebuilding the index per client.
+        self._name_to_host: Dict[str, str] = {}
+        self._pxmx_site_map: Dict[str, str] = {}
         try:
             data_dir = Path(getattr(spoke, "data_dir", None) or ".")
             data_dir.mkdir(parents=True, exist_ok=True)
@@ -108,12 +113,41 @@ class SimQuotaEngine:
         ls = c.get("last_seen")
         return bool(ls and (now - float(ls)) < ONLINE_WINDOW_S)
 
+    def _refresh_host_index(self) -> None:
+        """Snapshot the client→host and host→site indices for this sweep. Both
+        are guarded: a spoke with no deploy (tests / pre-agent mode) or no
+        pxmx_site_map yields empty maps and _effective_site falls through to the
+        bucket-default wsite path."""
+        deploy = getattr(self.spoke, "deploy", None)
+        try:
+            self._name_to_host = deploy.name_to_host() if deploy is not None else {}
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("SimQuotaEngine: name_to_host failed: %s", exc)
+            self._name_to_host = {}
+        try:
+            self._pxmx_site_map = self.spoke.local_store.get_pxmx_site_map() or {}
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("SimQuotaEngine: pxmx_site_map load failed: %s", exc)
+            self._pxmx_site_map = {}
+
     def _effective_site(self, hostname: str, c: Dict[str, Any]) -> str:
-        """The client's effective site = override wsite else bucket wsite."""
+        """The client's effective site =
+        override wsite → hosting pxmx server's assigned site (pxmx_site_map) →
+        bucket-default wsite → sim_config fallback. An operator-assigned server
+        site wins over the bucket default so a site-specific quota ("10 DNS-fail
+        in MIA") is filled from clients whose hosting server is in MIA; an
+        engine re-home override (wsite) still wins over both."""
         ov = c.get("overrides") or {}
         w = ov.get("wsite")
         if w:
             return str(w)
+        # Hosting pxmx server's assigned site (operator-set pxmx_site_map). The
+        # host index is refreshed once per reconcile sweep.
+        host = self._name_to_host.get(str(hostname).strip().lower())
+        if host:
+            s = self._pxmx_site_map.get(host)
+            if s:
+                return str(s)
         cfg = c.get("config") or {}
         w = cfg.get("wsite")
         if w:
@@ -202,6 +236,7 @@ class SimQuotaEngine:
             now = time.time()
             clients = self._all_clients()
             eff_keys = {_quota_key(q) for q in quotas}
+            self._refresh_host_index()
 
             actions = {"assigned": 0, "released": 0, "kept": 0}
             for q in quotas:

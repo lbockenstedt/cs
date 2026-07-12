@@ -79,6 +79,8 @@
         <button class="cs-tab-btn px-4 py-2 text-sm font-semibold rounded-t-lg border border-b-0 border-transparent text-slate-500"
                 data-view="Sim Quotas" role="tab" aria-selected="false">Sim Quotas</button>
         <button class="cs-tab-btn px-4 py-2 text-sm font-semibold rounded-t-lg border border-b-0 border-transparent text-slate-500"
+                data-view="PXMX Sites" role="tab" aria-selected="false">PXMX Sites</button>
+        <button class="cs-tab-btn px-4 py-2 text-sm font-semibold rounded-t-lg border border-b-0 border-transparent text-slate-500"
                 data-view="Auto-Provisioning" role="tab" aria-selected="false">Auto-Provisioning</button>
         <button class="cs-tab-btn px-4 py-2 text-sm font-semibold rounded-t-lg border border-b-0 border-transparent text-slate-500"
                 data-view="Central API Setup" role="tab" aria-selected="false">Central API Setup</button>
@@ -155,6 +157,7 @@
         const TAB_RENDERERS = {
             'Config': () => csRenderConfigSimulation(),
             'Sim Quotas': () => csRenderConfigSimQuotas(),
+            'PXMX Sites': () => csRenderPxmxSiteMap(),
             'Auto-Provisioning': () => renderAutoProvisioning(),
             'Central API Setup': () => csRenderSetupCentralApi(),
         };

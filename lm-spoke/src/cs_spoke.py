@@ -950,6 +950,54 @@ class CSSpoke(BaseSpoke):
                     "effective": self.local_store.get_effective_sim_quotas(),
                     "ledger": snap}
 
+        if cmd == "CS_GET_PXMX_SITE_MAP":
+            # Operator-assigned pxmx server → site map (Config → PXMX Sites). The
+            # engine resolves a client's site via its hosting server's entry.
+            # Also return the currently-connected pxmx agents so the UI can list
+            # assignable servers + flag servers whose agent has dropped.
+            agents = []
+            try:
+                agents = self._get_agents().get("agents", [])
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("CS_GET_PXMX_SITE_MAP: agents list failed: %s", exc)
+            return {"status": "SUCCESS",
+                    "pxmx_site_map": self.local_store.get_pxmx_site_map(),
+                    "agents": agents}
+
+        if cmd == "CS_SET_PXMX_SITE_MAP":
+            # Validate each assigned site against the sites this tenant's
+            # simulation.conf + Central site_mappings actually offer; drop
+            # unknown sites (keep the host mapping so the operator can fix the
+            # typo in-place) and surface errors. Unknown HOSTS are kept too — a
+            # server may be temporarily disconnected but still assigned.
+            raw = d.get("pxmx_site_map") if isinstance(d, dict) else None
+            raw = raw if isinstance(raw, dict) else (d if isinstance(d, dict) else {})
+            errs: list = []
+            try:
+                import sim_quota
+                csc = self.local_store.get_central_sites_config() or {}
+                valid = set(sim_quota.available_sites(
+                    self.settings.config_dir, csc.get("site_mappings")))
+                clean = {}
+                for host, site in raw.items():
+                    h = str(host).strip()
+                    s = str(site or "").strip()
+                    if not h:
+                        continue
+                    if s and valid and s not in valid:
+                        errs.append(f"{h}: unknown site '{s}'")
+                    clean[h] = s
+            except Exception as exc:  # noqa: BLE001 — never block the save
+                logger.warning("CS_SET_PXMX_SITE_MAP: validate failed: %s", exc)
+                clean = {str(k).strip(): str(v or "").strip()
+                         for k, v in raw.items() if str(k).strip()}
+            saved = self.local_store.set_pxmx_site_map(clean)
+            # Re-resolve sites on the next sweep — the engine reads the map at
+            # the top of each reconcile, so just nudge it now for promptness.
+            self._trigger_sim_quota_reconcile()
+            return {"status": "SUCCESS", "pxmx_site_map": saved,
+                    "errors": errs}
+
         # Phase 2/3 commands (queue/proxmox/clients) return NotImplemented until
         # those modules land, so the LM hub sees a clear "not yet" rather than a
         # silent error.

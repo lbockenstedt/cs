@@ -10,6 +10,8 @@ import sys
 import time
 from pathlib import Path
 
+import pytest
+
 HERE = Path(__file__).resolve().parent
 SRC = HERE.parent / "src"
 if str(SRC) not in sys.path:
@@ -40,11 +42,24 @@ class _FakeRegistry:
 
 
 class _FakeLocalStore:
-    def __init__(self, quotas):
+    def __init__(self, quotas, pxmx_site_map=None):
         self._q = quotas
+        self._map = pxmx_site_map or {}
 
     def get_effective_sim_quotas(self):
         return list(self._q)
+
+    def get_pxmx_site_map(self):
+        return dict(self._map)
+
+
+class _FakeDeploy:
+    """Stand-in for ProxmoxDeploy — just the name→host index the engine reads."""
+    def __init__(self, name_to_host):
+        self._n2h = name_to_host
+
+    def name_to_host(self):
+        return dict(self._n2h)
 
 
 class _FakeSettings:
@@ -52,11 +67,13 @@ class _FakeSettings:
 
 
 class _FakeSpoke:
-    def __init__(self, clients, quotas, tmp_path):
+    def __init__(self, clients, quotas, tmp_path, pxmx_site_map=None,
+                 name_to_host=None):
         self.registry = _FakeRegistry(clients)
-        self.local_store = _FakeLocalStore(quotas)
+        self.local_store = _FakeLocalStore(quotas, pxmx_site_map)
         self.settings = _FakeSettings()
         self.data_dir = str(tmp_path)
+        self.deploy = _FakeDeploy(name_to_host or {})
 
 
 def _client(host, site, online=True, overrides=None, sim_flags=None):
@@ -70,7 +87,26 @@ def _client(host, site, online=True, overrides=None, sim_flags=None):
 
 
 def _run(coro):
-    return asyncio.get_event_loop().run_until_complete(coro)
+    return _LOOP.run_until_complete(coro)
+
+
+# A dedicated, stable loop for every _run() in this module. SimQuotaEngine
+# creates an asyncio.Lock in __init__ that binds to whichever loop first runs
+# it, so all _run() calls in one test MUST share a loop — and it MUST NOT be the
+# global get_event_loop() (sibling test files like test_pxmx_site_map.py /
+# test_hub_config.py tear the global loop down to None in their fixtures, which
+# would make asyncio.get_event_loop() raise mid-suite on Python 3.9).
+_LOOP = asyncio.new_event_loop()
+asyncio.set_event_loop(_LOOP)
+
+
+@pytest.fixture(autouse=True)
+def _bind_engine_loop():
+    # Rebind the global loop to _LOOP before each test so SimQuotaEngine's
+    # asyncio.Lock() (eagerly bound on Python 3.9) finds it even after a sibling
+    # test file tore the global loop down to None.
+    asyncio.set_event_loop(_LOOP)
+    yield
 
 
 def _offline_recently():
@@ -175,6 +211,45 @@ def test_reconcile_blank_site_uses_any_online_client(tmp_path):
     actions = _run(eng.reconcile())
     assert actions["assigned"] == 2
     assert len(eng._ledger["alert:A:"]["clients"]) == 2
+
+
+def test_reconcile_resolves_site_via_hosting_pxmx_server(tmp_path):
+    # px1 is assigned to MIA, px2 to DFW. c0/c1 live on px1, c2/c3 on px2.
+    # All clients' bucket wsite is "DFW" (so without the server map the engine
+    # would see them all as DFW and none eligible for MIA). With the map, the
+    # engine resolves c0/c1's site via px1 → MIA and fills the MIA quota from
+    # them, ignoring px2's clients.
+    clients = {f"c{i}": _client(f"c{i}", "DFW") for i in range(4)}
+    n2h = {"c0": "px1", "c1": "px1", "c2": "px2", "c3": "px2"}
+    site_map = {"px1": "MIA", "px2": "DFW"}
+    spoke = _FakeSpoke(clients, [{"alert_id": "A", "sim_id": "dns_fail",
+                                  "count": 2, "site": "MIA", "enabled": True}],
+                      tmp_path, pxmx_site_map=site_map, name_to_host=n2h)
+    eng = SimQuotaEngine(spoke)
+    actions = _run(eng.reconcile())
+    assigned = list(eng._ledger["alert:A:MIA"]["clients"].keys())
+    assert actions["assigned"] == 2
+    assert set(assigned) == {"c0", "c1"}     # only px1's (MIA) clients
+    # px2's clients are NOT re-homed or touched.
+    assert "c2" not in assigned and "c3" not in assigned
+
+
+def test_reconcile_wsite_override_wins_over_server_site(tmp_path):
+    # c0 lives on px1 (MIA-assigned) but a manual wsite override pins it to DFW.
+    # The override wins → c0 is NOT eligible for the MIA quota; the engine picks
+    # other free runners on px1 instead.
+    clients = {f"c{i}": _client(f"c{i}", "DFW") for i in range(4)}
+    clients["c0"]["overrides"] = {"wsite": "DFW"}
+    n2h = {"c0": "px1", "c1": "px1", "c2": "px1", "c3": "px2"}
+    site_map = {"px1": "MIA", "px2": "DFW"}
+    spoke = _FakeSpoke(clients, [{"alert_id": "A", "sim_id": "dns_fail",
+                                  "count": 2, "site": "MIA", "enabled": True}],
+                      tmp_path, pxmx_site_map=site_map, name_to_host=n2h)
+    eng = SimQuotaEngine(spoke)
+    _run(eng.reconcile())
+    assigned = set(eng._ledger["alert:A:MIA"]["clients"].keys())
+    assert "c0" not in assigned          # override pinned it to DFW
+    assert assigned == {"c1", "c2"}      # other px1 (MIA) free runners
 
 
 def test_reconcile_substitute_stops_when_original_returns(tmp_path):

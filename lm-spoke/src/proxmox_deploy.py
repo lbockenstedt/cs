@@ -319,6 +319,22 @@ class ProxmoxDeploy:
                     name_to_vmid.setdefault(nm, str(v))
         return usb_vmids, name_to_vmid
 
+    def name_to_host(self) -> Dict[str, str]:
+        """``{client_hostname_lower: proxmx_host}`` across all reporting hosts.
+        Mirrors ``usb_vmid_index``'s name→vmid index but retains which pxmx
+        server (the ``proxmox_states`` key = the agent's short hostname) each
+        client VM lives on — used by SimQuotaEngine to resolve a client's site
+        via its hosting server's pxmx_site_map entry. ``setdefault`` keeps the
+        first host seen for a name (a client hostname maps to one VM on one
+        host in practice)."""
+        name_to_host: Dict[str, str] = {}
+        for host, st in self.proxmox_states.items():
+            for vm in (st.get("vms") or []):
+                nm = str(vm.get("name") or "").strip().lower()
+                if nm:
+                    name_to_host.setdefault(nm, str(host))
+        return name_to_host
+
     def vm_tier_index(self) -> Dict[str, str]:
         """``{str(vmid): 't1'|'t2'|'t3'}`` from the agent-computed per-VM ``tier``
         (pxmx ``compute_vm_tiers`` stamps it on each ``vms`` entry, classified by

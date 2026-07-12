@@ -382,6 +382,26 @@ def build_local_ui_router(spoke) -> APIRouter:
     async def get_sim_quota_catalog(tenant: str):
         return await _cmd("CS_GET_SIM_QUOTA_CATALOG")
 
+    @router.get("/{tenant}/pxmx-site-map")
+    async def get_pxmx_site_map(tenant: str):
+        return await _cmd("CS_GET_PXMX_SITE_MAP")
+
+    @router.post("/{tenant}/pxmx-site-map")
+    async def set_pxmx_site_map(tenant: str, request: Request):
+        body = await request.json()
+        payload = body if isinstance(body, dict) else {}
+        if "pxmx_site_map" not in payload and isinstance(body, dict):
+            # Allow the UI to POST just the mapping object.
+            payload = {"pxmx_site_map": body}
+        res = await _cmd("CS_SET_PXMX_SITE_MAP", payload)
+        return {"saved": res.get("status") == "SUCCESS",
+                "pxmx_site_map": res.get("pxmx_site_map", {}),
+                "errors": res.get("errors", [])}
+
+    @router.get("/{tenant}/agents")
+    async def get_agents(tenant: str):
+        return await _cmd("GET_AGENTS", {})
+
     @router.post("/{tenant}/test-central")
     async def test_central(tenant: str):
         return await _cmd("CS_TEST_CENTRAL")

@@ -279,6 +279,30 @@ class LocalStore:
             self._data["central_sites_config"] = cfg or {}
             self._save()
 
+    # ── pxmx server → site map (engine site resolver) ──────────────────────────
+    # An operator assigns each connected pxmx server (the agent host = its short
+    # hostname, the same key as connected_agents[agent_id]["hostname"] and
+    # proxmox_states) to a site (e.g. "MIA"). The SimQuotaEngine resolves a
+    # client's effective site via its hosting pxmx server's entry here (after a
+    # per-client wsite override, before the bucket-default wsite fallback), so a
+    # site-specific quota ("10 DNS-fail clients in MIA") is filled from clients
+    # whose hosting server is in MIA. Persisted so a spoke restart keeps the
+    # mapping until re-edited. Shape: {pxmx_host: site}.
+    def get_pxmx_site_map(self) -> Dict[str, str]:
+        return dict(self._data.get("pxmx_site_map") or {})
+
+    def set_pxmx_site_map(self, mapping: Dict[str, Any]) -> Dict[str, str]:
+        with self._lock:
+            clean: Dict[str, str] = {}
+            for host, site in (mapping or {}).items():
+                h = str(host).strip()
+                s = str(site or "").strip()
+                if h and s:
+                    clean[h] = s
+            self._data["pxmx_site_map"] = clean
+            self._save()
+            return clean
+
     # ── effective sim quotas (hub-pushed, engine input) ──────────────────────
     # The hub merges platform-wide defaults + this tenant's overrides (enabled
     # only) and pushes the result as effective_sim_quotas; the spoke's
