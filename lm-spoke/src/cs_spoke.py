@@ -927,7 +927,7 @@ class CSSpoke(BaseSpoke):
         if cmd == "CS_GET_SIM_QUOTA_CATALOG":
             # The Sim-Quota UI (Config → Sim Quotas) renders against this: the
             # sims/sites derived from this tenant's simulation.conf + the global
-            # suggested alert→sim marriages. Sims come from simulation.conf, not
+            # suggested alert→sim linkage. Sims come from simulation.conf, not
             # a hardcoded list, so a tenant that adds a flag to its buckets sees
             # it here automatically.
             try:

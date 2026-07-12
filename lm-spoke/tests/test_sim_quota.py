@@ -138,6 +138,6 @@ def test_sim_quota_catalog_shape(tmp_path):
 
 
 def test_suggested_excludes_hardware_alerts():
-    # Hardware alerts are monitoring-only — no sim marriage suggestion.
+    # Hardware alerts are monitoring-only — no sim linkage suggestion.
     for hw in ("AP_DOWN", "SWITCH_DOWN", "GATEWAY_DOWN"):
         assert hw not in sim_quota.SUGGESTED_ALERT_SIM

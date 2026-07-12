@@ -293,16 +293,34 @@ class SimQuotaEngine:
                     producing.append(h)
                     actions["kept"] += 1
 
-                # Top up producing to N from the free-runner pool.
+                # Top up producing to N from the free-runner pool. First try
+                # in-site free runners (clients whose hosting server / wsite is
+                # already the quota site — respects physical placement). If the
+                # quota opts into re-home (``rehome``) and the in-site pool is
+                # exhausted, borrow free runners from OTHER sites and set
+                # ``wsite`` to re-home them; the ledger records their original
+                # site as ``from_site`` so a later release reverts it.
                 if len(producing) < target:
                     owned = self._engine_owned_clients()
                     need = target - len(producing)
-                    pool = [h for h, c in clients.items()
-                            if h not in assigned and h not in owned
-                            and self._is_online(c, now)
-                            and self._is_free_runner(h, c)
-                            and (not site or self._effective_site(h, c) == site)]
-                    for h in pool[:need]:
+                    in_site = [h for h, c in clients.items()
+                               if h not in assigned and h not in owned
+                               and self._is_online(c, now)
+                               and self._is_free_runner(h, c)
+                               and (not site or self._effective_site(h, c) == site)]
+                    picks = in_site[:need]
+                    if q.get("rehome") and len(picks) < need:
+                        # Cross-site fallback: any other-site free runner. _assign
+                        # sets wsite=site when the client's current effective site
+                        # differs, re-homing it; assigned[h] captures the PRE-rehome
+                        # effective site (the snapshot ``c`` predates the override).
+                        cross = [h for h, c in clients.items()
+                                 if h not in assigned and h not in owned
+                                 and self._is_online(c, now)
+                                 and self._is_free_runner(h, c)
+                                 and (not site or self._effective_site(h, c) != site)]
+                        picks += cross[:need - len(picks)]
+                    for h in picks:
                         await self._assign(h, sim_id, site)
                         c = clients.get(h) or {}
                         assigned[h] = self._effective_site(h, c)

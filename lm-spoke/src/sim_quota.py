@@ -1,6 +1,6 @@
 """Sim-Quota config foundation (Chunk 1) — schema, validation, resolution.
 
-A sim-quota marries a monitored Aruba Central alert/insight to a simulation
+A sim-quota links a monitored Aruba Central alert/insight to a simulation
 flag + a run policy (N runners in a site) so the SimQuotaEngine (Chunk 2) can
 auto-generate per-client overrides that keep N online clients running the sim
 — producing the network condition Aruba Central reports as the alert. The
@@ -15,9 +15,9 @@ Data sourcing (per the feature design):
     PRIMITIVES), enriched with per-sim metadata (``SIM_META``).
   * Sites are pulled from ``simulation.conf`` ``wsite`` values ∪ Central
     ``site_mappings``.
-  * The alert→sim marriage is a TENANT user action (Config → Sim Quotas). The
+  * The alert→sim linkage is a TENANT user action (Config → Sim Quotas). The
     global catalog (Setup → Simulations) supplies per-sim metadata defaults +
-    suggested marriages (``SUGGESTED_ALERT_SIM``) the tenant UI pre-fills; the
+    suggested linkage (``SUGGESTED_ALERT_SIM``) the tenant UI pre-fills; the
     tenant can change the sim per-quota. Hardware alerts (AP_DOWN, ...) have no
     sim and are monitoring-only.
 
@@ -34,7 +34,8 @@ logger = logging.getLogger("CSSimQuota")
 # ── Schema ────────────────────────────────────────────────────────────────
 # A sim-quota record, stored as a list under central_sites_config["sim_quotas"].
 # Backward-compatible: an absent "sim_quotas" key = no quotas (today's behavior).
-SIM_QUOTA_KEYS = ("alert_id", "alert_type", "sim_id", "count", "site", "multi_capable", "enabled")
+SIM_QUOTA_KEYS = ("alert_id", "alert_type", "sim_id", "count", "site",
+                  "multi_capable", "rehome", "enabled")
 ALERT_TYPES = ("alert", "insight")
 
 # Per-sim metadata defaults. category: "failure" sims produce a network condition
@@ -57,7 +58,7 @@ SIM_META: Dict[str, Dict[str, object]] = {
     "iperf":       {"category": "traffic", "multi_capable": True},
 }
 
-# Suggested alert/insight → sim marriages (global defaults the tenant UI
+# Suggested alert/insight → sim linkage (global defaults the tenant UI
 # pre-fills; the tenant can change the sim per-quota). Hardware alerts
 # (AP_DOWN, SWITCH_DOWN, GATEWAY_DOWN, ...) are intentionally absent — they are
 # not produced by sim clients, so they get monitoring only, never a quota.
@@ -109,6 +110,7 @@ def normalize_quota(raw: Any) -> Dict[str, Any]:
         "count": _as_int(raw.get("count"), 1),
         "site": str(raw.get("site") or "").strip(),
         "multi_capable": _as_bool(raw.get("multi_capable"), bool(meta.get("multi_capable", False))),
+        "rehome": _as_bool(raw.get("rehome"), False),
         "enabled": _as_bool(raw.get("enabled"), False),
     }
 

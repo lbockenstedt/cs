@@ -26,10 +26,14 @@ class _FakeRegistry:
         self.clients = {h: dict(e) for h, e in clients.items()}
 
     def get_all(self):
-        return self.clients
+        # Match the real ClientRegistry.get_all() contract: a shallow copy per
+        # entry so the engine's pre-sweep snapshot isn't mutated by set_overrides
+        # mid-sweep (the ledger records the PRE-assign effective site).
+        return {h: dict(e) for h, e in self.clients.items()}
 
     def get(self, h):
-        return self.clients.get(h)
+        e = self.clients.get(h)
+        return dict(e) if e is not None else None
 
     async def set_overrides(self, hostname, overrides):
         e = self.clients.setdefault(hostname, {"hostname": hostname})
@@ -250,6 +254,70 @@ def test_reconcile_wsite_override_wins_over_server_site(tmp_path):
     assigned = set(eng._ledger["alert:A:MIA"]["clients"].keys())
     assert "c0" not in assigned          # override pinned it to DFW
     assert assigned == {"c1", "c2"}      # other px1 (MIA) free runners
+
+
+def test_reconcile_rehome_disabled_underfills_when_site_short(tmp_path):
+    # MIA quota N=3 but only c0 is in MIA (px1); c1-c4 are on px2 (DFW). Without
+    # rehome the engine respects physical placement → only 1 assigned, no
+    # cross-site borrowing, no wsite overrides set on DFW clients.
+    clients = {f"c{i}": _client(f"c{i}", "DFW") for i in range(5)}
+    n2h = {"c0": "px1", "c1": "px2", "c2": "px2", "c3": "px2", "c4": "px2"}
+    site_map = {"px1": "MIA", "px2": "DFW"}
+    spoke = _FakeSpoke(clients, [{"alert_id": "A", "sim_id": "dns_fail",
+                                  "count": 3, "site": "MIA", "rehome": False,
+                                  "enabled": True}],
+                      tmp_path, pxmx_site_map=site_map, name_to_host=n2h)
+    eng = SimQuotaEngine(spoke)
+    actions = _run(eng.reconcile())
+    assigned = list(eng._ledger["alert:A:MIA"]["clients"].keys())
+    assert actions["assigned"] == 1 and assigned == ["c0"]
+    # DFW clients untouched (no wsite override).
+    for h in ("c1", "c2", "c3", "c4"):
+        assert "wsite" not in (spoke.registry.clients[h].get("overrides") or {})
+
+
+def test_reconcile_rehome_borrows_cross_site_when_enabled(tmp_path):
+    # Same layout, rehome=True → c0 in-site + c1,c2 borrowed from DFW and
+    # re-homed (wsite=MIA). The ledger records their original site (DFW) so a
+    # later release reverts.
+    clients = {f"c{i}": _client(f"c{i}", "DFW") for i in range(5)}
+    n2h = {"c0": "px1", "c1": "px2", "c2": "px2", "c3": "px2", "c4": "px2"}
+    site_map = {"px1": "MIA", "px2": "DFW"}
+    spoke = _FakeSpoke(clients, [{"alert_id": "A", "sim_id": "dns_fail",
+                                  "count": 3, "site": "MIA", "rehome": True,
+                                  "enabled": True}],
+                      tmp_path, pxmx_site_map=site_map, name_to_host=n2h)
+    eng = SimQuotaEngine(spoke)
+    actions = _run(eng.reconcile())
+    assigned = eng._ledger["alert:A:MIA"]["clients"]
+    assert actions["assigned"] == 3
+    assert set(assigned.keys()) == {"c0", "c1", "c2"}
+    # Borrowed clients re-homed to MIA; ledger from_site preserves DFW.
+    assert spoke.registry.clients["c1"]["overrides"]["wsite"] == "MIA"
+    assert spoke.registry.clients["c2"]["overrides"]["wsite"] == "MIA"
+    assert assigned["c1"] == "DFW" and assigned["c2"] == "DFW"
+
+
+def test_reconcile_rehome_release_reverts_wsite(tmp_path):
+    # After a rehome assign, removing the quota releases the borrowed clients
+    # and reverts wsite back to their original site (DFW).
+    clients = {f"c{i}": _client(f"c{i}", "DFW") for i in range(5)}
+    n2h = {"c0": "px1", "c1": "px2", "c2": "px2", "c3": "px2", "c4": "px2"}
+    site_map = {"px1": "MIA", "px2": "DFW"}
+    spoke = _FakeSpoke(clients, [{"alert_id": "A", "sim_id": "dns_fail",
+                                  "count": 3, "site": "MIA", "rehome": True,
+                                  "enabled": True}],
+                      tmp_path, pxmx_site_map=site_map, name_to_host=n2h)
+    eng = SimQuotaEngine(spoke)
+    _run(eng.reconcile())
+    assert spoke.registry.clients["c1"]["overrides"]["wsite"] == "MIA"
+    # Remove the quota → engine releases all + reverts wsite.
+    spoke.local_store._q = []
+    _run(eng.reconcile())
+    assert eng._ledger == {}
+    # c1's wsite reverted to DFW (from_site), sim turned off.
+    assert spoke.registry.clients["c1"]["overrides"].get("wsite") == "DFW"
+    assert spoke.registry.clients["c1"]["overrides"].get("dns_fail") == "off"
 
 
 def test_reconcile_substitute_stops_when_original_returns(tmp_path):

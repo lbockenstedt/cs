@@ -2374,16 +2374,17 @@ async function csRenderConfigSimulation() {
 }
 
 // ── Config → Sim Quotas sub-tab ────────────────────────────────────────────
-// Declares alert/insight → simulation marriages + the per-site client quota
+// Declares alert/insight → simulation linkage + the per-site client quota
 // the SimQuotaEngine (Chunk 2) keeps filled from the online pool. Renders
 // against the spoke's /sim-quota-catalog (sims + sites derived from this
-// spoke's simulation.conf + the global suggested marriages). Save is a
+// spoke's simulation.conf + the global suggested linkage). Save is a
 // GET-merge-POST on central-sites-config so site_mappings / monitored_checks /
 // hardware_checks are preserved (mirrors csToggleMonitorCheck). The server
 // re-validates + dedups and returns the cleaned rows, which we adopt.
 // Mirrored from lm/WebUI/sim-views.js per the two-copy rule; single-tenant here.
 let csSimQuotaCatalog = null;       // {sims, sites, suggested, meta}
 let csSimQuotaRows = [];            // working set of quota rows
+let csSimQuotaMonitored = [];       // monitored_checks → {type,id,name,site} for the ID dropdown
 
 async function csRenderConfigSimQuotas() {
     csSetToolbar('');
@@ -2393,6 +2394,14 @@ async function csRenderConfigSimQuotas() {
             csFetch(`/${csTenant()}/central-sites-config?tenant_id=${csTenant()}`).catch(() => ({})),
         ]);
         csSimQuotaCatalog = cat || { sims: [], sites: [], suggested: {}, meta: {} };
+        // Monitored alerts/insights (Central → Alerts/Insights → Monitor) are the
+        // source for the row's Alert / Insight ID dropdown — a quota is linked to
+        // an alert/insight the tenant actually monitors.
+        csSimQuotaMonitored = Array.isArray(cfg && cfg.monitored_checks)
+            ? cfg.monitored_checks.filter(c => c && c.id).map(c => ({
+                  type: c.type || 'alert', id: String(c.id),
+                  name: c.name || c.id, site: c.site || '',
+              })) : [];
         const quotas = Array.isArray(cfg && cfg.sim_quotas) ? cfg.sim_quotas : [];
         csSimQuotaRows = quotas.map(csSimQuotaRowFromServer);
         csRenderSimQuotaEditor();
@@ -2410,6 +2419,7 @@ function csSimQuotaRowFromServer(q) {
         count: q.count != null ? q.count : 10,
         site: q.site || '',
         multi_capable: !!q.multi_capable,
+        rehome: !!q.rehome,
         enabled: !!q.enabled,
     };
 }
@@ -2417,6 +2427,27 @@ function csSimQuotaRowFromServer(q) {
 function csSimQuotaSelect(selected, items, placeholder) {
     return `<option value="">${csEscape(placeholder)}</option>` +
         items.map(it => `<option value="${csEscape(it)}" ${it === selected ? 'selected' : ''}>${csEscape(it)}</option>`).join('');
+}
+
+// Alert / Insight ID dropdown options for a row: the monitored checks matching
+// the row's alert_type (alert vs insight), labeled "name — id". A saved
+// alert_id that's no longer monitored is kept as a trailing option so it isn't
+// silently dropped on re-render.
+function csSimQuotaAlertIdOptions(alertType, selectedId) {
+    const opts = [];
+    const seen = new Set();
+    (csSimQuotaMonitored || []).forEach(c => {
+        if (c.type !== alertType || !c.id || seen.has(c.id)) return;
+        seen.add(c.id);
+        const label = c.name && c.name !== c.id ? `${c.name} — ${c.id}` : c.id;
+        opts.push({ id: c.id, label, selected: c.id === selectedId });
+    });
+    if (selectedId && !seen.has(selectedId)) {
+        opts.push({ id: selectedId, label: `${selectedId} (not monitored)`, selected: true });
+    }
+    const ph = opts.length ? '— select alert/insight —' : '— monitor an alert/insight first —';
+    return `<option value="">${csEscape(ph)}</option>` +
+        opts.map(o => `<option value="${csEscape(o.id)}" ${o.selected ? 'selected' : ''}>${csEscape(o.label)}</option>`).join('');
 }
 
 function csRenderSimQuotaEditor() {
@@ -2428,15 +2459,16 @@ function csRenderSimQuotaEditor() {
     const rowHtml = csSimQuotaRows.map((r, i) => {
         const simOpts = csSimQuotaSelect(r.sim_id, simIds, '— select sim —');
         const siteOpts = csSimQuotaSelect(r.site, sites, '— all sites —');
+        const idOpts = csSimQuotaAlertIdOptions(r.alert_type, r.alert_id);
         return `<div class="grid grid-cols-1 md:grid-cols-7 gap-2 items-end bg-white border border-slate-200 rounded-md p-2" data-cs-sqrow="${i}">
           <label class="text-xs text-slate-500">Type
-            <select data-cs-sq="alert_type" class="w-full bg-white border border-slate-300 rounded-md px-2 py-1.5 text-sm mt-1">
+            <select data-cs-sq="alert_type" onchange="csSimQuotaOnTypeChange(this)" class="w-full bg-white border border-slate-300 rounded-md px-2 py-1.5 text-sm mt-1">
               <option value="alert" ${r.alert_type === 'alert' ? 'selected' : ''}>Alert</option>
               <option value="insight" ${r.alert_type === 'insight' ? 'selected' : ''}>Insight</option>
             </select>
           </label>
           <label class="text-xs text-slate-500">Alert / Insight ID
-            <input data-cs-sq="alert_id" value="${csEscape(r.alert_id)}" placeholder="CLIENT_DHCP_FAILURE" class="w-full bg-white border border-slate-300 rounded-md px-2 py-1.5 text-sm mt-1">
+            <select data-cs-sq="alert_id" class="w-full bg-white border border-slate-300 rounded-md px-2 py-1.5 text-sm mt-1">${idOpts}</select>
           </label>
           <label class="text-xs text-slate-500">Simulation
             <select data-cs-sq="sim_id" class="w-full bg-white border border-slate-300 rounded-md px-2 py-1.5 text-sm mt-1">${simOpts}</select>
@@ -2449,6 +2481,7 @@ function csRenderSimQuotaEditor() {
           </label>
           <label class="text-xs text-slate-500 flex flex-col gap-1">
             <span class="flex items-center gap-1"><input data-cs-sq="multi_capable" type="checkbox" ${r.multi_capable ? 'checked' : ''}> Multi-capable</span>
+            <span class="flex items-center gap-1"><input data-cs-sq="rehome" type="checkbox" ${r.rehome ? 'checked' : ''}> Re-home</span>
             <span class="flex items-center gap-1"><input data-cs-sq="enabled" type="checkbox" ${r.enabled ? 'checked' : ''}> Enabled</span>
           </label>
           <button onclick="csSimQuotaDel(${i})" class="text-red-600 hover:text-red-800 text-xs font-bold py-1">Remove</button>
@@ -2456,7 +2489,7 @@ function csRenderSimQuotaEditor() {
     }).join('');
     const suggestHtml = Object.keys(suggested).length ? `
         <details class="text-xs text-slate-500 mt-2">
-          <summary class="cursor-pointer">Suggested alert → sim marriages</summary>
+          <summary class="cursor-pointer">Suggested alert → sim linkage</summary>
           <ul class="mt-1 list-disc list-inside space-y-0.5">
             ${Object.entries(suggested).map(([a, s]) => `<li><span class="font-mono">${csEscape(a)}</span> → <span class="font-mono">${csEscape(s)}</span> <button onclick="csSimQuotaAddSuggested('${csEscape(a)}','${csEscape(s)}')" class="text-[#01A982] hover:underline ml-1">add</button></li>`).join('')}
           </ul>
@@ -2470,9 +2503,9 @@ function csRenderSimQuotaEditor() {
             <button onclick="csSimQuotaSave()" class="bg-[#01A982]/10 hover:bg-[#01A982]/20 text-[#01A982] border border-[#01A982] px-4 py-1.5 rounded-md text-sm font-bold shadow-sm">Save Quotas</button>
           </div>
         </div>
-        <p class="text-xs text-slate-500 mb-2">Marry an alert or insight to the simulation that produces it, then set how many online clients the engine keeps running that sim in the chosen site. The engine auto-selects from the online pool and self-heals when a runner dies. Sims + sites come from this spoke's <span class="font-semibold">Raw Config</span> (simulation.conf) and Central site mappings.</p>
+        <p class="text-xs text-slate-500 mb-2">Link a monitored alert or insight (Central → Alerts/Insights → Monitor) to the simulation that produces it, then set how many online clients the engine keeps running that sim in the chosen site. The engine auto-selects from the online pool and self-heals when a runner dies. <span class="font-semibold">Re-home</span> lets it borrow runners from other sites (re-homing their <span class="font-mono">wsite</span>) when this site's pool can't fill the count. Sims + sites come from this spoke's <span class="font-semibold">Raw Config</span> (simulation.conf) and Central site mappings.</p>
         ${suggestHtml}
-        <div class="space-y-2 mt-2" id="cs-sq-rows">${rowHtml || '<div class="text-xs text-slate-400 italic">No quotas defined. Add one or pick a suggested marriage above.</div>'}</div>
+        <div class="space-y-2 mt-2" id="cs-sq-rows">${rowHtml || '<div class="text-xs text-slate-400 italic">No quotas defined. Add one or pick a suggested linkage above.</div>'}</div>
       </div>
     </div>`);
 }
@@ -2490,6 +2523,7 @@ function csSimQuotaSyncFromDom() {
             count: parseInt(g('count').value || '1', 10) || 1,
             site: g('site').value,
             multi_capable: !!g('multi_capable').checked,
+            rehome: !!g('rehome').checked,
             enabled: !!g('enabled').checked,
         });
     });
@@ -2507,9 +2541,22 @@ window.csSimQuotaAdd = function (preset) {
         count: p.count != null ? p.count : 10,
         site: p.site || '',
         multi_capable: p.multi_capable != null ? !!p.multi_capable : false,
+        rehome: p.rehome != null ? !!p.rehome : false,
         enabled: p.enabled != null ? !!p.enabled : false,
     });
     csRenderSimQuotaEditor();
+};
+
+// Repopulate the Alert / Insight ID dropdown when the row's Type flips between
+// alert and insight (the monitored-check list is type-scoped). Preserves the
+// current selection if it's still valid for the new type.
+window.csSimQuotaOnTypeChange = function (typeSel) {
+    const row = typeSel.closest('[data-cs-sqrow]');
+    if (!row) return;
+    const idSel = row.querySelector('[data-cs-sq="alert_id"]');
+    if (!idSel) return;
+    const cur = idSel.value;
+    idSel.innerHTML = csSimQuotaAlertIdOptions(typeSel.value, cur);
 };
 
 window.csSimQuotaAddSuggested = function (alertId, simId) {
