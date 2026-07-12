@@ -18,12 +18,19 @@ _KEY = "-----BEGIN PRIVATE KEY-----\nY\n-----END PRIVATE KEY-----\n"
 
 
 class _FakeCP:
-    """Stand-in for CSControlPlane: just connected_agents + send_to_agent."""
-    def __init__(self, agents, responses=None, exc=None):
+    """Stand-in for CSControlPlane: connected_agents + send_to_agent +
+    _apply_local_cert (the local-webui HTTPS apply). ``webui`` controls the
+    apply result (default SUCCESS); ``webui_exc`` makes it raise."""
+    def __init__(self, agents, responses=None, exc=None,
+                 webui=None, webui_exc=None):
         self.connected_agents = agents
         self._responses = responses or {}
         self._exc = exc
+        self._webui = webui if webui is not None else {
+            "status": "SUCCESS", "message": "local webui HTTPS applied"}
+        self._webui_exc = webui_exc
         self.sent = []
+        self.applied_certs = []
 
     async def send_to_agent(self, command, data, agent_id, timeout=None):
         self.sent.append({"agent_id": agent_id, "cmd": command,
@@ -34,13 +41,34 @@ class _FakeCP:
             agent_id,
             {"payload": {"data": {"status": "ERROR", "message": "no stub"}}})
 
+    async def _apply_local_cert(self, fullchain, privkey):
+        self.applied_certs.append({"fullchain": fullchain, "privkey": privkey})
+        if self._webui_exc:
+            raise self._webui_exc
+        return dict(self._webui)
+
+
+def _ensure_loop():
+    """CSSpoke/CSControlPlane construct asyncio.Lock() at __init__, which on
+    py3.9 binds to the current event loop — a prior suite test may have closed
+    / removed it. Make sure a live loop is current before construction + runs."""
+    try:
+        loop = asyncio.get_event_loop()
+        if loop.is_closed():
+            raise RuntimeError("closed")
+    except RuntimeError:
+        asyncio.set_event_loop(asyncio.new_event_loop())
+
 
 def _spoke() -> CSSpoke:
+    _ensure_loop()
     return CSSpoke("test-cs", {})
 
 
 def _run(coro):
-    return asyncio.new_event_loop().run_until_complete(coro)
+    _ensure_loop()
+    loop = asyncio.get_event_loop()
+    return loop.run_until_complete(coro)
 
 
 def _cert_data():
@@ -140,3 +168,127 @@ def test_install_cert_no_control_plane_is_error():
     s.control_plane = None
     res = _run(s.handle_command("INSTALL_CERT", _cert_data()))
     assert res["status"] == "ERROR"
+
+
+def test_install_cert_applies_cert_to_local_webui():
+    """INSTALL_CERT also applies the cert to the cs spoke's own 8080 dashboard
+    (control_plane._apply_local_cert) — the user wants the cert on the pxmx
+    servers AND the cs spoke's local webui. Both succeed → overall SUCCESS."""
+    s = _spoke()
+    s.control_plane = _FakeCP(
+        {"node-a": {"hostname": "a"}},
+        responses={"node-a": {"payload": {"data": {"status": "SUCCESS"}}}})
+    res = _run(s.handle_command("INSTALL_CERT", _cert_data()))
+    assert res["status"] == "SUCCESS"
+    # The local webui apply was handed the delivered cert material.
+    assert len(s.control_plane.applied_certs) == 1
+    assert s.control_plane.applied_certs[0]["fullchain"] == _PEM
+    assert s.control_plane.applied_certs[0]["privkey"] == _KEY
+    assert "webui success" in res["message"]
+
+
+def test_install_cert_webui_failure_marks_overall_error():
+    """A local-webui apply failure must surface as overall ERROR even when the
+    node relay succeeded — the failure is reported in the message, not dropped."""
+    s = _spoke()
+    s.control_plane = _FakeCP(
+        {"node-a": {"hostname": "a"}},
+        responses={"node-a": {"payload": {"data": {"status": "SUCCESS"}}}},
+        webui={"status": "ERROR", "message": "write failed: permission denied"})
+    res = _run(s.handle_command("INSTALL_CERT", _cert_data()))
+    assert res["status"] == "ERROR"
+    assert "webui error" in res["message"]
+    assert "permission denied" in res["message"]
+    # The node relay still ran + is reported.
+    assert res["nodes"][0]["status"] == "SUCCESS"
+
+
+def test_install_cert_webui_exception_does_not_raise():
+    s = _spoke()
+    s.control_plane = _FakeCP(
+        {"node-a": {"hostname": "a"}},
+        responses={"node-a": {"payload": {"data": {"status": "SUCCESS"}}}},
+        webui_exc=RuntimeError("rebind exploded"))
+    res = _run(s.handle_command("INSTALL_CERT", _cert_data()))
+    # Caught → overall ERROR with the exception in the message, not raised.
+    assert res["status"] == "ERROR"
+    assert "rebind exploded" in res["message"]
+
+
+# ── _apply_local_cert (the control plane's local-webui HTTPS apply) ──────────
+
+def _real_cert_pair():
+    """Generate a real self-signed cert+key PEM (so ssl.load_cert_chain
+    validates). Skips if cryptography isn't installed."""
+    try:
+        from cryptography import x509
+        from cryptography.hazmat.primitives import hashes, serialization
+        from cryptography.hazmat.primitives.asymmetric import rsa
+        from cryptography.x509.oid import NameOID
+        import datetime
+    except Exception:
+        import pytest
+        pytest.skip("cryptography not installed")
+    key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    subj = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "lm-test")])
+    now = datetime.datetime.utcnow()
+    cert = (x509.CertificateBuilder()
+            .subject_name(subj).issuer_name(subj)
+            .public_key(key.public_key())
+            .serial_number(x509.random_serial_number())
+            .not_valid_before(now).not_valid_after(now + datetime.timedelta(days=1))
+            .sign(key, hashes.SHA256()))
+    fullchain = cert.public_bytes(serialization.Encoding.PEM).decode()
+    privkey = key.private_bytes(serialization.Encoding.PEM,
+        serialization.PrivateFormat.TraditionalOpenSSL,
+        serialization.NoEncryption()).decode()
+    return fullchain, privkey
+
+
+def test_apply_local_cert_writes_files_and_rebinds(monkeypatch, tmp_path):
+    from control_plane import CSControlPlane
+    _ensure_loop()
+    monkeypatch.setenv("LM_CS_TLS_DIR", str(tmp_path / "tls"))
+    cp = CSControlPlane("test-cs", "secret", api_host="127.0.0.1", api_port=0)
+    cp._api_app = object()  # dummy; rebind is mocked so it never serves
+    rebound = []
+
+    async def _fake_rebind(ssl_certfile=None, ssl_keyfile=None):
+        rebound.append((ssl_certfile, ssl_keyfile))
+    cp._rebind_api_server = _fake_rebind  # type: ignore[assignment]
+
+    fullchain, privkey = _real_cert_pair()
+    res = _run(cp._apply_local_cert(fullchain, privkey))
+    assert res["status"] == "SUCCESS"
+    cert = tmp_path / "tls" / "fullchain.pem"
+    key = tmp_path / "tls" / "privkey.pem"
+    assert cert.read_text() == fullchain
+    assert key.read_bytes() == privkey.encode()
+    # Re-bind was called with the written paths (HTTPS on the 8080 server).
+    assert rebound == [(str(cert), str(key))]
+    # _local_tls_paths now sees the persisted cert (run() would bind HTTPS).
+    assert cp._local_tls_paths() == (str(cert), str(key))
+
+
+def test_apply_local_cert_rejects_invalid_material(monkeypatch, tmp_path):
+    from control_plane import CSControlPlane
+    _ensure_loop()
+    monkeypatch.setenv("LM_CS_TLS_DIR", str(tmp_path / "tls"))
+    cp = CSControlPlane("test-cs", "secret")
+    wrote = []
+    cp._atomic_write_text = lambda p, t: wrote.append(("text", p))  # type: ignore
+    cp._atomic_write_bytes = lambda p, d: wrote.append(("bytes", p))  # type: ignore
+    res = _run(cp._apply_local_cert("not a cert", "not a key"))
+    assert res["status"] == "ERROR"
+    assert "invalid cert material" in res["message"]
+    # Nothing was written (validation fails fast, no brick).
+    assert wrote == []
+
+
+def test_apply_local_cert_missing_material_is_error():
+    from control_plane import CSControlPlane
+    _ensure_loop()
+    cp = CSControlPlane("test-cs", "secret")
+    res = _run(cp._apply_local_cert("", "key"))
+    assert res["status"] == "ERROR"
+    assert "missing cert material" in res["message"]

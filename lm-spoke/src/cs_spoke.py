@@ -439,11 +439,32 @@ class CSSpoke(BaseSpoke):
             return {"status": "ERROR", "error": "Unknown relay command"}
 
         # ── cert distribution (hub-brokered; le spoke issued/renewed a cert) ──
-        # INSTALL_CERT relays the cert to each managed pxmx agent (→ pvenode cert
-        # set on that node's pveproxy) — the cs spoke owns the agents in the
-        # split topology. See _install_cert_relay (mirrors ProxmoxSpoke).
+        # INSTALL_CERT does TWO things: (1) relay the cert to each managed pxmx
+        # agent (→ pvenode cert set on that node's pveproxy) — the cs spoke owns
+        # the agents in the split topology; (2) apply the cert to THIS spoke's
+        # own local webui (the 8080 dashboard) so the operator's browser gets
+        # HTTPS with the LE cert. See _install_cert_relay + control_plane
+        # _apply_local_cert (mirror ProxmoxSpoke / statuspage respectively).
         if cmd == "INSTALL_CERT":
-            return await self._install_cert_relay(d)
+            relay = await self._install_cert_relay(d)
+            webui = {"status": "ERROR", "message": "no control plane"}
+            cp = self.control_plane
+            if cp is not None and hasattr(cp, "_apply_local_cert"):
+                try:
+                    webui = await cp._apply_local_cert(
+                        d.get("fullchain", ""), d.get("privkey", ""))
+                except Exception as exc:  # noqa: BLE001 - webui apply must not mask the relay result
+                    webui = {"status": "ERROR",
+                             "message": f"{type(exc).__name__}: {exc}"}
+            relay["webui"] = webui.get("message", "")
+            # Overall SUCCESS only if both the node relay AND the webui apply
+            # succeeded (a webui failure is surfaced in the message, not dropped).
+            relay["status"] = ("SUCCESS" if relay.get("status") == "SUCCESS"
+                               and webui.get("status") == "SUCCESS" else "ERROR")
+            relay["message"] = (relay.get("message", "")
+                                + f"; webui {webui.get('status', 'ERROR').lower()}"
+                                + (f": {webui.get('message', '')}" if webui.get("message") else ""))
+            return relay
 
         # ── VNC console relay (agent-terminates-WSS) ────────────────────────
         # PORT of ProxmoxSpoke.VNC_START/FRAME_DOWN/DISCONNECT. In the all-cs-

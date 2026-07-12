@@ -20,6 +20,8 @@ del _os, _sys, _ensure_requirements, _req
 import asyncio
 import uuid
 import time
+import ssl
+import tempfile
 import websockets
 import logging
 import argparse
@@ -124,6 +126,115 @@ class CSControlPlane(AgentHostingControlPlane):
         # backlogged link — the recurring cause of "provision loop not running"
         # after an agent restart. Complements the agent-side config persistence.
         self._agent_config_cache: Dict[str, Any] = {}
+        # Local webui (8080 uvicorn) TLS cert paths, set by _apply_local_cert
+        # when a le-issued cert is delivered via INSTALL_CERT. None until then.
+        self._api_app = None
+        self._api_server = None
+        self._api_task = None
+
+    # ── local webui TLS (le cert distribution → this spoke's own dashboard) ───
+    # The 8080 uvicorn server serves the local dashboard + client API. INSTALL_CERT
+    # applies the le cert here too (pxmx servers AND the cs spoke's own webui):
+    # validate → atomic-write → re-bind the server with ssl_certfile/ssl_keyfile
+    # in-process (no restart/installer change). run() re-reads the persisted cert
+    # at startup so a restart keeps HTTPS. Mirrors statuspage _apply_cert +
+    # _ensure_web_server and the hub's _install_cert_on_hub validation.
+    _TLS_DIR_ENV = "LM_CS_TLS_DIR"
+
+    def _tls_dir(self) -> Path:
+        """Where the local-webui fullchain/privkey live. Env-overridable; default
+        is <lm-spoke>/data/tls — the spoke's own data dir, always spoke-writable
+        (CSSpoke already persists settings/registry/queue there), so applying a
+        cert needs no installer or service-user change."""
+        d = os.getenv(self._TLS_DIR_ENV)
+        if d:
+            return Path(d)
+        # control_plane.py is <lm-spoke>/src/ → parent.parent = <lm-spoke>/
+        return Path(__file__).resolve().parent.parent / "data" / "tls"
+
+    def _local_tls_paths(self):
+        """Return (cert, key) paths if a local-webui cert is persisted on disk,
+        else (None, None). Used by run() to bind HTTPS on startup."""
+        d = self._tls_dir()
+        cert, key = d / "fullchain.pem", d / "privkey.pem"
+        if cert.is_file() and key.is_file():
+            return str(cert), str(key)
+        return None, None
+
+    @staticmethod
+    def _atomic_write_text(path: Path, text: str) -> None:
+        tmp = path.with_suffix(path.suffix + ".tmp")
+        tmp.write_text(text, encoding="utf-8")
+        os.replace(tmp, path)
+
+    @staticmethod
+    def _atomic_write_bytes(path: Path, data: bytes) -> None:
+        tmp = path.with_suffix(path.suffix + ".tmp")
+        tmp.write_bytes(data)
+        os.replace(tmp, path)
+
+    async def _rebind_api_server(self, ssl_certfile=None, ssl_keyfile=None) -> None:
+        """Tear down the current 8080 uvicorn server and start a fresh one,
+        optionally with TLS. Awaited so the old socket is released before the
+        new bind (avoids EADDRINUSE). The app is reused (self._api_app)."""
+        old = self._api_server
+        old_task = self._api_task
+        if old is not None:
+            old.should_exit = True
+        if old_task is not None:
+            try:
+                await asyncio.wait_for(old_task, timeout=5.0)
+            except Exception:  # noqa: BLE001 - shutdown timeout/Cancel is fine
+                pass
+        kwargs = dict(host=self.api_host, port=self.api_port, log_config=None)
+        if ssl_certfile and ssl_keyfile:
+            kwargs["ssl_certfile"] = ssl_certfile
+            kwargs["ssl_keyfile"] = ssl_keyfile
+        self._api_server = uvicorn.Server(uvicorn.Config(self._api_app, **kwargs))
+        self._api_task = asyncio.create_task(self._api_server.serve())
+
+    async def _apply_local_cert(self, fullchain: str, privkey: str) -> Dict[str, Any]:
+        """Apply a delivered TLS cert to this spoke's own local webui (8080).
+        Validate in a throwaway ssl context first (fail-fast — a bad cert must
+        not brick the listener), atomic-write fullchain+privkey, then re-bind
+        the uvicorn server with HTTPS in-process."""
+        if not (fullchain and privkey):
+            return {"status": "ERROR", "message": "missing cert material"}
+        # Validate before touching live files.
+        try:
+            with tempfile.NamedTemporaryFile(mode="w", suffix=".pem", delete=False) as cf:
+                cf.write(fullchain); cp = cf.name
+            with tempfile.NamedTemporaryFile(mode="wb", suffix=".pem", delete=False) as kf:
+                kf.write(privkey.encode("utf-8")); kp = kf.name
+            try:
+                ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+                ctx.load_cert_chain(cp, kp)
+            finally:
+                try: os.unlink(cp)
+                except OSError: pass
+                try: os.unlink(kp)
+                except OSError: pass
+        except Exception as exc:  # noqa: BLE001
+            return {"status": "ERROR", "message": f"invalid cert material: {exc}"}
+        # Atomic write to the TLS dir.
+        try:
+            d = self._tls_dir()
+            d.mkdir(parents=True, exist_ok=True)
+            cert_p, key_p = d / "fullchain.pem", d / "privkey.pem"
+            self._atomic_write_text(cert_p, fullchain)
+            os.chmod(cert_p, 0o644)
+            self._atomic_write_bytes(key_p, privkey.encode("utf-8"))
+            os.chmod(key_p, 0o600)
+        except Exception as exc:  # noqa: BLE001
+            return {"status": "ERROR", "message": f"write failed: {exc}"}
+        # Re-bind the 8080 server with HTTPS.
+        try:
+            await self._rebind_api_server(str(cert_p), str(key_p))
+        except Exception as exc:  # noqa: BLE001
+            return {"status": "ERROR", "message": f"rebind failed: {exc}"}
+        logger.info("Local webui TLS applied — re-bound https://%s:%s",
+                    self.api_host, self.api_port)
+        return {"status": "SUCCESS", "message": "local webui HTTPS applied"}
 
     async def _on_agent_registered(self, agent_id: str) -> None:
         """Re-push the agent's last-known client-simulation config the moment it
@@ -179,11 +290,18 @@ class CSControlPlane(AgentHostingControlPlane):
         # uvicorn.run), so it shares super().run()'s event loop — same pattern
         # as webui-spoke running the LM relay as a background task.
         app = build_client_api_app(cs_spoke)
+        self._api_app = app  # retained so _apply_local_cert can re-bind with TLS
+        # If a le-issued cert was previously applied to the local webui, re-bind
+        # HTTPS on startup so a restart keeps HTTPS (see _apply_local_cert).
+        tls_cert, tls_key = self._local_tls_paths()
+        _tls_kwargs = ({"ssl_certfile": tls_cert, "ssl_keyfile": tls_key}
+                       if tls_cert and tls_key else {})
         self._api_server = uvicorn.Server(
             uvicorn.Config(app, host=self.api_host, port=self.api_port,
-                           log_config=None))
+                           log_config=None, **_tls_kwargs))
         self._api_task = asyncio.create_task(self._api_server.serve())
-        logger.info("CS client API on %s:%s", self.api_host, self.api_port)
+        logger.info("CS client API on %s://%s:%s",
+                    "https" if _tls_kwargs else "http", self.api_host, self.api_port)
         try:
             await super().run()
         finally:
