@@ -303,6 +303,35 @@ def build_local_ui_router(spoke) -> APIRouter:
         res = await _cmd("CS_UPDATE_USER_OVERRIDES", {"content": body.get("content") or ""})
         return {**res, "synced_spokes": 1 if res.get("status") == "SUCCESS" else 0}
 
+    # ── Config Source of Truth (Hub | GitHub) ───────────────────────────────
+    # Mirrors the hub's /sim/api/{tenant}/config/source (routes.py). Single-tenant
+    # here: {tenant} is kept for route-shape parity but ignored — the value lives
+    # in the spoke's <configs>/hub-config-source flag file (written via the same
+    # CS_CONFIG_UPDATE path the hub uses, read by sim_config.load_configs).
+    @router.get("/{tenant}/config/source")
+    async def get_config_source(tenant: str):
+        try:
+            src = (_CONFIGS_DIR / "hub-config-source").read_text(encoding="utf-8").strip().lower()
+        except Exception:
+            src = "github"
+        source = "hub" if src == "hub" else "github"
+        gh = getattr(spoke, "_github_config", None) or {}
+        has_token = bool(str(gh.get("github_token") or "").strip())
+        return {"source": source, "has_token": has_token,
+                "writable": (source == "hub") or has_token,
+                "repo_url": gh.get("repo_url", ""), "repo_branch": gh.get("repo_branch", "")}
+
+    @router.post("/{tenant}/config/source")
+    async def set_config_source(tenant: str, request: Request):
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        source = "hub" if str((body or {}).get("source")) == "hub" else "github"
+        res = await _cmd("CS_CONFIG_UPDATE", {"config_source": source})
+        ok = isinstance(res, dict) and res.get("status") == "SUCCESS"
+        return {"saved": bool(ok), "source": source, "pushed_to_spokes": 1 if ok else 0}
+
     # ── Setup tab: hub-config (auto-provisioning knobs) ──────────────────────
     # csHubConfigCard/csSaveHubConfig/csResetHubConfig (sim-views.js) reused
     # as-is — same route shapes as the hub's /tenant/{tenant}/hub-config.
