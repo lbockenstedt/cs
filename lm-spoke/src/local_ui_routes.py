@@ -378,6 +378,10 @@ def build_local_ui_router(spoke) -> APIRouter:
     async def get_central_available(tenant: str):
         return await _cmd("CS_GET_CENTRAL_AVAILABLE")
 
+    @router.get("/{tenant}/sim-quota-catalog")
+    async def get_sim_quota_catalog(tenant: str):
+        return await _cmd("CS_GET_SIM_QUOTA_CATALOG")
+
     @router.post("/{tenant}/test-central")
     async def test_central(tenant: str):
         return await _cmd("CS_TEST_CENTRAL")

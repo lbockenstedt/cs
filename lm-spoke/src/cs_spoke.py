@@ -892,6 +892,20 @@ class CSSpoke(BaseSpoke):
 
         if cmd in ("CS_SET_CENTRAL_SITES_CONFIG",):
             cfg = d if isinstance(d, dict) else {}
+            # Validate sim_quotas against the sims this tenant's simulation.conf
+            # actually offers; drop unknown/invalid entries and surface errors so
+            # the UI can report them. The rest of central_sites_config
+            # (monitored_checks/hardware_checks/site_mappings) passes through
+            # unchanged — sim_quotas is an additive field.
+            try:
+                import sim_quota
+                sims = [s["sim_id"] for s in sim_quota.available_sims(self.settings.config_dir)]
+                clean, errs = sim_quota.validate_sim_quotas(cfg.get("sim_quotas"), sims)
+                if errs:
+                    logger.warning("CS_SET_CENTRAL_SITES_CONFIG: sim_quotas errors: %s", errs)
+                cfg = {**cfg, "sim_quotas": clean}
+            except Exception as exc:  # noqa: BLE001 — never block the save
+                logger.warning("sim_quotas validate failed: %s", exc)
             self.local_store.set_central_sites_config(cfg)
             self.central_poller.reload()
             return {"status": "SUCCESS"}
@@ -904,6 +918,23 @@ class CSSpoke(BaseSpoke):
 
         if cmd in ("CS_CENTRAL_BROWSE",):
             return await self.central_poller.browse()
+
+        if cmd == "CS_GET_SIM_QUOTA_CATALOG":
+            # The Sim-Quota UI (Config → Sim Quotas) renders against this: the
+            # sims/sites derived from this tenant's simulation.conf + the global
+            # suggested alert→sim marriages. Sims come from simulation.conf, not
+            # a hardcoded list, so a tenant that adds a flag to its buckets sees
+            # it here automatically.
+            try:
+                import sim_quota
+                csc = self.local_store.get_central_sites_config() or {}
+                cat = sim_quota.sim_quota_catalog(
+                    self.settings.config_dir, csc.get("site_mappings"))
+                return {"status": "SUCCESS", **cat}
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("CS_GET_SIM_QUOTA_CATALOG failed: %s", exc)
+                return {"status": "ERROR", "message": f"{type(exc).__name__}: {exc}",
+                        "sims": [], "sites": [], "suggested": {}, "meta": {}}
 
         # Phase 2/3 commands (queue/proxmox/clients) return NotImplemented until
         # those modules land, so the LM hub sees a clear "not yet" rather than a

@@ -1,0 +1,234 @@
+"""Sim-Quota config foundation (Chunk 1) — schema, validation, resolution.
+
+A sim-quota marries a monitored Aruba Central alert/insight to a simulation
+flag + a run policy (N runners in a site) so the SimQuotaEngine (Chunk 2) can
+auto-generate per-client overrides that keep N online clients running the sim
+— producing the network condition Aruba Central reports as the alert. The
+INVERTED-semantics poller (``central_poller``) is HEALTHY when the error IS
+present; the quota engine is what keeps it reliably present.
+
+This module is intentionally engine-free: declaring a quota here only stores
+config under ``central_sites_config["sim_quotas"]``; nothing auto-runs yet.
+
+Data sourcing (per the feature design):
+  * Sims are pulled from ``simulation.conf`` (the bucket flags that are runnable
+    PRIMITIVES), enriched with per-sim metadata (``SIM_META``).
+  * Sites are pulled from ``simulation.conf`` ``wsite`` values ∪ Central
+    ``site_mappings``.
+  * The alert→sim marriage is a TENANT user action (Config → Sim Quotas). The
+    global catalog (Setup → Simulations) supplies per-sim metadata defaults +
+    suggested marriages (``SUGGESTED_ALERT_SIM``) the tenant UI pre-fills; the
+    tenant can change the sim per-quota. Hardware alerts (AP_DOWN, ...) have no
+    sim and are monitoring-only.
+
+Mirrored in ``lm/core/src/simulations/sim_quota.py`` (vendored twin) so the hub
+and spoke agree on the schema. Keep the two in sync.
+"""
+from __future__ import annotations
+
+import logging
+from typing import Any, Dict, List, Tuple
+
+logger = logging.getLogger("CSSimQuota")
+
+# ── Schema ────────────────────────────────────────────────────────────────
+# A sim-quota record, stored as a list under central_sites_config["sim_quotas"].
+# Backward-compatible: an absent "sim_quotas" key = no quotas (today's behavior).
+SIM_QUOTA_KEYS = ("alert_id", "alert_type", "sim_id", "count", "site", "multi_capable", "enabled")
+ALERT_TYPES = ("alert", "insight")
+
+# Per-sim metadata defaults. category: "failure" sims produce a network condition
+# Aruba reports as an alert/insight; "traffic" sims are baseline load generators
+# (the default bucket state — the abundant generic pool the quota draws from).
+# multi_capable: True = may pack onto a client already running other sims;
+# False (exclusive) = the engine assigns it only to a client not already running
+# another exclusive quota sim. Defaults are overrideable per-quota in the tenant
+# Config → Sim Quotas subtab.
+SIM_META: Dict[str, Dict[str, object]] = {
+    "dns_fail":    {"category": "failure", "multi_capable": False},
+    "dhcp_fail":   {"category": "failure", "multi_capable": False},
+    "assoc_fail":  {"category": "failure", "multi_capable": False},
+    "auth_fail":   {"category": "failure", "multi_capable": False},
+    "ssidpw_fail": {"category": "failure", "multi_capable": False},
+    "port_flap":   {"category": "failure", "multi_capable": False},
+    "ping_test":   {"category": "traffic", "multi_capable": True},
+    "download":    {"category": "traffic", "multi_capable": True},
+    "www_traffic": {"category": "traffic", "multi_capable": True},
+    "iperf":       {"category": "traffic", "multi_capable": True},
+}
+
+# Suggested alert/insight → sim marriages (global defaults the tenant UI
+# pre-fills; the tenant can change the sim per-quota). Hardware alerts
+# (AP_DOWN, SWITCH_DOWN, GATEWAY_DOWN, ...) are intentionally absent — they are
+# not produced by sim clients, so they get monitoring only, never a quota.
+SUGGESTED_ALERT_SIM: Dict[str, str] = {
+    "CLIENT_DHCP_FAILURE": "dhcp_fail",
+    "CLIENT_ASSOCIATION_FAILURE": "assoc_fail",
+    "CLIENT_DISCONNECTED": "assoc_fail",
+    "WIRELESS_CLIENT_ROAM": "assoc_fail",
+    "DHCP_POOL_EXHAUSTED": "dhcp_fail",
+    # DNS failure alerts → dns_fail. Aruba classic's KNOWN_CLASSIC_ALERT_TYPES
+    # has no CLIENT_DNS_FAILURE; this is a forward-looking suggestion for
+    # new_central / custom checks a tenant may surface.
+    "CLIENT_DNS_FAILURE": "dns_fail",
+}
+
+
+# ── Coercion helpers ──────────────────────────────────────────────────────
+def _as_bool(v: Any, default: bool = False) -> bool:
+    if isinstance(v, bool):
+        return v
+    if v is None:
+        return default
+    return str(v).strip().lower() in ("1", "true", "yes", "on")
+
+
+def _as_int(v: Any, default: int = 1) -> int:
+    try:
+        n = int(str(v).strip())
+        return n if n >= 1 else default
+    except Exception:
+        return default
+
+
+def normalize_quota(raw: Any) -> Dict[str, Any]:
+    """Coerce a raw quota dict to the canonical shape; drop unknown keys.
+    ``multi_capable`` defaults from ``SIM_META[sim_id]`` when absent so the
+    tenant inherits the per-sim default unless they explicitly override it."""
+    if not isinstance(raw, dict):
+        return {}
+    sim_id = str(raw.get("sim_id") or "").strip()
+    meta = SIM_META.get(sim_id, {})
+    alert_type = str(raw.get("alert_type") or "alert").strip().lower()
+    if alert_type not in ALERT_TYPES:
+        alert_type = "alert"
+    return {
+        "alert_id": str(raw.get("alert_id") or "").strip(),
+        "alert_type": alert_type,
+        "sim_id": sim_id,
+        "count": _as_int(raw.get("count"), 1),
+        "site": str(raw.get("site") or "").strip(),
+        "multi_capable": _as_bool(raw.get("multi_capable"), bool(meta.get("multi_capable", False))),
+        "enabled": _as_bool(raw.get("enabled"), False),
+    }
+
+
+def validate_sim_quotas(
+    quotas: Any, available_sims: List[str] | None = None,
+) -> Tuple[List[Dict[str, Any]], List[str]]:
+    """Normalize + validate a ``sim_quotas`` list.
+
+    Returns ``(clean, errors)``. A quota with an empty alert_id/sim_id is
+    dropped + reported. A quota whose ``sim_id`` is not in *available_sims*
+    (when provided) is dropped + reported — the engine can only run sims the
+    tenant's simulation.conf actually offers. Duplicate keys
+    (``alert_type:alert_id:site``) collapse last-wins. The clean list is
+    normalized to the canonical shape.
+    """
+    clean: List[Dict[str, Any]] = []
+    errors: List[str] = []
+    seen: Dict[str, Dict[str, Any]] = {}
+    sim_set = set(available_sims or [])
+    for i, raw in enumerate(quotas or []):
+        q = normalize_quota(raw)
+        if not q["alert_id"] or not q["sim_id"]:
+            errors.append(f"quota #{i}: missing alert_id or sim_id — dropped")
+            continue
+        if sim_set and q["sim_id"] not in sim_set:
+            errors.append(
+                f"quota #{i} ({q['alert_id']}): sim_id '{q['sim_id']}' "
+                f"not in available sims — dropped")
+            continue
+        seen[f"{q['alert_type']}:{q['alert_id']}:{q['site']}"] = q
+    clean = list(seen.values())
+    return clean, errors
+
+
+def resolve_effective_quotas(
+    tenant_quotas: Any, available_sims: List[str] | None = None,
+) -> List[Dict[str, Any]]:
+    """The quotas the engine should run: validated + ``enabled`` only."""
+    clean, _ = validate_sim_quotas(tenant_quotas, available_sims)
+    return [q for q in clean if q["enabled"]]
+
+
+# ── Catalog: sims + sites derived from simulation.conf ─────────────────────
+def _bucket_sections(sim_conf) -> List[str]:
+    out = []
+    for sec in (sim_conf.sections() if sim_conf is not None else []):
+        if sec.startswith("s") and sec[1:].isdigit():
+            out.append(sec)
+    return out
+
+
+def available_sims(config_dir: Any) -> List[Dict[str, Any]]:
+    """Sims the Sim-Quota UI may offer, derived from ``simulation.conf`` bucket
+    sections (only flags that are runnable PRIMITIVES), enriched with
+    ``SIM_META``. Sims a tenant actually uses in its buckets appear first;
+    runnable sims not yet placed in any bucket follow (still offerable — the
+    engine sets them via per-client override regardless of bucket default)."""
+    try:
+        from sim_primitives import SIM_FLAGS  # lazy: avoid import cycle
+    except Exception:  # noqa: BLE001
+        SIM_FLAGS = tuple(SIM_META.keys())
+    flags = list(SIM_FLAGS)
+
+    bucket_flags: List[str] = []
+    seen = set()
+    try:
+        from sim_config import load_configs
+        sim_conf, _ = load_configs(config_dir)
+        for sec in _bucket_sections(sim_conf):
+            for key in sim_conf.options(sec):
+                if key in flags and key not in seen:
+                    seen.add(key)
+                    bucket_flags.append(key)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("available_sims: load_configs failed: %s", exc)
+
+    ordered = bucket_flags + [f for f in flags if f not in seen]
+    return [
+        {"sim_id": f,
+         "category": SIM_META.get(f, {}).get("category", "failure"),
+         "multi_capable": bool(SIM_META.get(f, {}).get("multi_capable", False))}
+        for f in ordered
+    ]
+
+
+def available_sites(
+    config_dir: Any, central_site_mappings: Dict[str, str] | None = None,
+) -> List[str]:
+    """Sites the Sim-Quota UI may offer =
+    ``simulation.conf`` ``wsite`` values across buckets ∪ Central
+    ``site_mappings`` keys+values. Sorted, de-duplicated."""
+    sites: set[str] = set()
+    try:
+        from sim_config import load_configs
+        sim_conf, _ = load_configs(config_dir)
+        for sec in _bucket_sections(sim_conf):
+            w = sim_conf.get(sec, "wsite", fallback="").strip()
+            if w:
+                sites.add(w)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("available_sites: load_configs failed: %s", exc)
+    for k, v in (central_site_mappings or {}).items():
+        if k:
+            sites.add(str(k))
+        if v:
+            sites.add(str(v))
+    return sorted(sites)
+
+
+def sim_quota_catalog(
+    config_dir: Any, central_site_mappings: Dict[str, str] | None = None,
+) -> Dict[str, Any]:
+    """The full catalog the Sim-Quota UI renders against:
+    ``{sims, sites, suggested, meta}``. ``sims``/``sites`` are derived from the
+    tenant's ``simulation.conf``; ``suggested`` is the global alert→sim map the
+    tenant UI pre-fills; ``meta`` is the per-sim metadata."""
+    return {
+        "sims": available_sims(config_dir),
+        "sites": available_sites(config_dir, central_site_mappings),
+        "suggested": dict(SUGGESTED_ALERT_SIM),
+        "meta": {k: dict(v) for k, v in SIM_META.items()},
+    }
