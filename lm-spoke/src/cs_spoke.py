@@ -239,6 +239,73 @@ class CSSpoke(BaseSpoke):
         ]
         return {"status": "SUCCESS", "agents": agents, "pending_agents": pending}
 
+    # ── cert distribution (hub-brokered; le spoke issued/renewed a cert) ──────
+    async def _install_cert_relay(self, d: Dict[str, Any]) -> Dict[str, Any]:
+        """Relay a hub-delivered TLS cert to each managed pxmx agent.
+
+        Mirrors ``ProxmoxSpoke``'s INSTALL_CERT branch
+        (``proxmox_spoke.py:203-213``): in the split topology THIS cs spoke owns
+        the pxmx agents (they dial ``wss://<cs>:443/ws/agent``), so the hub
+        routes the ``simulation`` cert target here and we relay ``INSTALL_CERT``
+        to each managed node's agent. The agent runs ``pvenode cert set --force
+        --restart`` and verifies the deployed cert by fingerprint on its own
+        timeout (pxmx agent ``install_cert``) — we never touch Proxmox directly.
+
+        Targeting: an explicit ``agent_id`` deploys to one node (parity with the
+        pxmx spoke's per-node path); otherwise broadcast to EVERY connected
+        agent so one ``simulation`` cert target covers the whole fleet (the
+        operator's "pxmx servers" plural). Relays run concurrently so wall-clock
+        ≈ 620s, not N×620s, and a per-agent error does NOT abort the rest.
+
+        The 620s relay window is > the agent's 600s pvenode wait and < the hub's
+        640s INSTALL_CERT timeout, so neither peer times out first and masks a
+        deploy still in progress (the agent reports SUCCESS on a slow restart
+        via its fingerprint check).
+        """
+        if not self.control_plane:
+            return {"status": "ERROR", "message": "not connected to a control plane"}
+        connected = dict(self.control_plane.connected_agents or {})
+        explicit = d.get("agent_id")
+        if explicit:
+            if explicit not in connected:
+                return {"status": "ERROR",
+                        "message": f"agent {explicit} not connected"}
+            agent_ids = [explicit]
+        else:
+            agent_ids = list(connected.keys())
+        if not agent_ids:
+            return {"status": "ERROR",
+                    "message": "no managed pxmx agents connected"}
+
+        relay_timeout = 620.0  # > agent 600s pvenode wait; < hub 640s timeout
+
+        async def _one(aid: str) -> Dict[str, Any]:
+            try:
+                r = await self.control_plane.send_to_agent(
+                    "INSTALL_CERT", d, agent_id=aid, timeout=relay_timeout)
+            except Exception as exc:  # noqa: BLE001 - one failure must not abort the rest
+                logger.warning("INSTALL_CERT relay to %s raised: %s", aid, exc)
+                return {"agent_id": aid, "status": "ERROR",
+                        "message": f"{type(exc).__name__}: {exc}"}
+            rret = (r.get("payload", {}).get("data", r)
+                    if isinstance(r, dict) else {})
+            if isinstance(rret, dict) and rret.get("status") == "SUCCESS":
+                return {"agent_id": aid, "status": "SUCCESS",
+                        "message": rret.get("message") or "installed"}
+            return {"agent_id": aid, "status": "ERROR",
+                    "message": (rret.get("message") if isinstance(rret, dict)
+                                else "INSTALL_CERT failed")}
+
+        nodes = list(await asyncio.gather(*[_one(aid) for aid in agent_ids]))
+        ok = sum(1 for n in nodes if n["status"] == "SUCCESS")
+        total = len(nodes)
+        failed = [n for n in nodes if n["status"] != "SUCCESS"]
+        overall = "SUCCESS" if ok == total and total else "ERROR"
+        msg = (f"deployed to {ok}/{total} node(s)"
+               + (f" — {len(failed)} FAILED: {failed[0]['message']}" if failed else ""))
+        logger.info("INSTALL_CERT relay: %s", msg)
+        return {"status": overall, "message": msg, "nodes": nodes}
+
     # ── Phase F: sim-tag sync (driven off CS_INGEST_TELEMETRY / token store) ──
     _SIM_TAG_MIN_INTERVAL = 60.0    # at most one sweep per minute
     _SIM_TAG_FAIL_BACKOFF = 600.0   # 10 min after a sweep with PUT failures
@@ -370,6 +437,13 @@ class CSSpoke(BaseSpoke):
                        else getattr(self, "_relay_timeout_fast", 15.0))
                 return await self.control_plane.send_to_agent(command, inner, agent_id=target, timeout=_to)
             return {"status": "ERROR", "error": "Unknown relay command"}
+
+        # ── cert distribution (hub-brokered; le spoke issued/renewed a cert) ──
+        # INSTALL_CERT relays the cert to each managed pxmx agent (→ pvenode cert
+        # set on that node's pveproxy) — the cs spoke owns the agents in the
+        # split topology. See _install_cert_relay (mirrors ProxmoxSpoke).
+        if cmd == "INSTALL_CERT":
+            return await self._install_cert_relay(d)
 
         # ── VNC console relay (agent-terminates-WSS) ────────────────────────
         # PORT of ProxmoxSpoke.VNC_START/FRAME_DOWN/DISCONNECT. In the all-cs-
