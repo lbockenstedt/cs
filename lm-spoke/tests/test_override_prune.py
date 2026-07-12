@@ -110,6 +110,33 @@ def test_existing_redundant_override_pruned_on_next_set(tmp_path):
     _close(loop)
 
 
+def test_non_toggle_string_override_is_never_pruned(tmp_path):
+    # Regression: wsite="MIA" (and other free-form string overrides like ssid,
+    # simulation_id) are NOT on/off sim toggles, so the prune loop must skip
+    # them. The SimQuotaEngine re-home sets wsite=<quota site> on a client whose
+    # bucket default wsite is some other site (e.g. "DFW"). The old prune logic
+    # compared lowercased values against "on" — both "dfw" and "mia" are False,
+    # False==False → it deleted wsite the instant it was written, so /api/config
+    # never baked wsite=MIA into [sX] and the client kept running at DFW. The
+    # sim-toggle alongside it (dns_fail=on, bucket off) is a real deviation and
+    # must still be kept.
+    reg, loop = _reg(tmp_path, resolver=lambda hn: {"wsite": "DFW", "dns_fail": ""})
+    entry = _run(loop, reg.set_overrides(
+        "host-a", {"wsite": "MIA", "dns_fail": "on"}))
+    assert entry["overrides"] == {"wsite": "MIA", "dns_fail": "on"}
+    _close(loop)
+
+
+def test_non_toggle_override_kept_even_when_bucket_lacks_key(tmp_path):
+    # Bucket resolver returns no wsite key at all (profile.get→""). The prune
+    # must STILL not touch wsite — a missing bucket default is not "off", and a
+    # site string isn't a toggle anyway.
+    reg, loop = _reg(tmp_path, resolver=lambda hn: {"dns_fail": ""})
+    entry = _run(loop, reg.set_overrides("host-a", {"wsite": "MIA"}))
+    assert entry["overrides"] == {"wsite": "MIA"}
+    _close(loop)
+
+
 def test_pure_bucket_profile_excludes_username_overlay(tmp_path):
     # The pure bucket MUST be simulation.conf only — the [username] overlay from
     # user-overrides.conf is excluded so the WebUI mirror's own writes can't

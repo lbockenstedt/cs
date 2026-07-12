@@ -182,9 +182,19 @@ class ClientRegistry:
                 # an I/O hiccup).
                 if profile is not None:
                     for flag in list(cur.keys()):
+                        ov_val = str(cur[flag]).strip().lower()
+                        # Only on/off sim-toggle flags are prune candidates. Other
+                        # overrides are free-form strings the bucket doesn't model
+                        # as toggles (e.g. wsite="MIA", ssid="…", simulation_id="s3")
+                        # — pruning those against a bucket default of "" (→ False)
+                        # would delete them whenever their value also isn't "on"
+                        # (False==False), silently dropping every non-toggle
+                        # override the instant it's written. The SimQuotaEngine
+                        # re-home sets wsite=<quota site>; that MUST survive.
+                        if ov_val not in ("on", "off"):
+                            continue
                         bucket_on = str(profile.get(flag, "")).strip().lower() == "on"
-                        ov_on = str(cur[flag]).strip().lower() == "on"
-                        if bucket_on == ov_on:
+                        if bucket_on == (ov_val == "on"):
                             del cur[flag]
             entry["overrides"] = cur
             self.clients[hostname] = entry

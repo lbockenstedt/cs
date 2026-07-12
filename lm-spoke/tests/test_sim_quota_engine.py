@@ -453,3 +453,52 @@ def test_reconcile_exclusive_skips_client_running_exclusive_via_bucket(tmp_path)
     assert set(eng._ledger["alert:A:MIA"]["clients"].keys()) == {"c1"}
     # c0's bucket assoc_fail left intact, engine never touched dns_fail on it.
     assert "dns_fail" not in (clients["c0"].get("overrides") or {})
+
+# ── real-registry regression: wsite override must survive set_overrides prune ─
+# The fake registry used above doesn't prune, so it can't catch the bug where
+# the engine's re-home wsite=MIA is deleted by ClientRegistry.set_overrides'
+# prune loop (which used to treat wsite like an on/off flag). This wires the
+# engine to a REAL ClientRegistry with a bucket_resolver whose bucket default
+# wsite is "DFW" — the exact shape of the user's MIA quota borrowing DFW
+# runners — and asserts wsite=MIA + dns_fail=on both survive into the registry
+# (and therefore reach the client via /api/config's bake-into-[sX]).
+def test_engine_rehome_wsite_survives_real_registry_prune(tmp_path):
+    from client_registry import ClientRegistry
+
+    class _RealRegSpoke:
+        def __init__(self, reg, quotas, pxmx_site_map, name_to_host, tmp_path):
+            self.registry = reg
+            self.local_store = _FakeLocalStore(quotas, pxmx_site_map)
+            self.settings = _FakeSettings()
+            self.data_dir = str(tmp_path)
+            self.deploy = _FakeDeploy(name_to_host)
+
+    # Bucket default wsite=DFW, dns_fail off — the DFW runner's natural bucket.
+    def _bucket(hn):
+        return {"wsite": "DFW", "dns_fail": "off"}
+
+    reg = ClientRegistry(tmp_path / "data", bucket_resolver=_bucket)
+    # Seed two clients hosted on a DFW-mapped pxmx server (px2→DFW) so their
+    # NATURAL site is DFW while the quota wants MIA → the engine must re-home
+    # (set wsite=MIA). Seeding via the status-beacon path (no register() method).
+    _run(reg.apply_status("c0", {"config": {"wsite": "DFW"}}))
+    _run(reg.apply_status("c1", {"config": {"wsite": "DFW"}}))
+
+    quotas = [{"alert_id": "A", "alert_type": "alert", "sim_id": "dns_fail",
+               "count": 2, "site": "MIA", "rehome": True,
+               "multi_capable": False, "enabled": True}]
+    spoke = _RealRegSpoke(reg, quotas, {"px2": "DFW"},
+                          {"c0": "px2", "c1": "px2"}, tmp_path)
+    eng = SimQuotaEngine(spoke)
+    _run(eng.reconcile())
+
+    ledger = eng._ledger["alert:A:MIA"]
+    assert len(ledger["clients"]) == 2
+    for h in ledger["clients"]:
+        ov = reg.get(h)["overrides"]
+        # wsite=MIA MUST survive the prune (the bug deleted it) AND dns_fail=on
+        # is a real deviation from the bucket (off) so it stays too.
+        assert ov.get("wsite") == "MIA", f"{h}: wsite pruned! overrides={ov}"
+        assert ov.get("dns_fail") == "on", f"{h}: dns_fail missing! overrides={ov}"
+        # from_site recorded as the natural DFW so a later release reverts.
+        assert ledger["clients"][h] == "DFW"
