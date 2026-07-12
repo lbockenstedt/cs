@@ -563,6 +563,9 @@ class CSSpoke(BaseSpoke):
             base = Path(__file__).resolve().parent.parent.parent / "configs"
             (base / "simulation.conf").write_text(content, encoding="utf-8")
             self.engine.reload_config()
+            # sim config changed → bucket-default wsite / sim flags changed, so a
+            # quota's site pool + exclusivity eligibility may shift. Re-reconcile.
+            self._trigger_sim_quota_reconcile()
             return {"status": "SUCCESS", "message": "simulation.conf updated"}
 
         if cmd in ("CS_UPDATE_USER_OVERRIDES",):
@@ -576,6 +579,9 @@ class CSSpoke(BaseSpoke):
             base = Path(__file__).resolve().parent.parent.parent / "configs"
             (base / "user-overrides.conf").write_text(content, encoding="utf-8")
             self.engine.reload_config()
+            # user-overrides can re-resolve a client's wsite / sim flags → same
+            # site-pool / exclusivity shift as a simulation.conf edit; reconcile.
+            self._trigger_sim_quota_reconcile()
             return {"status": "SUCCESS", "message": "user-overrides.conf updated"}
 
         # ── kill switch ────────────────────────────────────────────────────
@@ -1103,7 +1109,6 @@ class CSSpoke(BaseSpoke):
             eff = patch.get("effective_sim_quotas")
             if isinstance(eff, list):
                 self.local_store.set_effective_sim_quotas(eff)
-                self._trigger_sim_quota_reconcile()
                 applied.append("effective_sim_quotas")
         for key in self._HUB_DIRECT_KEYS:
             if key in patch:
@@ -1239,11 +1244,24 @@ class CSSpoke(BaseSpoke):
             self.settings.update(update)
         logger.info("CS_CONFIG_UPDATE: applied %s",
                     ", ".join(applied) if applied else "no changes")
+        # Re-reconcile the SimQuotaEngine when a CS_CONFIG_UPDATE changed anything
+        # the engine cares about: the effective quota list (the engine's target),
+        # central_sites_config (sim_quotas + site_mappings + monitored_checks), or
+        # the sim/user-override INI text (bucket-default wsite + sim flags → a
+        # quota's site pool + exclusivity eligibility can shift). One trigger per
+        # push; the reconcile lock serializes it with the periodic 60s sweep.
+        _reconcile_keys = (
+            "effective_sim_quotas", "central_sites_config",
+            "sim_conf_override", "user_conf_override",
+        )
+        if any(k in a for a in applied for k in _reconcile_keys):
+            self._trigger_sim_quota_reconcile()
         return applied
 
     def _trigger_sim_quota_reconcile(self) -> None:
         """Immediate best-effort SimQuotaEngine reconcile on an
-        effective_sim_quotas push (the periodic loop also sweeps every 60s)."""
+        effective_sim_quotas push or a sim-config change (the periodic loop also
+        sweeps every 60s)."""
         eng = getattr(self, "sim_quota_engine", None)
         if eng is not None:
             eng.trigger()
