@@ -441,11 +441,14 @@ function csAutoRefreshControl() {
 // reload, the Refresh button) always render.
 const CS_NO_REFRESH = new Set([
     'Setup::Proxmox',   // Proxmox hypervisor config — manual Refresh only
-    'Config',           // Config (form-heavy) — manual Refresh only. The spoke
-                        // exposes Sim Quotas as a sibling tab (dashboard.html
-                        // TAB_RENDERERS) — also form-heavy, also manual Refresh.
-    'Sim Quotas',       // Sim Quotas editor — manual Refresh only (form-heavy).
-    'PXMX Sites',       // PXMX site assignments — manual Refresh only (form-heavy).
+    // Config form editors are manual-refresh only (a telemetry-driven rebuild
+    // would stomp a half-edited form). Listed per child so Config::Quota State
+    // — a live ledger view, not a form — is NOT here and auto-refreshes.
+    'Config::Sim Quotas',    // Sim Quotas editor — manual Refresh only
+    'Config::PXMX Sites',    // PXMX site assignments — manual Refresh only
+    'Config::Config Editor', // raw config editor — manual Refresh only
+    'Sim Quotas',       // spoke sibling tab (dashboard.html TAB_RENDERERS) — manual Refresh only (form-heavy).
+    'PXMX Sites',       // spoke sibling tab (dashboard.html TAB_RENDERERS) — manual Refresh only (form-heavy).
 ]);
 
 function connectCSWebSocket() {
