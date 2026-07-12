@@ -143,6 +143,11 @@ class CSSpoke(BaseSpoke):
         # CSControlPlane.run()/run_standalone_mode() (needs a running loop).
         self.central_status: Dict[str, Any] = {}
         self.central_poller = CentralPoller(self)
+        # SimQuotaEngine — keeps each declared sim quota filled from the online
+        # pool (alert/insight → sim + N clients + site). Reconciles against the
+        # hub-pushed effective_sim_quotas; started by CSControlPlane.run().
+        from sim_quota_engine import SimQuotaEngine
+        self.sim_quota_engine = SimQuotaEngine(self)
 
     # ── BaseSpoke: status (fallback for *_GET_STATUS) ───────────────────────
     async def get_status(self) -> Dict[str, Any]:
@@ -936,6 +941,15 @@ class CSSpoke(BaseSpoke):
                 return {"status": "ERROR", "message": f"{type(exc).__name__}: {exc}",
                         "sims": [], "sites": [], "suggested": {}, "meta": {}}
 
+        if cmd == "CS_GET_SIM_QUOTA_STATE":
+            # Engine ledger snapshot for the quota-state view (Chunk 4): which
+            # clients are currently assigned to each effective quota.
+            eng = getattr(self, "sim_quota_engine", None)
+            snap = eng.snapshot() if eng is not None else {}
+            return {"status": "SUCCESS",
+                    "effective": self.local_store.get_effective_sim_quotas(),
+                    "ledger": snap}
+
         # Phase 2/3 commands (queue/proxmox/clients) return NotImplemented until
         # those modules land, so the LM hub sees a clear "not yet" rather than a
         # silent error.
@@ -1025,6 +1039,24 @@ class CSSpoke(BaseSpoke):
             cc = patch.get("central_config")
             self._merge_central_config(cc if isinstance(cc, dict) else {})
             applied.append("central_config")
+        # Hub-pushed central_sites_config (monitored_checks/hardware_checks/
+        # site_mappings + sim_quotas): apply to local_store + reload the poller
+        # so a hub-side Config → Sim Quotas / Central save reaches this spoke.
+        if "central_sites_config" in patch:
+            csc = patch.get("central_sites_config")
+            if isinstance(csc, dict):
+                self.local_store.set_central_sites_config(csc)
+                self.central_poller.reload()
+                applied.append("central_sites_config")
+        # Hub-pushed effective sim quotas (global defaults merged with this
+        # tenant's overrides, enabled-only) — the SimQuotaEngine's input. Persist
+        # + trigger a reconcile so the engine picks up the new target set.
+        if "effective_sim_quotas" in patch:
+            eff = patch.get("effective_sim_quotas")
+            if isinstance(eff, list):
+                self.local_store.set_effective_sim_quotas(eff)
+                self._trigger_sim_quota_reconcile()
+                applied.append("effective_sim_quotas")
         for key in self._HUB_DIRECT_KEYS:
             if key in patch:
                 update[key] = patch[key]
@@ -1160,6 +1192,13 @@ class CSSpoke(BaseSpoke):
         logger.info("CS_CONFIG_UPDATE: applied %s",
                     ", ".join(applied) if applied else "no changes")
         return applied
+
+    def _trigger_sim_quota_reconcile(self) -> None:
+        """Immediate best-effort SimQuotaEngine reconcile on an
+        effective_sim_quotas push (the periodic loop also sweeps every 60s)."""
+        eng = getattr(self, "sim_quota_engine", None)
+        if eng is not None:
+            eng.trigger()
 
     # ── GitHub push (Source of Truth = GitHub) ───────────────────────────────
     async def _git(self, *args: str, timeout: float = 120.0,

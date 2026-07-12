@@ -278,3 +278,17 @@ class LocalStore:
         with self._lock:
             self._data["central_sites_config"] = cfg or {}
             self._save()
+
+    # ── effective sim quotas (hub-pushed, engine input) ──────────────────────
+    # The hub merges platform-wide defaults + this tenant's overrides (enabled
+    # only) and pushes the result as effective_sim_quotas; the spoke's
+    # SimQuotaEngine reconciles client assignments against it. Persisted so a
+    # spoke restart re-runs the engine against the last-pushed set until the hub
+    # re-delivers (push_cs_hub_config on reconnect).
+    def get_effective_sim_quotas(self) -> list:
+        return list(self._data.get("effective_sim_quotas") or [])
+
+    def set_effective_sim_quotas(self, quotas: list) -> None:
+        with self._lock:
+            self._data["effective_sim_quotas"] = list(quotas or [])
+            self._save()
