@@ -120,3 +120,29 @@ def test_config_update_multiple_reconcile_keys_trigger_once(spoke_loop):
     }))
     assert res["status"] == "SUCCESS"
     assert rec.calls == 1
+
+
+def test_get_sim_quota_state_includes_monitored_checks(spoke_loop):
+    # The Quota State view joins alert/insight IDs to friendly names, so the
+    # state response must carry the monitored_checks slice from
+    # central_sites_config alongside the effective list + ledger snapshot.
+    s, loop, rec = spoke_loop
+    s.local_store.set_central_sites_config({
+        "sim_quotas": [],
+        "site_mappings": {},
+        "monitored_checks": [
+            {"type": "alert", "id": "A1", "name": "DNS fail MIA", "site": "MIA"},
+            {"type": "insight", "id": "I9", "name": "DHCP churn", "site": ""},
+        ],
+        "hardware_checks": [],
+    })
+    s.local_store.set_effective_sim_quotas([
+        {"alert_id": "A1", "alert_type": "alert", "sim_id": "dns_fail",
+         "count": 2, "site": "MIA", "enabled": True}])
+    res = _run(loop, s.handle_command("CS_GET_SIM_QUOTA_STATE", {}))
+    assert res["status"] == "SUCCESS"
+    assert res["effective"][0]["alert_id"] == "A1"
+    assert res["ledger"] == {}  # no engine running → empty snapshot
+    mc = res["monitored_checks"]
+    assert any(c["id"] == "A1" and c["name"] == "DNS fail MIA" for c in mc)
+    assert any(c["id"] == "I9" and c["type"] == "insight" for c in mc)

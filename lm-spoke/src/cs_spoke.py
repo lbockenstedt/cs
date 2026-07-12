@@ -949,12 +949,18 @@ class CSSpoke(BaseSpoke):
 
         if cmd == "CS_GET_SIM_QUOTA_STATE":
             # Engine ledger snapshot for the quota-state view (Chunk 4): which
-            # clients are currently assigned to each effective quota.
+            # clients are currently assigned to each effective quota. The
+            # monitored_checks slice from central_sites_config is included so the
+            # UI can join alert/insight IDs to their friendly names (a quota row
+            # stores only the bare id).
             eng = getattr(self, "sim_quota_engine", None)
             snap = eng.snapshot() if eng is not None else {}
+            csc = self.local_store.get_central_sites_config()
+            monitored = csc.get("monitored_checks") or []
             return {"status": "SUCCESS",
                     "effective": self.local_store.get_effective_sim_quotas(),
-                    "ledger": snap}
+                    "ledger": snap,
+                    "monitored_checks": monitored}
 
         if cmd == "CS_GET_PXMX_SITE_MAP":
             # Operator-assigned pxmx server → site map (Config → PXMX Sites). The
