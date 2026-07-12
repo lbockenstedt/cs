@@ -48,7 +48,11 @@ def spoke_loop(tmp_path):
         yield s, loop, rec
     finally:
         loop.close()
-        asyncio.set_event_loop(None)
+        # Leave a fresh open loop as the global so sibling test modules that call
+        # asyncio.get_event_loop() at fixture/setup time (e.g. test_client_api)
+        # don't hit "There is no current event loop" — set_event_loop(None)
+        # poisons the process-wide loop state for the rest of the session.
+        asyncio.set_event_loop(asyncio.new_event_loop())
 
 
 def _run(loop, coro):

@@ -346,6 +346,16 @@ def build_client_api_app(spoke) -> FastAPI:
         await ws.accept()
         client_ws_connections[hn] = ws
         logger.info("client WS connected: %s (%s)", hn, platform or "?")
+        # A (re)connecting client is a fresh pool member — nudge the SimQuotaEngine
+        # so an under-filled quota can top up from it within seconds instead of
+        # waiting for the 60s sweep. Fire-and-forget; guarded (standalone builds
+        # may not wire a SimQuotaEngine onto the spoke).
+        _sq = getattr(spoke, "_trigger_sim_quota_reconcile", None)
+        if callable(_sq):
+            try:
+                _sq()
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("client WS connect: sim-quota nudge failed: %s", exc)
         try:
             await ws.send_json({"type": "hello", "hostname": hn,
                                 "version": spoke.get_version()})
@@ -386,6 +396,19 @@ def build_client_api_app(spoke) -> FastAPI:
         finally:
             if client_ws_connections.get(hn) is ws:
                 client_ws_connections.pop(hn, None)
+            # WS drop → the engine re-evaluates this runner's gap promptly (the
+            # next sweep would catch it, but a dropped WS is a strong "going
+            # down" signal). We do NOT mutate last_seen here — that field drives
+            # the out-of-contact alerting + Clients view, and a transient WS
+            # blip with HTTP beacons continuing must not flicker a client
+            # offline. The engine's own _is_online (last_seen within 300s) still
+            # gates whether a substitute is actually picked.
+            _sq = getattr(spoke, "_trigger_sim_quota_reconcile", None)
+            if callable(_sq):
+                try:
+                    _sq()
+                except Exception as exc:  # noqa: BLE001
+                    logger.debug("client WS close: sim-quota nudge failed: %s", exc)
 
     # ── mgmt (kept from standalone, folded in so standalone == hub) ────────
     @app.get("/status")
