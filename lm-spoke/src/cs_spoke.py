@@ -251,10 +251,13 @@ class CSSpoke(BaseSpoke):
         --restart`` and verifies the deployed cert by fingerprint on its own
         timeout (pxmx agent ``install_cert``) — we never touch Proxmox directly.
 
-        Targeting: an explicit ``agent_id`` deploys to one node (parity with the
-        pxmx spoke's per-node path); otherwise broadcast to EVERY connected
-        agent so one ``simulation`` cert target covers the whole fleet (the
-        operator's "pxmx servers" plural). Relays run concurrently so wall-clock
+        Targeting: an explicit ``agent_id`` (or ``identifier`` — the hub's
+        INSTALL_CERT payload carries the target ``identifier``, which for a
+        per-node ``simulation`` target IS the pxmx agent_id; parity with the
+        pxmx spoke's ``_agent_for_node(data.get("identifier"))`` fallback)
+        deploys to one node; otherwise broadcast to EVERY connected agent so
+        one ``simulation`` cert target covers the whole fleet (the operator's
+        "pxmx servers" plural). Relays run concurrently so wall-clock
         ≈ 620s, not N×620s, and a per-agent error does NOT abort the rest.
 
         The 620s relay window is > the agent's 600s pvenode wait and < the hub's
@@ -265,7 +268,7 @@ class CSSpoke(BaseSpoke):
         if not self.control_plane:
             return {"status": "ERROR", "message": "not connected to a control plane"}
         connected = dict(self.control_plane.connected_agents or {})
-        explicit = d.get("agent_id")
+        explicit = d.get("agent_id") or d.get("identifier")
         if explicit:
             if explicit not in connected:
                 return {"status": "ERROR",

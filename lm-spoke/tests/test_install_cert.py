@@ -142,6 +142,24 @@ def test_install_cert_explicit_agent_id_targets_one_node():
     assert [c["agent_id"] for c in s.control_plane.sent] == ["node-a"]
 
 
+def test_install_cert_identifier_targets_one_node():
+    """The hub's INSTALL_CERT payload carries the target ``identifier`` (not
+    ``agent_id``); for a per-node ``simulation`` target the identifier IS the
+    pxmx agent_id. The relay must fall back to ``identifier`` (parity with the
+    pxmx spoke's ``_agent_for_node(data.get("identifier"))``) — else a per-node
+    target silently broadcasts to every node instead of the one clicked."""
+    s = _spoke()
+    s.control_plane = _FakeCP(
+        {"node-a": {"hostname": "a"}, "node-b": {"hostname": "b"}},
+        responses={"node-b": {"payload": {"data": {"status": "SUCCESS",
+                                                   "message": "ok"}}}})
+    data = dict(_cert_data())
+    data["identifier"] = "node-b"  # no agent_id — the hub sends identifier
+    res = _run(s.handle_command("INSTALL_CERT", data))
+    assert res["status"] == "SUCCESS"
+    assert [c["agent_id"] for c in s.control_plane.sent] == ["node-b"]
+
+
 def test_install_cert_explicit_agent_not_connected_is_error():
     s = _spoke()
     s.control_plane = _FakeCP({"node-a": {"hostname": "a"}})
