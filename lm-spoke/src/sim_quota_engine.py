@@ -154,6 +154,13 @@ class SimQuotaEngine:
         w = ov.get("wsite")
         if w:
             return str(w)
+        return self._site_without_override(hostname, c)
+
+    def _site_without_override(self, hostname: str, c: Dict[str, Any]) -> str:
+        """Effective site ignoring any ``wsite`` override (engine OR manual):
+        hosting pxmx server's assigned site → bucket-default wsite →
+        sim_config fallback. Shared by ``_effective_site`` (after the override
+        check) and ``_natural_site`` (always)."""
         # Hosting pxmx server's assigned site (operator-set pxmx_site_map). The
         # host index is refreshed once per reconcile sweep.
         host = self._name_to_host.get(str(hostname).strip().lower())
@@ -177,6 +184,30 @@ class SimQuotaEngine:
         except Exception:  # noqa: BLE001
             pass
         return ""
+
+    def _natural_site(self, hostname: str, c: Dict[str, Any]) -> str:
+        """The client's site with engine re-homes reverted — a MANUAL ``wsite``
+        override is honored, but an ENGINE-set ``wsite`` (one that matches the
+        site of a ledger entry owning this client) is skipped → pxmx_site_map →
+        bucket wsite → sim_config.
+
+        This is the site a release reverts ``wsite`` to, and the ``from_site``
+        captured at assign. Recording the NATURAL site (not the already-re-homed
+        effective site) is what makes the multi_capable packing × re-home
+        reference count work: a second quota that PACKS onto an already-re-homed
+        client records the client's natural site, so it's recognized as a fellow
+        re-homer and releasing one quota won't revert ``wsite`` out from under
+        the other. A manual operator ``wsite`` override is preserved on revert."""
+        ov = c.get("overrides") or {}
+        ov_wsite = str(ov.get("wsite") or "")
+        if ov_wsite:
+            owning_sites = {str(e.get("site") or "")
+                            for e in self._ledger.values()
+                            if hostname in (e.get("clients") or {})}
+            if ov_wsite not in owning_sites:
+                return ov_wsite  # manual wsite override — honor it
+            # engine-set wsite → skip, fall through to pxmx/bucket
+        return self._site_without_override(hostname, c)
 
     def _has_sim_on(self, c: Dict[str, Any], sim_id: str) -> bool:
         ov = c.get("overrides") or {}
@@ -285,7 +316,10 @@ class SimQuotaEngine:
         if reg is None:
             return
         c = reg.get(hostname) or {}
-        from_site = self._effective_site(hostname, c)
+        # Record the NATURAL site (engine re-homes reverted, manual wsite kept)
+        # so a packed second quota is recognized as a fellow re-homer — see
+        # _natural_site. The engine re-homes when the quota site differs from it.
+        from_site = self._natural_site(hostname, c)
         overrides: Dict[str, Any] = {sim_id: "on"}
         if site and site != from_site:
             overrides["wsite"] = site
@@ -293,20 +327,53 @@ class SimQuotaEngine:
         logger.info("SimQuotaEngine: assigned %s → sim=%s site=%s (from %s)",
                     hostname, sim_id, site or "*", from_site or "*")
 
-    async def _release(self, hostname: str, sim_id: str, from_site: str) -> None:
+    async def _release(self, hostname: str, sim_id: str, from_site: str,
+                       quota_key: Optional[str] = None) -> None:
         reg = self._registry()
         if reg is None:
             return
         # Turn the sim off (reverts to bucket default via registry prune) and
-        # restore the pre-assignment site if the engine re-homed it.
+        # restore the pre-assignment site if the engine re-homed it — UNLESS
+        # another ledger entry still re-homes this client (multi_capable
+        # packing can stack re-homing quotas on one client), in which case keep
+        # wsite at that other quota's target so releasing one doesn't undo the
+        # other's re-home.
         overrides: Dict[str, Any] = {sim_id: "off"}
         c = reg.get(hostname) or {}
         cur_site = self._effective_site(hostname, c)
-        if from_site and cur_site != from_site:
+        target = (self._remaining_rehome_target(hostname, quota_key)
+                  if quota_key else None)
+        if target:
+            if cur_site != target:
+                overrides["wsite"] = target
+        elif from_site and cur_site != from_site:
             overrides["wsite"] = from_site
         await reg.set_overrides(hostname, overrides)
-        logger.info("SimQuotaEngine: released %s ← sim=%s (restored site %s)",
-                    hostname, sim_id, from_site or "*")
+        logger.info("SimQuotaEngine: released %s ← sim=%s (site %s)",
+                    hostname, sim_id, target or from_site or "*")
+
+    def _remaining_rehome_target(self, hostname: str,
+                                 excluding_key: Optional[str]) -> Optional[str]:
+        """Target site another ledger entry still re-homes ``hostname`` to.
+
+        A ledger entry re-homed ``hostname`` when its ``site`` differs from the
+        ``from_site`` it recorded for that client. While any other entry still
+        re-homes the client, releasing this quota must keep ``wsite`` at that
+        target instead of reverting to ``from_site`` (which would undo the other
+        quota's re-home — the multi_capable packing × re-home edge case). Returns
+        ``None`` when no other quota re-homes the client.
+        """
+        for key, entry in self._ledger.items():
+            if key == excluding_key:
+                continue
+            clients = entry.get("clients") or {}
+            if hostname not in clients:
+                continue
+            esite = entry.get("site") or ""
+            fsite = clients.get(hostname) or ""
+            if esite and esite != fsite:
+                return esite
+        return None
 
     # ── reconcile ────────────────────────────────────────────────────────────
     async def reconcile(self) -> Dict[str, Any]:
@@ -357,7 +424,7 @@ class SimQuotaEngine:
                         continue
                     if site and self._effective_site(h, c) != site:
                         # Drifted off-site — release, let a substitute pick up.
-                        await self._release(h, sim_id, from_site)
+                        await self._release(h, sim_id, from_site, key)
                         assigned.pop(h, None)
                         actions["released"] += 1
                         continue
@@ -366,7 +433,7 @@ class SimQuotaEngine:
                         # been gone long enough to be considered dead.
                         last_seen = float(c.get("last_seen") or 0)
                         if (now - last_seen) > OFFLINE_TTL_S:
-                            await self._release(h, sim_id, from_site)
+                            await self._release(h, sim_id, from_site, key)
                             assigned.pop(h, None)
                             actions["released"] += 1
                         continue
@@ -378,8 +445,11 @@ class SimQuotaEngine:
                 # already the quota site — respects physical placement). If the
                 # quota opts into re-home (``rehome``) and the in-site pool is
                 # exhausted, borrow free runners from OTHER sites and set
-                # ``wsite`` to re-home them; the ledger records their original
-                # site as ``from_site`` so a later release reverts it.
+                # ``wsite`` to re-home them; the ledger records their NATURAL
+                # site (engine re-homes reverted, manual wsite kept) as
+                # ``from_site`` so a later release reverts it AND a packed fellow
+                # quota is recognized as a re-homer (no cross-quota wsite
+                # stomp).
                 if len(producing) < target:
                     need = target - len(producing)
                     multi = bool(q.get("multi_capable"))
@@ -389,10 +459,10 @@ class SimQuotaEngine:
                     picks = in_site[:need]
                     if q.get("rehome") and len(picks) < need:
                         # Cross-site fallback: any other-site eligible runner.
-                        # _assign sets wsite=site when the client's current
-                        # effective site differs, re-homing it; assigned[h]
-                        # captures the PRE-rehome effective site (the snapshot
-                        # ``c`` predates the override).
+                        # _assign sets wsite=site when the client's natural
+                        # site differs, re-homing it; assigned[h] captures the
+                        # NATURAL site (the snapshot ``c`` predates the override
+                        # and _natural_site skips any engine-set wsite).
                         cross = [h for h, c in clients.items()
                                  if self._pool_eligible(h, c, sim_id, multi, now, assigned)
                                  and (not site or self._effective_site(h, c) != site)]
@@ -400,7 +470,9 @@ class SimQuotaEngine:
                     for h in picks:
                         await self._assign(h, sim_id, site)
                         c = clients.get(h) or {}
-                        assigned[h] = self._effective_site(h, c)
+                        # Record the natural site (pre-rehome, manual wsite kept)
+                        # so a packed fellow quota is recognized as a re-homer.
+                        assigned[h] = self._natural_site(h, c)
                         producing.append(h)
                         actions["assigned"] += 1
 
@@ -413,7 +485,7 @@ class SimQuotaEngine:
                     extras = producing[target:]
                     for h in extras:
                         from_site = assigned.pop(h)
-                        await self._release(h, sim_id, from_site)
+                        await self._release(h, sim_id, from_site, key)
                         actions["released"] += 1
 
             # Release clients whose quota left the effective set.
@@ -422,7 +494,7 @@ class SimQuotaEngine:
                     entry = self._ledger.pop(key)
                     sim_id = entry.get("sim_id") or ""
                     for h, from_site in (entry.get("clients") or {}).items():
-                        await self._release(h, sim_id, from_site)
+                        await self._release(h, sim_id, from_site, key)
                         actions["released"] += 1
 
             self._save_ledger()

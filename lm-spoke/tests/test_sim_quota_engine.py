@@ -320,6 +320,50 @@ def test_reconcile_rehome_release_reverts_wsite(tmp_path):
     assert spoke.registry.clients["c1"]["overrides"].get("dns_fail") == "off"
 
 
+def test_reconcile_rehome_packed_multi_release_keeps_wsite(tmp_path):
+    # multi_capable packing × re-home edge: quota A (exclusive dns_fail) re-homes
+    # c0 DFW→MIA; quota B (multi ping_test, MIA) PACKS onto c0. Both record the
+    # NATURAL site (DFW) as from_site. Releasing B must NOT revert wsite (A still
+    # needs c0 at MIA); only releasing A (the last re-homer) reverts to DFW.
+    clients = {f"c{i}": _client(f"c{i}", "DFW") for i in range(3)}
+    n2h = {"c0": "px2", "c1": "px2", "c2": "px2"}
+    site_map = {"px2": "DFW"}
+    quotas = [
+        {"alert_id": "A", "sim_id": "dns_fail", "count": 1, "site": "MIA",
+         "rehome": True, "enabled": True},
+        {"alert_id": "B", "sim_id": "ping_test", "count": 1, "site": "MIA",
+         "rehome": True, "multi_capable": True, "enabled": True},
+    ]
+    spoke = _FakeSpoke(clients, quotas, tmp_path,
+                       pxmx_site_map=site_map, name_to_host=n2h)
+    eng = SimQuotaEngine(spoke)
+    _run(eng.reconcile())
+    # A re-homed c0 to MIA (cross-site borrow, first DFW runner); B packed onto
+    # c0 (in-site once re-homed). Both ledger entries recorded the natural site
+    # DFW → both are recognized as re-homers.
+    assert "c0" in eng._ledger["alert:A:MIA"]["clients"]
+    assert "c0" in eng._ledger["alert:B:MIA"]["clients"]
+    assert eng._ledger["alert:A:MIA"]["clients"]["c0"] == "DFW"
+    assert eng._ledger["alert:B:MIA"]["clients"]["c0"] == "DFW"
+    assert spoke.registry.clients["c0"]["overrides"]["wsite"] == "MIA"
+    assert spoke.registry.clients["c0"]["overrides"]["dns_fail"] == "on"
+    assert spoke.registry.clients["c0"]["overrides"]["ping_test"] == "on"
+    # Drop ONLY B → A still re-homes c0, so wsite stays at MIA (not reverted to
+    # DFW) and dns_fail stays on; ping_test turns off.
+    spoke.local_store._q = [quotas[0]]
+    _run(eng.reconcile())
+    assert "alert:B:MIA" not in eng._ledger
+    assert spoke.registry.clients["c0"]["overrides"]["wsite"] == "MIA"
+    assert spoke.registry.clients["c0"]["overrides"]["dns_fail"] == "on"
+    assert spoke.registry.clients["c0"]["overrides"].get("ping_test") == "off"
+    # Drop A too → no re-homer remains → wsite reverts to DFW, dns_fail off.
+    spoke.local_store._q = []
+    _run(eng.reconcile())
+    assert eng._ledger == {}
+    assert spoke.registry.clients["c0"]["overrides"].get("wsite") == "DFW"
+    assert spoke.registry.clients["c0"]["overrides"].get("dns_fail") == "off"
+
+
 def test_reconcile_substitute_stops_when_original_returns(tmp_path):
     # Quota N=2. c0,c1 assigned. c0 goes offline → c2 substitutes. c0 returns
     # → over N by 1 → one (the substitute c2, last in) is released.
