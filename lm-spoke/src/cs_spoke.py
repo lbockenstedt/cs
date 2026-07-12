@@ -442,14 +442,19 @@ class CSSpoke(BaseSpoke):
             return {"status": "ERROR", "error": "Unknown relay command"}
 
         # ── cert distribution (hub-brokered; le spoke issued/renewed a cert) ──
-        # INSTALL_CERT does TWO things: (1) relay the cert to each managed pxmx
-        # agent (→ pvenode cert set on that node's pveproxy) — the cs spoke owns
-        # the agents in the split topology; (2) apply the cert to THIS spoke's
-        # own local webui (the 8080 dashboard) so the operator's browser gets
-        # HTTPS with the LE cert. See _install_cert_relay + control_plane
-        # _apply_local_cert (mirror ProxmoxSpoke / statuspage respectively).
+        # INSTALL_CERT relays the cert to each managed pxmx agent (→ pvenode cert
+        # set on that node's pveproxy) — the cs spoke owns the agents in the split
+        # topology. A 'simulation' target ALSO applies the cert to THIS spoke's
+        # own 8080 dashboard (control_plane._apply_local_cert) so the operator's
+        # browser gets HTTPS with the LE cert. A 'hypervisor' target routed here
+        # (split topology: the pxmx agents dial the cs spoke, not the pxmx spoke)
+        # is destined for a pxmx node only — it must NOT rebind this spoke's
+        # dashboard, so it relays and returns.
         if cmd == "INSTALL_CERT":
+            mt = (d.get("module_type") or "").lower()
             relay = await self._install_cert_relay(d)
+            if mt == "hypervisor":
+                return relay
             webui = {"status": "ERROR", "message": "no control plane"}
             cp = self.control_plane
             if cp is not None and hasattr(cp, "_apply_local_cert"):
@@ -460,10 +465,12 @@ class CSSpoke(BaseSpoke):
                     webui = {"status": "ERROR",
                              "message": f"{type(exc).__name__}: {exc}"}
             relay["webui"] = webui.get("message", "")
-            # Overall SUCCESS only if both the node relay AND the webui apply
-            # succeeded (a webui failure is surfaced in the message, not dropped).
-            relay["status"] = ("SUCCESS" if relay.get("status") == "SUCCESS"
-                               and webui.get("status") == "SUCCESS" else "ERROR")
+            # The node relay owns the target status: a cert deployed to the
+            # nodes is SUCCESS even when the local-dashboard HTTPS rebind fails
+            # (that failure is surfaced in the message, not dropped — but it
+            # must not flip a successful node deploy red, which was the
+            # operator's complaint: a deployed cert showing failed). A relay
+            # ERROR stays ERROR regardless of the webui outcome.
             relay["message"] = (relay.get("message", "")
                                 + f"; webui {webui.get('status', 'ERROR').lower()}"
                                 + (f": {webui.get('message', '')}" if webui.get("message") else ""))

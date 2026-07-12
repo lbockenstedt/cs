@@ -205,32 +205,59 @@ def test_install_cert_applies_cert_to_local_webui():
     assert "webui success" in res["message"]
 
 
-def test_install_cert_webui_failure_marks_overall_error():
-    """A local-webui apply failure must surface as overall ERROR even when the
-    node relay succeeded — the failure is reported in the message, not dropped."""
+def test_install_cert_webui_failure_does_not_flip_successful_relay():
+    """A local-webui apply failure is surfaced in the message but must NOT flip
+    a successful node relay to ERROR — the cert IS deployed to the nodes, so the
+    target badge must be green. (Previously the overall status went ERROR
+    whenever the webui apply failed, so a deployed cert showed failed on the
+    UI — the operator's complaint.) The webui error is still reported, not
+    dropped."""
     s = _spoke()
     s.control_plane = _FakeCP(
         {"node-a": {"hostname": "a"}},
         responses={"node-a": {"payload": {"data": {"status": "SUCCESS"}}}},
         webui={"status": "ERROR", "message": "write failed: permission denied"})
     res = _run(s.handle_command("INSTALL_CERT", _cert_data()))
-    assert res["status"] == "ERROR"
+    assert res["status"] == "SUCCESS"  # node deploy succeeded
     assert "webui error" in res["message"]
     assert "permission denied" in res["message"]
     # The node relay still ran + is reported.
     assert res["nodes"][0]["status"] == "SUCCESS"
 
 
-def test_install_cert_webui_exception_does_not_raise():
+def test_install_cert_webui_exception_does_not_raise_or_flip_relay():
     s = _spoke()
     s.control_plane = _FakeCP(
         {"node-a": {"hostname": "a"}},
         responses={"node-a": {"payload": {"data": {"status": "SUCCESS"}}}},
         webui_exc=RuntimeError("rebind exploded"))
     res = _run(s.handle_command("INSTALL_CERT", _cert_data()))
-    # Caught → overall ERROR with the exception in the message, not raised.
-    assert res["status"] == "ERROR"
+    # Caught → relay SUCCESS preserved, the exception surfaced in the message.
+    assert res["status"] == "SUCCESS"
     assert "rebind exploded" in res["message"]
+
+
+def test_install_cert_hypervisor_target_relays_only_no_webui_apply():
+    """A 'hypervisor' target routed to the cs spoke (split topology: cs owns the
+    pxmx agents) is destined for a pxmx node's pveproxy, NOT this spoke's
+    dashboard. It must relay only and NOT call _apply_local_cert — otherwise a
+    webui failure would flip a successful node deploy red, and rebinding the
+    cs dashboard is the wrong side effect for a hypervisor-scoped target."""
+    s = _spoke()
+    s.control_plane = _FakeCP(
+        {"node-a": {"hostname": "a"}},
+        responses={"node-a": {"payload": {"data": {"status": "SUCCESS"}}}},
+        webui={"status": "ERROR", "message": "must NOT be called"})
+    data = _cert_data()
+    data["module_type"] = "hypervisor"
+    res = _run(s.handle_command("INSTALL_CERT", data))
+    assert res["status"] == "SUCCESS"
+    # The relay ran.
+    assert len(s.control_plane.sent) == 1
+    # The local-webui apply was NOT invoked (hypervisor target = relay only).
+    assert s.control_plane.applied_certs == []
+    # No webui note in the message (the dashboard wasn't touched).
+    assert "webui" not in res["message"]
 
 
 # ── _apply_local_cert (the control plane's local-webui HTTPS apply) ──────────
