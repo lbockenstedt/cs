@@ -297,10 +297,15 @@ def test_apply_local_cert_writes_files_and_rebinds(monkeypatch, tmp_path):
     cp = CSControlPlane("test-cs", "secret", api_host="127.0.0.1", api_port=0)
     cp._api_app = object()  # dummy; rebind is mocked so it never serves
     rebound = []
+    agent_rebound = []
 
     async def _fake_rebind(ssl_certfile=None, ssl_keyfile=None):
         rebound.append((ssl_certfile, ssl_keyfile))
     cp._rebind_api_server = _fake_rebind  # type: ignore[assignment]
+
+    async def _fake_agent_rebind():
+        agent_rebound.append(True)
+    cp._rebind_agent_server = _fake_agent_rebind  # type: ignore[assignment]
 
     fullchain, privkey = _real_cert_pair()
     res = _run(cp._apply_local_cert(fullchain, privkey))
@@ -311,8 +316,84 @@ def test_apply_local_cert_writes_files_and_rebinds(monkeypatch, tmp_path):
     assert key.read_bytes() == privkey.encode()
     # Re-bind was called with the written paths (HTTPS on the 8080 server).
     assert rebound == [(str(cert), str(key))]
+    # The /ws/agent listener (443) is also re-bound so it serves the new cert.
+    assert agent_rebound == [True]
     # _local_tls_paths now sees the persisted cert (run() would bind HTTPS).
     assert cp._local_tls_paths() == (str(cert), str(key))
+
+
+def test_apply_local_cert_agent_rebind_failure_does_not_mask_success(monkeypatch, tmp_path):
+    """The 443 agent-listener rebind is best-effort: if it fails, a successful
+    8080 webui apply still reports SUCCESS (the webui cert is the primary target;
+    the agent leg retries on next renew/re-distribute)."""
+    from control_plane import CSControlPlane
+    _ensure_loop()
+    monkeypatch.setenv("LM_CS_TLS_DIR", str(tmp_path / "tls"))
+    cp = CSControlPlane("test-cs", "secret", api_host="127.0.0.1", api_port=0)
+    cp._api_app = object()
+
+    async def _fake_rebind(ssl_certfile=None, ssl_keyfile=None):
+        pass
+    cp._rebind_api_server = _fake_rebind  # type: ignore[assignment]
+
+    async def _boom():
+        raise RuntimeError("agent listener port busy")
+    cp._rebind_agent_server = _boom  # type: ignore[assignment]
+
+    fullchain, privkey = _real_cert_pair()
+    res = _run(cp._apply_local_cert(fullchain, privkey))
+    assert res["status"] == "SUCCESS"
+    # Files still written even though the agent rebind raised.
+    assert (tmp_path / "tls" / "fullchain.pem").read_text() == fullchain
+
+
+# ── _agent_listener_tls_paths (the 443 listener serves the applied LE cert) ──
+
+def test_agent_listener_tls_paths_prefers_local_le_cert(monkeypatch, tmp_path):
+    """After _apply_local_cert persists the LE cert, the /ws/agent listener must
+    serve THAT cert (not the installer-provisioned LM_TLS_* env) so the
+    agent→spoke leg verifies against LE with LM_HUB_TLS_VERIFY=1."""
+    from control_plane import CSControlPlane
+    _ensure_loop()
+    monkeypatch.setenv("LM_CS_TLS_DIR", str(tmp_path / "tls"))
+    monkeypatch.setenv("LM_TLS_CERT", "/etc/lm/legacy/fullchain.pem")
+    monkeypatch.setenv("LM_TLS_KEY", "/etc/lm/legacy/privkey.pem")
+    cp = CSControlPlane("test-cs", "secret", api_host="127.0.0.1", api_port=0)
+    # No persisted LE cert yet → falls back to env.
+    assert cp._agent_listener_tls_paths() == \
+        ("/etc/lm/legacy/fullchain.pem", "/etc/lm/legacy/privkey.pem")
+    # Persist an LE cert (the apply writes these files).
+    d = tmp_path / "tls"; d.mkdir(parents=True, exist_ok=True)
+    (d / "fullchain.pem").write_text("LE-CHAIN")
+    (d / "privkey.pem").write_bytes(b"LE-KEY")
+    cert, key = cp._agent_listener_tls_paths()
+    assert cert == str(d / "fullchain.pem")
+    assert key == str(d / "privkey.pem")
+
+
+def test_agent_listener_tls_paths_falls_back_to_env_when_no_local_cert(monkeypatch, tmp_path):
+    """A cert-less / pre-INSTALL_CERT cs spoke falls back to the installer env
+    (may be empty → run_agent_server serves plaintext, the legacy/cert-less mode)."""
+    from control_plane import CSControlPlane
+    _ensure_loop()
+    monkeypatch.setenv("LM_CS_TLS_DIR", str(tmp_path / "tls"))  # dir absent
+    monkeypatch.setenv("LM_TLS_CERT", "/etc/lm/env/fullchain.pem")
+    monkeypatch.setenv("LM_TLS_KEY", "/etc/lm/env/privkey.pem")
+    cp = CSControlPlane("test-cs", "secret", api_host="127.0.0.1", api_port=0)
+    assert cp._agent_listener_tls_paths() == \
+        ("/etc/lm/env/fullchain.pem", "/etc/lm/env/privkey.pem")
+
+
+def test_agent_listener_tls_paths_empty_when_neither_local_nor_env(monkeypatch, tmp_path):
+    """No persisted LE cert AND no LM_TLS_* env → ('', '') → run_agent_server
+    serves plaintext (the cert-less standalone fallback)."""
+    from control_plane import CSControlPlane
+    _ensure_loop()
+    monkeypatch.setenv("LM_CS_TLS_DIR", str(tmp_path / "tls"))  # dir absent
+    monkeypatch.delenv("LM_TLS_CERT", raising=False)
+    monkeypatch.delenv("LM_TLS_KEY", raising=False)
+    cp = CSControlPlane("test-cs", "secret", api_host="127.0.0.1", api_port=0)
+    assert cp._agent_listener_tls_paths() == ("", "")
 
 
 def test_apply_local_cert_rejects_invalid_material(monkeypatch, tmp_path):

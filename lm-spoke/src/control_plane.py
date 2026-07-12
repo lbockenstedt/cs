@@ -161,6 +161,28 @@ class CSControlPlane(AgentHostingControlPlane):
             return str(cert), str(key)
         return None, None
 
+    def _agent_listener_tls_paths(self):
+        """Prefer the LE cert applied by ``_apply_local_cert`` (persisted under
+        the TLS dir) for the 443 ``/ws/agent`` listener, falling back to the
+        installer-provisioned ``LM_TLS_CERT`` / ``LM_TLS_KEY`` env. Without
+        this the agent listener kept serving the old/self-signed cert (or
+        plaintext) even after INSTALL_CERT applied a fresh LE cert to the 8080
+        webui — so the agent→spoke leg couldn't be verified against LE even
+        with ``LM_HUB_TLS_VERIFY=1``.
+
+        Self-contained (does not call ``super()``): the base hook lives in the
+        sibling lm ``core`` repo, which the cs spoke runs against at whatever
+        version is deployed (``/opt/lm/core`` in prod, the sibling checkout in
+        dev) — it may not yet have the hook. Inlining the env fallback keeps
+        the override correct against any base version (and mirrors the base's
+        own default exactly)."""
+        cert, key = self._local_tls_paths()
+        if cert and key:
+            return cert, key
+        cert = os.environ.get("LM_TLS_CERT", "").strip()
+        key = os.environ.get("LM_TLS_KEY", "").strip()
+        return cert, key
+
     @staticmethod
     def _atomic_write_text(path: Path, text: str) -> None:
         tmp = path.with_suffix(path.suffix + ".tmp")
@@ -232,6 +254,15 @@ class CSControlPlane(AgentHostingControlPlane):
             await self._rebind_api_server(str(cert_p), str(key_p))
         except Exception as exc:  # noqa: BLE001
             return {"status": "ERROR", "message": f"rebind failed: {exc}"}
+        # Re-bind the /ws/agent listener (443) so it presents the new cert too
+        # — run_agent_server reads the cert at serve-start, so without a rebind
+        # the agent→spoke leg keeps serving the old cert after a renew. Connected
+        # agents drop + reconnect (re-onboarded; agent_id stable). Best-effort:
+        # a rebind failure must not mask the successful webui apply.
+        try:
+            await self._rebind_agent_server()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Agent listener TLS rebind failed: %s", exc)
         logger.info("Local webui TLS applied — re-bound https://%s:%s",
                     self.api_host, self.api_port)
         return {"status": "SUCCESS", "message": "local webui HTTPS applied"}
