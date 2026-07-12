@@ -1269,8 +1269,7 @@ function csClientSimBar(c, host) {
     const isOn = f => {
         if (Object.prototype.hasOwnProperty.call(ov, f))
             return ['on', 'true', '1'].includes(String(ov[f]).toLowerCase());
-        return active.has(f) ||
-            ['on', 'true', '1'].includes(String(cfg[f] == null ? '' : cfg[f]).toLowerCase());
+        return ['on', 'true', '1'].includes(String(cfg[f] == null ? '' : cfg[f]).toLowerCase());  // enabled = resolved config (override wins), not active_simulations
     };
     // An override button exists iff the registry has an entry for this flag
     // (the pruned-override object only carries REAL deviations from the bucket,
