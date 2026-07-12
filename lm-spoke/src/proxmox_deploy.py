@@ -152,6 +152,9 @@ class ProxmoxDeploy:
         deleting_vmids = {
             int(x) for x in (body.get("deleting_vmids") or []) if x is not None
         }
+        reclone_vmids = {
+            int(x) for x in (body.get("reclone_vmids") or []) if x is not None
+        }
 
         enriched_vms: List[Dict[str, Any]] = []
         for v in raw_vms:
@@ -172,6 +175,8 @@ class ProxmoxDeploy:
                 _vmid = None
             if _vmid is not None and _vmid in deleting_vmids:
                 v["prov_status"] = "tearing_down"
+            elif _vmid is not None and _vmid in reclone_vmids:
+                v["prov_status"] = "recloning"
             elif _vmid is not None and _vmid in provisioning_vmids:
                 v["prov_status"] = "provisioning"
             enriched_vms.append(v)
