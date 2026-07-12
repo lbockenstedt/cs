@@ -382,6 +382,12 @@ def build_local_ui_router(spoke) -> APIRouter:
     async def get_sim_quota_catalog(tenant: str):
         return await _cmd("CS_GET_SIM_QUOTA_CATALOG")
 
+    @router.get("/{tenant}/sim-quota-state")
+    async def get_sim_quota_state(tenant: str):
+        # Live engine ledger for the Config → Quota State view (which clients
+        # are currently assigned to each effective quota + target vs. assigned).
+        return await _cmd("CS_GET_SIM_QUOTA_STATE")
+
     @router.get("/{tenant}/pxmx-site-map")
     async def get_pxmx_site_map(tenant: str):
         return await _cmd("CS_GET_PXMX_SITE_MAP")

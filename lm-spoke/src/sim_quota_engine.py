@@ -28,9 +28,12 @@ Re-home (Chunk 3 refines): assigning a client to a site-specific quota sets
 ``wsite``; releasing it reverts ``wsite`` to the bucket default site. The ledger
 records the client's original site so a return-and-revert path can restore it.
 
-multi_capable (Chunk 4 refines): failure sims are exclusive (one failure sim per
-client), traffic sims are multi-capable. Chunk 2 sets the flag + wsite only;
-exclusivity enforcement lands later.
+multi_capable (Chunk 4): failure sims are exclusive (one failure sim per
+client), traffic sims are multi-capable and may PACK onto a client already
+running other sims. Pool eligibility is quota-aware: an exclusive quota only
+takes a client not already running an exclusive sim; a multi-capable quota may
+stack onto an engine-owned client (and onto a client running an exclusive sim).
+A human manual pin on a sim flag the engine didn't set is never touched.
 """
 from __future__ import annotations
 
@@ -136,7 +139,17 @@ class SimQuotaEngine:
         bucket-default wsite → sim_config fallback. An operator-assigned server
         site wins over the bucket default so a site-specific quota ("10 DNS-fail
         in MIA") is filled from clients whose hosting server is in MIA; an
-        engine re-home override (wsite) still wins over both."""
+        engine re-home override (wsite) still wins over both.
+
+        WHY this is PXMX-server-based (not bucket-based): the sim systems live
+        in RF chambers with dedicated Proxmox nodes per site — a "site" is a
+        physical chamber and the pxmx server is its boundary. With site-based
+        SSID enabled the SSID appends the site (MIA + PSK → ``MIA-PSK``); with
+        it disabled every site uses the same SSID. Linking pxmx servers to a
+        site (pxmx_site_map) makes each site its OWN runner pool (per-site
+        scale + RF isolation); without it, clients fall back to bucket wsite
+        and you get one entire-tenant pool. The pxmx-server step is what lets a
+        quota's pool match the chamber boundary instead of the bucket hash."""
         ov = c.get("overrides") or {}
         w = ov.get("wsite")
         if w:
@@ -176,28 +189,95 @@ class SimQuotaEngine:
         prof = c.get("config") or {}
         return str(prof.get(sim_id, "")).strip().lower() == "on"
 
-    def _is_free_runner(self, hostname: str, c: Dict[str, Any]) -> bool:
-        """Online client with NO manual sim-flag override — eligible for the
-        pool. ``wsite`` alone doesn't disqualify (the engine may re-home)."""
-        ov = c.get("overrides") or {}
-        # A sim-flag override the engine didn't set means a human pinned it.
-        # The engine owns only the (sim_id, wsite) it set on ledger clients; a
-        # non-ledger client with any sim flag override is manually pinned.
-        if hostname in self._engine_owned_clients():
-            return False
-        for k, v in ov.items():
-            if k == "wsite":
-                continue
-            if str(v).strip().lower() in ("on", "off"):
-                return False
-        return True
-
     def _engine_owned_clients(self) -> set:
         out = set()
         for entry in self._ledger.values():
             for h in (entry.get("clients") or {}).keys():
                 out.add(h)
         return out
+
+    def _engine_sims_for(self, hostname: str) -> set:
+        """The sim_ids the engine has set ON on this client (across every ledger
+        entry it appears in — a multi-capable client can be packed under several
+        quotas). Used to tell engine-set overrides from human manual pins."""
+        out = set()
+        for entry in self._ledger.values():
+            if hostname in (entry.get("clients") or {}):
+                s = entry.get("sim_id")
+                if s:
+                    out.add(s)
+        return out
+
+    def _sim_multi(self, sim_id: str) -> bool:
+        try:
+            from sim_quota import SIM_META
+        except Exception:  # noqa: BLE001
+            return False
+        return bool(SIM_META.get(sim_id, {}).get("multi_capable", False))
+
+    def _client_active_sims(self, c: Dict[str, Any]) -> set:
+        """Sims currently ON for this client — override wins, else bucket default.
+        ``off`` overrides suppress a bucket-default-on sim."""
+        try:
+            from sim_quota import SIM_META
+            flags = list(SIM_META.keys())
+        except Exception:  # noqa: BLE001
+            flags = []
+        ov = c.get("overrides") or {}
+        cfg = c.get("config") or {}
+        active = set()
+        for sim in flags:
+            v = str(ov.get(sim, cfg.get(sim, ""))).strip().lower()
+            if v == "on":
+                active.add(sim)
+        return active
+
+    def _exclusive_running(self, hostname: str, c: Dict[str, Any]) -> set:
+        """The exclusive (multi_capable=False) sims currently ON on this client.
+
+        Combines the per-sweep snapshot (bucket defaults + manual pins + engine
+        sims from PRIOR sweeps) with the in-memory ledger (engine sims assigned
+        EARLIER in THIS sweep — the snapshot was taken before those overrides
+        landed, so without the ledger union a second exclusive quota would
+        re-pick a client the engine just assigned to the first one)."""
+        active = self._client_active_sims(c) | self._engine_sims_for(hostname)
+        return {s for s in active if not self._sim_multi(s)}
+
+    def _has_manual_sim_pin(self, hostname: str, c: Dict[str, Any]) -> bool:
+        """A human pinned a sim flag the engine didn't set on this client. The
+        engine owns only the (sim_id, wsite) it set on ledger clients; any OTHER
+        sim-flag override (on/off) is a manual pin we must not fight."""
+        eng = self._engine_sims_for(hostname)
+        ov = c.get("overrides") or {}
+        for k, v in ov.items():
+            if k == "wsite" or k in eng:
+                continue
+            if str(v).strip().lower() in ("on", "off"):
+                return True
+        return False
+
+    def _pool_eligible(self, hostname: str, c: Dict[str, Any], sim_id: str,
+                       multi: bool, now: float, assigned: Dict[str, str]) -> bool:
+        """Quota-aware pool eligibility for a top-up pick:
+
+        * online, and not already assigned to THIS quota;
+        * no human manual pin on a sim flag the engine didn't set (respect
+          provenance — never fight a human);
+        * an EXCLUSIVE quota (``multi`` False) only takes a client not already
+          running an exclusive sim — one failure sim per client;
+        * a MULTI-CAPABLE quota (``multi`` True) may PACK onto a client the
+          engine already owns under another quota (and onto a client running an
+          exclusive sim) — traffic sims stack.
+        """
+        if hostname in assigned:
+            return False
+        if not self._is_online(c, now):
+            return False
+        if self._has_manual_sim_pin(hostname, c):
+            return False
+        if multi:
+            return True
+        return not self._exclusive_running(hostname, c)
 
     # ── assign / release ─────────────────────────────────────────────────────
     async def _assign(self, hostname: str, sim_id: str, site: str) -> None:
@@ -301,23 +381,20 @@ class SimQuotaEngine:
                 # ``wsite`` to re-home them; the ledger records their original
                 # site as ``from_site`` so a later release reverts it.
                 if len(producing) < target:
-                    owned = self._engine_owned_clients()
                     need = target - len(producing)
+                    multi = bool(q.get("multi_capable"))
                     in_site = [h for h, c in clients.items()
-                               if h not in assigned and h not in owned
-                               and self._is_online(c, now)
-                               and self._is_free_runner(h, c)
+                               if self._pool_eligible(h, c, sim_id, multi, now, assigned)
                                and (not site or self._effective_site(h, c) == site)]
                     picks = in_site[:need]
                     if q.get("rehome") and len(picks) < need:
-                        # Cross-site fallback: any other-site free runner. _assign
-                        # sets wsite=site when the client's current effective site
-                        # differs, re-homing it; assigned[h] captures the PRE-rehome
-                        # effective site (the snapshot ``c`` predates the override).
+                        # Cross-site fallback: any other-site eligible runner.
+                        # _assign sets wsite=site when the client's current
+                        # effective site differs, re-homing it; assigned[h]
+                        # captures the PRE-rehome effective site (the snapshot
+                        # ``c`` predates the override).
                         cross = [h for h, c in clients.items()
-                                 if h not in assigned and h not in owned
-                                 and self._is_online(c, now)
-                                 and self._is_free_runner(h, c)
+                                 if self._pool_eligible(h, c, sim_id, multi, now, assigned)
                                  and (not site or self._effective_site(h, c) != site)]
                         picks += cross[:need - len(picks)]
                     for h in picks:

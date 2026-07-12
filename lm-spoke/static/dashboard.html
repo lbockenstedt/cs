@@ -81,6 +81,8 @@
         <button class="cs-tab-btn px-4 py-2 text-sm font-semibold rounded-t-lg border border-b-0 border-transparent text-slate-500"
                 data-view="PXMX Sites" role="tab" aria-selected="false">PXMX Sites</button>
         <button class="cs-tab-btn px-4 py-2 text-sm font-semibold rounded-t-lg border border-b-0 border-transparent text-slate-500"
+                data-view="Quota State" role="tab" aria-selected="false">Quota State</button>
+        <button class="cs-tab-btn px-4 py-2 text-sm font-semibold rounded-t-lg border border-b-0 border-transparent text-slate-500"
                 data-view="Auto-Provisioning" role="tab" aria-selected="false">Auto-Provisioning</button>
         <button class="cs-tab-btn px-4 py-2 text-sm font-semibold rounded-t-lg border border-b-0 border-transparent text-slate-500"
                 data-view="Central API Setup" role="tab" aria-selected="false">Central API Setup</button>
@@ -158,6 +160,7 @@
             'Config': () => csRenderConfigSimulation(),
             'Sim Quotas': () => csRenderConfigSimQuotas(),
             'PXMX Sites': () => csRenderPxmxSiteMap(),
+            'Quota State': () => csRenderSimQuotaState(),
             'Auto-Provisioning': () => renderAutoProvisioning(),
             'Central API Setup': () => csRenderSetupCentralApi(),
         };

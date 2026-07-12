@@ -338,3 +338,74 @@ def test_reconcile_substitute_stops_when_original_returns(tmp_path):
     actions = _run(eng.reconcile())           # over N → trim back to 2
     assert actions["released"] == 1
     assert len(eng._ledger["alert:A:MIA"]["clients"]) == 2
+
+
+# ── multi_capable exclusivity / packing (Chunk 4) ────────────────────────────
+def test_reconcile_exclusive_quotas_one_failure_sim_per_client(tmp_path):
+    # Two EXCLUSIVE quotas (dns_fail N=2, assoc_fail N=2) over 4 free clients.
+    # Each client gets at most one failure sim: dns_fail takes c0,c1; assoc_fail
+    # must skip them (they're running an exclusive sim) and take c2,c3 instead.
+    clients = {f"c{i}": _client(f"c{i}", "MIA") for i in range(4)}
+    spoke = _FakeSpoke(clients, [
+        {"alert_id": "A", "sim_id": "dns_fail", "count": 2, "site": "MIA", "enabled": True},
+        {"alert_id": "B", "sim_id": "assoc_fail", "count": 2, "site": "MIA", "enabled": True},
+    ], tmp_path)
+    eng = SimQuotaEngine(spoke)
+    _run(eng.reconcile())
+    dns = set(eng._ledger["alert:A:MIA"]["clients"].keys())
+    assoc = set(eng._ledger["alert:B:MIA"]["clients"].keys())
+    assert dns == {"c0", "c1"} and assoc == {"c2", "c3"}   # no overlap
+    assert dns.isdisjoint(assoc)                            # one failure sim/client
+
+
+def test_reconcile_multi_capable_packs_two_traffic_sims_on_same_clients(tmp_path):
+    # Two MULTI-CAPABLE quotas (ping_test N=2, download N=2) over just 2 clients.
+    # Traffic sims stack → both quotas fill to 2 on the SAME two clients.
+    clients = {f"c{i}": _client(f"c{i}", "MIA") for i in range(2)}
+    spoke = _FakeSpoke(clients, [
+        {"alert_id": "A", "sim_id": "ping_test", "count": 2, "site": "MIA",
+         "multi_capable": True, "enabled": True},
+        {"alert_id": "B", "sim_id": "download", "count": 2, "site": "MIA",
+         "multi_capable": True, "enabled": True},
+    ], tmp_path)
+    eng = SimQuotaEngine(spoke)
+    _run(eng.reconcile())
+    ping = set(eng._ledger["alert:A:MIA"]["clients"].keys())
+    dl = set(eng._ledger["alert:B:MIA"]["clients"].keys())
+    assert ping == {"c0", "c1"} and dl == {"c0", "c1"}      # packed, not disjoint
+    # Both sims ON on both clients.
+    for h in ("c0", "c1"):
+        assert spoke.registry.clients[h]["overrides"]["ping_test"] == "on"
+        assert spoke.registry.clients[h]["overrides"]["download"] == "on"
+
+
+def test_reconcile_multi_capable_packs_onto_exclusive_runner(tmp_path):
+    # One EXCLUSIVE (dns_fail N=1) + one MULTI (ping_test N=1) over 1 client.
+    # The traffic sim packs onto the client already running the failure sim.
+    clients = {"c0": _client("c0", "MIA")}
+    spoke = _FakeSpoke(clients, [
+        {"alert_id": "A", "sim_id": "dns_fail", "count": 1, "site": "MIA", "enabled": True},
+        {"alert_id": "B", "sim_id": "ping_test", "count": 1, "site": "MIA",
+         "multi_capable": True, "enabled": True},
+    ], tmp_path)
+    eng = SimQuotaEngine(spoke)
+    _run(eng.reconcile())
+    assert set(eng._ledger["alert:A:MIA"]["clients"].keys()) == {"c0"}
+    assert set(eng._ledger["alert:B:MIA"]["clients"].keys()) == {"c0"}
+    ov = spoke.registry.clients["c0"]["overrides"]
+    assert ov["dns_fail"] == "on" and ov["ping_test"] == "on"
+
+
+def test_reconcile_exclusive_skips_client_running_exclusive_via_bucket(tmp_path):
+    # c0's BUCKET default already runs assoc_fail (an exclusive sim) — no manual
+    # override, just the bucket profile. A dns_fail quota must NOT stack onto it
+    # (one failure sim per client, regardless of source); it picks c1 instead.
+    clients = {"c0": _client("c0", "MIA", sim_flags={"assoc_fail": "on"}),
+               "c1": _client("c1", "MIA")}
+    spoke = _FakeSpoke(clients, [{"alert_id": "A", "sim_id": "dns_fail",
+                                  "count": 1, "site": "MIA", "enabled": True}], tmp_path)
+    eng = SimQuotaEngine(spoke)
+    _run(eng.reconcile())
+    assert set(eng._ledger["alert:A:MIA"]["clients"].keys()) == {"c1"}
+    # c0's bucket assoc_fail left intact, engine never touched dns_fail on it.
+    assert "dns_fail" not in (clients["c0"].get("overrides") or {})
