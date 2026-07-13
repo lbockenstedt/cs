@@ -754,6 +754,15 @@ class CSSpoke(BaseSpoke):
                     except Exception as e:  # noqa: BLE001 — best-effort
                         logger.debug("CS_INGEST_PROGRESS touch %s failed: %s",
                                      cs_cmd_id, e)
+                # Relay the per-phase progress frame UP to the hub so it can fan
+                # out to the tenant's /sim/ws browsers for a realtime operations
+                # feed (reclone/provision/delete phases). The hub otherwise only
+                # sees the 10s CS_TELEMETRY re-emit. Fire-and-forget.
+                try:
+                    if self.control_plane is not None:
+                        await self.control_plane.send_to_hub("CS_PROGRESS", d)
+                except Exception as e:  # noqa: BLE001 — feed is best-effort
+                    logger.debug("CS_PROGRESS relay to hub failed: %s", e)
             return {"status": "SUCCESS", "hostname": hostname, "ingested": kind.lower()}
 
         if cmd == "CS_INGEST_COMMAND_RESULT":
