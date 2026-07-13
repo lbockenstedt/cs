@@ -1,9 +1,16 @@
 # Simulation Pool & Quota Engine — Design Spec
 
-Status: **design / build reference** (not yet implemented except where noted).
-Scope: the client-sim fleet (`lm-spoke` SimQuotaEngine + `clients/*` scripts +
-hub config/UI). This captures the target model agreed in design; it supersedes
+Status: **implemented** (the model below is live in `lm-spoke` SimQuotaEngine +
+`clients/*` scripts + hub config/UI; see §15 for the running-state tracker).
+Scope: the client-sim fleet. This is the authoritative model; it supersedes
 ad-hoc bucket behavior where the two conflict.
+
+> **Model update (2026-07):** SSID placement is no longer "hold N per cell." The
+> **SSID matrix is definitions only** (site / SSID / password). Clients reach a
+> cell two ways: an **accounted cell harvest quota** (exact/adaptive count,
+> §5/§8) or a **weighted random rule** (the stateless ~99%, §5). Sharing and
+> exclusivity are keyed **per SSID cell**, not per site (§8). See §15 for the
+> full list of what changed.
 
 ---
 
@@ -80,7 +87,7 @@ quota** or a **stateless default**:
 
 ```
 site   →  physical PXMX pool (chamber)  |  weighted assignment (site-based SSID)
-SSID   →  placement quota (hold N)      |  balance / random default
+SSID   →  cell harvest quota (accounted) |  weighted random rule (unaccounted)
 sims   →  harvest quota (task)          |  random from the randomizable set
 ```
 
@@ -107,34 +114,40 @@ random/default** (§10). A human `[username]` pin is always honored.
 
 ---
 
-## 5. SSID placement quotas (within a site)
+## 5. SSID cells — definitions, cell quotas, and weighted rules
 
-Inside a site's pool you can run **many SSIDs** and pin how many clients sit on
-each. This is the *same quota machinery as harvest, applied to placement.*
+The **SSID matrix** (Pool & SSID card) is **definitions only**: each cell is
+`{ name = "<site>-<ssid>", site, ssid (auth: PSK/1X/…), password, enabled }`.
+It carries **no** counts — no Hold N, no per-cell weight. A cell name like
+`MIA-PSK` encodes its physical site (`MIA`) and its auth (`PSK`).
 
-```
-MIA-PSK:   hold 20
-MIA-1X:    hold 50
-remainder: → balance to MIA-1X        (or: → random spread across SSIDs)
-```
+Clients land on a cell in exactly **two ways**, configured in one place
+(Config → Sim Quotas):
 
-- The engine **harvests from the site pool onto each SSID** to hit its target.
-- **Self-healing rebalance:** if `MIA-PSK` drops 20 → 10, the engine picks 10
-  boxes currently on another SSID (sourced from **telemetry** — clients report
-  their SSID) and reassigns them to `MIA-PSK`. Otherwise **sticky** — a box only
-  moves when the engine is correcting a target, never per iteration.
-- **Remainder policy** (operator choice per site):
-  - `balance → <SSID>`: everything not held elsewhere lands on one designated SSID.
-  - `random`: the remainder is spread across the site's SSIDs by a stateless,
-    stable weighted roll.
+1. **Accounted cell harvest quota** (the ~1%). A sim/presence quota whose **site
+   is a cell** (`MIA-PSK`) homes an **exact/adaptive** count of clients to that
+   cell — it scopes to the cell's physical site AND pins the client's
+   `ssid`/`ssidpw` to the cell. `MIA-PSK` and `MIA-ACD` are **distinct quotas
+   that coexist** at the same site. Tracked in the ledger (§8).
 
-**State:** only the **targeted placements** are tracked (20 + 50 = 70 in MIA),
-never the balance. Backfill is telemetry-sourced, so no prior per-client
-tracking of the remainder is needed.
+2. **Weighted random rules** (the ~99%, stateless — no accounting). A rule is
+   `{ site, ssid (cell), weight, all }`. After the harvest quotas claim their
+   clients, the engine (`_reconcile_weighted`) spreads every **spare** client at
+   a site across that site's cells **proportional to weight**:
+   - `weight 5` vs `weight 1` → 5× the clients;
+   - `weight 0` → that cell takes none;
+   - **`all`** → that cell soaks the **balance** after the weighted split.
 
-Placement writes `wsite` / `ssid` / `ssidpw` into the served `[username]`
-(frozen connectivity — see §12), so bucket randomization can never move a box's
-SSID.
+   No ledger, no per-client tracking — each sweep just re-sets the spare client's
+   `ssid`/`wsite`.
+
+Both write `wsite` / `ssid` / `ssidpw` into the served `[username]` (frozen
+connectivity — see §12), so bucket randomization can never move a box's SSID.
+
+> **Deprecated:** the old per-cell **Hold N** + **remainder** placement model
+> (`_reconcile_placement`, `ssid_placement`) is gone. Hold N → a cell harvest
+> quota; the remainder/weight → weighted rules. Legacy `placement:*` ledger
+> entries are dropped on reconcile.
 
 ---
 
@@ -181,17 +194,39 @@ the stable site/SSID layer and win via `[username]` (§12).
 Pull a specific number of boxes from a site's pool to run a specific sim
 (usually to fire the linked alert/insight).
 
-- **Fixed:** `count = N` (or `min == max`). Runs exactly N. *(Exists today.)*
+- **Fixed:** `count = N` (or `min == max`). Runs exactly N.
 - **Adaptive:** `min = X`, `max = Y`, `step`, `settle`, `buffer` — see §9.
+- **Cell- or site-scoped:** a quota's *site* field is either a whole site (`MIA`)
+  or an **SSID cell** (`MIA-PSK`, §5). A cell quota scopes to the cell's physical
+  site AND sets the assigned client's SSID.
 - Harvest draws from the site pool, **capped by pool size** (chamber ceiling).
-- A harvested box leaves the ambient pool (runs *only* its task, deterministic)
-  and rejoins on release.
-- Requires the quota be **tied to an alert/insight** to be adaptive (that's the
-  feedback signal). Untethered quotas are fixed-count only.
+- Requires the quota be **tied to an alert/insight** to be adaptive. Untethered
+  sim quotas are fixed-count and keyed `sim:{sim_id}:{site}`.
 
-Counting is **ledger-based** (the boxes the engine assigned), never raw
-telemetry — so ambient traffic running the same *class* of sim can't confuse the
-count.
+**Sharing & exclusivity — keyed per SSID cell** (`_claimed_cell` / `_cell_ok_for`):
+
+- Two quotas on the **same cell share** clients — a sim quota stacks onto that
+  cell's "Clients Associated" (presence) clients via `homed_here`. e.g. `dns_fail`
+  on `MIA-PSK` runs on the same boxes as `MIA-PSK`'s presence.
+- Two quotas on **different cells never share** a client — `MIA-PSK` and
+  `MIA-ACD` are disjoint (a client has one SSID).
+
+**Shareable vs exclusive sims** (`SIM_META.multi_capable` / the Simulation
+Sharing tile, `_sim_multi`):
+
+- A **shareable** sim (traffic, or a failure explicitly marked shareable like
+  `dns_fail`) may stack onto presence / traffic / other shareables — but **never
+  onto a client an EXCLUSIVE sim monopolizes**.
+- An **exclusive** sim (`ssidpw_fail`, `dhcp_fail`, …) **monopolizes** its client:
+  it only takes a client running **no other sim** (a presence-homed client
+  qualifies), and nothing else stacks onto it. Exclusive quotas are **processed
+  first** so they claim bare clients before shareables spread onto the rest; a
+  shareable quota **yields** a client the moment an exclusive claims it.
+
+Counting is **ledger-based** (boxes the engine assigned), never raw telemetry.
+**Ignored hosts** (`hub_config.ignored_hostnames`) are filtered out of the pool,
+counts, eligibility, and ledger entirely — a box being spun up/decommissioned is
+never assigned or shown.
 
 ---
 
@@ -201,13 +236,29 @@ Runs **hub-side** (the hub knows alert-firing status from the Central poller);
 it only modulates the `count` pushed to the spoke engine. The engine is
 unchanged — it fills to whatever count it's told.
 
-Per `(alert, site)`, respecting a **settle window** between changes (matched to
-the alert's detection latency, or you overshoot straight to `max`):
+Per `(alert, site-or-cell)`, respecting a **settle window** between changes:
 
 ```
-if alert NOT firing:   target = min(target + step, max)     # ramp up (fast)
+if alert NOT firing:   target = min(target + step, max)     # ramp up
 if alert firing:       decay slowly toward the floor         # probe the minimum
 ```
+
+> **30-min settle floor (Central latency).** Central reports alerts with 30+ min
+> latency, so the controller must **never change the target — up OR down — faster
+> than that**, or it ramps to `max` long before Central can confirm firing and
+> then falsely flags "at max, not firing." `settle` is floored at **1800s**
+> regardless of the configured value, and the settle clock starts at cold-start
+> so even the first step waits a full window.
+
+> **Cell → site firing resolution.** `_alert_firing` resolves the quota's site
+> to the Central site in two hops: if the site names an **SSID cell** (`MIA-ACD`)
+> → its physical `wsite` (`MIA`) via `ssid_matrix`, then → the Central site
+> (`Miami`) via `site_links`. Without hop 1 a cell-scoped adaptive quota never
+> matched a firing site and ramped to max forever.
+
+> **Anti-affinity (multi-spoke).** An **alert-tied** quota's target is split
+> **evenly (round-robin)** across the tenant's spokes — not pool-proportional —
+> so losing one server still leaves the alert firing from the others (§0).
 
 - **Learned floor:** when it fires at N and clears just below, the minimum that
   holds the alert is recorded as a smoothed value (EMA / high-water) per
@@ -303,23 +354,38 @@ Because `[username]` wins in `apply_override`, injected placement/harvest values
 **override whatever the random bucket rolled** — connectivity stays frozen,
 tasks stay pinned. This is **delivery-only**: nothing is written to the on-disk
 `user-overrides.conf`, so engine assignments are transient (no GitHub sync) and
-self-clean on release. *(The `[username]` injection is shipped — §15.)*
+self-clean on release.
 
 Client `username = $HOSTNAME | cut -d- -f1` matches server `username_for`.
+
+> **GOTCHA — the `web_server` gate.** A transient engine assignment reaches a
+> client **only** if `update.sh` re-fetches `/api/config`, and that fetch lives
+> **inside `if [[ "$web_server" == "on" ]]`**. If `web_server` is off (or the
+> client is on the GitHub update tier), the `[username]` injection never lands on
+> disk and the box **won't run its assigned sim even though the ledger says it
+> is**. First thing to check when "engine says running, client isn't": compare
+> what the spoke *serves* (`curl /api/config?hostname=$H`) vs the on-disk
+> `simulation.conf`.
+
+> **Harvest window.** A client is "in the pool" (`_is_harvestable`) if it beaconed
+> within **`HARVEST_WINDOW_S = 1800s` (30 min)** — real-ish clients flap in/out, so
+> a tight "online now" window would collapse the pool to a handful.
 
 ---
 
 ## 13. Config surfaces (all fleet-size-independent)
 
-- **SSID matrix** — the cells that exist: `{ site, auth (PSK/1X/…), password,
-  enabled }`.
+- **SSID matrix** — the cells that exist: `{ site, ssid/auth (PSK/1X/…),
+  password, enabled }`. **Definitions only** — no counts.
 - **Site source / mode** — PXMX topology vs weighted-assignment + site-based SSID.
-- **Per-site SSID placement** — `hold N` per SSID + remainder policy (`balance →
-  SSID` | `random`).
+- **Weighted random rules** (`ssid_weights`) — `{ site, ssid(cell), weight, all }`
+  for the spare pool (replaces the old Hold-N/remainder placement).
 - **Randomizable sim set** — the `randomizable` flag per sim.
-- **Harvest quotas** — per site/alert: `min` / `max` / `step` / `settle` /
-  `buffer` (or a fixed `count`).
-- **Weights** (site-based-SSID mode) — target proportions per site.
+- **Simulation Sharing** — per-sim shareable vs exclusive (`sim_shareable`).
+- **Harvest quotas** — per site/cell/alert: `min` / `max` / `step` / `settle` /
+  `buffer` (or a fixed `count`); `multi_capable`, `rehome`; target = site **or**
+  SSID cell.
+- **Ignored hostnames** (`hub_config.ignored_hostnames`) — excluded everywhere.
 
 ---
 
@@ -343,61 +409,73 @@ alert feature when it ships** (planned, not built).
 
 ## 15. Build status
 
-**Shipped (slices 1–6, this codebase):**
+**Core (shipped):**
 
 - **Config plumbing** — spoke `local_store` get/set + `cs_spoke._apply_hub_config`
   for `site_source`, `randomizable_sims`, `random_pool`, `ssid_matrix`,
-  `ssid_placement`; hub `_pool_config` flattens them into the CS_CONFIG_UPDATE push.
-- **Serve-time injection** (`client_api.py`) — `wsite` from `pxmx_site_map` in
-  chamber mode; `random_pool` + `randomizable_sims` delivered as `[simulation]`
-  globals; `[username]`-layer delivery with human-key preservation (§10, §12).
-- **Client ambient rotation** (`simulation.sh` + `simulation.ps1`) — random
-  bucket for randomizable sim flags only, failures forced off, connectivity
-  frozen, `[username]` pins win.
-- **SSID placement quotas** (`_reconcile_placement`) — per-site `hold N`, sticky,
-  telemetry-sourced rebalance, remainder policy.
-- **Adaptive controller** (hub) — `normalize_quota` carries min/max/step/settle/
-  buffer; `_adaptive_step` ramp/decay/learn + floor×(1+buffer); `_alert_firing`
-  (mode-aware, cached, holds when unknown); 45s loop from `main.py`.
-- **Reconcile** processes presence first; sim quotas count ledger-homed clients
-  as in-site; untethered quotas keyed `sim:{sim_id}:{site}`.
-- **WebUI** — adaptive Min/Max on quota rows; Pool & SSID config card; adaptive
-  learning indicator (🔄/✅/⚠️) in Quota State.
+  `ssid_weights`; hub `_pool_config` flattens them into CS_CONFIG_UPDATE.
+- **Serve-time injection** (`client_api.py`) — `wsite`, `[username]` layer with
+  human-key preservation, random-pool + randomizable-set globals (§10, §12).
+- **Client ambient rotation** — randomizable sim flags only, failures off,
+  connectivity frozen, `[username]` pins win.
+- **Adaptive controller** (hub, 45s loop) — ramp/decay/learn + floor×(1+buffer);
+  `_alert_firing` mode-aware + cached; learning indicator + Adaptive Controllers
+  panel in Quota State.
+- **Human-override invariant** — `_pool_eligible` skips human-pinned sims;
+  `effective_client_fields` lets reported toggles win in the Clients view.
 
-**Polish (shipped):**
+**Unified placement model (2026-07, shipped):**
 
-1. ✅ **Engine respects human `user-overrides.conf [username]` pins** — reconcile
-   loads user-overrides per sweep; `_pool_eligible` skips a client whose human
-   override sets the target sim, so the ledger never over-counts (§10).
-2. ✅ **Reported sim flags win in the Clients view** — `effective_client_fields`
-   lets a rotating client's reported toggles win over its home-bucket profile
-   (connectivity still from the profile).
-3. ✅ **Placement under-min + at-max warnings** — `_reconcile_placement` records
-   shortfalls (`placement_warnings()`); Quota State shows a warnings banner plus
-   the per-quota ⚠️ At-max badge.
+- **SSID matrix = definitions only** — Weight/Hold N removed (WebUI + `_reconcile_
+  placement` deleted). `ssid_placement` deprecated; legacy `placement:*` ledger
+  entries dropped on reconcile.
+- **Cell harvest quotas** — a quota's site may be an SSID cell (`MIA-PSK`);
+  `_quota_cell` → `scope_site` (physical) for eligibility, `_assign(cell=)` pins
+  the SSID. Quota target dropdown shows combined `site/ssid` (`MIA/PSK`) items.
+- **Weighted random rules** (`_reconcile_weighted`, runs after harvest) — spread
+  the spare pool by `{site, ssid, weight, all}`; stateless, no accounting.
+- **Per-cell sharing + exclusivity** (`_claimed_cell` / `_cell_ok_for`) — same
+  cell shares clients, different cells don't (§8).
+- **Shareable vs exclusive sims** — exclusive sims monopolize their client and
+  run first; a shareable never stacks onto an exclusive, and yields when one
+  claims the client (§8).
+- **Anti-affinity** — alert-tied quota targets split **evenly** across spokes; other
+  quotas split pool-proportional (§0/§9).
 
-**Remaining (needs live validation / future feature):**
+**Adaptive & operational (shipped):**
 
-4. **`_alert_firing` signal** reads active Central alerts best-effort (mode-aware,
-   cached, holds when unknown) — validate end-to-end against the live poller for
-   centralized vs distributed tenants once exercised.
-5. **`quota_at_max_not_firing` / `placement_under_min`** currently surface as UI
-   badges/banner; wire them into the internal **alert feature** as emitters when
-   it ships (§14).
+- **30-min settle floor** — `settle` floored at 1800s (Central alert latency), clock
+  starts at cold-start (§9).
+- **Cell → site firing resolution** in `_alert_firing` (§9).
+- **Harvest window** — `HARVEST_WINDOW_S = 1800s` (§12).
+- **Ignored hostnames** — filtered from pool/ledger/counts/eligibility (§8).
+- **Pool count** — cheap `pool_counts()` (online / assignable / per-site) in Quota
+  State, no accounting.
+- **Reset & Reshuffle** — `engine.reset()` clears ledger + engine overrides and
+  reconciles fresh; `CS_RESET_SIM_QUOTA` → hub `POST /sim-quota-reset` → button.
+- **UI display key fix** — Quota State `keyOf` handles the untethered
+  `sim:{sim}:{site}` case (was showing 0/N + phantom "RELEASING").
+
+**Client-script sims (shipped, `clients/linux/*`, VERSION-gated):**
+
+- **`dns_fail`** — fire-and-forget rapid DNS failures (readable rewrite).
+- **`dhcp_fail`** — MAC spoof to `00:01:00:00:<real last 2 octets>` while on,
+  restore real (permanent) MAC when off.
+- **`ssidpw_fail`** — wrong password = **effective** ssidpw (`[username]`/cell
+  wins over bucket) + suffix; restore reconnects with the correct cell password.
+- **802.1X** — `connect_1x()` (PEAP/MSCHAPv2, identity = short username, no cert
+  validation); `connect_wifi()` dispatches to it when the cell auth is `1X`;
+  `ssidpw_fail` flows through it automatically.
+- Dead `mac_id` (unused crc32 MAC) removed.
+
+**Remaining / future:**
+
+- `_alert_firing` — validate end-to-end against the live poller (centralized vs
+  distributed) once exercised at scale.
+- `quota_at_max_not_firing` / `placement_under_min` — surface as UI badges today;
+  wire into the internal **alert feature** when it ships (§14).
+- Weighted-rule **learning indicator** parity for non-adaptive cells (nice-to-have).
 
 ---
 
-## 16. Suggested build order (low → high client risk)
-
-1. **Hub + spoke, no client change:** SSID matrix + placement quotas + site
-   source (PXMX injection) + adaptive controller + warnings + reported-bucket
-   trust. Fully testable server-side; old clients ignore what they don't read.
-2. **Client scripts (VERSION-gated):** ambient bucket rotation + `random_pool`
-   honoring + frozen connectivity. Rolls out gradually via `update.sh`;
-   backward-safe (old clients keep their crc32 bucket).
-3. **Learning + indicators + operator visibility** polish.
-
----
-
-*Design agreed iteratively; this doc is the build reference. Update it as the
-implementation lands (keep §15 current).*
+*This doc is the authoritative model. Keep §15 current as changes land.*
