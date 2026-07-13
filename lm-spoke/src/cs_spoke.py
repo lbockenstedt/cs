@@ -863,18 +863,36 @@ class CSSpoke(BaseSpoke):
             action = str(d.get("action") or "").strip()
             if not action:
                 return {"status": "ERROR", "message": "missing 'action'"}
+            # Fleet-broadcast actions must reach EVERY connected pxmx agent, not
+            # just the first to poll. A single target="proxmox" command matches
+            # any host but poll_agent_inbox marks it delivered on the first poll,
+            # so only one server would act. Enqueue one copy per connected agent
+            # hostname (target=hostname) so all servers run it in parallel.
+            _FLEET = {"proxmox_reclone_all", "proxmox_reclone_stop"}
+            targets = [target]
+            if target == "proxmox" and action in _FLEET and self.control_plane:
+                hns = [info.get("hostname") for info in
+                       (self.control_plane.connected_agents or {}).values()
+                       if info.get("hostname")]
+                if hns:
+                    targets = sorted(set(hns))
             try:
-                res = await self.queue.enqueue(target, action,
-                                               d.get("args") or {},
-                                               command_type=d.get("type"))
+                results = []
+                for tgt in targets:
+                    res = await self.queue.enqueue(tgt, action,
+                                                   d.get("args") or {},
+                                                   command_type=d.get("type"))
+                    results.append(res)
+                    # Live-deliver to that host's connected WS agent (best-effort).
+                    await client_api.push_pending(self, tgt)
             except ValueError as exc:
                 # Safeguard refusal (protected vmid / below sim floor).
                 return {"status": "ERROR", "message": str(exc)}
-            # Live-deliver to a connected client WS agent (no waiting for sync).
-            await client_api.push_pending(self, target)
-            return {"status": "SUCCESS", "command": res["command"],
-                    "created": res["created"], "expired": res["expired"],
-                    "purged": res["purged"]}
+            first = results[0] if results else {"command": None, "expired": 0, "purged": 0}
+            return {"status": "SUCCESS", "command": first["command"],
+                    "created": sum(1 for r in results if r.get("created")),
+                    "queued_targets": len(results),
+                    "expired": first["expired"], "purged": first["purged"]}
 
         if cmd == "CS_POLL_AGENT_INBOX":
             hostname = str(d.get("hostname") or "").strip()
