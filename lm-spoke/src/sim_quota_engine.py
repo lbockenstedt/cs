@@ -60,6 +60,10 @@ def _quota_key(q: Dict[str, Any]) -> str:
     # alone, so it never collides with an alert-driven sim quota's ledger entry.
     if not (q.get("sim_id") or ""):
         return f"presence::{q.get('site', '')}"
+    # An untethered sim quota (sim_id set, no alert_id) is keyed by sim+site so
+    # two untethered quotas for different sims at a site don't collide.
+    if not (q.get("alert_id") or ""):
+        return f"sim:{q.get('sim_id', '')}:{q.get('site', '')}"
     return f"{q.get('alert_type', 'alert')}:{q.get('alert_id', '')}:{q.get('site', '')}"
 
 

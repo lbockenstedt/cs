@@ -2443,6 +2443,7 @@ function csSimQuotaRowFromServer(q) {
         multi_capable: !!q.multi_capable,
         rehome: !!q.rehome,
         enabled: !!q.enabled,
+        tied: !!(q.sim_id && q.alert_id),
     };
 }
 
@@ -2499,6 +2500,10 @@ function csRenderSimQuotaEditor() {
     const suggested = cat.suggested || {};
     const rowHtml = csSimQuotaRows.map((r, i) => {
         const isPresence = !r.sim_id;
+        // A non-presence quota may be UNTETHERED (not tied to an alert/insight):
+        // then no alert ID is needed — it just keeps N clients on the sim at the
+        // site, like a presence row. tied defaults on for backward compat.
+        const tied = !isPresence && r.tied !== false;
         const simOpts = csSimQuotaSimOptions(r.sim_id, simIds);
         const siteOpts = csSimQuotaSelect(r.site, sites, '— all sites —');
         const idOpts = csSimQuotaAlertIdOptions(r.alert_type, r.alert_id);
@@ -2506,19 +2511,27 @@ function csRenderSimQuotaEditor() {
             ? `<label class="text-xs text-slate-500" data-cs-sq-presence-note>Presence
                 <div class="text-[11px] text-slate-400 italic mt-1 leading-tight">Homes N clients to the site — no sim. They stay free for stackable sims.</div>
               </label>`
-            : `<label class="text-xs text-slate-500">Type
+            : (!tied
+              ? `<label class="text-xs text-slate-500">Type
+                <div class="text-[11px] text-slate-400 italic mt-1 leading-tight">— not tied to an alert/insight —</div>
+              </label>`
+              : `<label class="text-xs text-slate-500">Type
                 <select data-cs-sq="alert_type" onchange="csSimQuotaOnTypeChange(this)" class="w-full bg-white border border-slate-300 rounded-md px-2 py-1.5 text-sm mt-1">
                   <option value="alert" ${r.alert_type === 'alert' ? 'selected' : ''}>Alert</option>
                   <option value="insight" ${r.alert_type === 'insight' ? 'selected' : ''}>Insight</option>
                 </select>
-              </label>`;
+              </label>`);
         const idCell = isPresence
             ? `<label class="text-xs text-slate-500">Alert / Insight ID
                 <div class="text-[11px] text-slate-400 italic mt-1 leading-tight">— none (presence) —</div>
               </label>`
-            : `<label class="text-xs text-slate-500">Alert / Insight ID
+            : (!tied
+              ? `<label class="text-xs text-slate-500">Alert / Insight ID
+                <div class="text-[11px] text-slate-400 italic mt-1 leading-tight">— not required —</div>
+              </label>`
+              : `<label class="text-xs text-slate-500">Alert / Insight ID
                 <select data-cs-sq="alert_id" class="w-full bg-white border border-slate-300 rounded-md px-2 py-1.5 text-sm mt-1">${idOpts}</select>
-              </label>`;
+              </label>`);
         return `<div class="grid grid-cols-1 md:grid-cols-7 gap-2 items-end bg-white border border-slate-200 rounded-md p-2" data-cs-sqrow="${i}">
           ${alertCell}
           ${idCell}
@@ -2532,6 +2545,7 @@ function csRenderSimQuotaEditor() {
             <select data-cs-sq="site" class="w-full bg-white border border-slate-300 rounded-md px-2 py-1.5 text-sm mt-1">${siteOpts}</select>
           </label>
           <label class="text-xs text-slate-500 flex flex-col gap-1">
+            ${isPresence ? '' : `<span class="flex items-center gap-1"><input data-cs-sq="tied" type="checkbox" onchange="csSimQuotaOnTiedChange(this)" ${tied ? 'checked' : ''}> Tied to alert/insight</span>`}
             <span class="flex items-center gap-1"><input data-cs-sq="multi_capable" type="checkbox" ${isPresence ? 'checked disabled' : (r.multi_capable ? 'checked' : '')}> Multi-capable</span>
             <span class="flex items-center gap-1"><input data-cs-sq="rehome" type="checkbox" ${r.rehome ? 'checked' : ''}> Re-home</span>
             <span class="flex items-center gap-1"><input data-cs-sq="enabled" type="checkbox" ${r.enabled ? 'checked' : ''}> Enabled</span>
@@ -2571,20 +2585,34 @@ function csSimQuotaSyncFromDom() {
         // A presence row (Clients Associated) has no Type / Alert ID controls
         // (they're replaced by static labels) — nullish-guard so the sync
         // doesn't throw and preserves alert_type/alert_id defaults.
+        const sim_id = g('sim_id').value;
+        const tied = sim_id ? !!(g('tied') || {}).checked : false;
         rows.push({
             alert_type: (g('alert_type') || {}).value || 'alert',
-            alert_id: ((g('alert_id') || {}).value || '').trim(),
-            sim_id: g('sim_id').value,
+            alert_id: tied ? ((g('alert_id') || {}).value || '').trim() : '',
+            sim_id,
             count: parseInt(g('count').value || '1', 10) || 1,
             site: g('site').value,
             multi_capable: !!g('multi_capable').checked,
             rehome: !!g('rehome').checked,
             enabled: !!g('enabled').checked,
+            tied,
         });
     });
     csSimQuotaRows = rows;
     return rows;
 }
+
+// Toggling a row's "Tied to alert/insight" flips whether Type / Alert ID show.
+window.csSimQuotaOnTiedChange = function (cb) {
+    csSimQuotaSyncFromDom();
+    const row = cb && cb.closest('[data-cs-sqrow]');
+    if (row) {
+        const idx = parseInt(row.getAttribute('data-cs-sqrow'), 10);
+        if (csSimQuotaRows[idx]) csSimQuotaRows[idx].tied = !!cb.checked;
+    }
+    csRenderSimQuotaEditor();
+};
 
 window.csSimQuotaAdd = function (preset) {
     csSimQuotaSyncFromDom();
@@ -2598,6 +2626,7 @@ window.csSimQuotaAdd = function (preset) {
         multi_capable: p.multi_capable != null ? !!p.multi_capable : false,
         rehome: p.rehome != null ? !!p.rehome : false,
         enabled: p.enabled != null ? !!p.enabled : false,
+        tied: p.tied != null ? !!p.tied : true,
     });
     csRenderSimQuotaEditor();
 };
