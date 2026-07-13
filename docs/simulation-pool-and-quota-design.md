@@ -7,6 +7,28 @@ ad-hoc bucket behavior where the two conflict.
 
 ---
 
+## 0. Multi-spoke tenants (tenant-wide coordination)
+
+A tenant may bind **several Client-Sim spokes** (e.g. `cs-svr-02/03/04`), each an
+independent spoke with its own client registry + SimQuotaEngine + pxmx agent.
+The pool/quota model is **tenant-wide across all of them**:
+
+- **Config writes** fan out to every spoke (`get_client_sim_spokes`).
+- **Reads aggregate** across spokes: `_cs_forward_all` merges the pxmx-site-map +
+  agents (so all servers show/are assignable) and sums the Quota-State ledgers
+  into tenant totals.
+- **Target splitting:** on push, each quota/placement target `N` is apportioned
+  across the spokes **proportional to each spoke's pool size** (largest-remainder,
+  sum == `N`). So "hold 10" is 10 tenant-wide, not 10 per spoke; each spoke fills
+  its share from its own clients and Quota State sums the ledgers back to `N`.
+
+**Site Links** (Config → PXMX Sites): tie a sim `wsite` (SSID prefix, `MIA`) to a
+Central site name (`Miami`) with a friendly Name. The Name shows in the pxmx
+assignment dropdown (value = `wsite`), and `_alert_firing` maps a quota's `wsite`
+to its Central site so alert-driven quotas match where the alert fires.
+
+---
+
 ## 1. Purpose
 
 Run a large client-sim fleet (~5,000 boxes) where:
