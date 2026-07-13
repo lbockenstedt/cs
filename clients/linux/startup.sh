@@ -110,10 +110,6 @@ wladapter=$(ip -br a | grep "wlx\|wlan" | cut -d ' ' -f '1')
 eadapter=$(ip -br a | grep "enp\|eno\|eth0\|eth1\|eth2\|eth3\|eth4\|eth5\|eth6\|ens" | cut -d ' ' -f '1')
 if [[ -n ${wladapter} ]]; then echo WLAN Adapter name $wladapter | tee -a /usr/local/scripts/sim.log; fi
 if [[ -n ${eadapter} ]]; then echo Wired Adapter name $eadapter | tee -a /usr/local/scripts/sim.log; fi
-#------------------------------------------------------------
-#Changing the MAC Address of the wireless adapter
-#------------------------------------------------------------
-mac_id=$(python3 -c "import zlib; h=zlib.crc32('${username}'.encode())&0xFFFFFF; print(f'bc:07:1d:{h>>16:02x}:{(h>>8)&0xff:02x}:{h&0xff:02x}')")
 if [[ -n ${wladapter} ]]; then sudo ip link set dev $wladapter up; fi
 if [[ -n ${eadapter} ]]; then sudo ip link set dev $eadapter up; fi
 echo -----------------------------| tee -a /usr/local/scripts/sim.log

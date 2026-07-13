@@ -385,7 +385,6 @@ connect_wifi 30
 echo Disabling unused interface | tee -a ${LOG_FILE}
 if [[ "$sim_phy" == "ethernet" ]]; then sudo ip link set dev $wladapter down; fi
 if [[ "$sim_phy" == "wireless" ]]; then ea_down; fi
-mac_id=$(python3 -c "import zlib; h=zlib.crc32('${username}'.encode())&0xFFFFFF; print(f'bc:07:1d:{h>>16:02x}:{(h>>8)&0xff:02x}:{h&0xff:02x}')")
 #------------------------------------------------------------
 #Checking to see if the default gateway is reachable
 #------------------------------------------------------------
