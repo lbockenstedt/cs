@@ -14,6 +14,14 @@ source '/usr/local/scripts/ini-parser.sh'
 process_ini_file '/usr/local/scripts/simulation.conf'
 iperf_server=$(get_value 'address' 'iperf_server')
 iperf_bw=$(get_value 'simulation' 'iperf_bw')
+# Per-user overrides — mirror simulation.sh's apply_override so a
+# user-overrides.conf [username] override of iperf_server / iperf_bw reaches the
+# iperf run. Without this iperf.sh used ONLY the global [address]/[simulation]
+# values and ignored the per-user override simulation.sh honors.
+username=$(echo "$HOSTNAME" | cut -d "-" -f 1)
+apply_override() { local v; v=$(get_value "$username" "$1"); [[ -n "$v" ]] && declare -g "$1=$v"; }
+apply_override iperf_server
+apply_override iperf_bw
 rn_iperf_port=$((5201 + RANDOM % 10))
 rn_iperf_time=$((1 + RANDOM % 300))
 if [[ -z "$iperf_server" ]]; then
