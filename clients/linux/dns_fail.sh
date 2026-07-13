@@ -16,6 +16,26 @@ dns_bad_ip_3=$(get_value 'address' 'dns_bad_ip_3')
 dns_bad_record_1=$(get_value 'address' 'dns_bad_record_1')
 dns_bad_record_2=$(get_value 'address' 'dns_bad_record_2')
 dns_bad_record_3=$(get_value 'address' 'dns_bad_record_3')
+#------------------------------------------------------------
+# Per-user overrides — mirror simulation.sh's apply_override so a
+# user-overrides.conf [username] override of a DNS server (dns_bad_ip /
+# dns_bad_record / dns_latency) actually reaches the dig loop. Without this,
+# dns_fail.sh used ONLY the global [address] values and silently ignored any
+# per-user override that simulation.sh honors. Username = hostname prefix
+# before the first '-' (same derivation as simulation.sh).
+#------------------------------------------------------------
+username=$(echo "$HOSTNAME" | cut -d "-" -f 1)
+apply_override() {
+  local var=$1
+  local val
+  val=$(get_value "$username" "$var")
+  [[ -n ${val} ]] && declare -g "$var=$val"
+}
+for key in dns_latency_1 dns_latency_2 dns_latency_3 \
+           dns_bad_ip_1 dns_bad_ip_2 dns_bad_ip_3 \
+           dns_bad_record_1 dns_bad_record_2 dns_bad_record_3; do
+  apply_override "$key"
+done
 bad_records=($dns_bad_record_1 $dns_bad_record_2 $dns_bad_record_3)
 bad_ips=($dns_bad_ip_1 $dns_bad_ip_2 $dns_bad_ip_3)
 latencies=($dns_latency_1 $dns_latency_2 $dns_latency_3)
