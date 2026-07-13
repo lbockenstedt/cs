@@ -5102,8 +5102,23 @@ async function csRenderVmServerQueue(live) {
     // Filter the queue to the selected host(s); empty selection = all hosts.
     const _scope = csVmSelectedHosts();
     const _scopeHosts = new Set(_scope.map(h => h.hostname || h.spoke_hostname || h.spoke_id));
-    const shown = csVmSelectedHostIds.length ? cmds.filter(c => _scopeHosts.has(c.target)) : cmds;
-    const rows = shown.map(c => `<tr>
+    const _filtered = csVmSelectedHostIds.length ? cmds.filter(c => _scopeHosts.has(c.target)) : cmds;
+    // Newest on top: sort by created_at desc (fall back to age_secs asc when
+    // created_at is absent — smaller age = newer). A mass-delete dump is far
+    // easier to triage when the freshest commands sit at the top.
+    const shown = _filtered.slice().sort((a, b) => {
+        const ca = Number(a.created_at || 0), cb = Number(b.created_at || 0);
+        if (ca && cb) return cb - ca;
+        const aa = Number(a.age_secs != null ? a.age_secs : 1e18);
+        const ab = Number(b.age_secs != null ? b.age_secs : 1e18);
+        return aa - ab;
+    });
+    const rows = shown.map(c => {
+        // Second row: the command string (action + args JSON) so an operator
+        // can see WHAT a queued command will do, e.g. `delete_vm {"vmid":90075}`.
+        const _argsStr = (() => { try { return c.args ? JSON.stringify(c.args) : ''; } catch (e) { return ''; } })();
+        const _cmdStr = `${c.action || ''}${_argsStr ? ' ' + _argsStr : ''}`;
+        return `<tr>
       <td class="px-3 py-2 font-mono text-xs">${csEscape(c.id ? c.id.slice(0,8) : '—')}</td>
       <td class="px-3 py-2 text-sm">${csEscape(c.action || '—')}</td>
       <td class="px-3 py-2 font-mono text-xs">${csEscape(c.target || '—')}</td>
@@ -5112,7 +5127,10 @@ async function csRenderVmServerQueue(live) {
       <td class="px-3 py-2 text-slate-500 text-xs">${csEscape(c.message || '—')}</td>
       <td class="px-3 py-2"><button data-cs-cmd-id="${csEscape(c.id || '')}" onclick="csCmdDelete(this)"
         class="bg-red-100 hover:bg-red-200 text-red-700 px-2 py-1 rounded-md text-[11px] font-bold">Delete</button></td>
-    </tr>`).join('');
+    </tr><tr class="bg-slate-50/60">
+      <td colspan="7" class="px-3 pb-2 pt-0 font-mono text-[11px] text-slate-500 break-all">${csEscape(_cmdStr || '—')}</td>
+    </tr>`;
+    }).join('');
     const sendForm = `<div class="hpe-card rounded-lg p-4 shadow-sm mb-4">
       <p class="text-[11px] font-bold text-slate-400 uppercase tracking-wider mb-2">Send Proxmox Command</p>
       <div class="flex flex-wrap gap-2 items-end text-sm">
