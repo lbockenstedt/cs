@@ -387,7 +387,7 @@ class SimQuotaEngine:
         if site and site != from_site:
             overrides["wsite"] = site
         if overrides:
-            await reg.set_overrides(hostname, overrides)
+            await self._engine_set(hostname, overrides)
         logger.info("SimQuotaEngine: assigned %s → sim=%s site=%s (from %s)",
                     hostname, sim_id or "(presence)", site or "*", from_site or "*")
 
@@ -396,29 +396,60 @@ class SimQuotaEngine:
         reg = self._registry()
         if reg is None:
             return
-        # Turn the sim off (reverts to bucket default via registry prune) and
-        # restore the pre-assignment site if the engine re-homed it — UNLESS
-        # another ledger entry still re-homes this client (multi_capable
-        # packing can stack re-homing quotas on one client), in which case keep
-        # wsite at that other quota's target so releasing one doesn't undo the
-        # other's re-home. A PRESENCE quota (sim_id empty) sets NO sim flag —
-        # only the wsite revert applies.
-        overrides: Dict[str, Any] = {}
+        # Revert the sim flag by DELETION so the client returns to its bucket
+        # default (ON or OFF) — setting "off" would linger as a real override
+        # when the bucket default is ON, keeping a released sim forced off
+        # instead of reverting (the old "reverts to bucket default via registry
+        # prune" only pruned when the bucket was off). _engine_remove is a no-op
+        # when the engine doesn't own the key (e.g. a human reclaimed the sim
+        # mid-assignment). A PRESENCE quota (sim_id empty) sets NO sim flag.
         if sim_id:
-            overrides[sim_id] = "off"
+            await self._engine_remove(hostname, [sim_id])
+        # Restore the pre-assignment site UNLESS another ledger entry still
+        # re-homes this client (multi_capable packing can stack re-homing
+        # quotas on one client), in which case keep wsite at that other quota's
+        # target so releasing one doesn't undo the other's re-home. A manual
+        # operator wsite pin is preserved (revert target == the from_site
+        # _natural_site captured at assign, which honors a manual wsite).
         c = reg.get(hostname) or {}
         cur_site = self._effective_site(hostname, c)
         target = (self._remaining_rehome_target(hostname, quota_key)
                   if quota_key else None)
         if target:
             if cur_site != target:
-                overrides["wsite"] = target
+                await self._engine_set(hostname, {"wsite": target})
         elif from_site and cur_site != from_site:
-            overrides["wsite"] = from_site
-        if overrides:
-            await reg.set_overrides(hostname, overrides)
+            await self._engine_set(hostname, {"wsite": from_site})
         logger.info("SimQuotaEngine: released %s ← sim=%s (site %s)",
                     hostname, sim_id or "(presence)", target or from_site or "*")
+
+    async def _engine_set(self, hostname: str, overrides: Dict[str, Any]) -> None:
+        """Set engine-owned overrides, recording provenance in ``engine_keys``
+        so the reconcile tail can later remove ONLY keys the engine set (never
+        a human manual pin). Falls back to plain ``set_overrides`` for
+        fake/test registries that don't track provenance (behavior identical
+        minus the engine_keys bookkeeping)."""
+        reg = self._registry()
+        if reg is None:
+            return
+        if hasattr(reg, "set_engine_overrides"):
+            await reg.set_engine_overrides(hostname, overrides)
+        else:
+            await reg.set_overrides(hostname, overrides)
+
+    async def _engine_remove(self, hostname: str, keys: List[str]) -> None:
+        """Revert engine-owned keys by DELETION (return to bucket default).
+        Falls back to setting each key ``"off"`` for fakes without
+        ``remove_engine_keys`` — matches the pre-provenance release behavior
+        (and the fake's set_overrides doesn't prune, so the "off" lingers in
+        the fake exactly as it did before)."""
+        reg = self._registry()
+        if reg is None:
+            return
+        if hasattr(reg, "remove_engine_keys"):
+            await reg.remove_engine_keys(hostname, keys)
+        else:
+            await reg.set_overrides(hostname, {k: "off" for k in keys})
 
     def _remaining_rehome_target(self, hostname: str,
                                  excluding_key: Optional[str]) -> Optional[str]:
@@ -693,10 +724,77 @@ class SimQuotaEngine:
                         await self._release(h, sim_id, from_site, key)
                         actions["released"] += 1
 
+            # Reconcile engine-owned override keys against the ledger: drop
+            # orphaned engine-set sim flags (a transient _release failure left
+            # sim_id=on after the ledger entry was dropped) and re-prune every
+            # client's on/off overrides against the CURRENT bucket default
+            # (set_overrides prunes at write time; this catches flags that
+            # became no-ops when the bucket config changed). Both are pure
+            # hygiene — the engine removes only keys it set (provenance via
+            # engine_keys) and only on/off flags matching the bucket, so a
+            # human manual pin is never touched and served config is unchanged.
+            await self._reconcile_engine_keys(clients)
+            await self._reconcile_prune_defaults(clients)
+
             self._save_ledger()
             if any(actions.values()):
                 logger.info("SimQuotaEngine reconcile: %s", actions)
             return actions
+
+    # ── override hygiene (provenance + bucket re-prune) ──────────────────────
+    async def _reconcile_engine_keys(self, clients: Dict[str, Any]) -> None:
+        """Remove engine-set sim_id overrides the ledger no longer claims.
+
+        Closes the missed-_release leak: if ``_release`` silently failed (a
+        transient registry error) the ledger entry was dropped but the
+        ``sim_id=on`` override it set lingered, so the client kept running a
+        sim no quota was paying for. The engine removes ONLY sim_id keys it
+        recorded in ``engine_keys`` that are STILL "on" AND no longer claimed
+        by any ledger entry: a human manual pin is never in ``engine_keys``,
+        and a human "off" (which made the quota loop drop the ledger entry at
+        ``not _has_sim_on``) is left untouched — reverting it is the re-prune
+        pass's job, and only when it matches the bucket. ``wsite`` is
+        reconciled by ``_release``'s from_site revert, not here (a stale
+        ``engine_keys`` wsite entry with no override is a no-op)."""
+        reg = self._registry()
+        if reg is None or not hasattr(reg, "remove_engine_keys"):
+            return
+        for hostname, c in clients.items():
+            eng = list((c.get("engine_keys") or []))
+            if not eng:
+                continue
+            claimed = self._engine_sims_for(hostname)
+            ov = c.get("overrides") or {}
+            orphans = [k for k in eng
+                       if k != "wsite" and k not in claimed
+                       and str(ov.get(k, "")).strip().lower() == "on"]
+            if orphans:
+                await reg.remove_engine_keys(hostname, orphans)
+                logger.debug("SimQuotaEngine: removed orphan engine keys %s for %s",
+                             orphans, hostname)
+
+    async def _reconcile_prune_defaults(self, clients: Dict[str, Any]) -> None:
+        """Re-prune every client's on/off overrides against the CURRENT bucket
+        default. ``set_overrides`` prunes at write time; this catches flags
+        that became no-ops because the bucket default changed LATER (a flag
+        pinned "off" when the bucket was on is redundant once the bucket
+        flips off, so the prune drops it and the override object stays a true
+        diff over the bucket). Only removes overrides matching the bucket —
+        served config is unchanged. Skips clients with no on/off flags."""
+        reg = self._registry()
+        if reg is None or not hasattr(reg, "prune_against_bucket"):
+            return
+        for hostname, c in clients.items():
+            ov = c.get("overrides") or {}
+            if not ov:
+                continue
+            if not any(str(v).strip().lower() in ("on", "off") for v in ov.values()):
+                continue
+            try:
+                await reg.prune_against_bucket(hostname)
+            except Exception as exc:  # noqa: BLE001 — hygiene pass must not kill the sweep
+                logger.debug("SimQuotaEngine: re-prune failed for %s: %s",
+                             hostname, exc)
 
     # ── loop ─────────────────────────────────────────────────────────────────
     def start(self) -> None:

@@ -146,6 +146,48 @@ class ClientRegistry:
         return len(self.clients)
 
     # ── per-client overrides ───────────────────────────────────────────────
+    def _bucket_profile(self, hostname: str) -> Optional[Dict[str, Any]]:
+        """Resolve the pure simulation.conf bucket default profile for
+        *hostname*, or ``None`` on failure. A failed resolve MUST return None
+        so callers skip pruning entirely (an empty profile would treat every
+        key as "off" and wrongly prune "off" overrides — a toggle must never
+        be silently dropped on an I/O hiccup)."""
+        if not self._bucket_resolver:
+            return None
+        try:
+            return self._bucket_resolver(hostname) or {}
+        except Exception as exc:  # noqa: BLE001 — never block a toggle
+            logger.warning("bucket resolve failed for %s: %s — skip prune",
+                           hostname, exc)
+            return None
+
+    def _prune_redundant(self, cur: Dict[str, Any], hostname: str) -> None:
+        """In-place: drop on/off overrides that match the pure bucket default.
+
+        This is the "turn off a sim → it reverts to the bucket default →
+        remove the override entry" behaviour: without it, every toggle-off
+        leaves a ``flag:"off"`` entry that masks the bucket, so the override
+        object grows to mirror the bucket instead of being a diff. An
+        override that genuinely deviates (e.g. turning OFF a sim the bucket
+        has ON) is kept. Only on/off sim-toggle flags are prune candidates —
+        free-form overrides (``wsite="MIA"``, ``ssid="…"``, ``simulation_id``
+        …) are never pruned (a bucket default of "" would delete them the
+        instant they're written); the SimQuotaEngine re-home sets
+        ``wsite=<quota site>`` and that MUST survive. No-op when *cur* is
+        empty or no resolver is wired (tests / standalone registry)."""
+        if not cur:
+            return
+        profile = self._bucket_profile(hostname)
+        if profile is None:
+            return
+        for flag in list(cur.keys()):
+            ov_val = str(cur[flag]).strip().lower()
+            if ov_val not in ("on", "off"):
+                continue
+            bucket_on = str(profile.get(flag, "")).strip().lower() == "on"
+            if bucket_on == (ov_val == "on"):
+                del cur[flag]
+
     async def set_overrides(self, hostname: str, overrides: Dict[str, Any]) -> Dict[str, Any]:
         hostname = str(hostname or "").strip()
         async with self._lock:
@@ -159,44 +201,107 @@ class ClientRegistry:
             cur = dict(entry.get("overrides") or {})
             if isinstance(overrides, dict):
                 cur.update(overrides)
-            # PRUNE redundant overrides: drop any key whose on/off value matches
-            # the pure simulation.conf bucket default for this hostname. This is
-            # the "turn off a sim → it reverts to the bucket default → remove the
-            # override entry" behaviour: without it, every toggle-off leaves a
-            # `flag:"off"` entry that masks the bucket, so the override object
-            # grows to mirror the bucket instead of being a diff. An override that
-            # genuinely deviates from the bucket (e.g. turning OFF a sim the
-            # bucket has ON) is kept. Best-effort: a resolver failure leaves the
-            # merged overrides intact (never blocks a toggle).
-            if self._bucket_resolver and cur:
-                profile = None
-                try:
-                    profile = self._bucket_resolver(hostname) or {}
-                except Exception as exc:  # noqa: BLE001 — never block a toggle
-                    logger.warning("bucket resolve failed for %s: %s — skip prune",
-                                   hostname, exc)
-                # Only prune when we actually resolved the bucket; a failed
-                # resolve MUST leave the merged overrides intact (an empty
-                # profile would treat every key as "off" and wrongly prune
-                # "off" overrides — a toggle must never be silently dropped on
-                # an I/O hiccup).
-                if profile is not None:
-                    for flag in list(cur.keys()):
-                        ov_val = str(cur[flag]).strip().lower()
-                        # Only on/off sim-toggle flags are prune candidates. Other
-                        # overrides are free-form strings the bucket doesn't model
-                        # as toggles (e.g. wsite="MIA", ssid="…", simulation_id="s3")
-                        # — pruning those against a bucket default of "" (→ False)
-                        # would delete them whenever their value also isn't "on"
-                        # (False==False), silently dropping every non-toggle
-                        # override the instant it's written. The SimQuotaEngine
-                        # re-home sets wsite=<quota site>; that MUST survive.
-                        if ov_val not in ("on", "off"):
-                            continue
-                        bucket_on = str(profile.get(flag, "")).strip().lower() == "on"
-                        if bucket_on == (ov_val == "on"):
-                            del cur[flag]
+            self._prune_redundant(cur, hostname)
             entry["overrides"] = cur
+            self.clients[hostname] = entry
+            await self._apersist()
+            return dict(entry)
+
+    async def set_engine_overrides(self, hostname: str,
+                                   overrides: Dict[str, Any]) -> Dict[str, Any]:
+        """Set overrides the SimQuotaEngine owns and record provenance.
+
+        Same merge+prune as ``set_overrides``, but ALSO records the keys set
+        into ``engine_keys`` so a later reconcile can remove ONLY engine-set
+        keys the ledger no longer claims — never a human manual pin (a pin
+        written via ``set_overrides`` / the Control Panel is never added to
+        ``engine_keys``). The engine owns ``sim_id`` (the sim flag it toggles
+        on) and ``wsite`` (a re-home) on its ledger clients. Keys pruned away
+        by the bucket-default match are dropped from ``engine_keys`` too
+        (there's nothing to revert)."""
+        hostname = str(hostname or "").strip()
+        async with self._lock:
+            entry = self.clients.setdefault(hostname, {"hostname": hostname})
+            entry["hostname"] = hostname
+            cur = dict(entry.get("overrides") or {})
+            eng = list(entry.get("engine_keys") or [])
+            if isinstance(overrides, dict):
+                cur.update(overrides)
+                for k in overrides:
+                    if k not in eng:
+                        eng.append(k)
+            self._prune_redundant(cur, hostname)
+            # A key pruned (matched the bucket default) is no longer an
+            # override — drop it from engine_keys so reconcile doesn't try to
+            # remove a key that isn't there.
+            eng = [k for k in eng if k in cur]
+            entry["overrides"] = cur
+            entry["engine_keys"] = eng
+            self.clients[hostname] = entry
+            await self._apersist()
+            return dict(entry)
+
+    async def remove_engine_keys(self, hostname: str,
+                                 keys: List[str]) -> Dict[str, Any]:
+        """Remove keys the engine owns from both ``overrides`` and
+        ``engine_keys`` — revert to the bucket default by DELETION, not by
+        setting ``"off"`` (which lingers as a real override when the bucket
+        default is ON, keeping a released sim forced off instead of
+        reverting). Called by the SimQuotaEngine reconcile tail for
+        engine-set keys the ledger no longer claims (the missed-_release
+        leak). No-op for a key not present."""
+        hostname = str(hostname or "").strip()
+        keys = list(keys or [])
+        if not keys:
+            return {}
+        async with self._lock:
+            entry = self.clients.get(hostname)
+            if entry is None:
+                return {}
+            cur = dict(entry.get("overrides") or {})
+            eng = list(entry.get("engine_keys") or [])
+            changed = False
+            for k in keys:
+                if k in cur:
+                    del cur[k]
+                    changed = True
+                if k in eng:
+                    eng.remove(k)
+                    changed = True
+            if changed:
+                entry["overrides"] = cur
+                entry["engine_keys"] = eng
+                self.clients[hostname] = entry
+                await self._apersist()
+            return dict(entry)
+
+    async def prune_against_bucket(self, hostname: str) -> Dict[str, Any]:
+        """Re-prune this client's on/off overrides against the CURRENT bucket
+        default — drop flags that now match the bucket (no-ops).
+        ``set_overrides`` prunes at write time; this catches flags that
+        became redundant because the bucket default changed LATER (e.g. a
+        sim flag pinned "off" when the bucket was on is no longer a
+        deviation once the bucket flips off). Called by the SimQuotaEngine
+        sweep. Only removes overrides that match the bucket, so the served
+        config is unchanged. Non-toggle overrides (wsite/ssid/…) are never
+        pruned. Also drops any engine_keys that the prune removed."""
+        hostname = str(hostname or "").strip()
+        async with self._lock:
+            entry = self.clients.get(hostname)
+            if entry is None:
+                return {}
+            cur = dict(entry.get("overrides") or {})
+            if not cur:
+                return dict(entry)
+            before = dict(cur)
+            self._prune_redundant(cur, hostname)
+            if cur == before:
+                return dict(entry)
+            entry["overrides"] = cur
+            eng = entry.get("engine_keys") or []
+            new_eng = [k for k in eng if k in cur]
+            if new_eng != eng:
+                entry["engine_keys"] = new_eng
             self.clients[hostname] = entry
             await self._apersist()
             return dict(entry)
