@@ -1,5 +1,5 @@
 #!/bin/bash
-version=.03
+version=.04
 log="/usr/local/scripts/sim.log"
 debug="/usr/local/scripts/debug-update.log"
 echo DNS Failure Script Version $version | tee "$debug"
@@ -39,14 +39,56 @@ done
 bad_records=($dns_bad_record_1 $dns_bad_record_2 $dns_bad_record_3)
 bad_ips=($dns_bad_ip_1 $dns_bad_ip_2 $dns_bad_ip_3)
 latencies=($dns_latency_1 $dns_latency_2 $dns_latency_3)
-for i in {1..10}; do
-  for r in $dnsfile; do
-   echo $(date) | tee -a "$debug"
-   echo Running DNS Failure: | tee -a "$debug"
-   echo $r | tee -a "$debug"
-   for server in "${bad_records[@]}" "${bad_ips[@]}" "${latencies[@]}"; do
-     dig @$server $r
-   done
-   sleep 5
+#------------------------------------------------------------
+# Fire-and-forget DNS failures
+#
+# Central's DNS-failure alarm is rate-based: it needs roughly 200 failed
+# lookups per minute before it trips. The servers above are unreachable or slow
+# on purpose (the bad_ip ones are RFC1918 blackholes), so a normal 'dig' would
+# sit and WAIT on its timeout and we'd only manage a handful per minute -- the
+# alarm would never fire.
+#
+# Instead we launch every 'dig' in the background with '&' and never wait for
+# the answer. The failure is the point, not the reply. We give each 'dig' a
+# 1-second timeout so the background lookups clear quickly instead of piling
+# up, and we pause a fraction of a second between launches to set the rate.
+#------------------------------------------------------------
+
+# How fast to fire (lookups per minute) and how long to keep firing (seconds).
+# Both are read from simulation.conf [simulation]; if unset we use safe
+# defaults. The rate is never allowed below the ~200/min the alarm needs.
+rate_per_minute=$(get_value 'simulation' 'dns_fail_rate')
+burst_seconds=$(get_value 'simulation' 'dns_fail_duration')
+[[ -z "$rate_per_minute" ]] && rate_per_minute=600
+[[ -z "$burst_seconds"   ]] && burst_seconds=60
+(( rate_per_minute < 200 )) && rate_per_minute=200
+
+# Seconds to wait between each launch to hit the target rate.
+# Example: 600 per minute -> 60/600 -> 0.1 second between lookups.
+pause_between=$(awk "BEGIN { printf \"%.3f\", 60 / $rate_per_minute }")
+
+echo "$(date) Firing DNS failures at ${rate_per_minute}/min for ${burst_seconds}s" | tee -a "$debug"
+
+# Keep firing until the burst window is up, cycling through every record
+# against every bad/slow server.
+stop_at=$((SECONDS + burst_seconds))
+fired=0
+while (( SECONDS < stop_at )); do
+  for record in $dnsfile; do
+    for server in "${bad_records[@]}" "${bad_ips[@]}" "${latencies[@]}"; do
+
+      # Stop the moment the burst window closes (break out of both loops).
+      (( SECONDS >= stop_at )) && break 2
+
+      # Launch the lookup in the background and move straight on.
+      dig +time=1 +tries=1 +short @"$server" "$record" >/dev/null 2>&1 &
+
+      fired=$((fired + 1))
+      sleep "$pause_between"
+    done
   done
 done
+
+# Let any lookups still in flight finish, then record how many we fired.
+wait 2>/dev/null
+echo "$(date) DNS failures fired: ${fired}" | tee -a "$debug"
