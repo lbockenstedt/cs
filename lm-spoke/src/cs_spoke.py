@@ -822,6 +822,29 @@ class CSSpoke(BaseSpoke):
                 return {"status": "ERROR", "message": res.get("message", "ack failed")}
             return {"status": "SUCCESS", **res}
 
+        if cmd == "CS_REQUEUE_COMMAND":
+            # Hub CSBridgePoller: a command's relay to the agent TIMED OUT (the
+            # agent was too busy to ACCEPT within CS_RELAY_TIMEOUT_S). Re-queue
+            # it for the next poll tick instead of marking it dead — bounded by
+            # max_retries (default 5). The queue flips it to failed once
+            # exhausted. See command_queue.requeue_command.
+            try:
+                max_retries = int(d.get("max_retries") or 5)
+            except (TypeError, ValueError):
+                max_retries = 5
+            res = await self.queue.requeue_command(
+                d.get("id"), max_retries, d.get("message"))
+            if not res.get("ok"):
+                return {"status": "ERROR", "message": res.get("message", "requeue failed")}
+            # ``res`` carries its own ``status`` (pending|failed) describing the
+            # COMMAND's new state; surface that as ``queue_status`` so this
+            # handler's own ``status: SUCCESS`` (the request succeeded) isn't
+            # clobbered by ``**res``. The bridge reads ``requeued``/``attempts``.
+            return {"status": "SUCCESS", "id": res.get("id"),
+                    "queue_status": res.get("status"),
+                    "requeued": res.get("requeued"), "attempts": res.get("attempts"),
+                    "max_retries": res.get("max_retries")}
+
         if cmd == "CS_GET_USB_CONFIG":
             hostname = str(d.get("hostname") or "").strip() or None
             cfg = await self.queue.get_usb_config(hostname)

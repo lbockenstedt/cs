@@ -482,6 +482,13 @@ class CommandQueue:
             "purge_after": None,
             "result": None,
             "message": None,
+            # How many times the hub's CSBridgePoller has re-queued this command
+            # after a relay timeout (the agent was too busy to ACCEPT within
+            # CS_RELAY_TIMEOUT_S). Re-queue retries up to ``max_retries`` before
+            # the command is marked failed — see ``requeue_command``. A fresh
+            # command has 0 attempts. Old persisted commands without this key
+            # default to 0 via .get().
+            "relay_attempts": 0,
         }
 
     @staticmethod
@@ -651,6 +658,54 @@ class CommandQueue:
             cmd["purge_after"] = cmd["updated_at"] + COMMAND_RESULT_RETENTION_SECS
             await self._asave()
             return {"ok": True, "id": cmd_id, "status": status}
+
+    async def requeue_command(self, cmd_id: str, max_retries: int = 5,
+                              message: Optional[str] = None) -> Dict[str, Any]:
+        """Re-queue a ``delivered`` command whose hub→agent relay TIMED OUT
+        (the agent was too busy to ACCEPT within ``CS_RELAY_TIMEOUT_S``) instead
+        of marking it dead. Bounded: increments ``relay_attempts`` and resets
+        status → ``pending`` so the CSBridgePoller's next tick re-relays it,
+        up to ``max_retries``. Once ``relay_attempts`` reaches ``max_retries``
+        the command is marked ``failed`` (terminal) with the timeout message —
+        this is the "retry 5 then give up" the operator asked for, instead of a
+        single relay timeout killing a mass-delete on a busy agent.
+
+        Idempotent-ish: a command that isn't currently ``delivered`` (already
+        completed/failed/expired, or pending) is left alone (returns its
+        current status) — the bridge may call this twice for the same timeout
+        if a re-deliver races a requeue. ``max_retries <= 0`` means "never
+        retry" → the first timeout fails the command (preserves the old
+        behavior for a site that wants fail-fast)."""
+        cmd_id = str(cmd_id or "").strip()
+        async with self.lock:
+            self._cleanup()
+            cmd = next((c for c in self.commands if c.get("id") == cmd_id), None)
+            if not cmd:
+                return {"ok": False, "message": "Command not found"}
+            cur = str(cmd.get("status", "")).lower()
+            if cur in ("completed", "failed", "expired"):
+                return {"ok": True, "id": cmd_id, "status": cur,
+                        "requeued": False, "attempts": int(cmd.get("relay_attempts", 0))}
+            attempts = int(cmd.get("relay_attempts", 0)) + 1
+            cmd["relay_attempts"] = attempts
+            now = time.time()
+            if max_retries > 0 and attempts < max_retries:
+                cmd["status"] = "pending"
+                cmd["updated_at"] = now
+                await self._asave()
+                return {"ok": True, "id": cmd_id, "status": "pending",
+                        "requeued": True, "attempts": attempts,
+                        "max_retries": max_retries}
+            # Exhausted retries (or max_retries<=0 fail-fast) → terminal failed.
+            cmd["status"] = "failed"
+            cmd["message"] = (message or "relay timed out — gave up after "
+                              f"{attempts} attempt(s)")
+            cmd["updated_at"] = now
+            cmd["purge_after"] = now + COMMAND_RESULT_RETENTION_SECS
+            await self._asave()
+            return {"ok": True, "id": cmd_id, "status": "failed",
+                    "requeued": False, "attempts": attempts,
+                    "max_retries": max_retries}
 
     async def list_commands(self) -> List[Dict[str, Any]]:
         async with self.lock:
