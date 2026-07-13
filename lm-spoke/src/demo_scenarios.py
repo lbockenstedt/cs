@@ -21,7 +21,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
-from typing import Any, Dict, List, Optional
+from typing import Any, Awaitable, Callable, Dict, List, Optional
 
 logger = logging.getLogger("CSDemo")
 
@@ -47,11 +47,21 @@ DEMO_SCENARIOS: Dict[str, Dict[str, str]] = build_scenarios()
 class DemoManager:
     """In-memory per-client demo-scenario state with TTL auto-expiry."""
 
-    def __init__(self) -> None:
+    def __init__(self, on_change: Optional[Callable[[str], Awaitable[None]]] = None
+                 ) -> None:
         # hostname → {scenario, flags, expires_at, triggered_by}
         self._active: Dict[str, Dict[str, Any]] = {}
         self._lock = asyncio.Lock()
         self._expiry_task: Optional[asyncio.Task] = None
+        # Fired (best-effort) whenever a client's demo flags change — apply,
+        # clear, OR the 120-min expiry sweep. The spoke passes a callback that
+        # enqueues ``update_now`` so the client re-fetches /api/config and its
+        # LOCAL simulation.conf picks up the change. Without this a demo
+        # expiring on the spoke leaves the client serving a stale [username]
+        # from its cached file (update.sh runs only on update_now / a VERSION
+        # bump), so the 2-hour auto-clear never reached the client — the bug
+        # behind "the overrides are still there after they should have expired".
+        self._on_change = on_change
 
     def start(self) -> None:
         """Start the background expiry sweep. No-op if there's no running loop
@@ -73,13 +83,25 @@ class DemoManager:
             except Exception as exc:  # noqa: BLE001
                 logger.warning("demo expiry loop error: %s", exc)
 
+    async def _fire_on_change(self, hostname: str) -> None:
+        """Best-effort: tell the spoke a client's demo flags changed so it can
+        push a re-fetch. Never raises — a push failure must not break the
+        demo mutation that triggered it."""
+        cb = self._on_change
+        if cb is None or not hostname:
+            return
+        try:
+            await cb(hostname)
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("demo on_change for %s failed: %s", hostname, exc)
+
     async def sweep_expired(self) -> int:
         now = time.time()
         expired = [h for h, v in list(self._active.items())
                    if v["expires_at"] <= now]
         for h in expired:
             logger.info("Demo override expired for %s — reverting to normal", h)
-            await self.clear(h)
+            await self.clear(h)  # clear() fires on_change → client re-fetches
         return len(expired)
 
     async def apply(self, hostname: str, scenario: str,
@@ -100,11 +122,15 @@ class DemoManager:
                     "expires_at": time.time() + DEMO_TTL_SECONDS,
                     "triggered_by": triggered_by,
                 }
+        await self._fire_on_change(hostname)
         return await self.summary_one(hostname)
 
     async def clear(self, hostname: str) -> bool:
         async with self._lock:
-            return self._active.pop(hostname, None) is not None
+            was = self._active.pop(hostname, None) is not None
+        if was:
+            await self._fire_on_change(hostname)
+        return was
 
     def clear_all(self) -> None:
         """Synchronous best-effort clear of all demo overrides (used on hub

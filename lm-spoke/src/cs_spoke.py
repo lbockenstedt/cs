@@ -117,7 +117,7 @@ class CSSpoke(BaseSpoke):
         # live flags are layered on top of the registry's persisted overrides at
         # config delivery time (client_api /api/config); demos never touch the
         # persisted store. Expiry sweep is started by control_plane.run().
-        self.demo = DemoManager()
+        self.demo = DemoManager(on_change=self._on_client_override_changed)
         self._sim_tag_cache: Dict[tuple, set] = {}
         self._sim_tag_sync_lock = asyncio.Lock()
         # Sim-tag sweep is DEBOUNCED off the per-frame telemetry hot path: at most
@@ -661,6 +661,7 @@ class CSSpoke(BaseSpoke):
             if not isinstance(overrides, dict):
                 return {"status": "ERROR", "message": "'overrides' must be an object"}
             entry = await self.registry.set_overrides(hostname, overrides)
+            await self._on_client_override_changed(hostname)
             return {"status": "SUCCESS", "hostname": hostname,
                     "overrides": entry.get("overrides", {})}
 
@@ -669,6 +670,7 @@ class CSSpoke(BaseSpoke):
             if not hostname:
                 return {"status": "ERROR", "message": "missing 'hostname'"}
             await self.registry.clear_overrides(hostname)
+            await self._on_client_override_changed(hostname)
             return {"status": "SUCCESS", "hostname": hostname, "cleared": True}
 
         if cmd in ("CS_SET_ALL_CLIENT_OVERRIDES",):
@@ -679,27 +681,43 @@ class CSSpoke(BaseSpoke):
             for hostname in list(self.registry.get_all().keys()):
                 await self.registry.set_overrides(hostname, dict(overrides))
                 applied += 1
+            # Every registered client's served [username] changed → re-fetch all.
+            await self._push_config_refresh_to_clients()
             return {"status": "SUCCESS", "applied": applied,
                     "overrides": dict(overrides)}
 
         if cmd in ("CS_CLEAR_ALL_CLIENT_OVERRIDES",):
-            # Bulk-clear the legacy per-client REGISTRY override layer — the
-            # hidden [username] sim-flag source /api/config bakes in
-            # (client_api.py:304-313). Model A moved the editor to
-            # user-overrides.conf, but stale registry overrides persist in
-            # clients.json (set by the old Control Panel / a prior bulk set /
-            # a since-removed SimQuotaEngine assignment that didn't revert) and
-            # are invisible in the UI (the User Overrides card reads
-            # user-overrides.conf; cs_get_client_control reads the same). This
-            # wipes them for every registered client so the served
-            # simulation.conf drops the stale [username] sim flags on the next
-            # fetch. Idempotent + safe (clear_overrides just pops the key).
+            # Bulk-clear EVERY override layer /api/config bakes into the served
+            # [username] section, not just the registry:
+            #   * the legacy per-client REGISTRY override layer (client_api.py
+            #     :304-313) — stale flags persisted in clients.json, invisible
+            #     in the User Overrides card (which reads user-overrides.conf);
+            #   * the ephemeral DEMO scenario layer (client_api.py :243-245) — a
+            #     demo triggered from the Clients tab "Demo" column injects the
+            #     FAILURE_FLAGS (dns_fail/ssidpw_fail/…) the user was seeing and
+            #     survives a registry-only clear (the 120-min TTL otherwise).
+            # Then enqueue update_now to every client so each re-fetches the
+            # now-clean config: update.sh runs ONLY on update_now / a VERSION
+            # bump (the 1-min watchdog runs sys_mon, not update.sh), so without
+            # this the client keeps its stale local simulation.conf with the old
+            # [username] section — the "still there after Clear All" symptom.
             cleared = 0
             for hostname in list(self.registry.get_all().keys()):
                 await self.registry.clear_overrides(hostname)
                 cleared += 1
-            logger.info("CS_CLEAR_ALL_CLIENT_OVERRIDES: cleared registry overrides for %d client(s)", cleared)
-            return {"status": "SUCCESS", "cleared": cleared}
+            demos_cleared = 0
+            demo = getattr(self, "demo", None)
+            if demo is not None:
+                try:
+                    demos_cleared = len(await demo.active_summary())
+                    demo.clear_all()
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("CS_CLEAR_ALL_CLIENT_OVERRIDES: demo clear failed: %s", exc)
+            logger.info("CS_CLEAR_ALL_CLIENT_OVERRIDES: cleared %d registry override(s) + %d demo(s)",
+                         cleared, demos_cleared)
+            await self._push_config_refresh_to_clients()
+            return {"status": "SUCCESS", "cleared": cleared,
+                    "demos_cleared": demos_cleared}
 
         if cmd in ("CS_PURGE_CLIENTS",):
             # The "Purge Clients" button (original cs-webui
@@ -1425,6 +1443,16 @@ class CSSpoke(BaseSpoke):
             logger.debug("update_now[%s]: no registered clients — skipping",
                          self.spoke_id)
             return
+        await self._push_update_now_to(hostnames)
+
+    async def _push_update_now_to(self, hostnames: List[str]) -> None:
+        """Enqueue ``update_now`` to each given hostname + live-push it to any
+        currently-connected one. Shared by the bulk refresh (all clients) and
+        the per-client ``_on_client_override_changed`` (one client). Idempotent
+        (CommandQueue dedups by target+action) + best-effort (an offline client
+        picks up the command on its next inbox poll)."""
+        if not hostnames:
+            return
         pushed = 0
         for hn in hostnames:
             try:
@@ -1437,6 +1465,25 @@ class CSSpoke(BaseSpoke):
                              self.spoke_id, hn, exc)
         logger.info("update_now[%s]: enqueued to %d client(s); %d live-pushed",
                     self.spoke_id, len(hostnames), pushed)
+
+    async def _on_client_override_changed(self, hostname: str) -> None:
+        """An override layer (registry override OR demo scenario) for *hostname*
+        changed on the spoke — enqueue ``update_now`` so the client re-fetches
+        ``/api/config`` and its LOCAL ``simulation.conf`` picks up the new
+        ``[username]`` section.
+
+        This is the source-of-the-bug fix: a click (sim-bar toggle, Demo column
+        Go/normal) or the 120-min demo expiry changes the spoke's served config,
+        but ``update.sh`` runs ONLY on ``update_now`` / a VERSION bump (the 1-min
+        watchdog runs ``sys_mon``, not ``update.sh``), so without this push the
+        client kept its stale local file — a demo that expired on the spoke left
+        the client serving a stale ``[username]`` forever (the "overrides still
+        there after they should have auto-cleared" symptom). Idempotent (queue
+        dedups) + best-effort; wired as DemoManager's ``on_change`` callback so
+        demo apply / clear / the expiry sweep all propagate too."""
+        if not hostname:
+            return
+        await self._push_update_now_to([hostname])
 
     # ── GitHub push (Source of Truth = GitHub) ───────────────────────────────
     async def _git(self, *args: str, timeout: float = 120.0,

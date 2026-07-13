@@ -18,7 +18,7 @@ import pytest
 from command_queue import CommandQueue, CSSettings
 from client_registry import ClientRegistry
 from cs_spoke import CSSpoke
-from demo_scenarios import DEMO_SCENARIOS, DEMO_TTL_SECONDS, FAILURE_FLAGS
+from demo_scenarios import DEMO_SCENARIOS, DEMO_TTL_SECONDS, FAILURE_FLAGS, DemoManager
 
 CONFIGS = Path(__file__).resolve().parent.parent.parent / "configs"
 
@@ -139,3 +139,70 @@ def test_expired_demo_auto_clears_on_summary(spoke_loop):
     active = _run(loop, spoke.handle_command("CS_GET_DEMO_ACTIVE", {}))["active"]
     assert active == []
     assert spoke.demo.effective_flags("host-a") == {}
+
+
+# ── propagation: a demo change must enqueue update_now so the client re-fetches ─
+
+def _update_now_targets(spoke, loop):
+    cmds = _run(loop, spoke.queue.list_commands())
+    return sorted(c.get("target") for c in cmds
+                  if c.get("action") == "update_now")
+
+
+def test_demo_apply_enqueues_update_now(spoke_loop):
+    """Triggering a demo (Demo column "Go") changes the spoke's served config —
+    the client must be told to re-fetch, else the demo never takes effect
+    (update.sh runs only on update_now / a VERSION bump)."""
+    spoke, loop = spoke_loop
+    _run(loop, spoke.registry.apply_status("host-a", {"platform": "linux"}))
+    _run(loop, spoke.handle_command(
+        "CS_DEMO_SCENARIO", {"hostname": "host-a", "scenario": "dns_fail"}))
+    assert _update_now_targets(spoke, loop) == ["host-a"]
+
+
+def test_demo_clear_enqueues_update_now(spoke_loop):
+    """Clearing a demo ("normal" / CS_DEMO_CLEAR) must also re-fetch the client
+    so the stale [username] demo flags leave its local simulation.conf."""
+    spoke, loop = spoke_loop
+    _run(loop, spoke.registry.apply_status("host-a", {"platform": "linux"}))
+    _run(loop, spoke.handle_command(
+        "CS_DEMO_SCENARIO", {"hostname": "host-a", "scenario": "dns_fail"}))
+    _run(loop, spoke.queue.list_commands())  # drain
+    # Clear the pending apply update_now so the next enqueue is unambiguous.
+    _run(loop, spoke.handle_command("CS_DEMO_CLEAR", {"hostname": "host-a"}))
+    assert "host-a" in _update_now_targets(spoke, loop)
+
+
+def test_demo_expiry_enqueues_update_now(spoke_loop):
+    """The 120-min auto-clear must reach the client: when the expiry sweep drops
+    a demo, the on_change callback enqueues update_now so the client re-fetches
+    a clean config (the bug: expiry left the client serving a stale [username])."""
+    spoke, loop = spoke_loop
+    _run(loop, spoke.registry.apply_status("host-a", {"platform": "linux"}))
+    _run(loop, spoke.handle_command(
+        "CS_DEMO_SCENARIO", {"hostname": "host-a", "scenario": "ssidpw_fail"}))
+    _run(loop, spoke.queue.list_commands())  # drain the apply update_now
+    # Force expiry + run the sweep directly (the background loop isn't started
+    # in tests).
+    spoke.demo._active["host-a"]["expires_at"] = time.time() - 1
+    _run(loop, spoke.demo.sweep_expired())
+    assert "host-a" in _update_now_targets(spoke, loop)
+    assert spoke.demo.effective_flags("host-a") == {}
+
+
+def test_demo_on_change_callback_fires_on_apply_and_clear():
+    """DemoManager fires its on_change callback on apply + clear (unit-level,
+    no spoke). Verifies the callback contract the spoke relies on."""
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    fired = []
+    async def _cb(h):
+        fired.append(h)
+    dm = DemoManager(on_change=_cb)
+    try:
+        _run(loop, dm.apply("host-a", "dns_fail"))
+        _run(loop, dm.clear("host-a"))
+    finally:
+        loop.close()
+        asyncio.set_event_loop(None)
+    assert fired == ["host-a", "host-a"]
