@@ -902,6 +902,24 @@ class SimQuotaEngine:
                 logger.info("SimQuotaEngine reconcile: %s", actions)
             return actions
 
+    async def reset(self) -> Dict[str, Any]:
+        """Full re-shuffle: clear the ledger and strip EVERY engine-set sim/site
+        override, then reconcile from scratch. Human user-override pins survive
+        (the engine only removes keys it recorded in engine_keys). Use to clear
+        stale assignments after a config/model change — e.g. a client stuck in
+        two quotas from an older engine build."""
+        async with self._reconcile_lock:
+            clients = self._all_clients()
+            self._ledger = {}
+            # Ledger now empty → _engine_sims_for() is empty for everyone, so
+            # _reconcile_engine_keys treats every engine-set sim as an orphan and
+            # removes it (reverting clients to their bucket defaults).
+            await self._reconcile_engine_keys(clients)
+            await self._reconcile_prune_defaults(clients)
+            self._save_ledger()
+            logger.info("SimQuotaEngine: ledger reset — re-shuffling from scratch")
+        return await self.reconcile()
+
     # ── override hygiene (provenance + bucket re-prune) ──────────────────────
     async def _reconcile_engine_keys(self, clients: Dict[str, Any]) -> None:
         """Remove engine-set sim_id overrides the ledger no longer claims.

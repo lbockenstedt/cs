@@ -1074,6 +1074,15 @@ class CSSpoke(BaseSpoke):
                     "placement_warnings": placement_warnings,
                     "pool": eng.pool_counts() if eng is not None else {}}
 
+        if cmd == "CS_RESET_SIM_QUOTA":
+            # Clear the engine ledger + engine-set overrides and reconcile fresh —
+            # a clean re-shuffle (operator "Reset & Reshuffle" button).
+            eng = getattr(self, "sim_quota_engine", None)
+            if eng is None:
+                return {"status": "ERROR", "message": "sim quota engine unavailable"}
+            actions = await eng.reset()
+            return {"status": "SUCCESS", "actions": actions}
+
         if cmd == "CS_GET_PXMX_SITE_MAP":
             # Operator-assigned pxmx server → site map (Config → PXMX Sites). The
             # engine resolves a client's site via its hosting server's entry.
