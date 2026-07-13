@@ -312,33 +312,41 @@ alert feature when it ships** (planned, not built).
 
 ---
 
-## 15. Already built vs. to build
+## 15. Build status
 
-**Shipped (this codebase, recent commits):**
+**Shipped (slices 1–6, this codebase):**
 
-- `[username]`-layer delivery of engine/registry overrides in `client_api.py`
-  (§12) — with human-key preservation (§10).
-- Reconcile processes presence/homing quotas first; sim quotas count
-  ledger-homed clients as in-site (so tasks stack onto homed boxes).
-- Untethered quotas (sim with no alert) + `sim:{sim_id}:{site}` keying.
-- Adaptive-quota *fields* precedent: `min`/`max` groundwork via the existing
-  `count` push path.
+- **Config plumbing** — spoke `local_store` get/set + `cs_spoke._apply_hub_config`
+  for `site_source`, `randomizable_sims`, `random_pool`, `ssid_matrix`,
+  `ssid_placement`; hub `_pool_config` flattens them into the CS_CONFIG_UPDATE push.
+- **Serve-time injection** (`client_api.py`) — `wsite` from `pxmx_site_map` in
+  chamber mode; `random_pool` + `randomizable_sims` delivered as `[simulation]`
+  globals; `[username]`-layer delivery with human-key preservation (§10, §12).
+- **Client ambient rotation** (`simulation.sh` + `simulation.ps1`) — random
+  bucket for randomizable sim flags only, failures forced off, connectivity
+  frozen, `[username]` pins win.
+- **SSID placement quotas** (`_reconcile_placement`) — per-site `hold N`, sticky,
+  telemetry-sourced rebalance, remainder policy.
+- **Adaptive controller** (hub) — `normalize_quota` carries min/max/step/settle/
+  buffer; `_adaptive_step` ramp/decay/learn + floor×(1+buffer); `_alert_firing`
+  (mode-aware, cached, holds when unknown); 45s loop from `main.py`.
+- **Reconcile** processes presence first; sim quotas count ledger-homed clients
+  as in-site; untethered quotas keyed `sim:{sim_id}:{site}`.
+- **WebUI** — adaptive Min/Max on quota rows; Pool & SSID config card; adaptive
+  learning indicator (🔄/✅/⚠️) in Quota State.
 
-**To build:**
+**Remaining polish (not blocking):**
 
-1. **Randomizable-sim flag** + ambient client-side bucket rotation (sim flags
-   only, connectivity frozen), gated by served `random_pool`.
-2. **Site source = PXMX topology**: inject `wsite` from `pxmx_site_map` at serve
-   time (chamber mode); weighted-assignment path for site-based-SSID mode.
-3. **SSID placement quotas** — per-site `hold N` + remainder policy +
-   telemetry-sourced self-healing rebalance.
-4. **Adaptive harvest controller** (hub-side) — ramp / decay / learned floor /
-   `+buffer` / warm-start / anti-flap + **learning indicator**.
-5. **Engine eligibility reads human `[username]` pins** (§10).
-6. **Hub trusts reported `simulation_id`/`active_simulations`** for Clients /
-   Quota-State views (rotating boxes show what they actually run).
-7. **Warnings + hooks** for the future alert feature (§14).
-8. **Config surfaces** (§13) + WebUI.
+1. **Engine eligibility reads human `user-overrides.conf [username]` pins** (§10)
+   so the harvest never counts against a human-forced flag (serve-time already
+   honors it; this is the engine-count refinement).
+2. **Hub trusts reported `simulation_id`/`active_simulations`** for the Clients
+   view (rotating boxes show live bucket vs. the crc32 guess).
+3. **Infeasibility / placement-under-min warnings** surfaced in the UI, and the
+   `quota_at_max_not_firing` hook wired into the internal alert feature when it
+   ships (§14).
+4. **`_alert_firing` signal** currently reads active Central alerts best-effort;
+   validate against the live poller for centralized vs distributed tenants.
 
 ---
 
