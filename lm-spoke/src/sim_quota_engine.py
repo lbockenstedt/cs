@@ -55,7 +55,12 @@ RECONCILE_INTERVAL_S = 60.0      # periodic self-heal sweep
 
 
 def _quota_key(q: Dict[str, Any]) -> str:
-    return f"{q.get('alert_type','alert')}:{q.get('alert_id','')}:{q.get('site','')}"
+    # Mirrors sim_quota.quota_dedup_key: a presence quota (sim_id empty —
+    # "Clients Associated", N clients homed to a site, no sim) is keyed by site
+    # alone, so it never collides with an alert-driven sim quota's ledger entry.
+    if not (q.get("sim_id") or ""):
+        return f"presence::{q.get('site', '')}"
+    return f"{q.get('alert_type', 'alert')}:{q.get('alert_id', '')}:{q.get('site', '')}"
 
 
 class SimQuotaEngine:
@@ -320,12 +325,18 @@ class SimQuotaEngine:
         # so a packed second quota is recognized as a fellow re-homer — see
         # _natural_site. The engine re-homes when the quota site differs from it.
         from_site = self._natural_site(hostname, c)
-        overrides: Dict[str, Any] = {sim_id: "on"}
+        overrides: Dict[str, Any] = {}
+        # A sim quota turns its sim flag ON; a PRESENCE quota (sim_id empty —
+        # "Clients Associated") sets NO sim flag — it only homes the client
+        # (wsite) so other stackable sims may still pack onto it.
+        if sim_id:
+            overrides[sim_id] = "on"
         if site and site != from_site:
             overrides["wsite"] = site
-        await reg.set_overrides(hostname, overrides)
+        if overrides:
+            await reg.set_overrides(hostname, overrides)
         logger.info("SimQuotaEngine: assigned %s → sim=%s site=%s (from %s)",
-                    hostname, sim_id, site or "*", from_site or "*")
+                    hostname, sim_id or "(presence)", site or "*", from_site or "*")
 
     async def _release(self, hostname: str, sim_id: str, from_site: str,
                        quota_key: Optional[str] = None) -> None:
@@ -337,8 +348,11 @@ class SimQuotaEngine:
         # another ledger entry still re-homes this client (multi_capable
         # packing can stack re-homing quotas on one client), in which case keep
         # wsite at that other quota's target so releasing one doesn't undo the
-        # other's re-home.
-        overrides: Dict[str, Any] = {sim_id: "off"}
+        # other's re-home. A PRESENCE quota (sim_id empty) sets NO sim flag —
+        # only the wsite revert applies.
+        overrides: Dict[str, Any] = {}
+        if sim_id:
+            overrides[sim_id] = "off"
         c = reg.get(hostname) or {}
         cur_site = self._effective_site(hostname, c)
         target = (self._remaining_rehome_target(hostname, quota_key)
@@ -348,9 +362,10 @@ class SimQuotaEngine:
                 overrides["wsite"] = target
         elif from_site and cur_site != from_site:
             overrides["wsite"] = from_site
-        await reg.set_overrides(hostname, overrides)
+        if overrides:
+            await reg.set_overrides(hostname, overrides)
         logger.info("SimQuotaEngine: released %s ← sim=%s (site %s)",
-                    hostname, sim_id, target or from_site or "*")
+                    hostname, sim_id or "(presence)", target or from_site or "*")
 
     def _remaining_rehome_target(self, hostname: str,
                                  excluding_key: Optional[str]) -> Optional[str]:
@@ -391,8 +406,9 @@ class SimQuotaEngine:
                 sim_id = q.get("sim_id") or ""
                 site = q.get("site") or ""
                 target = int(q.get("count") or 1)
-                if not sim_id:
-                    continue
+                # A PRESENCE quota (sim_id empty — "Clients Associated") homes N
+                # clients to the site and runs no sim; it's still a real ledger
+                # entry the engine keeps filled (substitute on offline/dead).
                 entry = self._ledger.setdefault(
                     key, {"sim_id": sim_id, "site": site, "clients": {}})
                 entry["sim_id"] = sim_id
@@ -417,9 +433,11 @@ class SimQuotaEngine:
                         # Vanished from the registry — drop the dead entry.
                         assigned.pop(h, None)
                         continue
-                    if not self._has_sim_on(c, sim_id):
-                        # Lost the override (human cleared it) — drop from
-                        # ledger, don't fight the human.
+                    if sim_id and not self._has_sim_on(c, sim_id):
+                        # Lost the sim override (human cleared it) — drop from
+                        # ledger, don't fight the human. A PRESENCE quota has no
+                        # sim flag to lose; it stays until it drifts off-site or
+                        # goes dead (handled below).
                         assigned.pop(h, None)
                         continue
                     if site and self._effective_site(h, c) != site:

@@ -95,7 +95,13 @@ def _as_int(v: Any, default: int = 1) -> int:
 def normalize_quota(raw: Any) -> Dict[str, Any]:
     """Coerce a raw quota dict to the canonical shape; drop unknown keys.
     ``multi_capable`` defaults from ``SIM_META[sim_id]`` when absent so the
-    tenant inherits the per-sim default unless they explicitly override it."""
+    tenant inherits the per-sim default unless they explicitly override it.
+
+    A PRESENCE quota (``sim_id`` empty, "Clients Associated") homes N clients
+    to a site and runs NO sim — it only guarantees N clients are associated to
+    the site (re-homing ``wsite`` if ``rehome``). Presence quotas are ALWAYS
+    multi-capable (they don't consume the client for sim purposes; other
+    stackable sims may pack onto a presence-homed client)."""
     if not isinstance(raw, dict):
         return {}
     sim_id = str(raw.get("sim_id") or "").strip()
@@ -103,16 +109,34 @@ def normalize_quota(raw: Any) -> Dict[str, Any]:
     alert_type = str(raw.get("alert_type") or "alert").strip().lower()
     if alert_type not in ALERT_TYPES:
         alert_type = "alert"
+    is_presence = not sim_id
     return {
         "alert_id": str(raw.get("alert_id") or "").strip(),
         "alert_type": alert_type,
         "sim_id": sim_id,
         "count": _as_int(raw.get("count"), 1),
         "site": str(raw.get("site") or "").strip(),
-        "multi_capable": _as_bool(raw.get("multi_capable"), bool(meta.get("multi_capable", False))),
+        # Presence always packs (a homed-but-sim-less client is still a free
+        # runner other sims may stack onto); ignore an operator override here.
+        "multi_capable": True if is_presence
+        else _as_bool(raw.get("multi_capable"), bool(meta.get("multi_capable", False))),
         "rehome": _as_bool(raw.get("rehome"), False),
         "enabled": _as_bool(raw.get("enabled"), False),
     }
+
+
+def quota_dedup_key(q: Dict[str, Any]) -> str:
+    """The dedup/identity key for a normalized quota.
+
+    A sim quota is keyed by ``alert_type:alert_id:site`` (one sim per monitored
+    alert per site). A presence quota (``sim_id`` empty — "Clients Associated")
+    has no alert, so it's keyed by site alone — one presence count per site
+    (last-wins), independent of the sim-quota namespace so a presence row never
+    collides with an alert-driven row. The engine's ``_quota_key`` mirrors this.
+    """
+    if not q.get("sim_id"):
+        return f"presence::{q.get('site', '')}"
+    return f"{q.get('alert_type', 'alert')}:{q.get('alert_id', '')}:{q.get('site', '')}"
 
 
 def validate_sim_quotas(
@@ -120,11 +144,12 @@ def validate_sim_quotas(
 ) -> Tuple[List[Dict[str, Any]], List[str]]:
     """Normalize + validate a ``sim_quotas`` list.
 
-    Returns ``(clean, errors)``. A quota with an empty alert_id/sim_id is
-    dropped + reported. A quota whose ``sim_id`` is not in *available_sims*
-    (when provided) is dropped + reported — the engine can only run sims the
-    tenant's simulation.conf actually offers. Duplicate keys
-    (``alert_type:alert_id:site``) collapse last-wins. The clean list is
+    Returns ``(clean, errors)``. A SIM quota (``sim_id`` set) requires an
+    ``alert_id`` and its ``sim_id`` must be in *available_sims* (when provided) —
+    the engine can only run sims the tenant's simulation.conf offers. A PRESENCE
+    quota (``sim_id`` empty — "Clients Associated") requires a ``site`` and NO
+    ``alert_id`` (it homes clients, runs no sim, so there's nothing to monitor).
+    Duplicate keys (``quota_dedup_key``) collapse last-wins. The clean list is
     normalized to the canonical shape.
     """
     clean: List[Dict[str, Any]] = []
@@ -133,15 +158,23 @@ def validate_sim_quotas(
     sim_set = set(available_sims or [])
     for i, raw in enumerate(quotas or []):
         q = normalize_quota(raw)
-        if not q["alert_id"] or not q["sim_id"]:
-            errors.append(f"quota #{i}: missing alert_id or sim_id — dropped")
-            continue
-        if sim_set and q["sim_id"] not in sim_set:
-            errors.append(
-                f"quota #{i} ({q['alert_id']}): sim_id '{q['sim_id']}' "
-                f"not in available sims — dropped")
-            continue
-        seen[f"{q['alert_type']}:{q['alert_id']}:{q['site']}"] = q
+        if not q["sim_id"]:
+            # Presence quota — needs a site (it homes N clients there); no
+            # alert_id (nothing to monitor — no sim runs).
+            if not q["site"]:
+                errors.append(f"quota #{i}: presence quota (Clients Associated) "
+                              f"requires a site — dropped")
+                continue
+        else:
+            if not q["alert_id"]:
+                errors.append(f"quota #{i}: missing alert_id — dropped")
+                continue
+            if sim_set and q["sim_id"] not in sim_set:
+                errors.append(
+                    f"quota #{i} ({q['alert_id']}): sim_id '{q['sim_id']}' "
+                    f"not in available sims — dropped")
+                continue
+        seen[quota_dedup_key(q)] = q
     clean = list(seen.values())
     return clean, errors
 

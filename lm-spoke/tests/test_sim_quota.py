@@ -141,3 +141,70 @@ def test_suggested_excludes_hardware_alerts():
     # Hardware alerts are monitoring-only — no sim linkage suggestion.
     for hw in ("AP_DOWN", "SWITCH_DOWN", "GATEWAY_DOWN"):
         assert hw not in sim_quota.SUGGESTED_ALERT_SIM
+
+# ── presence quotas (Clients Associated — sim_id empty) ────────────────────
+def test_normalize_presence_quota_forces_multi_capable():
+    q = sim_quota.normalize_quota({"sim_id": "", "count": 17, "site": "MIA"})
+    assert q["sim_id"] == "" and q["site"] == "MIA" and q["count"] == 17
+    # Presence always packs (a homed-but-sim-less client is still a free runner
+    # other sims may stack onto); an operator multi_capable=False is ignored.
+    assert q["multi_capable"] is True
+    assert sim_quota.normalize_quota(
+        {"sim_id": "", "count": 17, "site": "MIA", "multi_capable": False}
+    )["multi_capable"] is True
+
+
+def test_validate_presence_quota_needs_site_not_alert_id():
+    clean, errs = sim_quota.validate_sim_quotas(
+        [{"sim_id": "", "count": 17, "site": "MIA", "enabled": True}],
+        ["dns_fail"])
+    assert errs == [] and len(clean) == 1
+    assert clean[0]["sim_id"] == "" and clean[0]["site"] == "MIA"
+    # A presence quota with no site is dropped.
+    clean, errs = sim_quota.validate_sim_quotas(
+        [{"sim_id": "", "count": 17, "enabled": True}], ["dns_fail"])
+    assert clean == [] and any("requires a site" in e for e in errs)
+
+
+def test_validate_presence_quota_ignored_alert_id_and_sim_set():
+    # Presence quotas carry no alert_id and aren't filtered by available_sims
+    # (they run no sim) — an empty/odd alert_id is accepted, not an error.
+    clean, errs = sim_quota.validate_sim_quotas(
+        [{"sim_id": "", "alert_id": "whatever", "count": 5, "site": "DFW",
+          "enabled": True}], ["dns_fail"])
+    assert errs == [] and len(clean) == 1
+    # available_sims filter never applies to presence.
+    clean, _ = sim_quota.validate_sim_quotas(
+        [{"sim_id": "", "count": 5, "site": "DFW", "enabled": True}], [])
+    assert len(clean) == 1
+
+
+def test_validate_presence_dedup_by_site_last_wins():
+    # Two presence rows at MIA collapse to one (last-wins) keyed by site; a DFW
+    # presence row survives separately.
+    clean, _ = sim_quota.validate_sim_quotas(
+        [{"sim_id": "", "count": 17, "site": "MIA", "enabled": True},
+         {"sim_id": "", "count": 10, "site": "MIA", "enabled": True},
+         {"sim_id": "", "count": 5, "site": "DFW", "enabled": True}])
+    assert len(clean) == 2
+    mia = [c for c in clean if c["site"] == "MIA"][0]
+    assert mia["count"] == 10  # last-wins
+
+
+def test_validate_presence_does_not_collide_with_sim_quota_namespace():
+    # A presence quota at MIA (key presence::MIA) and a sim quota for an alert
+    # at MIA (key alert:CLIENT_DNS_FAILURE:MIA) coexist — different namespaces.
+    clean, _ = sim_quota.validate_sim_quotas(
+        [{"sim_id": "", "count": 17, "site": "MIA", "enabled": True},
+         {"alert_id": "CLIENT_DNS_FAILURE", "sim_id": "dns_fail", "count": 8,
+          "site": "MIA", "enabled": True}], ["dns_fail"])
+    assert len(clean) == 2
+    assert any(c["sim_id"] == "" for c in clean)
+    assert any(c["sim_id"] == "dns_fail" for c in clean)
+
+
+def test_quota_dedup_key_presence_vs_sim():
+    assert sim_quota.quota_dedup_key({"sim_id": "", "site": "MIA"}) == "presence::MIA"
+    assert sim_quota.quota_dedup_key(
+        {"alert_type": "alert", "alert_id": "X", "sim_id": "dns_fail", "site": "MIA"}
+    ) == "alert:X:MIA"

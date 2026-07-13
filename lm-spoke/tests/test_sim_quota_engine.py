@@ -502,3 +502,115 @@ def test_engine_rehome_wsite_survives_real_registry_prune(tmp_path):
         assert ov.get("dns_fail") == "on", f"{h}: dns_fail missing! overrides={ov}"
         # from_site recorded as the natural DFW so a later release reverts.
         assert ledger["clients"][h] == "DFW"
+
+
+# ── presence quotas (Clients Associated — sim_id empty) ────────────────────
+def test_reconcile_presence_homes_n_clients_no_sim_flag(tmp_path):
+    # A presence quota (sim_id="") on MIA homes N online free runners and sets
+    # NO sim flag — only wsite (and only when re-homing). The clients remain
+    # free runners other sims may stack onto.
+    clients = {f"c{i}": _client(f"c{i}", "MIA") for i in range(5)}
+    spoke = _FakeSpoke(clients, [{"alert_id": "", "alert_type": "alert",
+                                  "sim_id": "", "count": 3, "site": "MIA",
+                                  "multi_capable": True, "rehome": False,
+                                  "enabled": True}], tmp_path)
+    eng = SimQuotaEngine(spoke)
+    _run(eng.reconcile())
+    ledger = eng._ledger["presence::MIA"]
+    assert len(ledger["clients"]) == 3
+    for h in ledger["clients"]:
+        ov = spoke.registry.clients[h]["overrides"]
+        # No sim flag set — presence homes only. In-site clients (already MIA)
+        # aren't re-homed, so no wsite override either.
+        assert "dns_fail" not in ov and "ping_test" not in ov
+        assert "wsite" not in ov  # already MIA → no re-home
+
+
+def test_reconcile_presence_rehomes_cross_site_sets_wsite(tmp_path):
+    # Presence MIA with rehome borrows DFW runners and re-homes them (wsite=MIA),
+    # still setting NO sim flag. Ledger records from_site=DFW so release reverts.
+    clients = {f"c{i}": _client(f"c{i}", "DFW") for i in range(3)}
+    spoke = _FakeSpoke(clients, [{"alert_id": "", "sim_id": "", "count": 2,
+                                  "site": "MIA", "multi_capable": True,
+                                  "rehome": True, "enabled": True}], tmp_path)
+    eng = SimQuotaEngine(spoke)
+    _run(eng.reconcile())
+    ledger = eng._ledger["presence::MIA"]
+    assert len(ledger["clients"]) == 2
+    for h in ledger["clients"]:
+        ov = spoke.registry.clients[h]["overrides"]
+        assert ov.get("wsite") == "MIA"          # re-homed, no sim flag
+        assert not any(k for k in ov if k != "wsite")
+        assert ledger["clients"][h] == "DFW"      # from_site recorded
+
+
+def test_reconcile_presence_packs_with_sim_quota_on_same_client(tmp_path):
+    # A presence MIA quota + a dns_fail MIA quota over 3 MIA clients: presence
+    # homes 3 (no sim flag), dns_fail stacks dns_fail=on onto 2 of them (the
+    # user's "they can run other simulations that are stackable"). The presence
+    # clients remain available for the sim quota to pack onto.
+    clients = {f"c{i}": _client(f"c{i}", "MIA") for i in range(3)}
+    spoke = _FakeSpoke(clients, [
+        {"alert_id": "", "sim_id": "", "count": 3, "site": "MIA",
+         "multi_capable": True, "rehome": False, "enabled": True},
+        {"alert_id": "A", "sim_id": "dns_fail", "count": 2, "site": "MIA",
+         "enabled": True},
+    ], tmp_path)
+    eng = SimQuotaEngine(spoke)
+    _run(eng.reconcile())
+    pres = eng._ledger["presence::MIA"]["clients"]
+    sim = eng._ledger["alert:A:MIA"]["clients"]
+    assert len(pres) == 3
+    assert len(sim) == 2
+    # The 2 dns_fail clients are a subset of the 3 presence-homed clients —
+    # presence doesn't consume the client for sim purposes.
+    assert set(sim).issubset(set(pres))
+    for h in pres:
+        # presence clients have no sim flag from the presence quota; the two
+        # that dns_fail packed onto DO have dns_fail=on (from the sim quota).
+        ov = spoke.registry.clients[h]["overrides"]
+        if h in sim:
+            assert ov.get("dns_fail") == "on"
+        else:
+            assert "dns_fail" not in ov
+    # No presence client got a sim flag from the presence quota itself.
+    assert all("ping_test" not in (spoke.registry.clients[h]["overrides"] or {})
+               for h in pres)
+
+
+def test_reconcile_presence_releases_revert_wsite_no_sim_flag(tmp_path):
+    # After a presence re-home, removing the quota releases the borrowed
+    # clients: wsite reverts to DFW, NO sim flag is toggled (there was none).
+    clients = {f"c{i}": _client(f"c{i}", "DFW") for i in range(2)}
+    spoke = _FakeSpoke(clients, [{"alert_id": "", "sim_id": "", "count": 2,
+                                  "site": "MIA", "multi_capable": True,
+                                  "rehome": True, "enabled": True}], tmp_path)
+    eng = SimQuotaEngine(spoke)
+    _run(eng.reconcile())
+    assert spoke.registry.clients["c0"]["overrides"]["wsite"] == "MIA"
+    spoke.local_store._q = []                    # quota removed
+    _run(eng.reconcile())
+    assert eng._ledger == {}
+    for h in clients:
+        ov = spoke.registry.clients[h]["overrides"]
+        assert ov.get("wsite") == "DFW"           # reverted
+        # No sim flag was ever set, so none toggled off on release.
+        assert not any(k != "wsite" for k in ov)
+
+
+def test_reconcile_presence_substitute_on_offline(tmp_path):
+    # Presence keeps N homed: an assigned client going dead (>OFFLINE_TTL) is
+    # released and a substitute fills so the homed count stays at N.
+    clients = {f"c{i}": _client(f"c{i}", "MIA") for i in range(5)}
+    spoke = _FakeSpoke(clients, [{"alert_id": "", "sim_id": "", "count": 3,
+                                  "site": "MIA", "multi_capable": True,
+                                  "rehome": False, "enabled": True}], tmp_path)
+    eng = SimQuotaEngine(spoke)
+    _run(eng.reconcile())
+    first = set(eng._ledger["presence::MIA"]["clients"])
+    dead = next(iter(first))
+    spoke.registry.clients[dead]["last_seen"] = 0  # past OFFLINE_TTL → dead
+    _run(eng.reconcile())
+    after = set(eng._ledger["presence::MIA"]["clients"])
+    assert dead not in after                       # dead client released
+    assert len(after) == 3                         # substitute filled → still N
