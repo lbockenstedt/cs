@@ -316,3 +316,15 @@ class LocalStore:
         with self._lock:
             self._data["effective_sim_quotas"] = list(quotas or [])
             self._save()
+
+    # ── per-sim shareable/stackable overrides (hub-pushed, authoritative) ─────
+    # {sim_id: bool}. A sim set False can NEVER be stacked by the SimQuotaEngine,
+    # overriding the hardcoded SIM_META multi_capable default.
+    def get_sim_shareable(self) -> dict:
+        v = self._data.get("sim_shareable")
+        return dict(v) if isinstance(v, dict) else {}
+
+    def set_sim_shareable(self, mapping: dict) -> None:
+        with self._lock:
+            self._data["sim_shareable"] = dict(mapping) if isinstance(mapping, dict) else {}
+            self._save()

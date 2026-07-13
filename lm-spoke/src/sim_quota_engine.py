@@ -245,6 +245,15 @@ class SimQuotaEngine:
         return out
 
     def _sim_multi(self, sim_id: str) -> bool:
+        # Authoritative per-sim shareable override (hub-pushed via sim_shareable)
+        # WINS over the hardcoded SIM_META default — a sim set non-shareable can
+        # never be stacked (Config → Sim Quotas → Simulation Sharing tile).
+        try:
+            sh = self.spoke.local_store.get_sim_shareable()
+            if sim_id in sh:
+                return bool(sh[sim_id])
+        except Exception:  # noqa: BLE001
+            pass
         try:
             from sim_quota import SIM_META
         except Exception:  # noqa: BLE001

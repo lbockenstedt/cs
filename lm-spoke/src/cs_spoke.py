@@ -1163,6 +1163,11 @@ class CSSpoke(BaseSpoke):
             if isinstance(eff, list):
                 self.local_store.set_effective_sim_quotas(eff)
                 applied.append("effective_sim_quotas")
+        if "sim_shareable" in patch:
+            sh = patch.get("sim_shareable")
+            if isinstance(sh, dict):
+                self.local_store.set_sim_shareable(sh)
+                applied.append("sim_shareable")
         for key in self._HUB_DIRECT_KEYS:
             if key in patch:
                 update[key] = patch[key]
