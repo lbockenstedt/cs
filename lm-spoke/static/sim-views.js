@@ -2267,13 +2267,17 @@ function csSimField(section, key, label, value) {
     const id = `cs-sim-${csEscape(section)}-${csEscape(key)}`;
     const v = (value === undefined || value === null) ? '' : String(value);
     if (CS_ONOFF_KEYS.has(key)) {
-        const on = v.toLowerCase() === 'on';
+        const lc = v.toLowerCase();
+        const on = lc === 'on', off = lc === 'off';
+        // Unset shows "— default —" (empty → serializer skips it), never a silent
+        // "off" — the bug that flipped web_server off and disabled clients.
         return `<div class="flex flex-col gap-1">
           <label class="text-[10px] text-slate-500 uppercase font-bold tracking-wider">${csEscape(label)}</label>
           <select id="${id}" data-cs-section="${csEscape(section)}" data-cs-key="${csEscape(key)}"
                   class="border border-slate-200 rounded-md px-2 py-1.5 text-sm ${on ? 'text-emerald-700 font-semibold' : 'text-slate-600'}">
+            <option value="" ${(!on && !off) ? 'selected' : ''}>— default —</option>
             <option value="on" ${on ? 'selected' : ''}>on</option>
-            <option value="off" ${!on ? 'selected' : ''}>off</option>
+            <option value="off" ${off ? 'selected' : ''}>off</option>
           </select></div>`;
     }
     return `<div class="flex flex-col gap-1">
@@ -3043,13 +3047,15 @@ function csUOField(user, key, value) {
     const v = (value === undefined || value === null) ? '' : String(value);
     const attrs = `data-cs-uo-user="${csEscape(user)}" data-cs-uo-key="${csEscape(key)}"`;
     if (CS_ONOFF_KEYS.has(key)) {
-        const on = v.toLowerCase() === 'on';
+        const lc = v.toLowerCase();
+        const on = lc === 'on', off = lc === 'off';
         return `<div class="flex flex-col gap-1">
           <label class="text-[10px] text-slate-500 uppercase font-bold tracking-wider">${csEscape(label)}</label>
           <select ${attrs} onchange="csUOSet(this)"
                   class="border border-slate-200 rounded-md px-2 py-1.5 text-sm ${on ? 'text-emerald-700 font-semibold' : 'text-slate-600'}">
+            <option value="" ${(!on && !off) ? 'selected' : ''}>— default —</option>
             <option value="on" ${on ? 'selected' : ''}>on</option>
-            <option value="off" ${!on ? 'selected' : ''}>off</option>
+            <option value="off" ${off ? 'selected' : ''}>off</option>
           </select></div>`;
     }
     return `<div class="flex flex-col gap-1">
