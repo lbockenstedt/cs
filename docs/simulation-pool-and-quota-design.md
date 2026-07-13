@@ -335,18 +335,26 @@ alert feature when it ships** (planned, not built).
 - **WebUI** — adaptive Min/Max on quota rows; Pool & SSID config card; adaptive
   learning indicator (🔄/✅/⚠️) in Quota State.
 
-**Remaining polish (not blocking):**
+**Polish (shipped):**
 
-1. **Engine eligibility reads human `user-overrides.conf [username]` pins** (§10)
-   so the harvest never counts against a human-forced flag (serve-time already
-   honors it; this is the engine-count refinement).
-2. **Hub trusts reported `simulation_id`/`active_simulations`** for the Clients
-   view (rotating boxes show live bucket vs. the crc32 guess).
-3. **Infeasibility / placement-under-min warnings** surfaced in the UI, and the
-   `quota_at_max_not_firing` hook wired into the internal alert feature when it
-   ships (§14).
-4. **`_alert_firing` signal** currently reads active Central alerts best-effort;
-   validate against the live poller for centralized vs distributed tenants.
+1. ✅ **Engine respects human `user-overrides.conf [username]` pins** — reconcile
+   loads user-overrides per sweep; `_pool_eligible` skips a client whose human
+   override sets the target sim, so the ledger never over-counts (§10).
+2. ✅ **Reported sim flags win in the Clients view** — `effective_client_fields`
+   lets a rotating client's reported toggles win over its home-bucket profile
+   (connectivity still from the profile).
+3. ✅ **Placement under-min + at-max warnings** — `_reconcile_placement` records
+   shortfalls (`placement_warnings()`); Quota State shows a warnings banner plus
+   the per-quota ⚠️ At-max badge.
+
+**Remaining (needs live validation / future feature):**
+
+4. **`_alert_firing` signal** reads active Central alerts best-effort (mode-aware,
+   cached, holds when unknown) — validate end-to-end against the live poller for
+   centralized vs distributed tenants once exercised.
+5. **`quota_at_max_not_firing` / `placement_under_min`** currently surface as UI
+   badges/banner; wire them into the internal **alert feature** as emitters when
+   it ships (§14).
 
 ---
 
