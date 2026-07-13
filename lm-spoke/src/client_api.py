@@ -243,6 +243,49 @@ def build_client_api_app(spoke) -> FastAPI:
         demo = getattr(spoke, "demo", None)
         if demo is not None and hostname:
             overrides.update(demo.effective_flags(hostname))
+        # ── Pool / SSID serve-time injection (design doc §4, §7, §12) ──────────
+        # In RF-chamber mode (site_source=pxmx, the common case) a client's site
+        # is its HOSTING PXMX server's site — inject wsite so it's frozen and the
+        # client joins the reachable SSID. Engine placement wsite (already in the
+        # registry overrides) and a human [username] wsite still win. In
+        # site_source=assigned mode, leave wsite to the bucket/weighted layer.
+        def _physical_site(host: str) -> str:
+            try:
+                deploy = getattr(spoke, "deploy", None)
+                n2h = deploy.name_to_host() if deploy is not None else {}
+                srv = n2h.get(str(host).strip().lower())
+                if srv:
+                    return str(spoke.local_store.get_pxmx_site_map().get(srv) or "").strip()
+            except Exception:  # noqa: BLE001
+                pass
+            return ""
+        resolved_site = str(overrides.get("wsite") or "").strip()  # engine placement wins
+        try:
+            if hostname and spoke.local_store.get_site_source() == "pxmx":
+                phys = _physical_site(hostname)
+                if phys:
+                    overrides.setdefault("wsite", phys)   # engine wsite (if set) kept
+                    resolved_site = resolved_site or phys
+        except Exception:  # noqa: BLE001
+            pass
+        if not resolved_site and hostname:  # fall back to a human/bucket wsite
+            _un = sim_config.username_for(hostname)
+            if user_conf.has_section(_un):
+                resolved_site = str(user_conf.get(_un, "wsite", fallback="") or "").strip()
+        # Deliver the ambient random-pool policy for this site + the randomizable
+        # sim set as [simulation] globals the client rotation reads (Slice 5).
+        try:
+            pool_map = spoke.local_store.get_random_pool()
+            rand_sims = spoke.local_store.get_randomizable_sims()
+            if not sim_conf.has_section("simulation"):
+                sim_conf.add_section("simulation")
+            pool_on = bool(pool_map.get(resolved_site, pool_map.get("*", False)))
+            sim_conf.set("simulation", "random_pool", "on" if pool_on else "off")
+            if rand_sims:
+                sim_conf.set("simulation", "randomizable_sims",
+                             " ".join(str(s) for s in rand_sims))
+        except Exception:  # noqa: BLE001
+            pass
         # Deliver the engine/registry overrides into the client's [username]
         # section — the layer simulation.sh's apply_override() resolves LAST, so
         # it WINS over the client's bucket no matter which bucket the client is
