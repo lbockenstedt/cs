@@ -739,6 +739,21 @@ class CSSpoke(BaseSpoke):
             hostname = (d.get("hostname") or "").strip()
             kind = cmd[len("CS_INGEST_"):]
             self.deploy.ingest_event(hostname, kind.lower(), d)
+            # A CS_PROGRESS frame means a long op is genuinely running on the
+            # agent — refresh the command's updated_at so the
+            # STALE_DELIVERED_SECS reset doesn't re-send it while it's still
+            # working (delete_vm/reclone_vm can take minutes). The frame
+            # carries the cs_cmd_id correlation key (same as
+            # CS_COMMAND_RESULT). Best-effort: a missing/unknown id is fine.
+            if cmd == "CS_INGEST_PROGRESS":
+                cs_cmd_id = d.get("cs_cmd_id")
+                if cs_cmd_id:
+                    try:
+                        await self.queue.touch_command(cs_cmd_id,
+                                                      d.get("message"))
+                    except Exception as e:  # noqa: BLE001 — best-effort
+                        logger.debug("CS_INGEST_PROGRESS touch %s failed: %s",
+                                     cs_cmd_id, e)
             return {"status": "SUCCESS", "hostname": hostname, "ingested": kind.lower()}
 
         if cmd == "CS_INGEST_COMMAND_RESULT":

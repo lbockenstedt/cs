@@ -628,24 +628,51 @@ class CommandQueue:
             return True
         return _hostnames_match(cmd.get("target", ""), hostname)
 
-    async def poll_agent_inbox(self, hostname: str) -> Dict[str, Any]:
+    async def poll_agent_inbox(self, hostname: str,
+                                max_retries: int = 0) -> Dict[str, Any]:
         """Reset stale delivered→pending, cleanup, return serialized pending for
         this host, and mark them delivered. Returns
-        ``{commands, expired, purged, reset, delivered}``."""
+        ``{commands, expired, purged, reset, delivered, gave_up}``.
+
+        ``max_retries`` caps the total re-send attempts for a command that's
+        delivered but never acked (no CS_COMMAND_RESULT, no progress frames —
+        the agent lost it or crashed mid-op). Each stale reset increments
+        ``relay_attempts`` (shared with the relay-timeout requeue path); once
+        it reaches ``max_retries`` the command is marked ``failed`` instead of
+        re-sent — "re-send up to X times then give up", the same budget as a
+        relay timeout. ``max_retries <= 0`` preserves the old unbounded
+        re-send behavior (re-send every STALE_DELIVERED_SECS until the command
+        expires). A running long op that streams CS_PROGRESS never hits this:
+        ``touch_command`` refreshes ``updated_at`` on each progress frame."""
         hn = _normalize_hostname(hostname)
         async with self.lock:
             now = time.time()
             expired, purged = self._cleanup(now)
 
-            # Reset stale delivered (>STALE_DELIVERED_SECS, no ack) → pending.
+            # Reset stale delivered (>STALE_DELIVERED_SECS, no ack) → pending,
+            # capped at max_retries (shared with the relay-timeout requeue
+            # budget) — a command that's been re-sent max_retries times with
+            # no ack is marked failed, not re-sent forever.
             reset = 0
+            gave_up = 0
             for cmd in self.commands:
                 if cmd.get("status") == "delivered" and \
                         (now - float(cmd.get("updated_at", now))) > STALE_DELIVERED_SECS and \
                         self._command_matches_agent(cmd, hn):
-                    cmd["status"] = "pending"
-                    cmd["updated_at"] = now
-                    reset += 1
+                    attempts = int(cmd.get("relay_attempts", 0)) + 1
+                    cmd["relay_attempts"] = attempts
+                    if max_retries > 0 and attempts >= max_retries:
+                        # Exhausted the re-send budget — give up (terminal).
+                        cmd["status"] = "failed"
+                        cmd["message"] = (f"no ack after {attempts} "
+                                          f"re-send attempt(s) — gave up")
+                        cmd["updated_at"] = now
+                        cmd["purge_after"] = now + COMMAND_RESULT_RETENTION_SECS
+                        gave_up += 1
+                    else:
+                        cmd["status"] = "pending"
+                        cmd["updated_at"] = now
+                        reset += 1
 
             pending = [c for c in self.commands
                        if c.get("status") == "pending" and self._command_matches_agent(c, hn)]
@@ -655,7 +682,7 @@ class CommandQueue:
                     cmd["status"] = "delivered"
                     cmd["updated_at"] = now
 
-            if reset or delivered_ids or expired or purged:
+            if reset or delivered_ids or expired or purged or gave_up:
                 await self._asave()
 
             return {
@@ -664,6 +691,7 @@ class CommandQueue:
                 "purged": purged,
                 "reset": reset,
                 "delivered": delivered_ids,
+                "gave_up": gave_up,
             }
 
     async def ack_command(self, cmd_id: str, status: str,
@@ -734,6 +762,39 @@ class CommandQueue:
             return {"ok": True, "id": cmd_id, "status": "failed",
                     "requeued": False, "attempts": attempts,
                     "max_retries": max_retries}
+
+    async def touch_command(self, cmd_id: str,
+                             message: Optional[str] = None) -> Dict[str, Any]:
+        """Refresh a ``delivered`` command's ``updated_at`` on a CS_INGEST_PROGRESS
+        tick so the ``STALE_DELIVERED_SECS`` reset doesn't re-send an in-flight
+        long op (delete_vm / reclone_vm can take minutes; without this, a
+        delivered command with no ack for 30s is reset to ``pending`` and
+        re-relayed — duplicating the op while the first one is still running,
+        the "some don't get deleted / queue grows" symptom on slow storage).
+
+        Only refreshes a ``delivered`` command (a running long op); ``pending``
+        (not yet relayed) and terminal (``completed``/``failed``/``expired``)
+        are left alone. In-memory only — does NOT persist: a progress frame
+        lands every second or so during a long op, and an atomic disk write per
+        frame would be a write storm on the hot CS_POLL_AGENT_INBOX path. The
+        next ``poll_agent_inbox`` (5s) saves, and the stale reset reads
+        ``updated_at`` in-memory, which is exactly what this refreshes. A
+        crash reverts to the last persisted ``updated_at`` — worst case a
+        single re-send on restart, which the agent's ``_pending_delete_vmids``
+        guard dedups."""
+        cmd_id = str(cmd_id or "").strip()
+        async with self.lock:
+            cmd = next((c for c in self.commands if c.get("id") == cmd_id), None)
+            if not cmd:
+                return {"ok": False, "message": "Command not found"}
+            if cmd.get("status") != "delivered":
+                return {"ok": True, "id": cmd_id, "status": cmd.get("status"),
+                        "touched": False}
+            cmd["updated_at"] = time.time()
+            if message:
+                cmd["message"] = str(message)
+            return {"ok": True, "id": cmd_id, "status": "delivered",
+                    "touched": True}
 
     async def list_commands(self) -> List[Dict[str, Any]]:
         async with self.lock:
