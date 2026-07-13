@@ -413,11 +413,12 @@ class SimQuotaEngine:
         * online, and not already assigned to THIS quota;
         * no human manual pin on a sim flag the engine didn't set (respect
           provenance — never fight a human);
-        * an EXCLUSIVE quota (``multi`` False) only takes a client not already
-          running an exclusive sim — one failure sim per client;
-        * a MULTI-CAPABLE quota (``multi`` True) may PACK onto a client the
-          engine already owns under another quota (and onto a client running an
-          exclusive sim) — traffic sims stack.
+        * a SHAREABLE quota (``multi`` True) may stack onto presence / traffic /
+          other shareable sims, but NEVER onto a client an EXCLUSIVE sim
+          monopolizes (e.g. ssidpw_fail — the client can't even associate);
+        * an EXCLUSIVE quota (``multi`` False) monopolizes its client, so it only
+          takes a client running NO other sim (a presence-homed client qualifies
+          — presence runs no sim).
         """
         if hostname in assigned:
             return False
@@ -430,8 +431,9 @@ class SimQuotaEngine:
         if self._human_pinned_sim(hostname, sim_id):
             return False
         if multi:
-            return True
-        return not self._exclusive_running(hostname, c)
+            return not self._exclusive_running(hostname, c)
+        active = self._client_active_sims(c) | self._engine_sims_for(hostname)
+        return not (active - {sim_id})
 
     # ── assign / release ─────────────────────────────────────────────────────
     async def _assign(self, hostname: str, sim_id: str, site: str,
@@ -701,10 +703,15 @@ class SimQuotaEngine:
             # onto them run. get_all() is a per-sweep SNAPSHOT COPY, so a same-
             # sweep re-home isn't visible to a later sim quota via _effective_site
             # — the sim quotas instead consult the ledger (homed_here) below.
-            quotas = sorted(quotas, key=lambda q: 0 if not (q.get("sim_id") or "") else 1)
+            # Order: PRESENCE first (home clients), then EXCLUSIVE (non-shareable,
+            # e.g. ssidpw_fail) sims so they claim bare clients before shareable
+            # sims (dns_fail) stack onto the rest, then the shareable sims.
+            quotas = sorted(quotas, key=lambda q: 0 if not (q.get("sim_id") or "")
+                            else (1 if not bool(q.get("multi_capable")) else 2))
             for q in quotas:
                 key = _quota_key(q)
                 sim_id = q.get("sim_id") or ""
+                multi = bool(q.get("multi_capable"))
                 site = q.get("site") or ""
                 # If `site` names an SSID cell (e.g. "MIA-PSK"), scope to the
                 # cell's PHYSICAL site for all in-site/pool/claim tests, and pin
@@ -768,6 +775,14 @@ class SimQuotaEngine:
                             assigned.pop(h, None)
                             actions["released"] += 1
                         continue
+                    if multi and sim_id and self._exclusive_running(h, c):
+                        # This is a SHAREABLE sim but an EXCLUSIVE sim now
+                        # monopolizes the client (exclusive quotas run first) —
+                        # yield it so a client never runs a shareable + exclusive.
+                        await self._release(h, sim_id, from_site, key)
+                        assigned.pop(h, None)
+                        actions["released"] += 1
+                        continue
                     producing.append(h)
                     actions["kept"] += 1
 
@@ -783,7 +798,6 @@ class SimQuotaEngine:
                 # stomp).
                 if len(producing) < target:
                     need = target - len(producing)
-                    multi = bool(q.get("multi_capable"))
                     # Clients the engine has ALREADY homed to this site under any
                     # other quota (typically a presence quota — "Clients
                     # Associated") count as in-site here, so a sim quota's tests
