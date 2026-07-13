@@ -682,6 +682,25 @@ class CSSpoke(BaseSpoke):
             return {"status": "SUCCESS", "applied": applied,
                     "overrides": dict(overrides)}
 
+        if cmd in ("CS_CLEAR_ALL_CLIENT_OVERRIDES",):
+            # Bulk-clear the legacy per-client REGISTRY override layer — the
+            # hidden [username] sim-flag source /api/config bakes in
+            # (client_api.py:304-313). Model A moved the editor to
+            # user-overrides.conf, but stale registry overrides persist in
+            # clients.json (set by the old Control Panel / a prior bulk set /
+            # a since-removed SimQuotaEngine assignment that didn't revert) and
+            # are invisible in the UI (the User Overrides card reads
+            # user-overrides.conf; cs_get_client_control reads the same). This
+            # wipes them for every registered client so the served
+            # simulation.conf drops the stale [username] sim flags on the next
+            # fetch. Idempotent + safe (clear_overrides just pops the key).
+            cleared = 0
+            for hostname in list(self.registry.get_all().keys()):
+                await self.registry.clear_overrides(hostname)
+                cleared += 1
+            logger.info("CS_CLEAR_ALL_CLIENT_OVERRIDES: cleared registry overrides for %d client(s)", cleared)
+            return {"status": "SUCCESS", "cleared": cleared}
+
         if cmd in ("CS_PURGE_CLIENTS",):
             # The "Purge Clients" button (original cs-webui
             # DELETE /api/clients/history): drop every registered client from
@@ -1009,12 +1028,14 @@ class CSSpoke(BaseSpoke):
             # stores only the bare id).
             eng = getattr(self, "sim_quota_engine", None)
             snap = eng.snapshot() if eng is not None else {}
+            placement_warnings = eng.placement_warnings() if eng is not None else []
             csc = self.local_store.get_central_sites_config()
             monitored = csc.get("monitored_checks") or []
             return {"status": "SUCCESS",
                     "effective": self.local_store.get_effective_sim_quotas(),
                     "ledger": snap,
-                    "monitored_checks": monitored}
+                    "monitored_checks": monitored,
+                    "placement_warnings": placement_warnings}
 
         if cmd == "CS_GET_PXMX_SITE_MAP":
             # Operator-assigned pxmx server → site map (Config → PXMX Sites). The

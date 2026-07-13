@@ -79,6 +79,8 @@ class SimQuotaEngine:
         # from_site is the client's pre-assignment site (for Chunk 3 revert);
         # "" / None means the client was already in the target site.
         self._ledger: Dict[str, Dict[str, Any]] = {}
+        self._placement_warnings: List[Dict[str, Any]] = []
+        self._user_conf = None
         self._ledger_path: Optional[Path] = None
         self._loop_task: Optional[asyncio.Task] = None
         self._reconcile_lock = asyncio.Lock()
@@ -475,6 +477,7 @@ class SimQuotaEngine:
         self-healing). Backfill is sourced from the live pool of clients already
         physically in the site — no separate per-client tracking of the balance.
         A ``remainder`` cell soaks up everyone not held by a target."""
+        self._placement_warnings = []
         try:
             placement = self.spoke.local_store.get_ssid_placement() or {}
             matrix = self.spoke.local_store.get_ssid_matrix() or []
@@ -524,6 +527,12 @@ class SimQuotaEngine:
                         where[h] = cell_name
                         held.add(h)
                         actions["assigned"] += 1
+                # Record a shortfall (pool too small to meet the floor) so the UI
+                # can warn instead of silently under-filling.
+                final = len([h for h in assigned if where.get(h) == cell_name])
+                if final < want:
+                    self._placement_warnings.append(
+                        {"site": site, "cell": cell_name, "have": final, "want": want})
 
             # Remainder: everyone in the pool not held by a target lands on the
             # remainder cell (stable). No tracking — it's the site's default cell.
@@ -724,3 +733,8 @@ class SimQuotaEngine:
                   "clients": list((e.get("clients") or {}).keys())}
             for key, e in self._ledger.items()
         }
+
+    def placement_warnings(self) -> List[Dict[str, Any]]:
+        """SSID cells that couldn't reach their hold-N floor last sweep (pool too
+        small). Consumed by the Quota State view."""
+        return list(getattr(self, "_placement_warnings", []) or [])
