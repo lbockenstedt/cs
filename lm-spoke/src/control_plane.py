@@ -161,6 +161,34 @@ class CSControlPlane(AgentHostingControlPlane):
             return str(cert), str(key)
         return None, None
 
+    # The client API serves the ISOLATED sim-client segment (169.253.1.0/24),
+    # where the linux/windows agents HARD-CODE http://169.253.1.1:8080. It must
+    # never run HTTPS: a le cert delivered here (INSTALL_CERT, or le-module
+    # testing) silently re-binds 8080 to TLS and every plain-http client then
+    # gets "empty reply from server" — the client can't fetch config or beacon,
+    # so it never comes online. Plaintext is the default; an operator who truly
+    # wants TLS on the client webui sets LM_CS_ALLOW_LOCAL_CERT=1.
+    _ALLOW_LOCAL_CERT_ENV = "LM_CS_ALLOW_LOCAL_CERT"
+
+    def _local_cert_allowed(self) -> bool:
+        return os.getenv(self._ALLOW_LOCAL_CERT_ENV) == "1"
+
+    def _purge_local_cert(self) -> None:
+        """Delete any persisted local-webui cert so the client API binds plaintext.
+        Called on startup and whenever an INSTALL_CERT is refused, so a stray le
+        cert can't linger and flip 8080 to HTTPS on the next restart."""
+        d = self._tls_dir()
+        for name in ("fullchain.pem", "privkey.pem"):
+            p = d / name
+            try:
+                if p.exists():
+                    p.unlink()
+                    logger.warning(
+                        "Removed local-webui cert %s — cs client API is "
+                        "plaintext-only on the isolated sim segment", p)
+            except OSError as exc:  # noqa: BLE001
+                logger.warning("Could not remove local-webui cert %s: %s", p, exc)
+
     def _agent_listener_tls_paths(self):
         """Prefer the LE cert applied by ``_apply_local_cert`` (persisted under
         the TLS dir) for the 443 ``/ws/agent`` listener, falling back to the
@@ -220,6 +248,17 @@ class CSControlPlane(AgentHostingControlPlane):
         Validate in a throwaway ssl context first (fail-fast — a bad cert must
         not brick the listener), atomic-write fullchain+privkey, then re-bind
         the uvicorn server with HTTPS in-process."""
+        # The cs client API is plaintext-only on the isolated sim segment (the
+        # agents speak plain http). Refuse to apply a cert here unless explicitly
+        # allowed, and scrub any that a prior push left behind. Return SUCCESS so
+        # the hub/le doesn't flag the spoke as a cert-install failure.
+        if not self._local_cert_allowed():
+            self._purge_local_cert()
+            logger.info("INSTALL_CERT ignored for cs client API — plaintext-only "
+                        "on the isolated sim segment (set %s=1 to override)",
+                        self._ALLOW_LOCAL_CERT_ENV)
+            return {"status": "SUCCESS",
+                    "message": "cs client API is plaintext-only; cert not applied"}
         if not (fullchain and privkey):
             return {"status": "ERROR", "message": "missing cert material"}
         # Validate before touching live files.
@@ -332,11 +371,17 @@ class CSControlPlane(AgentHostingControlPlane):
         # as webui-spoke running the LM relay as a background task.
         app = build_client_api_app(cs_spoke)
         self._api_app = app  # retained so _apply_local_cert can re-bind with TLS
-        # If a le-issued cert was previously applied to the local webui, re-bind
-        # HTTPS on startup so a restart keeps HTTPS (see _apply_local_cert).
-        tls_cert, tls_key = self._local_tls_paths()
-        _tls_kwargs = ({"ssl_certfile": tls_cert, "ssl_keyfile": tls_key}
-                       if tls_cert and tls_key else {})
+        # Client API is plaintext-only by default (isolated sim segment; agents
+        # hard-code http://169.253.1.1:8080). Scrub any stray le cert so 8080
+        # binds HTTP. Only when LM_CS_ALLOW_LOCAL_CERT=1 do we honor a persisted
+        # cert and bind HTTPS on startup (see _apply_local_cert / _purge_local_cert).
+        if self._local_cert_allowed():
+            tls_cert, tls_key = self._local_tls_paths()
+            _tls_kwargs = ({"ssl_certfile": tls_cert, "ssl_keyfile": tls_key}
+                           if tls_cert and tls_key else {})
+        else:
+            self._purge_local_cert()
+            _tls_kwargs = {}
         self._api_server = uvicorn.Server(
             uvicorn.Config(app, host=self.api_host, port=self.api_port,
                            log_config=None, **_tls_kwargs))
