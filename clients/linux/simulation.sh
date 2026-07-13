@@ -363,6 +363,17 @@ echo Kill Switch is $kill_switch | tee -a ${LOG_FILE}
 if [ "$kill_switch" != "on" ]; then
  for z in {1..100}; do
   #------------------------------------------------------------
+  # Rapid update — MUST fire every iteration REGARDLESS of which
+  # simulation is running. It sits at the very top of the loop, before
+  # the ssidpw_fail/auth_fail branch and before the connectivity gate,
+  # so update.sh polls config/scripts frequently for EVERY client. It
+  # used to live at the bottom of the non-auth-fail branch, where an
+  # auth_fail/ssidpw_fail client (which takes the other branch) or any
+  # connectivity `continue 2` skipped it entirely — so rapid_update
+  # silently never ran for those clients.
+  #------------------------------------------------------------
+  if [[ "$rapid_update" == "on" ]]; then source '/usr/local/scripts/update.sh'; fi
+  #------------------------------------------------------------
   #SSID Incorrect Password Simulation or Auth Failure Simulation
   #since these are very similar they are in the same section one
   #has a bad PSK and others have a blocked mac or invalud username/password combo
@@ -478,11 +489,8 @@ if [ "$kill_switch" != "on" ]; then
    #------------------------------------------------------------
    echo End of simulation | tee -a ${LOG_FILE}
    #------------------------------------------------------------
-   #Running update to either the cloud repo or local SMB repo
-   #------------------------------------------------------------
-   if [[ "$rapid_update" == "on" ]]; then source '/usr/local/scripts/update.sh'; fi
-   #------------------------------------------------------------
-   #End Script Updates
+   # (rapid_update now runs at the TOP of the loop so it fires for
+   # every client regardless of simulation — see above.)
    #------------------------------------------------------------
    report_status $z
    echo Sleeping for 5 seconds | tee -a ${LOG_FILE}
@@ -498,6 +506,10 @@ else
  #If kill switch is enabled - sleeping for 5 minutes then restarting the loop
  #------------------------------------------------------------
  echo Kill switch enabled - sleeping for 5 minutes
+ # Still poll for updates while kill-switched so the client can pick up a
+ # config change that turns the kill switch back OFF (update.sh pulls a fresh
+ # simulation.conf; init_simulation_context re-reads it next outer loop).
+ if [[ "$rapid_update" == "on" ]]; then source '/usr/local/scripts/update.sh'; fi
  sleep 300
 fi
 #------------------------------------------------------------

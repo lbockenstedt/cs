@@ -493,6 +493,15 @@ while ($true) {
 
     if ($script:kill_switch -eq 'off') {
         for ($z = 1; $z -le 100; $z++) {
+            # Rapid update — MUST fire every iteration REGARDLESS of which
+            # simulation is running. At the top of the loop, before the
+            # ssidpw_fail/auth_fail branch and the connectivity gate, so it runs
+            # for every client. It used to sit at the bottom of the non-auth-fail
+            # branch, where an auth_fail/ssidpw_fail client (other branch) or a
+            # connectivity break skipped it entirely.
+            if ($script:rapid_update -eq 'on') {
+                . 'C:\Scripts\update.ps1'
+            }
             $wladapter = Get-WifiAdapter
             $gateway = Get-DefaultGateway
             $script:gateway_reachable = Test-GatewayReachable -Gateway $gateway
@@ -582,9 +591,8 @@ while ($true) {
                     $script:www_traffic = 'on'
                 }
                 Write-SimDebug 'End of simulation'
-                if ($script:rapid_update -eq 'on') {
-                    . 'C:\Scripts\update.ps1'
-                }
+                # (rapid_update now runs at the TOP of the loop so it fires for
+                # every client regardless of simulation — see above.)
                 Write-SimDebug 'Sleeping for 5 seconds'
                 Write-SimDebug "Loop iteration $z of 100"
                 Start-Sleep -Seconds 5
@@ -592,6 +600,11 @@ while ($true) {
         }
     } else {
         Write-SimDebug 'Kill switch enabled - sleeping for 5 minutes'
+        # Poll for updates while kill-switched so the client can pick up a config
+        # change that turns the kill switch back off.
+        if ($script:rapid_update -eq 'on') {
+            . 'C:\Scripts\update.ps1'
+        }
         Start-Sleep -Seconds 300
     }
 
