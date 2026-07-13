@@ -449,9 +449,15 @@ if [ "$kill_switch" != "on" ]; then
   #------------------------------------------------------------
   if [[ ($ssidpw_fail == "on" || $auth_fail == "on") && -n ${wladapter} ]]; then
     if [[ "$ssidpw_fail" == "on" ]]; then
+     # Base the wrong password on the client's EFFECTIVE password: the
+     # [username]/cell override (get_value $username) wins over the [s0-s9]
+     # bucket, so it's genuinely one char off the REAL password for the SSID this
+     # client associates to. Re-resolve here — apply_override's $ssidpw may have
+     # been clobbered by a prior iteration's restore.
+     real_ssidpw=$(get_value $username 'ssidpw'); [[ -z "$real_ssidpw" ]] && real_ssidpw=$(get_value $simulation_id 'ssidpw')
      for i in {1..100}; do
       echo Running SSID Incorrect Password | tee -a ${LOG_FILE}
-      ssidpw="$(get_value $simulation_id 'ssidpw')""_fail"
+      ssidpw="${real_ssidpw}_fail"
       echo Iteration $i of 100 | tee -a ${LOG_FILE}
       delete_matching_connections
       connect_wifi 5
@@ -471,7 +477,7 @@ if [ "$kill_switch" != "on" ]; then
    #------------------------------------------------------------
    #Resetting the WIFI Password so it can connect correctly for updates/maintenance
    #------------------------------------------------------------
-   ssidpw=$(get_value $simulation_id 'ssidpw')
+   ssidpw=$(get_value $username 'ssidpw'); [[ -z "$ssidpw" ]] && ssidpw=$(get_value $simulation_id 'ssidpw')
    connect_wifi 5
    #------------------------------------------------------------
    #End SSID Incorrect Password Simualtion or Auth Failure Simulation
