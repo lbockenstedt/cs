@@ -1175,6 +1175,30 @@ class CSSpoke(BaseSpoke):
             if isinstance(sh, dict):
                 self.local_store.set_sim_shareable(sh)
                 applied.append("sim_shareable")
+        # Pool / SSID config (docs/simulation-pool-and-quota-design.md).
+        if "site_source" in patch:
+            self.local_store.set_site_source(str(patch.get("site_source") or "pxmx"))
+            applied.append("site_source")
+        if "randomizable_sims" in patch:
+            rs = patch.get("randomizable_sims")
+            if isinstance(rs, list):
+                self.local_store.set_randomizable_sims(rs)
+                applied.append("randomizable_sims")
+        if "random_pool" in patch:
+            rp = patch.get("random_pool")
+            if isinstance(rp, dict):
+                self.local_store.set_random_pool(rp)
+                applied.append("random_pool")
+        if "ssid_matrix" in patch:
+            sm = patch.get("ssid_matrix")
+            if isinstance(sm, list):
+                self.local_store.set_ssid_matrix(sm)
+                applied.append("ssid_matrix")
+        if "ssid_placement" in patch:
+            sp = patch.get("ssid_placement")
+            if isinstance(sp, dict):
+                self.local_store.set_ssid_placement(sp)
+                applied.append("ssid_placement")
         for key in self._HUB_DIRECT_KEYS:
             if key in patch:
                 update[key] = patch[key]

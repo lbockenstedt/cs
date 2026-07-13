@@ -328,3 +328,60 @@ class LocalStore:
         with self._lock:
             self._data["sim_shareable"] = dict(mapping) if isinstance(mapping, dict) else {}
             self._save()
+
+    # ── pool / SSID config (hub-pushed) — see docs/simulation-pool-and-quota-design.md ──
+    # site_source: "pxmx" (site from the hosting PXMX server — RF chamber, the
+    # common case) or "assigned" (weighted logical assignment + site-based SSID).
+    def get_site_source(self) -> str:
+        v = str(self._data.get("site_source") or "pxmx").strip().lower()
+        return v if v in ("pxmx", "assigned") else "pxmx"
+
+    def set_site_source(self, mode: str) -> None:
+        with self._lock:
+            m = str(mode or "pxmx").strip().lower()
+            self._data["site_source"] = m if m in ("pxmx", "assigned") else "pxmx"
+            self._save()
+
+    # randomizable_sims: the sim_ids the ambient pool may randomly run (traffic
+    # sims). Failure/alert sims are harvest-only and NEVER appear here.
+    def get_randomizable_sims(self) -> list:
+        v = self._data.get("randomizable_sims")
+        return list(v) if isinstance(v, list) else []
+
+    def set_randomizable_sims(self, sims: list) -> None:
+        with self._lock:
+            self._data["randomizable_sims"] = [str(s) for s in sims] if isinstance(sims, list) else []
+            self._save()
+
+    # random_pool: {site: bool} — whether ambient clients at a site randomize.
+    def get_random_pool(self) -> dict:
+        v = self._data.get("random_pool")
+        return dict(v) if isinstance(v, dict) else {}
+
+    def set_random_pool(self, mapping: dict) -> None:
+        with self._lock:
+            self._data["random_pool"] = {str(k): bool(v) for k, v in mapping.items()} \
+                if isinstance(mapping, dict) else {}
+            self._save()
+
+    # ssid_matrix: the defined cells [{site, auth, ssid, ssidpw, enabled, weight}].
+    def get_ssid_matrix(self) -> list:
+        v = self._data.get("ssid_matrix")
+        return [dict(c) for c in v if isinstance(c, dict)] if isinstance(v, list) else []
+
+    def set_ssid_matrix(self, cells: list) -> None:
+        with self._lock:
+            self._data["ssid_matrix"] = [dict(c) for c in cells if isinstance(c, dict)] \
+                if isinstance(cells, list) else []
+            self._save()
+
+    # ssid_placement: per-site SSID hold targets + remainder policy, e.g.
+    # {"MIA": {"targets": {"MIA-PSK": 20, "MIA-1X": 50}, "remainder": "MIA-1X"}}.
+    def get_ssid_placement(self) -> dict:
+        v = self._data.get("ssid_placement")
+        return dict(v) if isinstance(v, dict) else {}
+
+    def set_ssid_placement(self, mapping: dict) -> None:
+        with self._lock:
+            self._data["ssid_placement"] = dict(mapping) if isinstance(mapping, dict) else {}
+            self._save()
