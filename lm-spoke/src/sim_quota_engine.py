@@ -271,6 +271,15 @@ class SimQuotaEngine:
         in two sites at once."""
         return getattr(self, "_claimed_site", {}).get(hostname, site) == site
 
+    def _cell_ok_for(self, hostname: str, claim: str) -> bool:
+        """A client may be used by a quota keyed on ``claim`` (an SSID cell like
+        "MIA-PSK", or a bare site for non-cell quotas) only if it isn't already
+        claimed for a DIFFERENT cell this sweep — a client has ONE SSID, so
+        MIA-PSK and MIA-ACD can't both hold it. Quotas on the SAME cell share
+        (same claim → eligible), which is what lets dns_fail stack onto the cell's
+        "Clients Associated" clients."""
+        return getattr(self, "_claimed_cell", {}).get(hostname, claim) == claim
+
     def _natural_site(self, hostname: str, c: Dict[str, Any]) -> str:
         """The client's site with engine re-homes reverted — a MANUAL ``wsite``
         override is honored, but an ENGINE-set ``wsite`` (one that matches the
@@ -652,18 +661,23 @@ class SimQuotaEngine:
                 self._cells_by_name = {}
 
             actions = {"assigned": 0, "released": 0, "kept": 0}
-            # Site exclusivity: a tenant-pool client (assignable, not physically
-            # site-bound) must belong to exactly ONE site per sweep — otherwise the
-            # same client lands in BOTH MIA and DFW quotas. Seed from the current
-            # ledger (first entry's site wins) so an already-homed client stays put;
-            # placement + the sim quotas below claim into this map and skip any
-            # tenant-pool client already claimed for a different site.
+            # Exclusivity: a tenant-pool client belongs to exactly ONE physical
+            # SITE per sweep (no MIA+DFW), and to exactly ONE SSID CELL (no
+            # MIA-PSK+MIA-ACD). Seed both from the current ledger (first entry
+            # wins) so an already-homed client stays put; the sim quotas below
+            # claim into these maps. _claimed_cell keys sharing too: quotas on the
+            # SAME cell reuse each other's clients (dns_fail stacks onto the cell's
+            # Clients Associated), different cells don't.
             self._claimed_site: Dict[str, str] = {}
+            self._claimed_cell: Dict[str, str] = {}
             for _e in self._ledger.values():
                 _s = str(_e.get("site") or "")
-                if _s:
-                    for _h in (_e.get("clients") or {}):
+                _ck = str(_e.get("claim") or _s)
+                for _h in (_e.get("clients") or {}):
+                    if _s:
                         self._claimed_site.setdefault(_h, _s)
+                    if _ck:
+                        self._claimed_cell.setdefault(_h, _ck)
             # Harvest quotas run FIRST and claim their exact (accounted) clients;
             # the weighted random spread (below, after the loop) then places every
             # remaining spare client — so only the ~1% harvested is accounted for.
@@ -684,6 +698,10 @@ class SimQuotaEngine:
                 # are distinct quotas that can coexist at the same site.
                 cell = self._quota_cell(q)
                 scope_site = str(cell.get("site") or "") if cell else site
+                # claim = the SHARING + EXCLUSIVITY identity: the SSID cell name
+                # for a cell quota, else the (physical) site. Quotas with the same
+                # claim share clients; different claims can't hold the same client.
+                claim_key = str(cell.get("name") or scope_site) if cell else scope_site
                 target = int(q.get("count") or 1)
                 # A PRESENCE quota (sim_id empty — "Clients Associated") homes N
                 # clients to the site and runs no sim; it's still a real ledger
@@ -692,6 +710,7 @@ class SimQuotaEngine:
                     key, {"sim_id": sim_id, "site": scope_site, "clients": {}})
                 entry["sim_id"] = sim_id
                 entry["site"] = scope_site
+                entry["claim"] = claim_key
                 # Alias the stored dict (NOT `or {}` — an empty dict is falsy,
                 # so `or {}` would rebind to a fresh dict and mutations wouldn't
                 # land in the ledger).
@@ -756,17 +775,23 @@ class SimQuotaEngine:
                     # stack onto presence-homed clients immediately instead of
                     # waiting for the next sweep's snapshot to reflect the wsite
                     # re-home (get_all() is a stale per-sweep copy).
+                    # Share by CELL, not site: only clients already homed to THIS
+                    # cell (same claim) count as homed_here — so dns_fail on MIA-PSK
+                    # stacks onto MIA-PSK's Clients Associated, but NOT onto MIA-ACD.
                     homed_here = set()
-                    if scope_site:
+                    if claim_key:
                         for e in self._ledger.values():
-                            if (e.get("site") or "") == scope_site:
+                            if (e.get("claim") or e.get("site") or "") == claim_key:
                                 homed_here.update((e.get("clients") or {}).keys())
                     # A tenant-pool client (server not site-pinned) is assignable
                     # to any site, so it counts as in-site for a site-scoped
                     # harvest (assign sets its wsite=site). Physically-bound
                     # clients at OTHER sites are still excluded (RF isolation).
+                    # _cell_ok_for excludes a client already claimed for a DIFFERENT
+                    # cell this sweep (one SSID per client).
                     in_site = [h for h, c in clients.items()
                                if self._pool_eligible(h, c, sim_id, multi, now, assigned)
+                               and self._cell_ok_for(h, claim_key)
                                and (not scope_site or self._effective_site(h, c) == scope_site
                                     or h in homed_here
                                     or (self._is_tenant_pool_client(h) and self._site_ok_for(h, scope_site)))]
@@ -783,6 +808,7 @@ class SimQuotaEngine:
                         cross = [h for h, c in clients.items()
                                  if self._pool_eligible(h, c, sim_id, multi, now, assigned)
                                  and self._is_tenant_pool_client(h)
+                                 and self._cell_ok_for(h, claim_key)
                                  and self._site_ok_for(h, scope_site)
                                  and (not scope_site or self._effective_site(h, c) != scope_site)]
                         picks += cross[:need - len(picks)]
@@ -794,6 +820,8 @@ class SimQuotaEngine:
                         assigned[h] = self._natural_site(h, c)
                         if scope_site:
                             self._claimed_site[h] = scope_site   # one site per client per sweep
+                        if claim_key:
+                            self._claimed_cell[h] = claim_key    # one SSID cell per client per sweep
                         producing.append(h)
                         actions["assigned"] += 1
 
