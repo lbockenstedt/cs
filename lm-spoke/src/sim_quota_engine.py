@@ -410,7 +410,8 @@ class SimQuotaEngine:
         return not self._exclusive_running(hostname, c)
 
     # ── assign / release ─────────────────────────────────────────────────────
-    async def _assign(self, hostname: str, sim_id: str, site: str) -> None:
+    async def _assign(self, hostname: str, sim_id: str, site: str,
+                      cell: Optional[Dict[str, Any]] = None) -> None:
         reg = self._registry()
         if reg is None:
             return
@@ -427,6 +428,13 @@ class SimQuotaEngine:
             overrides[sim_id] = "on"
         if site and site != from_site:
             overrides["wsite"] = site
+        # Cell quota: also pin the client's SSID (+ password) to the cell, so a
+        # "MIA-PSK" quota lands the client on the PSK SSID — not just the site.
+        if cell:
+            for src, key in (("ssid", "ssid"), ("ssidpw", "ssidpw")):
+                val = str(cell.get(src) or "").strip()
+                if val:
+                    overrides[key] = val
         if overrides:
             await self._engine_set(hostname, overrides)
         logger.info("SimQuotaEngine: assigned %s → sim=%s site=%s (from %s)",
@@ -543,87 +551,83 @@ class SimQuotaEngine:
                 return name
         return ""
 
-    async def _reconcile_placement(self, clients: Dict[str, Any], now: float,
-                                   actions: Dict[str, int]) -> None:
-        """Hold N clients on each configured SSID cell within a site (sticky,
-        self-healing). Backfill is sourced from the live pool of clients already
-        physically in the site — no separate per-client tracking of the balance.
-        A ``remainder`` cell soaks up everyone not held by a target."""
+    def _quota_cell(self, q: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """If a quota's ``site`` names an SSID cell (Pool & SSID matrix), return
+        that cell dict; else None. A cell quota scopes to the cell's physical
+        site and pins the assigned client's ssid/ssidpw to the cell."""
+        return getattr(self, "_cells_by_name", {}).get(str(q.get("site") or "").strip())
+
+    async def _reconcile_weighted(self, clients: Dict[str, Any], now: float,
+                                  actions: Dict[str, int]) -> None:
+        """Spread the SPARE pool (clients no harvest quota claimed this sweep)
+        across each site's weighted SSID cells — the ~99% random clients, with NO
+        per-client accounting (no ledger). Each weighted rule is {site, ssid,
+        weight, all}: clients split proportional to weight; weight 0 = that cell
+        takes none; a cell flagged ``all`` soaks the balance after the split.
+        Runs AFTER the harvest loop so it only touches clients not pinned to a
+        quota. Stateless: it just sets each spare client's ssid/wsite each sweep."""
         self._placement_warnings = []
         try:
-            placement = self.spoke.local_store.get_ssid_placement() or {}
-            matrix = self.spoke.local_store.get_ssid_matrix() or []
+            rules = self.spoke.local_store.get_ssid_weights() or []
         except Exception:  # noqa: BLE001
             return
-        if not placement:
+        if not rules:
             return
-        cells: Dict[str, Dict[str, Any]] = {}
-        for cd in matrix:
-            name = str(cd.get("name") or cd.get("ssid_name") or "").strip()
-            if name and cd.get("enabled", True):
-                cells[name] = cd
-        # Per-server binding (a deployment can mix): a client on a server pinned to
-        # a REAL site (RF chamber) is physically bound to that site and can only be
-        # placed on that site's cells; a client on a TENANT-POOL server is
-        # assignable to ANY site/SSID. So a cell at site S draws from clients
-        # physically at S PLUS the tenant pool. `claimed` (global to the sweep)
-        # keeps each client on exactly one cell.
+        cells = getattr(self, "_cells_by_name", {})
         online = {h for h, c in clients.items() if self._is_harvestable(c, now)}
-        claimed: set = set()
-
-        for site, cfg in placement.items():
-            if not isinstance(cfg, dict):
+        # Group rules by the cell's physical site.
+        by_site: Dict[str, List[Dict[str, Any]]] = {}
+        for r in rules:
+            cname = str(r.get("ssid") or r.get("cell") or "").strip()
+            cell = cells.get(cname)
+            if not cell:
                 continue
-            targets = cfg.get("targets") or {}
-            remainder = str(cfg.get("remainder") or "").strip()
-            site_pool = [h for h in online
-                         if self._physical_site_of(h) == site
-                         or (self._is_tenant_pool_client(h) and self._site_ok_for(h, site))]
+            site = str(cell.get("site") or r.get("site") or "").strip()
+            if not site:
+                continue
+            by_site.setdefault(site, []).append({
+                "cell": cell, "name": cname,
+                "weight": max(0.0, float(r.get("weight") or 0)),
+                "all": bool(r.get("all")),
+            })
 
-            for cell_name, want in targets.items():
-                want = int(want or 0)
-                cell = cells.get(cell_name)
-                if not cell:
-                    continue
-                key = f"{PLACEMENT_PREFIX}{site}:{cell_name}"
-                entry = self._ledger.setdefault(key, {"cell": cell_name, "site": site, "clients": {}})
-                assigned = entry.setdefault("clients", {})
-                # Sticky: keep clients already placed here that are still online
-                # (and not already claimed by an earlier cell); drop the rest.
-                for h in list(assigned.keys()):
-                    if h in online and h not in claimed:
-                        claimed.add(h)
-                        self._claimed_site[h] = site
-                    else:
-                        assigned.pop(h, None)
-                # Backfill to the target from unclaimed candidates in the pool.
-                if len(assigned) < want:
-                    for h in site_pool:
-                        if len(assigned) >= want:
-                            break
-                        if h in claimed:
-                            continue
-                        await self._place(h, cell)
-                        assigned[h] = ""
-                        claimed.add(h)
-                        self._claimed_site[h] = site
-                        actions["assigned"] += 1
-                # Warn when the pool couldn't reach the floor (design §14).
-                if len(assigned) < want:
-                    self._placement_warnings.append(
-                        {"site": site, "cell": cell_name, "have": len(assigned), "want": want})
-
-            # Remainder: unclaimed clients in this site's pool land on the
-            # remainder cell (a catch-all default). In assigned mode this soaks
-            # the leftover giant pool, so set a remainder on ONE site only.
-            rem_cell = cells.get(remainder)
-            if rem_cell:
-                for h in site_pool:
-                    if h not in claimed:
-                        await self._place(h, rem_cell)
-                        claimed.add(h)
-                        self._claimed_site[h] = site
-                        actions["assigned"] += 1
+        for site, srules in by_site.items():
+            # Spare = online clients physically here (RF chamber) OR assignable
+            # (tenant-pool), that no harvest quota already claimed this sweep.
+            spare = [h for h in online
+                     if h not in self._claimed_site
+                     and (self._physical_site_of(h) == site
+                          or (self._is_tenant_pool_client(h) and self._site_ok_for(h, site)))]
+            if not spare:
+                continue
+            weighted = [r for r in srules if r["weight"] > 0]
+            all_rule = next((r for r in srules if r["all"]), None)
+            total_w = sum(r["weight"] for r in weighted)
+            n = len(spare)
+            alloc: Dict[str, int] = {r["name"]: 0 for r in srules}
+            if total_w > 0:
+                raw = [(r, n * r["weight"] / total_w) for r in weighted]
+                for r, x in raw:
+                    alloc[r["name"]] = int(x)
+                rem = n - sum(alloc.values())
+                if all_rule is not None:            # balance → the `all` cell
+                    alloc[all_rule["name"]] += rem
+                else:                                # largest-remainder among weighted
+                    for r, _x in sorted(raw, key=lambda t: t[1] - int(t[1]),
+                                        reverse=True)[:max(0, rem)]:
+                        alloc[r["name"]] += 1
+            elif all_rule is not None:               # no weights set → everyone to `all`
+                alloc[all_rule["name"]] = n
+            # Hand out the spare clients per allocation (order is arbitrary — these
+            # are random clients; no stickiness needed).
+            i = 0
+            for r in srules:
+                take = alloc.get(r["name"], 0)
+                for h in spare[i:i + take]:
+                    await self._place(h, r["cell"])
+                    self._claimed_site[h] = site
+                    actions["assigned"] += 1
+                i += take
 
     # ── reconcile ────────────────────────────────────────────────────────────
     async def reconcile(self) -> Dict[str, Any]:
@@ -634,6 +638,18 @@ class SimQuotaEngine:
             clients = self._all_clients()
             eff_keys = {_quota_key(q) for q in quotas}
             self._refresh_host_index()
+            # SSID-cell index for this sweep. A quota whose `site` names a cell
+            # (e.g. "MIA-PSK") scopes to the cell's physical SITE and pins each
+            # assigned client's ssid/ssidpw to the cell — a self-contained cell
+            # quota. The weighted spread (_reconcile_weighted) reuses this index.
+            self._cells_by_name = {}
+            try:
+                for cd in (self.spoke.local_store.get_ssid_matrix() or []):
+                    nm = str(cd.get("name") or cd.get("ssid_name") or "").strip()
+                    if nm and cd.get("enabled", True):
+                        self._cells_by_name[nm] = cd
+            except Exception:  # noqa: BLE001
+                self._cells_by_name = {}
 
             actions = {"assigned": 0, "released": 0, "kept": 0}
             # Site exclusivity: a tenant-pool client (assignable, not physically
@@ -648,9 +664,9 @@ class SimQuotaEngine:
                 if _s:
                     for _h in (_e.get("clients") or {}):
                         self._claimed_site.setdefault(_h, _s)
-            # SSID placement first: settle each client's site/SSID before the sim
-            # harvest (which sits on top of that placement).
-            await self._reconcile_placement(clients, now, actions)
+            # Harvest quotas run FIRST and claim their exact (accounted) clients;
+            # the weighted random spread (below, after the loop) then places every
+            # remaining spare client — so only the ~1% harvested is accounted for.
             # Process PRESENCE quotas (sim_id empty — "Clients Associated") first
             # so clients are homed to their site before the sim quotas that stack
             # onto them run. get_all() is a per-sweep SNAPSHOT COPY, so a same-
@@ -661,14 +677,21 @@ class SimQuotaEngine:
                 key = _quota_key(q)
                 sim_id = q.get("sim_id") or ""
                 site = q.get("site") or ""
+                # If `site` names an SSID cell (e.g. "MIA-PSK"), scope to the
+                # cell's PHYSICAL site for all in-site/pool/claim tests, and pin
+                # that cell's SSID on the clients we assign. The ledger KEY still
+                # carries the cell name (via _quota_key), so MIA-PSK and MIA-ACD
+                # are distinct quotas that can coexist at the same site.
+                cell = self._quota_cell(q)
+                scope_site = str(cell.get("site") or "") if cell else site
                 target = int(q.get("count") or 1)
                 # A PRESENCE quota (sim_id empty — "Clients Associated") homes N
                 # clients to the site and runs no sim; it's still a real ledger
                 # entry the engine keeps filled (substitute on offline/dead).
                 entry = self._ledger.setdefault(
-                    key, {"sim_id": sim_id, "site": site, "clients": {}})
+                    key, {"sim_id": sim_id, "site": scope_site, "clients": {}})
                 entry["sim_id"] = sim_id
-                entry["site"] = site
+                entry["site"] = scope_site
                 # Alias the stored dict (NOT `or {}` — an empty dict is falsy,
                 # so `or {}` would rebind to a fresh dict and mutations wouldn't
                 # land in the ledger).
@@ -696,7 +719,7 @@ class SimQuotaEngine:
                         # goes dead (handled below).
                         assigned.pop(h, None)
                         continue
-                    if site and self._effective_site(h, c) != site:
+                    if scope_site and self._effective_site(h, c) != scope_site:
                         # Drifted off-site — release, let a substitute pick up.
                         await self._release(h, sim_id, from_site, key)
                         assigned.pop(h, None)
@@ -734,9 +757,9 @@ class SimQuotaEngine:
                     # waiting for the next sweep's snapshot to reflect the wsite
                     # re-home (get_all() is a stale per-sweep copy).
                     homed_here = set()
-                    if site:
+                    if scope_site:
                         for e in self._ledger.values():
-                            if (e.get("site") or "") == site:
+                            if (e.get("site") or "") == scope_site:
                                 homed_here.update((e.get("clients") or {}).keys())
                     # A tenant-pool client (server not site-pinned) is assignable
                     # to any site, so it counts as in-site for a site-scoped
@@ -744,9 +767,9 @@ class SimQuotaEngine:
                     # clients at OTHER sites are still excluded (RF isolation).
                     in_site = [h for h, c in clients.items()
                                if self._pool_eligible(h, c, sim_id, multi, now, assigned)
-                               and (not site or self._effective_site(h, c) == site
+                               and (not scope_site or self._effective_site(h, c) == scope_site
                                     or h in homed_here
-                                    or (self._is_tenant_pool_client(h) and self._site_ok_for(h, site)))]
+                                    or (self._is_tenant_pool_client(h) and self._site_ok_for(h, scope_site)))]
                     picks = in_site[:need]
                     if q.get("rehome") and len(picks) < need:
                         # Cross-site fallback: any other-site eligible runner.
@@ -760,17 +783,17 @@ class SimQuotaEngine:
                         cross = [h for h, c in clients.items()
                                  if self._pool_eligible(h, c, sim_id, multi, now, assigned)
                                  and self._is_tenant_pool_client(h)
-                                 and self._site_ok_for(h, site)
-                                 and (not site or self._effective_site(h, c) != site)]
+                                 and self._site_ok_for(h, scope_site)
+                                 and (not scope_site or self._effective_site(h, c) != scope_site)]
                         picks += cross[:need - len(picks)]
                     for h in picks:
-                        await self._assign(h, sim_id, site)
+                        await self._assign(h, sim_id, scope_site, cell=cell)
                         c = clients.get(h) or {}
                         # Record the natural site (pre-rehome, manual wsite kept)
                         # so a packed fellow quota is recognized as a re-homer.
                         assigned[h] = self._natural_site(h, c)
-                        if site:
-                            self._claimed_site[h] = site   # one site per client per sweep
+                        if scope_site:
+                            self._claimed_site[h] = scope_site   # one site per client per sweep
                         producing.append(h)
                         actions["assigned"] += 1
 
@@ -786,11 +809,13 @@ class SimQuotaEngine:
                         await self._release(h, sim_id, from_site, key)
                         actions["released"] += 1
 
-            # Release clients whose quota left the effective set. Placement
-            # entries (SSID cells) are managed by _reconcile_placement, not the
-            # sim-quota effective set — never release them here.
+            # Release clients whose quota left the effective set. Legacy
+            # placement:* ledger entries are DEPRECATED (placement is now the
+            # stateless weighted spread) — drop them without a release; the
+            # weighted pass re-sets each spare client's ssid this same sweep.
             for key in list(self._ledger.keys()):
                 if key.startswith(PLACEMENT_PREFIX):
+                    self._ledger.pop(key, None)
                     continue
                 if key not in eff_keys:
                     entry = self._ledger.pop(key)
@@ -798,6 +823,10 @@ class SimQuotaEngine:
                     for h, from_site in (entry.get("clients") or {}).items():
                         await self._release(h, sim_id, from_site, key)
                         actions["released"] += 1
+
+            # Weighted random spread: place every spare (un-harvested) client
+            # across the site's weighted SSID cells. Stateless, no accounting.
+            await self._reconcile_weighted(clients, now, actions)
 
             # Reconcile engine-owned override keys against the ledger: drop
             # orphaned engine-set sim flags (a transient _release failure left

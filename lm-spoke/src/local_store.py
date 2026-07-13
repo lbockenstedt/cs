@@ -385,3 +385,18 @@ class LocalStore:
         with self._lock:
             self._data["ssid_placement"] = dict(mapping) if isinstance(mapping, dict) else {}
             self._save()
+
+    # ssid_weights: weighted random-spread rules for the SPARE (unaccounted)
+    # pool — a list of {site, ssid, weight, all}. weight 0 = that cell takes
+    # none; ``all`` = the cell soaks the balance. Replaces the deprecated
+    # ssid_placement hold-N/remainder model; the engine's _reconcile_weighted
+    # consumes it.
+    def get_ssid_weights(self) -> list:
+        v = self._data.get("ssid_weights")
+        return [dict(r) for r in v if isinstance(r, dict)] if isinstance(v, list) else []
+
+    def set_ssid_weights(self, rules: list) -> None:
+        with self._lock:
+            self._data["ssid_weights"] = [dict(r) for r in rules if isinstance(r, dict)] \
+                if isinstance(rules, list) else []
+            self._save()

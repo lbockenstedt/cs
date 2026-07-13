@@ -1257,6 +1257,11 @@ class CSSpoke(BaseSpoke):
             if isinstance(sp, dict):
                 self.local_store.set_ssid_placement(sp)
                 applied.append("ssid_placement")
+        if "ssid_weights" in patch:
+            sw = patch.get("ssid_weights")
+            if isinstance(sw, list):
+                self.local_store.set_ssid_weights(sw)
+                applied.append("ssid_weights")
         for key in self._HUB_DIRECT_KEYS:
             if key in patch:
                 update[key] = patch[key]
