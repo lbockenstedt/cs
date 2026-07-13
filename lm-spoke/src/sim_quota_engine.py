@@ -144,6 +144,37 @@ class SimQuotaEngine:
         except Exception as exc:  # noqa: BLE001
             logger.debug("SimQuotaEngine: pxmx_site_map load failed: %s", exc)
             self._pxmx_site_map = {}
+        # Load user-overrides.conf so the engine can honor a HUMAN per-user sim
+        # pin ([username] flag = on/off) — it must never harvest/count against a
+        # flag a human explicitly set (serve-time already lets the human win; this
+        # keeps the engine's ledger honest so it doesn't over-count a client whose
+        # human 'off' will actually keep the sim off).
+        self._user_conf = None
+        try:
+            import sim_config
+            cd = getattr(self.spoke.settings, "config_dir", None)
+            if cd is not None:
+                _, self._user_conf = sim_config.load_configs(cd)
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("SimQuotaEngine: user_conf load failed: %s", exc)
+            self._user_conf = None
+
+    def _human_pinned_sim(self, hostname: str, sim_id: str) -> bool:
+        """True when a human explicitly set this sim flag in the client's
+        user-overrides.conf ``[username]`` section (on OR off). The engine leaves
+        those clients alone for that sim."""
+        uc = getattr(self, "_user_conf", None)
+        if uc is None or not sim_id:
+            return False
+        try:
+            from sim_config import username_for
+            un = username_for(hostname)
+            if uc.has_section(un):
+                v = str(uc.get(un, sim_id, fallback="")).strip().lower()
+                return v in ("on", "off")
+        except Exception:  # noqa: BLE001
+            return False
+        return False
 
     def _effective_site(self, hostname: str, c: Dict[str, Any]) -> str:
         """The client's effective site =
@@ -326,6 +357,10 @@ class SimQuotaEngine:
         if not self._is_online(c, now):
             return False
         if self._has_manual_sim_pin(hostname, c):
+            return False
+        # Never harvest a client whose HUMAN user-override pins THIS sim — the
+        # served config would honor the human, so counting it here would lie.
+        if self._human_pinned_sim(hostname, sim_id):
             return False
         if multi:
             return True
