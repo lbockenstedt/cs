@@ -814,16 +814,23 @@ class ArubaClient:
             return "yellow"
         return "info"
 
-    async def _new_central_alerts(self) -> list[dict[str, Any]]:
-        """Fetch active alerts from /network-notifications/v1/alerts.
+    async def _new_central_alerts(self, include_cleared: bool = False) -> list[dict[str, Any]]:
+        """Fetch alerts from /network-notifications/v1/alerts.
 
         This is the real individual-alert endpoint (returned 404 on old paths like
         /monitoring/v1/alerts).  Each alert has name, site, severity, category,
         deviceType, summary and createdAt.  Results are grouped by (name, site) so
         the same alert firing multiple times shows as one row with a count.
         Cache TTL: 5 minutes.
+
+        include_cleared=False (default) returns ONLY currently-active alerts — the
+        set the dashboard counts as present problems. include_cleared=True ALSO
+        returns cleared/closed alerts (each tagged ``status`` = "active"|"cleared")
+        so the browse/Monitor view and the Sim-Quota ID picker can offer the full
+        universe of alert names, not just the ones firing right now.
         """
-        cached = _alerts_cache.get(self._config_hash)
+        cache_key = f"{self._config_hash}:{'all' if include_cleared else 'active'}"
+        cached = _alerts_cache.get(cache_key)
         if cached and time.time() - cached[0] < _ALERTS_CACHE_TTL:
             return cached[1]
         alerts: list[dict[str, Any]] = []
@@ -877,12 +884,15 @@ class ArubaClient:
                 except Exception:  # noqa: BLE001
                     pass
 
-                # Group by (name, site). Keep only non-cleared alerts (the demo's
-                # expected errors that should be PRESENT).
+                # Group by (name, site). By default keep only non-cleared alerts
+                # (the demo's expected errors that should be PRESENT); with
+                # include_cleared, keep cleared ones too and tag each group's
+                # status "active" if ANY occurrence is still active else "cleared".
                 groups: dict[tuple[str, str], dict[str, Any]] = {}
                 for item in raw_alerts:
                     status = str(item.get("status") or "").strip().lower()
-                    if status in ("cleared", "closed", "resolved") or item.get("clearedReason"):
+                    is_cleared = status in ("cleared", "closed", "resolved") or bool(item.get("clearedReason"))
+                    if is_cleared and not include_cleared:
                         continue
                     name = str(item.get("name") or item.get("summary") or "Alert").strip()
                     site = (str(item.get("siteName") or item.get("site_name")
@@ -900,9 +910,12 @@ class ArubaClient:
                             "device_type": str(item.get("deviceType") or "").strip(),
                             "detail": str(item.get("summary") or item.get("description") or "").strip(),
                             "ts": item.get("createdAt") or item.get("updatedAt") or None,
+                            "status": "cleared",
                             "count": 0,
                         }
                     groups[key]["count"] += 1
+                    if not is_cleared:
+                        groups[key]["status"] = "active"
 
                 for entry in groups.values():
                     cnt = entry.pop("count")
@@ -913,9 +926,10 @@ class ArubaClient:
         except Exception as exc:
             body = getattr(getattr(exc, "response", None), "text", None)
             logger.warning("new_central alerts fetch [%s]: %s%s", self._config_hash, exc, f" — {body}" if body else "")
-        logger.info("new_central alerts fetched [%s]: %d alert groups from /network-notifications/v1/alerts", self._config_hash, len(alerts))
+        logger.info("new_central alerts fetched [%s]: %d alert groups (include_cleared=%s) from /network-notifications/v1/alerts",
+                    self._config_hash, len(alerts), include_cleared)
         ttl_offset = 0 if alerts else (_ALERTS_CACHE_TTL - 60)
-        _alerts_cache[self._config_hash] = (time.time() - ttl_offset, alerts)
+        _alerts_cache[cache_key] = (time.time() - ttl_offset, alerts)
         return alerts
 
     async def _new_central_insights(self) -> list[dict[str, Any]]:
@@ -985,7 +999,7 @@ class ArubaClient:
                 self._nc_devices(),
                 self._nc_clients(),
                 self._new_central_insights(),
-                self._new_central_alerts(),
+                self._new_central_alerts(include_cleared=True),
                 return_exceptions=True,
             )
             if isinstance(sites, Exception):
