@@ -258,6 +258,12 @@ class SimQuotaEngine:
         s = self._pxmx_site_map.get(host)
         return (not s) or s == TENANT_POOL
 
+    def _site_ok_for(self, hostname: str, site: str) -> bool:
+        """A tenant-pool (assignable) client may go to ``site`` only if it hasn't
+        already been claimed for a DIFFERENT site this sweep — so it can't end up
+        in two sites at once."""
+        return getattr(self, "_claimed_site", {}).get(hostname, site) == site
+
     def _natural_site(self, hostname: str, c: Dict[str, Any]) -> str:
         """The client's site with engine re-homes reverted — a MANUAL ``wsite``
         override is honored, but an ENGINE-set ``wsite`` (one that matches the
@@ -564,7 +570,8 @@ class SimQuotaEngine:
             targets = cfg.get("targets") or {}
             remainder = str(cfg.get("remainder") or "").strip()
             site_pool = [h for h in online
-                         if self._physical_site_of(h) == site or self._is_tenant_pool_client(h)]
+                         if self._physical_site_of(h) == site
+                         or (self._is_tenant_pool_client(h) and self._site_ok_for(h, site))]
 
             for cell_name, want in targets.items():
                 want = int(want or 0)
@@ -579,6 +586,7 @@ class SimQuotaEngine:
                 for h in list(assigned.keys()):
                     if h in online and h not in claimed:
                         claimed.add(h)
+                        self._claimed_site[h] = site
                     else:
                         assigned.pop(h, None)
                 # Backfill to the target from unclaimed candidates in the pool.
@@ -591,6 +599,7 @@ class SimQuotaEngine:
                         await self._place(h, cell)
                         assigned[h] = ""
                         claimed.add(h)
+                        self._claimed_site[h] = site
                         actions["assigned"] += 1
                 # Warn when the pool couldn't reach the floor (design §14).
                 if len(assigned) < want:
@@ -606,6 +615,7 @@ class SimQuotaEngine:
                     if h not in claimed:
                         await self._place(h, rem_cell)
                         claimed.add(h)
+                        self._claimed_site[h] = site
                         actions["assigned"] += 1
 
     # ── reconcile ────────────────────────────────────────────────────────────
@@ -619,6 +629,18 @@ class SimQuotaEngine:
             self._refresh_host_index()
 
             actions = {"assigned": 0, "released": 0, "kept": 0}
+            # Site exclusivity: a tenant-pool client (assignable, not physically
+            # site-bound) must belong to exactly ONE site per sweep — otherwise the
+            # same client lands in BOTH MIA and DFW quotas. Seed from the current
+            # ledger (first entry's site wins) so an already-homed client stays put;
+            # placement + the sim quotas below claim into this map and skip any
+            # tenant-pool client already claimed for a different site.
+            self._claimed_site: Dict[str, str] = {}
+            for _e in self._ledger.values():
+                _s = str(_e.get("site") or "")
+                if _s:
+                    for _h in (_e.get("clients") or {}):
+                        self._claimed_site.setdefault(_h, _s)
             # SSID placement first: settle each client's site/SSID before the sim
             # harvest (which sits on top of that placement).
             await self._reconcile_placement(clients, now, actions)
@@ -716,7 +738,8 @@ class SimQuotaEngine:
                     in_site = [h for h, c in clients.items()
                                if self._pool_eligible(h, c, sim_id, multi, now, assigned)
                                and (not site or self._effective_site(h, c) == site
-                                    or h in homed_here or self._is_tenant_pool_client(h))]
+                                    or h in homed_here
+                                    or (self._is_tenant_pool_client(h) and self._site_ok_for(h, site)))]
                     picks = in_site[:need]
                     if q.get("rehome") and len(picks) < need:
                         # Cross-site fallback: any other-site eligible runner.
@@ -724,8 +747,13 @@ class SimQuotaEngine:
                         # site differs, re-homing it; assigned[h] captures the
                         # NATURAL site (the snapshot ``c`` predates the override
                         # and _natural_site skips any engine-set wsite).
+                        # Only TENANT-POOL clients can be re-homed across sites (a
+                        # physically-bound client can't leave its chamber), and only
+                        # if not already claimed for another site this sweep.
                         cross = [h for h, c in clients.items()
                                  if self._pool_eligible(h, c, sim_id, multi, now, assigned)
+                                 and self._is_tenant_pool_client(h)
+                                 and self._site_ok_for(h, site)
                                  and (not site or self._effective_site(h, c) != site)]
                         picks += cross[:need - len(picks)]
                     for h in picks:
@@ -734,6 +762,8 @@ class SimQuotaEngine:
                         # Record the natural site (pre-rehome, manual wsite kept)
                         # so a packed fellow quota is recognized as a re-homer.
                         assigned[h] = self._natural_site(h, c)
+                        if site:
+                            self._claimed_site[h] = site   # one site per client per sweep
                         producing.append(h)
                         actions["assigned"] += 1
 
