@@ -1083,6 +1083,7 @@ class CSSpoke(BaseSpoke):
                 csc = self.local_store.get_central_sites_config() or {}
                 valid = set(sim_quota.available_sites(
                     self.settings.config_dir, csc.get("site_mappings")))
+                valid.add("Tenant-Wide Pool")  # a server may be in the tenant pool
                 clean = {}
                 for host, site in raw.items():
                     h = str(host).strip()

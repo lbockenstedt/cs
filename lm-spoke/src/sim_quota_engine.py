@@ -68,6 +68,12 @@ def _quota_key(q: Dict[str, Any]) -> str:
 
 
 PLACEMENT_PREFIX = "placement:"   # ledger key prefix for SSID placement quotas
+# pxmx_site_map value marking a server whose clients are NOT physically site-bound
+# (site-based SSID) — they join this tenant's assignable pool and placement gives
+# them a site/SSID. A deployment can MIX: some servers → a real site (RF chamber),
+# others → TENANT_POOL. An unmapped server is treated as tenant-pool too. Pools
+# are always per-tenant (each tenant has its own spoke/registry) — never shared.
+TENANT_POOL = "Tenant-Wide Pool"
 
 
 class SimQuotaEngine:
@@ -207,11 +213,13 @@ class SimQuotaEngine:
         sim_config fallback. Shared by ``_effective_site`` (after the override
         check) and ``_natural_site`` (always)."""
         # Hosting pxmx server's assigned site (operator-set pxmx_site_map). The
-        # host index is refreshed once per reconcile sweep.
+        # host index is refreshed once per reconcile sweep. A TENANT_POOL server
+        # is NOT a physical site — its clients fall through to the wsite that
+        # placement assigns (or the bucket default) so they can be placed anywhere.
         host = self._name_to_host.get(str(hostname).strip().lower())
         if host:
             s = self._pxmx_site_map.get(host)
-            if s:
+            if s and s != TENANT_POOL:
                 return str(s)
         cfg = c.get("config") or {}
         w = cfg.get("wsite")
@@ -229,6 +237,26 @@ class SimQuotaEngine:
         except Exception:  # noqa: BLE001
             pass
         return ""
+
+    def _physical_site_of(self, hostname: str) -> str:
+        """The hosting pxmx server's REAL assigned site (RF chamber), or "" when
+        the server is in the tenant pool or unmapped. Uses the per-sweep index."""
+        host = self._name_to_host.get(str(hostname).strip().lower())
+        if host:
+            s = self._pxmx_site_map.get(host)
+            if s and s != TENANT_POOL:
+                return str(s)
+        return ""
+
+    def _is_tenant_pool_client(self, hostname: str) -> bool:
+        """True when the client's hosting server is in the tenant-wide pool (or
+        unmapped) — i.e. it is assignable to any site/SSID by placement rather
+        than physically pinned to one chamber."""
+        host = self._name_to_host.get(str(hostname).strip().lower())
+        if not host:
+            return True  # unmapped server → assignable (tenant pool)
+        s = self._pxmx_site_map.get(host)
+        return (not s) or s == TENANT_POOL
 
     def _natural_site(self, hostname: str, c: Dict[str, Any]) -> str:
         """The client's site with engine re-homes reverted — a MANUAL ``wsite``
@@ -521,17 +549,22 @@ class SimQuotaEngine:
             name = str(cd.get("name") or cd.get("ssid_name") or "").strip()
             if name and cd.get("enabled", True):
                 cells[name] = cd
+        # Per-server binding (a deployment can mix): a client on a server pinned to
+        # a REAL site (RF chamber) is physically bound to that site and can only be
+        # placed on that site's cells; a client on a TENANT-POOL server is
+        # assignable to ANY site/SSID. So a cell at site S draws from clients
+        # physically at S PLUS the tenant pool. `claimed` (global to the sweep)
+        # keeps each client on exactly one cell.
+        online = {h for h, c in clients.items() if self._is_online(c, now)}
+        claimed: set = set()
 
         for site, cfg in placement.items():
             if not isinstance(cfg, dict):
                 continue
             targets = cfg.get("targets") or {}
             remainder = str(cfg.get("remainder") or "").strip()
-            # Clients physically in this site, online = the site's pool.
-            pool = [h for h, c in clients.items()
-                    if self._is_online(c, now) and self._effective_site(h, c) == site]
-            where = {h: self._cell_of(h, clients[h], site, cells) for h in pool}
-            held: set = set()  # clients a target cell already owns this pass
+            site_pool = [h for h in online
+                         if self._physical_site_of(h) == site or self._is_tenant_pool_client(h)]
 
             for cell_name, want in targets.items():
                 want = int(want or 0)
@@ -541,38 +574,38 @@ class SimQuotaEngine:
                 key = f"{PLACEMENT_PREFIX}{site}:{cell_name}"
                 entry = self._ledger.setdefault(key, {"cell": cell_name, "site": site, "clients": {}})
                 assigned = entry.setdefault("clients", {})
-                # Keep only clients still in the pool and still on this cell.
+                # Sticky: keep clients already placed here that are still online
+                # (and not already claimed by an earlier cell); drop the rest.
                 for h in list(assigned.keys()):
-                    if where.get(h) == cell_name:
-                        held.add(h)
+                    if h in online and h not in claimed:
+                        claimed.add(h)
                     else:
                         assigned.pop(h, None)
-                have = [h for h in assigned if where.get(h) == cell_name]
-                if len(have) < want:
-                    need = want - len(have)
-                    # Backfill from pooled clients not already on/holding a target.
-                    candidates = [h for h in pool if where.get(h) != cell_name and h not in held]
-                    for h in candidates[:need]:
+                # Backfill to the target from unclaimed candidates in the pool.
+                if len(assigned) < want:
+                    for h in site_pool:
+                        if len(assigned) >= want:
+                            break
+                        if h in claimed:
+                            continue
                         await self._place(h, cell)
-                        assigned[h] = where.get(h, "")
-                        where[h] = cell_name
-                        held.add(h)
+                        assigned[h] = ""
+                        claimed.add(h)
                         actions["assigned"] += 1
-                # Record a shortfall (pool too small to meet the floor) so the UI
-                # can warn instead of silently under-filling.
-                final = len([h for h in assigned if where.get(h) == cell_name])
-                if final < want:
+                # Warn when the pool couldn't reach the floor (design §14).
+                if len(assigned) < want:
                     self._placement_warnings.append(
-                        {"site": site, "cell": cell_name, "have": final, "want": want})
+                        {"site": site, "cell": cell_name, "have": len(assigned), "want": want})
 
-            # Remainder: everyone in the pool not held by a target lands on the
-            # remainder cell (stable). No tracking — it's the site's default cell.
+            # Remainder: unclaimed clients in this site's pool land on the
+            # remainder cell (a catch-all default). In assigned mode this soaks
+            # the leftover giant pool, so set a remainder on ONE site only.
             rem_cell = cells.get(remainder)
             if rem_cell:
-                for h in pool:
-                    if h not in held and where.get(h) != remainder:
+                for h in site_pool:
+                    if h not in claimed:
                         await self._place(h, rem_cell)
-                        where[h] = remainder
+                        claimed.add(h)
                         actions["assigned"] += 1
 
     # ── reconcile ────────────────────────────────────────────────────────────
@@ -676,9 +709,14 @@ class SimQuotaEngine:
                         for e in self._ledger.values():
                             if (e.get("site") or "") == site:
                                 homed_here.update((e.get("clients") or {}).keys())
+                    # A tenant-pool client (server not site-pinned) is assignable
+                    # to any site, so it counts as in-site for a site-scoped
+                    # harvest (assign sets its wsite=site). Physically-bound
+                    # clients at OTHER sites are still excluded (RF isolation).
                     in_site = [h for h, c in clients.items()
                                if self._pool_eligible(h, c, sim_id, multi, now, assigned)
-                               and (not site or self._effective_site(h, c) == site or h in homed_here)]
+                               and (not site or self._effective_site(h, c) == site
+                                    or h in homed_here or self._is_tenant_pool_client(h))]
                     picks = in_site[:need]
                     if q.get("rehome") and len(picks) < need:
                         # Cross-site fallback: any other-site eligible runner.
