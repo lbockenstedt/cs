@@ -1243,12 +1243,14 @@ class CSSpoke(BaseSpoke):
         #  - otherwise: write configs/hub-*-overrides.conf (hub-managed override).
         #    None = clear the override so the base file applies.
         _push_map = {}  # repo-relative path -> content, for the fetch+reset+push
+        _client_config_changed = False  # sim/user override changed → push update_now
         for override_key, hub_filename, repo_filename in (
             ("sim_conf_override", "hub-sim-overrides.conf", "simulation.conf"),
             ("user_conf_override", "hub-user-overrides.conf", "user-overrides.conf"),
         ):
             if override_key not in patch:
                 continue
+            _client_config_changed = True
             text = patch[override_key]
             if _source == "github" and text is not None and not _gh_token:
                 # Source=GitHub but this spoke has NO token in memory. The token
@@ -1318,6 +1320,26 @@ class CSSpoke(BaseSpoke):
             except Exception as exc:  # noqa: BLE001
                 logger.warning("CS_CONFIG_UPDATE[%s]: github push schedule failed: %s",
                                self.spoke_id, exc)
+        # A sim/user override change is only useful if the clients re-fetch it.
+        # update.sh (which fetches /api/config + /api/config/overrides and diffs)
+        # runs ONLY on an ``update_now`` command or a VERSION bump — there is no
+        # periodic config-pull timer (the 1-min watchdog runs sys_mon.sh, not
+        # update.sh). So without enqueueing ``update_now`` here, a hub-side edit
+        # writes the spoke's override file but the client's local simulation.conf
+        # stays stale until the next manual update / version bump. Mirror the
+        # kill_switch "all clients" pattern: enqueue update_now to every
+        # registered client and push it live to any currently connected. Fire-and-
+        # forget (this method is sync); update.sh is idempotent (diffs before mv).
+        if _client_config_changed:
+            try:
+                _t2 = asyncio.get_event_loop().create_task(
+                    self._push_config_refresh_to_clients())
+                self._gh_push_tasks.add(_t2)
+                _t2.add_done_callback(
+                    lambda t, _set=self._gh_push_tasks: _set.discard(t))
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("CS_CONFIG_UPDATE[%s]: update_now schedule failed: %s",
+                               self.spoke_id, exc)
         # Config Source of Truth ('hub' | 'github'). In 'hub' mode sim_config.
         # load_configs uses the hub override files as the WHOLE config and ignores
         # the repo base (so a repo pull can never revert hub edits). Persisted as a
@@ -1362,6 +1384,38 @@ class CSSpoke(BaseSpoke):
         eng = getattr(self, "sim_quota_engine", None)
         if eng is not None:
             eng.trigger()
+
+    async def _push_config_refresh_to_clients(self) -> None:
+        """Enqueue ``update_now`` to every registered client and push it live to
+        any currently-connected one, so a hub-side sim/user-override edit reaches
+        the clients' local ``simulation.conf`` without waiting for a manual
+        update or a VERSION bump. ``update_now`` runs ``update.sh``, which
+        re-fetches ``/api/config`` + ``/api/config/overrides`` and diffs before
+        applying — idempotent, so an unchanged config is a no-op. Best-effort:
+        a client offline now picks up the command on its next inbox poll."""
+        try:
+            hostnames = list((self.registry.get_all() or {}).keys()) if \
+                getattr(self, "registry", None) is not None else []
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("update_now[%s]: registry read failed: %s",
+                           self.spoke_id, exc)
+            return
+        if not hostnames:
+            logger.debug("update_now[%s]: no registered clients — skipping",
+                         self.spoke_id)
+            return
+        pushed = 0
+        for hn in hostnames:
+            try:
+                await self.queue.enqueue(hn, "update_now", {},
+                                         command_type="update_now")
+                if await client_api.push_pending(self, hn):
+                    pushed += 1
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("update_now[%s]: enqueue/push for %s failed: %s",
+                             self.spoke_id, hn, exc)
+        logger.info("update_now[%s]: enqueued to %d client(s); %d live-pushed",
+                    self.spoke_id, len(hostnames), pushed)
 
     # ── GitHub push (Source of Truth = GitHub) ───────────────────────────────
     async def _git(self, *args: str, timeout: float = 120.0,
