@@ -26,21 +26,28 @@ numbers you actually asked for — never to the fleet size.
 
 ---
 
-## 2. Deployment topologies
+## 2. Deployment topologies — per-PXMX-server binding
 
-Two ways a "site" maps to reality. Both are supported; a per-tenant (or
-per-site) **site-source** setting selects which.
+The site model is set **per PXMX server** (`pxmx_site_map`, Config → PXMX Sites),
+not tenant-wide — so a single deployment can **mix** both. Every server is
+assigned to exactly one of:
 
-| | **RF chamber** (common) | **Site-based SSID** (rare) |
+| | **Site Pool** (RF chamber) | **Tenant-Wide Pool** (site-based SSID) |
 |---|---|---|
-| `wsite` source | **hosting PXMX server** (`pxmx_site_map`) — physical | **assigned** (weighted roll across configured sites) — logical |
-| Pool size | **hardware-bounded** (e.g. MIA = 4 servers × 50 = 200) | logical share of the fleet (the weight) |
-| Isolation | physical / RF | SSID name |
-| `site_based_ssid` | **off** — plain `PSK`/`1X` on the chamber's own AP | **on** — SSID = `{wsite}-{ssid}` → `MIA-PSK` |
+| `pxmx_site_map[server]` | a real site name (`MIA`) | `"Tenant-Wide Pool"` (or unmapped) |
+| its clients' `wsite` | **physical** — the server's site, frozen | **assignable** — placement gives them a site/SSID |
+| pool size | hardware-bounded (servers × clients) | the tenant's assignable clients |
+| isolation | physical / RF | SSID name |
+| `site_based_ssid` | off — plain `PSK`/`1X` on the chamber AP | on — `{wsite}-{ssid}` → `MIA-PSK` |
+
+Pools are **always per-tenant** — each tenant has its own spoke/registry; a pool
+or simulation client is never shared across tenants.
 
 **`wsite` is the universal pool key.** Everything downstream (placement, harvest,
-adaptive control, random behavior) operates *per-`wsite`* identically. Only the
-*source* of `wsite` — and whether the SSID gets a site prefix — forks by mode.
+adaptive control, ambient random) operates *per-`wsite`* identically. A
+Site-Pool client is pinned to its server's site; a Tenant-Wide-Pool client is a
+candidate for any site's cells, and placement/harvest set its `wsite` when they
+assign it. `_physical_site_of` / `_is_tenant_pool_client` (engine) decide which.
 
 ---
 
