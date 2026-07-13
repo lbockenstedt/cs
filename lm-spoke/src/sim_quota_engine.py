@@ -46,7 +46,11 @@ from typing import Any, Dict, List, Optional, Tuple
 
 logger = logging.getLogger("SimQuotaEngine")
 
-ONLINE_WINDOW_S = 300.0          # mirrors control_plane.py's online threshold
+HARVEST_WINDOW_S = 1800.0        # a client seen within the last 30 min is
+                                 # harvestable. Real-ish clients flap (connect/
+                                 # disconnect constantly), so a tight "online now"
+                                 # window would shrink the pool to a handful; 30
+                                 # min keeps a flapping client in the pool.
 OFFLINE_TTL_S = 3600.0           # keep an offline runner this long before
                                  # treating it as dead (the sim keeps running on
                                  # the VM through a WS blip; release only a
@@ -132,9 +136,12 @@ class SimQuotaEngine:
         reg = self._registry()
         return reg.get_all() if reg is not None else {}
 
-    def _is_online(self, c: Dict[str, Any], now: float) -> bool:
+    def _is_harvestable(self, c: Dict[str, Any], now: float) -> bool:
+        """Eligible for the pool if seen within HARVEST_WINDOW_S. Clients flap in
+        and out constantly (like real ones), so "seen recently" — not "connected
+        right now" — is what keeps the pool from collapsing to a handful."""
         ls = c.get("last_seen")
-        return bool(ls and (now - float(ls)) < ONLINE_WINDOW_S)
+        return bool(ls and (now - float(ls)) < HARVEST_WINDOW_S)
 
     def _refresh_host_index(self) -> None:
         """Snapshot the client→host and host→site indices for this sweep. Both
@@ -390,7 +397,7 @@ class SimQuotaEngine:
         """
         if hostname in assigned:
             return False
-        if not self._is_online(c, now):
+        if not self._is_harvestable(c, now):
             return False
         if self._has_manual_sim_pin(hostname, c):
             return False
@@ -561,7 +568,7 @@ class SimQuotaEngine:
         # assignable to ANY site/SSID. So a cell at site S draws from clients
         # physically at S PLUS the tenant pool. `claimed` (global to the sweep)
         # keeps each client on exactly one cell.
-        online = {h for h, c in clients.items() if self._is_online(c, now)}
+        online = {h for h, c in clients.items() if self._is_harvestable(c, now)}
         claimed: set = set()
 
         for site, cfg in placement.items():
@@ -695,7 +702,7 @@ class SimQuotaEngine:
                         assigned.pop(h, None)
                         actions["released"] += 1
                         continue
-                    if not self._is_online(c, now):
+                    if not self._is_harvestable(c, now):
                         # Offline: keep (sim still runs on the VM) unless it's
                         # been gone long enough to be considered dead.
                         last_seen = float(c.get("last_seen") or 0)
