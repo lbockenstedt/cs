@@ -18,3 +18,7 @@ secrets.json
 data/
 cs.log
 *.log
+
+# SimQuotaEngine runtime ledger (written to data_dir; leaks to repo root when unset)
+sim_quota_ledger.json
+**/sim_quota_ledger.json
