@@ -1071,7 +1071,8 @@ class CSSpoke(BaseSpoke):
                     "effective": self.local_store.get_effective_sim_quotas(),
                     "ledger": snap,
                     "monitored_checks": monitored,
-                    "placement_warnings": placement_warnings}
+                    "placement_warnings": placement_warnings,
+                    "pool": eng.pool_counts() if eng is not None else {}}
 
         if cmd == "CS_GET_PXMX_SITE_MAP":
             # Operator-assigned pxmx server → site map (Config → PXMX Sites). The

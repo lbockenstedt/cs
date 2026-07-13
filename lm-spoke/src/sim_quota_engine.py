@@ -968,3 +968,23 @@ class SimQuotaEngine:
         """SSID cells that couldn't reach their hold-N floor last sweep (pool too
         small). Consumed by the Quota State view."""
         return list(getattr(self, "_placement_warnings", []) or [])
+
+    def pool_counts(self) -> Dict[str, Any]:
+        """A CHEAP count of the current harvestable pool — one O(n) pass over the
+        client registry, NO ledger/accounting (this is the ~99% we deliberately
+        don't track per-client). Returns total online, per-physical-site counts,
+        and the tenant-pool (assignable-anywhere) count."""
+        now = time.time()
+        self._refresh_host_index()
+        out = {"online": 0, "by_site": {}, "tenant_pool": 0}
+        for h, c in self._all_clients().items():
+            if not self._is_harvestable(c, now):
+                continue
+            out["online"] += 1
+            if self._is_tenant_pool_client(h):
+                out["tenant_pool"] += 1
+            else:
+                s = self._physical_site_of(h)
+                if s:
+                    out["by_site"][s] = out["by_site"].get(s, 0) + 1
+        return out
