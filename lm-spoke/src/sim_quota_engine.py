@@ -132,9 +132,24 @@ class SimQuotaEngine:
     def _registry(self):
         return getattr(self.spoke, "registry", None)
 
+    def _ignored_hostnames(self) -> set:
+        """Hostnames the operator flagged to ignore (hub_config.ignored_hostnames)
+        — e.g. a client being spun up or decommissioned. Excluded from the pool,
+        harvest, counts, and ledger so it's never assigned or shown."""
+        try:
+            hc = self.spoke.local_store.get_hub_config() or {}
+            return {str(h).strip().lower()
+                    for h in (hc.get("ignored_hostnames") or []) if str(h).strip()}
+        except Exception:  # noqa: BLE001
+            return set()
+
     def _all_clients(self) -> Dict[str, Dict[str, Any]]:
         reg = self._registry()
-        return reg.get_all() if reg is not None else {}
+        allc = reg.get_all() if reg is not None else {}
+        ignored = self._ignored_hostnames()
+        if not ignored:
+            return allc
+        return {h: c for h, c in allc.items() if str(h).strip().lower() not in ignored}
 
     def _is_harvestable(self, c: Dict[str, Any], now: float) -> bool:
         """Eligible for the pool if seen within HARVEST_WINDOW_S. Clients flap in
@@ -958,9 +973,13 @@ class SimQuotaEngine:
 
     # ── introspection (for the Chunk 4 quota-state view) ─────────────────────
     def snapshot(self) -> Dict[str, Any]:
+        # Hide ignored hostnames from the ledger view immediately (the next
+        # reconcile also drops them from the ledger proper).
+        ignored = self._ignored_hostnames()
         return {
             key: {"sim_id": e.get("sim_id"), "site": e.get("site"),
-                  "clients": list((e.get("clients") or {}).keys())}
+                  "clients": [h for h in (e.get("clients") or {}).keys()
+                              if str(h).strip().lower() not in ignored]}
             for key, e in self._ledger.items()
         }
 
