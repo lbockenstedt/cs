@@ -37,6 +37,14 @@ logger = logging.getLogger("CSConfig")
 
 # Keys that may appear in [simulation]/[sX]/[username]. Used only to validate
 # ``simulation_id`` pin values and to keep the override surface explicit.
+# The per-client sim ON/OFF toggles (the flags the ambient random pool rotates).
+# Used by effective_client_fields to let a rotating client's REPORTED flags win
+# over its home-bucket profile for the Clients view.
+_SIM_TOGGLE_KEYS = (
+    "dhcp_fail", "dns_fail", "assoc_fail", "port_flap", "ping_test", "download",
+    "iperf", "www_traffic", "ssidpw_fail", "auth_fail", "kill_switch",
+)
+
 SIM_FLAG_KEYS = (
     "kill_switch", "rapid_update", "sim_load", "github_repo", "repo_location",
     "site_based_ssid", "iperf_bw", "ssidpw_fail", "auth_fail", "allow_offline",
@@ -307,6 +315,18 @@ def effective_client_fields(
         # active_simulations + per-client registry overrides on top.
         if prof:
             cfg.update(prof)
+            # A random-pool client rolls its OWN bucket locally each sweep, so its
+            # home-bucket profile (prof) no longer reflects which sims it's
+            # actually running. Let the client's REPORTED sim flags win back for
+            # the sim toggles only — connectivity (wsite/ssid/phy) stays from the
+            # profile (it's frozen and the client may under-report it). Only when
+            # the client actually reported a value; else the profile default holds
+            # (still fixes the "no simulations" case for clients that reported none).
+            rc = reported_config or {}
+            for flag in _SIM_TOGGLE_KEYS:
+                v = rc.get(flag)
+                if v not in (None, ""):
+                    cfg[flag] = v
     except Exception:  # noqa: BLE001 — degrade to reported values
         pass
     return sim_id, cfg
