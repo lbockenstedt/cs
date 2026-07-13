@@ -129,6 +129,37 @@ download=$(get_value $simulation_id 'download')
 iperf=$(get_value $simulation_id 'iperf')
 www_traffic=$(get_value $simulation_id 'www_traffic')
 #------------------------------------------------------------
+#Ambient random pool
+#
+#When the spoke tells us this client's site is in the random pool, its
+#behaviour is randomised: we pick a random bucket (s0-s9) and take only the
+#randomizable sim flags (background traffic, e.g. ping_test/download) from it.
+#Every other sim - the failure/alert sims - is forced OFF here, because those
+#only run when the engine deliberately harvests this client. A harvest arrives
+#as a [username] override applied just below, which WINS, so a harvested client
+#still runs its assigned failure sim. Connectivity (wsite/ssid/ssidpw/sim_phy)
+#is NOT touched - the client stays on its own site and SSID.
+#
+#random_pool (on/off) and randomizable_sims (space separated list) are
+#delivered by the spoke in the [simulation] section of simulation.conf.
+#------------------------------------------------------------
+random_pool=$(get_value 'simulation' 'random_pool')
+randomizable_sims=$(get_value 'simulation' 'randomizable_sims')
+if [[ "$random_pool" == "on" && -n "$randomizable_sims" ]]; then
+  random_bucket="s$(( RANDOM % 10 ))"
+  echo "Ambient random pool: rolling behaviour from bucket ${random_bucket}" | tee -a ${LOG_FILE}
+  # Every sim we know about. A randomizable one is rolled from the random
+  # bucket; anything else is turned off (harvest-only, unless pinned below).
+  for sim in dhcp_fail dns_fail assoc_fail port_flap ssidpw_fail auth_fail \
+             ping_test download iperf www_traffic; do
+    if [[ " $randomizable_sims " == *" $sim "* ]]; then
+      declare -g "$sim=$(get_value $random_bucket "$sim")"
+    else
+      declare -g "$sim=off"
+    fi
+  done
+fi
+#------------------------------------------------------------
 #Simlation IP
 #------------------------------------------------------------
 smb_address=$(get_value 'address' 'smb_address')

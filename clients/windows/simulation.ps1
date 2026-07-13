@@ -404,6 +404,35 @@ while ($true) {
     $script:iperf = get_value $script:simulation_id 'iperf'
     $script:www_traffic = get_value $script:simulation_id 'www_traffic'
 
+    # ------------------------------------------------------------
+    # Ambient random pool (see clients/linux/simulation.sh for the full story).
+    #
+    # When the spoke tells us this client's site is in the random pool, its
+    # behaviour is randomised: pick a random bucket (s0-s9) and take only the
+    # randomizable sim flags from it. Every other sim - the failure/alert sims -
+    # is forced OFF, because those only run when the engine harvests this client
+    # (a harvest arrives as a [username] override applied below and WINS, so a
+    # harvested client still runs its assigned sim). Connectivity
+    # (wsite/ssid/ssidpw/sim_phy) is NOT touched.
+    #
+    # random_pool (on/off) and randomizable_sims (space separated list) are
+    # delivered by the spoke in the [simulation] section of simulation.conf.
+    # ------------------------------------------------------------
+    $script:random_pool = get_value 'simulation' 'random_pool'
+    $randomizableSims = get_value 'simulation' 'randomizable_sims'
+    if ($script:random_pool -eq 'on' -and $randomizableSims) {
+        $randomBucket = 's' + (Get-Random -Minimum 0 -Maximum 10)
+        Write-SimLog "Ambient random pool: rolling behaviour from bucket $randomBucket"
+        $randomizableList = $randomizableSims -split '\s+' | Where-Object { $_ }
+        foreach ($sim in @('dhcp_fail','dns_fail','assoc_fail','port_flap','ssidpw_fail','auth_fail','ping_test','download','iperf','www_traffic')) {
+            if ($randomizableList -contains $sim) {
+                Set-Variable -Name $sim -Scope Script -Value (get_value $randomBucket $sim)
+            } else {
+                Set-Variable -Name $sim -Scope Script -Value 'off'
+            }
+        }
+    }
+
     $script:smb_address = get_value 'address' 'smb_address'
     $script:ping_address = get_value 'address' 'ping_address'
     $script:dns_latency_1 = get_value 'address' 'dns_latency_1'
