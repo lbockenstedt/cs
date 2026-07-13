@@ -67,6 +67,9 @@ def _quota_key(q: Dict[str, Any]) -> str:
     return f"{q.get('alert_type', 'alert')}:{q.get('alert_id', '')}:{q.get('site', '')}"
 
 
+PLACEMENT_PREFIX = "placement:"   # ledger key prefix for SSID placement quotas
+
+
 class SimQuotaEngine:
     """Owns the engine ledger + reconcile loop for one cs spoke."""
 
@@ -403,6 +406,100 @@ class SimQuotaEngine:
                 return esite
         return None
 
+    # ── SSID placement (design doc §5) ───────────────────────────────────────
+    async def _place(self, hostname: str, cell: Dict[str, Any]) -> None:
+        """Move a client onto an SSID cell by setting its connectivity overrides
+        (wsite/ssid/ssidpw). Delivered via the served [username] layer, so it
+        wins over the client's bucket. Non-toggle overrides survive the registry
+        prune (unlike on/off sim flags)."""
+        reg = self._registry()
+        if reg is None:
+            return
+        overrides: Dict[str, Any] = {}
+        for src, key in (("site", "wsite"), ("ssid", "ssid"), ("ssidpw", "ssidpw")):
+            val = str(cell.get(src) or "").strip()
+            if val:
+                overrides[key] = val
+        if overrides:
+            await reg.set_overrides(hostname, overrides)
+
+    def _cell_of(self, hostname: str, c: Dict[str, Any], site: str,
+                 cells: Dict[str, Dict[str, Any]]) -> str:
+        """Which cell (by name) this client currently sits on at ``site`` — matched
+        by its effective ssid (override → bucket default)."""
+        ov = c.get("overrides") or {}
+        ssid = str(ov.get("ssid") or (c.get("config") or {}).get("ssid") or "").strip()
+        for name, cd in cells.items():
+            if str(cd.get("site") or "").strip() == site and str(cd.get("ssid") or "").strip() == ssid:
+                return name
+        return ""
+
+    async def _reconcile_placement(self, clients: Dict[str, Any], now: float,
+                                   actions: Dict[str, int]) -> None:
+        """Hold N clients on each configured SSID cell within a site (sticky,
+        self-healing). Backfill is sourced from the live pool of clients already
+        physically in the site — no separate per-client tracking of the balance.
+        A ``remainder`` cell soaks up everyone not held by a target."""
+        try:
+            placement = self.spoke.local_store.get_ssid_placement() or {}
+            matrix = self.spoke.local_store.get_ssid_matrix() or []
+        except Exception:  # noqa: BLE001
+            return
+        if not placement:
+            return
+        cells: Dict[str, Dict[str, Any]] = {}
+        for cd in matrix:
+            name = str(cd.get("name") or cd.get("ssid_name") or "").strip()
+            if name and cd.get("enabled", True):
+                cells[name] = cd
+
+        for site, cfg in placement.items():
+            if not isinstance(cfg, dict):
+                continue
+            targets = cfg.get("targets") or {}
+            remainder = str(cfg.get("remainder") or "").strip()
+            # Clients physically in this site, online = the site's pool.
+            pool = [h for h, c in clients.items()
+                    if self._is_online(c, now) and self._effective_site(h, c) == site]
+            where = {h: self._cell_of(h, clients[h], site, cells) for h in pool}
+            held: set = set()  # clients a target cell already owns this pass
+
+            for cell_name, want in targets.items():
+                want = int(want or 0)
+                cell = cells.get(cell_name)
+                if not cell:
+                    continue
+                key = f"{PLACEMENT_PREFIX}{site}:{cell_name}"
+                entry = self._ledger.setdefault(key, {"cell": cell_name, "site": site, "clients": {}})
+                assigned = entry.setdefault("clients", {})
+                # Keep only clients still in the pool and still on this cell.
+                for h in list(assigned.keys()):
+                    if where.get(h) == cell_name:
+                        held.add(h)
+                    else:
+                        assigned.pop(h, None)
+                have = [h for h in assigned if where.get(h) == cell_name]
+                if len(have) < want:
+                    need = want - len(have)
+                    # Backfill from pooled clients not already on/holding a target.
+                    candidates = [h for h in pool if where.get(h) != cell_name and h not in held]
+                    for h in candidates[:need]:
+                        await self._place(h, cell)
+                        assigned[h] = where.get(h, "")
+                        where[h] = cell_name
+                        held.add(h)
+                        actions["assigned"] += 1
+
+            # Remainder: everyone in the pool not held by a target lands on the
+            # remainder cell (stable). No tracking — it's the site's default cell.
+            rem_cell = cells.get(remainder)
+            if rem_cell:
+                for h in pool:
+                    if h not in held and where.get(h) != remainder:
+                        await self._place(h, rem_cell)
+                        where[h] = remainder
+                        actions["assigned"] += 1
+
     # ── reconcile ────────────────────────────────────────────────────────────
     async def reconcile(self) -> Dict[str, Any]:
         """One sweep: align the ledger + overrides with effective_sim_quotas."""
@@ -414,6 +511,9 @@ class SimQuotaEngine:
             self._refresh_host_index()
 
             actions = {"assigned": 0, "released": 0, "kept": 0}
+            # SSID placement first: settle each client's site/SSID before the sim
+            # harvest (which sits on top of that placement).
+            await self._reconcile_placement(clients, now, actions)
             # Process PRESENCE quotas (sim_id empty — "Clients Associated") first
             # so clients are homed to their site before the sim quotas that stack
             # onto them run. get_all() is a per-sweep SNAPSHOT COPY, so a same-
@@ -536,8 +636,12 @@ class SimQuotaEngine:
                         await self._release(h, sim_id, from_site, key)
                         actions["released"] += 1
 
-            # Release clients whose quota left the effective set.
+            # Release clients whose quota left the effective set. Placement
+            # entries (SSID cells) are managed by _reconcile_placement, not the
+            # sim-quota effective set — never release them here.
             for key in list(self._ledger.keys()):
+                if key.startswith(PLACEMENT_PREFIX):
+                    continue
                 if key not in eff_keys:
                     entry = self._ledger.pop(key)
                     sim_id = entry.get("sim_id") or ""
