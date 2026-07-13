@@ -230,6 +230,11 @@ class ProxmoxDeploy:
             # on — surfaced so the WebUI shows what auto-prov decides on and why.
             "delete_gate":      body.get("delete_gate") or {},
             "gate_averages":    body.get("gate_averages") or {},
+            # Fleet "Reclone All" batch state (status/current_vm/phase/total/
+            # completed/failed/started_at/type/log/last_run) from the pxmx agent's
+            # reclone-batch tracker. Relayed per-host + top-level (freshest) below
+            # so the hub's Fleet Reclone progress bar advances live. Empty = idle.
+            "reclone_state":    body.get("reclone_state") or {},
         }
         # Roll a CPU + mem sample from this frame's node block, then read the
         # 1h averages back into the entry so they ride the relay payload's
@@ -420,7 +425,7 @@ class ProxmoxDeploy:
                 "proxmox":       summary,
                 "proxmox_vms":   vms,
                 "usb_devices":   usb,
-                "reclone_state": {},
+                "reclone_state": st.get("reclone_state") or {},
             })
             if freshest is None or float(st.get("last_seen", 0) or 0) > \
                     float((freshest or {}).get("last_seen", 0) or 0):
@@ -444,7 +449,10 @@ class ProxmoxDeploy:
             "proxmox_vms": all_vms,
             "usb_devices": all_usb,
             "proxmox_hosts": hosts,
-            "reclone_state": {},
+            # Top-level (freshest host) reclone_state for legacy single-host readers
+            # + the hub's /fleet-reclone-status route (reads per-spoke reclone_state
+            # from _tenant_cache). Per-host state rides proxmox_hosts[].reclone_state.
+            "reclone_state": (freshest or {}).get("reclone_state") or {},
             "api_server":  {},
             "central":     {},
             # cs-owned Kea (kea-dhcp4-sim) DHCP-server status for the isolated
