@@ -320,6 +320,11 @@ class CSControlPlane(AgentHostingControlPlane):
         # reconcile also fires on each effective_sim_quotas push).
         if getattr(cs_spoke, "sim_quota_engine", None) is not None:
             cs_spoke.sim_quota_engine.start()
+        # Start the GitHub config-branch pull loop (repo_sync.py): periodically
+        # fetch + reset onto origin/<branch> when source=github + creds are set;
+        # no-op otherwise. Survives hub reconnects like the loops above.
+        if getattr(cs_spoke, "repo_sync", None) is not None:
+            cs_spoke.repo_sync.start()
         # Start the client API server as a long-lived task that SURVIVES hub
         # reconnects (NOT via _create_spoke_tasks, which the base class tears
         # down per-connection). Server.serve() is awaitable (vs blocking

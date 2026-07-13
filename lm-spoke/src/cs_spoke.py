@@ -148,6 +148,13 @@ class CSSpoke(BaseSpoke):
         # hub-pushed effective_sim_quotas; started by CSControlPlane.run().
         from sim_quota_engine import SimQuotaEngine
         self.sim_quota_engine = SimQuotaEngine(self)
+        # RepoSync — periodic pull of the tenant's GitHub config branch (fetch
+        # --prune origin + checkout -B <branch> origin/<branch>), so edits made
+        # directly on GitHub reach the spoke and a fresh install switches off
+        # main onto the tenant branch. See repo_sync.py; started by
+        # CSControlPlane.run(). No-op when source_of_truth != github.
+        from repo_sync import RepoSync
+        self.repo_sync = RepoSync(self)
 
     # ── BaseSpoke: status (fallback for *_GET_STATUS) ───────────────────────
     async def get_status(self) -> Dict[str, Any]:
@@ -1314,6 +1321,14 @@ class CSSpoke(BaseSpoke):
         )
         if any(k in a for a in applied for k in _reconcile_keys):
             self._trigger_sim_quota_reconcile()
+        # RepoSync: when github_config (creds/branch) or config_source changed,
+        # pull the tenant's branch immediately rather than waiting up to the
+        # loop interval (e.g. switching a fresh install off main onto the
+        # tenant branch at save-time). No-op unless source=github + creds set.
+        if "github_config" in patch or "config_source" in patch:
+            rs = getattr(self, "repo_sync", None)
+            if rs is not None:
+                rs.trigger()
         return applied
 
     def _trigger_sim_quota_reconcile(self) -> None:
