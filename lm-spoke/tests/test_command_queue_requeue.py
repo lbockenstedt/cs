@@ -165,3 +165,39 @@ def test_cs_requeue_command_handler(spoke_loop):
     assert res["status"] == "SUCCESS"
     assert res["requeued"] is True
     assert _find(q, c["id"])["status"] == "pending"
+
+# ── env-tunable expiry (cloud-connected agents offline > old 15-min window) ──
+
+def test_default_command_expire_is_two_hours():
+    """The default COMMAND_EXPIRE_SECS is 7200 (2h) — a cloud agent offline
+    past the old 15-min window must NOT have its queued delete_vm expire."""
+    import command_queue as cq
+    assert cq.COMMAND_EXPIRE_SECS == 7200
+
+
+def test_command_expire_is_env_overridable(monkeypatch):
+    """CS_COMMAND_EXPIRE_SECS overrides the default at import time."""
+    import importlib
+    import command_queue as cq
+    monkeypatch.setenv("CS_COMMAND_EXPIRE_SECS", "3600")
+    monkeypatch.setenv("CS_STALE_DELIVERED_SECS", "120")
+    try:
+        importlib.reload(cq)
+        assert cq.COMMAND_EXPIRE_SECS == 3600
+        assert cq.STALE_DELIVERED_SECS == 120
+    finally:
+        # Restore the module for the rest of the session.
+        monkeypatch.delenv("CS_COMMAND_EXPIRE_SECS", raising=False)
+        monkeypatch.delenv("CS_STALE_DELIVERED_SECS", raising=False)
+        importlib.reload(cq)
+
+
+def test_enqueued_command_expires_at_creation_plus_two_hours(spoke_loop):
+    """A fresh command's expires_at is created_at + 7200 (2h), so it survives
+    a cloud agent offline for up to 2h."""
+    import command_queue as cq
+    assert cq.COMMAND_EXPIRE_SECS == 7200
+    spoke, loop = spoke_loop
+    q = spoke.queue
+    c = _enqueue(q, loop, "pxmx-cloud-01", "delete_vm", {"vmid": 90090})["command"]
+    assert abs(c["expires_at"] - c["created_at"] - 7200) < 5

@@ -27,13 +27,19 @@ Semantics (ported from the legacy queue):
     signature while one is still ``pending``/``delivered`` returns the existing
     command (no duplicate).
   - **stale-delivered reset**: on poll, a ``delivered`` command older than
-    ``STALE_DELIVERED_SECS`` (30s) with no ack is reset to ``pending`` so it is
-    re-delivered (mirrors the legacy WS-reconnect reset).
+    ``STALE_DELIVERED_SECS`` (default 30s, env ``CS_STALE_DELIVERED_SECS``) with
+    no ack is reset to ``pending`` so it is re-delivered (mirrors the legacy
+    WS-reconnect reset).
   - **cleanup**: ``pending``/``delivered`` older than ``COMMAND_EXPIRE_SECS``
-    (900s) become ``expired``; terminal commands past ``purge_after`` are
-    dropped (retention ``COMMAND_RESULT_RETENTION_SECS`` = 86400s).
-  - **trim**: queue capped at ``COMMAND_MAX`` (100); terminal commands dropped
-    oldest-first.
+    (default 7200s = 2h, env ``CS_COMMAND_EXPIRE_SECS``) become ``expired``;
+    terminal commands past ``purge_after`` are dropped (retention
+    ``COMMAND_RESULT_RETENTION_SECS``, default 86400s, env
+    ``CS_COMMAND_RESULT_RETENTION_SECS``). The 2h default covers a
+    cloud-connected agent offline past the old 15-min window; the env knob
+    lets a site tune the stale-command tradeoff (a delete queued before a
+    long outage firing much later, possibly against rebuilt state).
+  - **trim**: queue capped at ``COMMAND_MAX`` (default 100, env
+    ``CS_COMMAND_MAX``); terminal commands dropped oldest-first.
   - **ack**: idempotent terminal update (``completed``/``failed``); sets
     ``message``/``updated_at``/``purge_after``; no prior-state check (a late ack
     for an already-terminal command re-records the result).
@@ -60,6 +66,7 @@ import asyncio
 import configparser
 import json
 import logging
+import os
 import time
 import uuid
 from pathlib import Path
@@ -67,11 +74,32 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 
 logger = logging.getLogger("CSCommandQueue")
 
-# ── tunables (ported constants) ──────────────────────────────────────────────
-COMMAND_MAX = 100                 # keep last N commands in memory
-COMMAND_EXPIRE_SECS = 900         # pending/delivered expire after 15 minutes
-COMMAND_RESULT_RETENTION_SECS = 86400  # keep completed/expired results 24 hours
-STALE_DELIVERED_SECS = 30         # delivered w/ no ack older than this → re-send
+
+def _env_int(name: str, default: int, minimum: int = 1) -> int:
+    try:
+        return max(minimum, int(os.environ.get(name, str(default))))
+    except Exception:
+        return default
+
+
+# ── tunables (env-overridable so cloud / high-latency sites can stretch them) ─
+COMMAND_MAX = _env_int("CS_COMMAND_MAX", 100, 10)        # keep last N commands in memory
+# A pending/delivered command older than this from CREATION is marked expired.
+# Default 2h — a cloud-connected agent can be offline (link flap / NAT idle /
+# WAN brownout) well past the old 15-min window; expiring a delete_vm at 15 min
+# meant the VM was never torn down when the agent finally reconnected. Bump via
+# CS_COMMAND_EXPIRE_SECS for sites with longer outages; lower it for on-prem
+# sites that want stale commands reaped faster (stale-command tradeoff: a
+# delete queued before a long outage fires much later, possibly against
+# rebuilt state — keep it bounded to what your outage window realistically is).
+COMMAND_EXPIRE_SECS = _env_int("CS_COMMAND_EXPIRE_SECS", 7200, 60)
+# Terminal rows (completed/failed/expired) kept for the queue view, then purged.
+COMMAND_RESULT_RETENTION_SECS = _env_int("CS_COMMAND_RESULT_RETENTION_SECS", 86400, 60)
+# A delivered command with no ack older than this is reset to pending so the
+# next poll re-sends it. 30s is fine on a tight LAN; raise it on a high-latency
+# cloud link where the agent's ack can legitimately take longer (avoids
+# needless re-sends that double-execute an idempotent-but-noisy op).
+STALE_DELIVERED_SECS = _env_int("CS_STALE_DELIVERED_SECS", 30, 5)
 
 # Single-VM actions that take a ``vmid`` arg and must respect the sim range +
 # protected-VMID guard at enqueue time (defense-in-depth; the agent's cs_guard
