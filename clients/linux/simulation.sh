@@ -302,6 +302,12 @@ report_status() {
 #WiFi connections
 #------------------------------------------------------------
 connect_wifi() {
+  # An 802.1X (enterprise) SSID is flagged by ssid=="1X" in the Pool/SSID matrix —
+  # route it to connect_1x(); every other SSID is PSK below.
+  if [[ "$ssid" == "1X" ]]; then
+    connect_1x "$1"
+    return
+  fi
   nmcli radio wifi off
   nmcli radio wifi on
   sleep 15
@@ -310,6 +316,41 @@ connect_wifi() {
   else
     nmcli -w $1 device wifi connect $ssid password $ssidpw
   fi
+}
+#------------------------------------------------------------
+#WiFi 802.1X (WPA-Enterprise / PEAP-MSCHAPv2) connection
+#------------------------------------------------------------
+# nmcli's "device wifi connect" is PSK-only, so 802.1X needs an explicit profile
+# with 802-1x.* settings. EAP identity is the short username (e.g. kbell); the
+# password is the SSID password ($ssidpw). PEAP + MSCHAPv2, no server-cert
+# validation (lab). ssidpw_fail flows through here too: it sets $ssidpw to the
+# wrong password before connecting, so PEAP auth fails and Central logs the insight.
+connect_1x() {
+  local wait_time=$1
+  local eap="${dot1x_eap:-peap}"
+  local target_ssid
+  if [[ "$site_based_ssid" == "on" ]]; then
+    target_ssid="$wsite-$ssid"
+  else
+    target_ssid="$ssid"
+  fi
+
+  nmcli radio wifi off
+  nmcli radio wifi on
+  sleep 15
+
+  # Rebuild the profile each run so identity / password / SSID always re-apply.
+  nmcli -t -f NAME connection show | grep -Fxq "$target_ssid" && nmcli connection delete "$target_ssid"
+
+  nmcli connection add type wifi con-name "$target_ssid" ifname "$wladapter" ssid "$target_ssid" \
+    wifi-sec.key-mgmt wpa-eap \
+    802-1x.eap "$eap" \
+    802-1x.phase2-auth mschapv2 \
+    802-1x.identity "$username" \
+    802-1x.password "$ssidpw" \
+    802-1x.system-ca-certs no
+
+  nmcli -w "$wait_time" connection up "$target_ssid"
 }
 #------------------------------------------------------------
 #Connection management
