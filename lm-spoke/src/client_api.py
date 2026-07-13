@@ -243,6 +243,31 @@ def build_client_api_app(spoke) -> FastAPI:
         demo = getattr(spoke, "demo", None)
         if demo is not None and hostname:
             overrides.update(demo.effective_flags(hostname))
+        # Deliver the engine/registry overrides into the client's [username]
+        # section — the layer simulation.sh's apply_override() resolves LAST, so
+        # it WINS over the client's bucket no matter which bucket the client is
+        # pinned to. render_ini_for_client (below) only bakes into the crc32 hash
+        # bucket [sX]; a client moved off that bucket by a per-user simulation_id
+        # override would never see a quota assignment. The [username] layer is
+        # where the client authoritatively resolves every sim flag + wsite, so a
+        # SimQuotaEngine assignment must land there to actually turn the sim on.
+        #
+        # This is DELIVERY-ONLY: it edits the in-memory served config, never the
+        # on-disk user-overrides.conf — so quota assignments stay transient (no
+        # GitHub sync) and self-clean the moment the engine releases (the next
+        # render simply omits them). A human Model-A per-user override already in
+        # user-overrides.conf [username] is preserved — the engine never fights a
+        # human pin.
+        if hostname and overrides:
+            uname = sim_config.username_for(hostname)
+            human_keys = (set(user_conf.options(uname))
+                          if user_conf.has_section(uname) else set())
+            if not sim_conf.has_section(uname):
+                sim_conf.add_section(uname)
+            for k, v in overrides.items():
+                if k in human_keys:
+                    continue  # human per-user override wins (Model A)
+                sim_conf.set(uname, str(k), str(v))
         text = sim_config.render_ini_for_client(sim_conf, hostname, overrides or None)
         return PlainTextResponse(text)
 
