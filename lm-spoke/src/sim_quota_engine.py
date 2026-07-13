@@ -414,6 +414,12 @@ class SimQuotaEngine:
             self._refresh_host_index()
 
             actions = {"assigned": 0, "released": 0, "kept": 0}
+            # Process PRESENCE quotas (sim_id empty — "Clients Associated") first
+            # so clients are homed to their site before the sim quotas that stack
+            # onto them run. get_all() is a per-sweep SNAPSHOT COPY, so a same-
+            # sweep re-home isn't visible to a later sim quota via _effective_site
+            # — the sim quotas instead consult the ledger (homed_here) below.
+            quotas = sorted(quotas, key=lambda q: 0 if not (q.get("sim_id") or "") else 1)
             for q in quotas:
                 key = _quota_key(q)
                 sim_id = q.get("sim_id") or ""
@@ -484,9 +490,20 @@ class SimQuotaEngine:
                 if len(producing) < target:
                     need = target - len(producing)
                     multi = bool(q.get("multi_capable"))
+                    # Clients the engine has ALREADY homed to this site under any
+                    # other quota (typically a presence quota — "Clients
+                    # Associated") count as in-site here, so a sim quota's tests
+                    # stack onto presence-homed clients immediately instead of
+                    # waiting for the next sweep's snapshot to reflect the wsite
+                    # re-home (get_all() is a stale per-sweep copy).
+                    homed_here = set()
+                    if site:
+                        for e in self._ledger.values():
+                            if (e.get("site") or "") == site:
+                                homed_here.update((e.get("clients") or {}).keys())
                     in_site = [h for h, c in clients.items()
                                if self._pool_eligible(h, c, sim_id, multi, now, assigned)
-                               and (not site or self._effective_site(h, c) == site)]
+                               and (not site or self._effective_site(h, c) == site or h in homed_here)]
                     picks = in_site[:need]
                     if q.get("rehome") and len(picks) < need:
                         # Cross-site fallback: any other-site eligible runner.

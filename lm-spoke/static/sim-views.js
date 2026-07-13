@@ -2521,7 +2521,7 @@ function csRenderSimQuotaEditor() {
                        <option value="alert" ${r.alert_type === 'alert' ? 'selected' : ''}>Alert</option>
                        <option value="insight" ${r.alert_type === 'insight' ? 'selected' : ''}>Insight</option>
                      </select>`
-                  : `<div class="text-[11px] text-slate-400 italic mt-1 leading-tight">— untethered: no alert/insight needed —</div>`}
+                  : `<div class="text-[11px] text-slate-400 italic mt-1 leading-tight">Presence — no alert/insight (keeps N clients on the sim)</div>`}
               </div>`;
         const idCell = isPresence
             ? `<label class="text-xs text-slate-500">Alert / Insight ID
@@ -2730,12 +2730,16 @@ async function csRenderSimQuotaState() {
                 : `<span class="text-amber-600 font-semibold">${clients.length}/${target}</span>`;
             const fname = nameOf(q.alert_type, q.alert_id);
             const isPresence = !q.sim_id;
+            // A sim quota with no alert/insight is untethered — shown as Presence.
+            const untethered = !isPresence && !q.alert_id;
             const idCell = isPresence
                 ? `<span class="text-slate-700 italic">Clients Associated</span>`
-                : (fname
-                    ? `<span class="text-slate-700">${csEscape(fname)}</span> <span class="font-mono text-slate-400 text-[11px]">${csEscape(q.alert_id || '')}</span>`
-                    : `<span class="font-mono">${csEscape(q.alert_id || '')}</span>`);
-            const typeCell = isPresence ? 'presence' : (q.alert_type || 'alert');
+                : untethered
+                    ? `<span class="italic text-slate-400">— none —</span>`
+                    : (fname
+                        ? `<span class="text-slate-700">${csEscape(fname)}</span> <span class="font-mono text-slate-400 text-[11px]">${csEscape(q.alert_id || '')}</span>`
+                        : `<span class="font-mono">${csEscape(q.alert_id || '')}</span>`);
+            const typeCell = (isPresence || untethered) ? 'presence' : (q.alert_type || 'alert');
             const simCell = isPresence
                 ? `<span class="italic text-slate-400">— none —</span>`
                 : `<span class="font-mono">${csEscape(q.sim_id || '')}</span>`;
