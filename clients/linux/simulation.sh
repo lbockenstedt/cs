@@ -338,6 +338,44 @@ run_simulation() {
  fi
 }
 #------------------------------------------------------------
+#DHCP-fail MAC
+#------------------------------------------------------------
+# While dhcp_fail is ON, force the active adapter's MAC to
+# 00:01:00:00:<real 5th octet>:<real 6th octet> — a fixed prefix makes the
+# failure recognizable, the real last two octets keep every client unique, and
+# the unknown MAC gets no lease/reservation (which is what fails DHCP). When
+# dhcp_fail is OFF, the real (permanent) MAC is restored.
+apply_dhcp_fail_mac() {
+  local iface
+  if [[ "$sim_phy" == "wireless" ]]; then iface=$wladapter; else iface=$eadapter; fi
+  [[ -z "$iface" ]] && return
+  local savefile="/usr/local/scripts/.real_mac_${iface}"
+  local cur=$(cat /sys/class/net/"$iface"/address 2>/dev/null)
+  # The NIC's permanent MAC survives our own override; persist it once so we can
+  # still restore if ethtool is unavailable after we've already spoofed.
+  local real=$(ethtool -P "$iface" 2>/dev/null | grep -oiE '([0-9a-f]{2}:){5}[0-9a-f]{2}')
+  [[ "$real" == "00:00:00:00:00:00" ]] && real=""
+  if [[ -z "$real" ]]; then
+    if [[ -f "$savefile" ]]; then real=$(cat "$savefile"); elif [[ "$cur" != 00:01:00:00:* ]]; then real=$cur; fi
+  fi
+  [[ -n "$real" && "$real" != 00:01:00:00:* ]] && echo "$real" > "$savefile" 2>/dev/null
+  [[ -z "$real" ]] && return
+  local target="00:01:00:00:$(echo "$real" | awk -F: '{print $5":"$6}')"
+  if [[ "$dhcp_fail" == "on" ]]; then
+    [[ "$cur" == "$target" ]] && return
+    echo "DHCP Fail: setting $iface MAC $cur -> $target" | tee -a ${LOG_FILE}
+    sudo ip link set dev "$iface" down
+    sudo ip link set dev "$iface" address "$target"
+    sudo ip link set dev "$iface" up
+  elif [[ "$cur" != "$real" ]]; then
+    echo "DHCP Fail off: restoring $iface MAC $cur -> $real" | tee -a ${LOG_FILE}
+    sudo ip link set dev "$iface" down
+    sudo ip link set dev "$iface" address "$real"
+    sudo ip link set dev "$iface" up
+  fi
+}
+apply_dhcp_fail_mac
+#------------------------------------------------------------
 #Attempting WiFi connection
 #------------------------------------------------------------
 connect_wifi 30
