@@ -111,6 +111,13 @@ auth_fail=$(get_value 'simulation' 'auth_fail')
 ssidpw_fail=$(get_value 'simulation' 'ssidpw_fail')
 allow_offline=$(get_value 'simulation' 'allow_offline')
 web_server=$(get_value 'simulation' 'web_server')
+# 802.1X EAP method: 'peap' (default, PEAP-MSCHAPv2 username/password) or 'tls'
+# (EAP-TLS, cert-based — for Cloud NAC; certs provisioned by cloud_nac_onboard.py).
+dot1x_eap=$(get_value 'simulation' 'dot1x_eap')
+dot1x_eap="${dot1x_eap:-peap}"
+dot1x_client_cert=$(get_value 'simulation' 'dot1x_client_cert')
+dot1x_private_key=$(get_value 'simulation' 'dot1x_private_key')
+dot1x_ca_cert=$(get_value 'simulation' 'dot1x_ca_cert')
 server_url=$(get_value 'server' 'server_url')
 server_url="${server_url:-http://169.253.1.1:8080}"
 #------------------------------------------------------------
@@ -342,13 +349,31 @@ connect_1x() {
   # Rebuild the profile each run so identity / password / SSID always re-apply.
   nmcli -t -f NAME connection show | grep -Fxq "$target_ssid" && nmcli connection delete "$target_ssid"
 
-  nmcli connection add type wifi con-name "$target_ssid" ifname "$wladapter" ssid "$target_ssid" \
-    wifi-sec.key-mgmt wpa-eap \
-    802-1x.eap "$eap" \
-    802-1x.phase2-auth mschapv2 \
-    802-1x.identity "$username" \
-    802-1x.password "$ssidpw" \
-    802-1x.system-ca-certs no
+  if [[ "$eap" == "tls" ]]; then
+    # EAP-TLS (cert-based) — for Cloud NAC. Certs are provisioned headlessly by
+    # cloud_nac_onboard.py and referenced by path here. No password/phase2.
+    if [[ -z "$dot1x_client_cert" || -z "$dot1x_private_key" || -z "$dot1x_ca_cert" ]]; then
+      echo "EAP-TLS selected but cert paths missing (dot1x_client_cert/private_key/ca_cert)" | tee -a ${LOG_FILE}
+      return 1
+    fi
+    nmcli connection add type wifi con-name "$target_ssid" ifname "$wladapter" ssid "$target_ssid" \
+      wifi-sec.key-mgmt wpa-eap \
+      802-1x.eap tls \
+      802-1x.identity "$username" \
+      802-1x.client-cert "$dot1x_client_cert" \
+      802-1x.private-key "$dot1x_private_key" \
+      802-1x.ca-cert "$dot1x_ca_cert" \
+      802-1x.system-ca-certs no
+  else
+    # PEAP-MSCHAPv2 (username/password) — the legacy default.
+    nmcli connection add type wifi con-name "$target_ssid" ifname "$wladapter" ssid "$target_ssid" \
+      wifi-sec.key-mgmt wpa-eap \
+      802-1x.eap "$eap" \
+      802-1x.phase2-auth mschapv2 \
+      802-1x.identity "$username" \
+      802-1x.password "$ssidpw" \
+      802-1x.system-ca-certs no
+  fi
 
   nmcli -w "$wait_time" connection up "$target_ssid"
 }
