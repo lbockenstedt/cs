@@ -290,18 +290,31 @@ def build_client_api_app(spoke) -> FastAPI:
             # Ambient weighting (HUB mode). ambient_pct is the automatic uniform
             # weight; when the operator opts into steering, ambient_control=on and
             # the per-sim weights ride in the [ambient_weights] section.
-            sim_conf.set("simulation", "ambient_pct",
-                         str(spoke.local_store.get_ambient_pct()))
+            # Ambient distribution (see docs §7.1). Two-step model: ambient_pct is
+            # the LEVEL (% of the fleet that is ambient-active); the per-sim
+            # relative weights split those active clients (weight 3 → 3x the
+            # clients of weight 1). Site load weight scales the LEVEL per site.
+            base_pct = spoke.local_store.get_ambient_pct()
             control_on = spoke.local_store.get_ambient_control()
             sim_conf.set("simulation", "ambient_control",
                          "on" if control_on else "off")
             if control_on:
+                # Scale THIS client's level by its site's load weight (default 1),
+                # so a site weighted 3 has 3x the ambient-active clients. Folded
+                # here so the client just rolls the served level.
+                site_w = spoke.local_store.get_ambient_site_weights()
+                sfactor = site_w.get(resolved_site) or 1
+                eff_level = max(0, min(100, int(round(base_pct * sfactor))))
+                sim_conf.set("simulation", "ambient_pct", str(eff_level))
+                # Serve the relative per-sim weights the client picks among.
                 weights = spoke.local_store.get_ambient_weights()
                 if weights:
                     if not sim_conf.has_section("ambient_weights"):
                         sim_conf.add_section("ambient_weights")
                     for _sim, _w in weights.items():
                         sim_conf.set("ambient_weights", str(_sim), str(_w))
+            else:
+                sim_conf.set("simulation", "ambient_pct", str(base_pct))
         except Exception:  # noqa: BLE001
             pass
         # Deliver the engine/registry overrides into the client's [username]

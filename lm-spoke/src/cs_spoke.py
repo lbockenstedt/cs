@@ -1268,6 +1268,11 @@ class CSSpoke(BaseSpoke):
             if isinstance(aw, dict):
                 self.local_store.set_ambient_weights(aw)
                 applied.append("ambient_weights")
+        if "ambient_site_weights" in patch:
+            asw = patch.get("ambient_site_weights")
+            if isinstance(asw, dict):
+                self.local_store.set_ambient_site_weights(asw)
+                applied.append("ambient_site_weights")
         if "ssid_matrix" in patch:
             sm = patch.get("ssid_matrix")
             if isinstance(sm, list):

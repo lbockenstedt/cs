@@ -393,9 +393,11 @@ class LocalStore:
             self._data["ambient_control"] = bool(on)
             self._save()
 
-    # ambient_weights: {sim_id: 0-100}. A sim's weight is the share of the fleet
-    # that runs it — higher weight, more clients. Only consulted when
-    # ambient_control is on; missing sims fall back to ambient_pct on the client.
+    # ambient_weights: {sim_id: relative int, default 1}. Among the ambient-active
+    # clients (see ambient_pct = the level), each runs ONE randomizable sim chosen
+    # by weighted random pick — a sim weighted 3 runs on 3x the clients of one
+    # weighted 1. Only consulted when ambient_control is on; a sim not listed
+    # defaults to weight 1 (even split). Relative, so no upper clamp beyond sanity.
     def get_ambient_weights(self) -> dict:
         v = self._data.get("ambient_weights")
         if not isinstance(v, dict):
@@ -403,7 +405,7 @@ class LocalStore:
         out = {}
         for k, w in v.items():
             try:
-                out[str(k)] = max(0, min(100, int(w)))
+                out[str(k)] = max(0, min(100000, int(w)))
             except (TypeError, ValueError):
                 continue
         return out
@@ -414,10 +416,40 @@ class LocalStore:
             if isinstance(mapping, dict):
                 for k, w in mapping.items():
                     try:
-                        clean[str(k)] = max(0, min(100, int(w)))
+                        clean[str(k)] = max(0, min(100000, int(w)))
                     except (TypeError, ValueError):
                         continue
             self._data["ambient_weights"] = clean
+            self._save()
+
+    # ambient_site_weights: {site: relative int, default 1} — a per-site load
+    # weight. A site's ambient LEVEL is base_level × site_weight, so a site
+    # weighted 3 has 3x the ambient-active clients of a site weighted 1 (default).
+    # Only used when ambient_control is on; a site not listed stays weight 1. The
+    # multiplier is folded into the served ambient_pct (level) at request time
+    # (client_api), so the client never sees the site weight directly.
+    def get_ambient_site_weights(self) -> dict:
+        v = self._data.get("ambient_site_weights")
+        if not isinstance(v, dict):
+            return {}
+        out = {}
+        for k, w in v.items():
+            try:
+                out[str(k)] = max(0, int(w))
+            except (TypeError, ValueError):
+                continue
+        return out
+
+    def set_ambient_site_weights(self, mapping: dict) -> None:
+        with self._lock:
+            clean = {}
+            if isinstance(mapping, dict):
+                for k, w in mapping.items():
+                    try:
+                        clean[str(k)] = max(0, int(w))
+                    except (TypeError, ValueError):
+                        continue
+            self._data["ambient_site_weights"] = clean
             self._save()
 
     # ssid_matrix: the defined cells [{site, auth, ssid, ssidpw, enabled, weight}].

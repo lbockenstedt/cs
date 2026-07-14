@@ -155,39 +155,54 @@ if [[ "$web_server" == "on" ]]; then
   for sim in dhcp_fail dns_fail assoc_fail port_flap ssidpw_fail auth_fail \
              ping_test download iperf www_traffic; do declare -g "$sim=off"; done
   #
-  # Ambient weighting
-  # -----------------
-  # Each randomizable sim flips on independently with a probability of 0-100%.
-  # That probability is the sim's WEIGHT: the higher the weight, the larger the
-  # share of the fleet that runs it ("more clients get it").
+  # Ambient distribution — two-step model (level, then weighted split)
+  # ------------------------------------------------------------------
+  # STEP 1 (level): this client is "ambient-active" with probability ambient_pct
+  #   (the % of the fleet doing ambient traffic). ambient_pct is delivered already
+  #   scaled for THIS client's site — the spoke folded the per-site load weight in
+  #   (a site weighted 3 gets 3x the level of a site weighted 1), so the client
+  #   just rolls against it. If the client rolls inactive, it runs NO ambient sim.
+  # STEP 2 (split): an active client runs exactly ONE randomizable sim, chosen by a
+  #   WEIGHTED random pick over [ambient_weights] (relative integers, default 1).
+  #   A sim weighted 3 is picked 3x as often as one weighted 1 — so it runs on 3x
+  #   the clients. This is the SAME "weight N = N x clients" rule as the SSID
+  #   weighted placement rules.
   #
-  #   ambient_control = off  (DEFAULT, automatic):
-  #       every randomizable sim uses the same weight, ambient_pct. The operator
-  #       does nothing and the fleet self-balances evenly across the set.
-  #   ambient_control = on   (operator chose to steer distribution):
-  #       each sim's weight comes from [ambient_weights] <sim> = <0-100>. Any sim
-  #       missing from that section falls back to ambient_pct. Raise a sim's weight
-  #       to hand it more clients; lower it to hand it fewer.
+  #   ambient_control = off (DEFAULT): every sim weight is 1 → the active clients
+  #       split EVENLY across the randomizable set. The operator does nothing.
+  #   ambient_control = on: per-sim weights come from [ambient_weights] and the
+  #       per-site level scaling is applied (both delivered by the spoke).
   #
-  # Because each client rolls independently, over a large fleet the fraction
-  # running sim X converges to weight(X)%, which is exactly the distribution the
-  # weight expresses.
+  # Failure sims never enter this pool — the engine owns them via [username].
   ambient_control=$(get_value 'simulation' 'ambient_control'); ambient_control="${ambient_control:-off}"
   ambient_pct=$(get_value 'simulation' 'ambient_pct'); ambient_pct="${ambient_pct:-50}"
-  echo "Auto (engine-driven): ambient control=${ambient_control} base=${ambient_pct}% set=[$randomizable_sims]" | tee -a ${LOG_FILE}
-  for sim in $randomizable_sims; do
-    # Resolve this sim's weight: its own entry when the operator is steering,
-    # otherwise the uniform ambient_pct.
-    if [[ "$ambient_control" == "on" ]]; then
-      weight=$(get_value 'ambient_weights' "$sim"); weight="${weight:-$ambient_pct}"
-    else
-      weight="$ambient_pct"
+  echo "Auto (engine-driven): ambient control=${ambient_control} level=${ambient_pct}% set=[$randomizable_sims]" | tee -a ${LOG_FILE}
+  if [[ -n "$randomizable_sims" ]] && (( RANDOM % 100 < ambient_pct )); then
+    # Active — weighted single-pick. First total the weights (default 1 each).
+    ambient_total=0
+    for sim in $randomizable_sims; do
+      weight=$(get_value 'ambient_weights' "$sim"); weight="${weight:-1}"
+      [[ "$weight" =~ ^[0-9]+$ ]] || weight=1
+      ambient_total=$(( ambient_total + weight ))
+    done
+    if (( ambient_total > 0 )); then
+      # Roll a point in [0, total) and walk the cumulative weights to find its sim.
+      ambient_roll=$(( RANDOM % ambient_total ))
+      ambient_acc=0
+      for sim in $randomizable_sims; do
+        weight=$(get_value 'ambient_weights' "$sim"); weight="${weight:-1}"
+        [[ "$weight" =~ ^[0-9]+$ ]] || weight=1
+        ambient_acc=$(( ambient_acc + weight ))
+        if (( ambient_roll < ambient_acc )); then
+          declare -g "$sim=on"
+          echo "  ambient: active → ${sim} ON (weight ${weight}/${ambient_total})" | tee -a ${LOG_FILE}
+          break
+        fi
+      done
     fi
-    if (( RANDOM % 100 < weight )); then
-      declare -g "$sim=on"
-      echo "  ambient: ${sim} ON (weight ${weight}%)" | tee -a ${LOG_FILE}
-    fi
-  done
+  else
+    echo "  ambient: inactive this cycle" | tee -a ${LOG_FILE}
+  fi
 else
   wsite=$(get_value $simulation_id 'wsite')
   sim_phy=$(get_value $simulation_id 'sim_phy')
