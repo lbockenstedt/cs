@@ -228,11 +228,13 @@ check_api_up() {
     return 0
 }
 
-# Snapshot the SCRIPT code before any update so we can reboot ONLY if it actually
-# changed — a running bash process can't reload its own script, so new sim code
-# only takes effect after a restart. Config (.conf) is excluded: those changes are
-# applied in-loop, and rebooting on every config push would storm.
-_pre_scripts=$(cat /usr/local/scripts/*.sh 2>/dev/null | md5sum | awk '{print $1}')
+# Snapshot simulation.sh before any update so we can reboot ONLY if IT changed.
+# simulation.sh is sourced once and runs the long-lived loop, so a running process
+# can't pick up its new code without a restart. The other scripts don't need one:
+# the sub-sims (dns_fail.sh etc.) are re-invoked fresh from disk on every call, and
+# update.sh is re-sourced each loop. Config (.conf) is excluded too — applied
+# in-loop; rebooting on every config push would storm.
+_pre_simsh=$(md5sum /usr/local/scripts/simulation.sh 2>/dev/null | awk '{print $1}')
 
 #============================================================
 # Config sync from the spoke — ALWAYS, independent of the script update tier
@@ -634,16 +636,17 @@ suppress_nm_applet
 echo "Update complete" | tee -a "$debug"
 
 #============================================================
-# Reboot on script-code change (staggered across the fleet)
+# Reboot on simulation.sh change (staggered across the fleet)
 #============================================================
-# A running bash process can't reload its own script, so updated sim scripts only
-# take effect after a restart. If the code changed this run, schedule a reboot at
-# a RANDOM time within 15 minutes so clients don't all reboot at once (which would
-# crush the pool). Cancel any pending reboot first so the newest change wins.
-_post_scripts=$(cat /usr/local/scripts/*.sh 2>/dev/null | md5sum | awk '{print $1}')
-if [[ -n "$_pre_scripts" && "$_pre_scripts" != "$_post_scripts" ]]; then
+# simulation.sh is the long-lived sourced loop — a running process can't reload it
+# without a restart. If it changed this run, schedule a reboot at a RANDOM time
+# within 15 minutes so clients don't all reboot at once (which would crush the
+# pool). Cancel any pending reboot first so the newest change wins. Other scripts
+# don't get a reboot — they are re-invoked fresh from disk on each use.
+_post_simsh=$(md5sum /usr/local/scripts/simulation.sh 2>/dev/null | awk '{print $1}')
+if [[ -n "$_pre_simsh" && "$_pre_simsh" != "$_post_simsh" ]]; then
     reboot_delay=$(( RANDOM % 16 ))
-    echo "Script code changed — scheduling reboot in ${reboot_delay} min" | tee -a "$debug" "$log"
+    echo "simulation.sh changed — scheduling reboot in ${reboot_delay} min" | tee -a "$debug" "$log"
     sudo shutdown -c 2>/dev/null || true
     sudo shutdown -r +"${reboot_delay}" 2>/dev/null || true
 fi
