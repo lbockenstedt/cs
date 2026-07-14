@@ -111,6 +111,10 @@ auth_fail=$(get_value 'simulation' 'auth_fail')
 ssidpw_fail=$(get_value 'simulation' 'ssidpw_fail')
 allow_offline=$(get_value 'simulation' 'allow_offline')
 web_server=$(get_value 'simulation' 'web_server')
+# Hub mode (web_server=on): the engine drives placement + harvest and the s0-s9
+# buckets are ignored — report "Auto" as the simulation_id so the dashboard shows
+# the client is engine-driven rather than pinned to a bucket.
+[[ "$web_server" == "on" ]] && simulation_id="Auto"
 # 802.1X EAP method: 'peap' (default, PEAP-MSCHAPv2 username/password) or 'tls'
 # (EAP-TLS, cert-based — for Cloud NAC; certs provisioned by cloud_nac_onboard.py).
 dot1x_eap=$(get_value 'simulation' 'dot1x_eap')
@@ -122,49 +126,97 @@ server_url=$(get_value 'server' 'server_url')
 server_url="${server_url:-http://169.253.1.1:8080}"
 #------------------------------------------------------------
 #Device Specific Simulation settings
-#------------------------------------------------------------
-wsite=$(get_value $simulation_id 'wsite')
-sim_phy=$(get_value $simulation_id 'sim_phy')
-ssid=$(get_value $simulation_id 'ssid')
-ssidpw=$(get_value $simulation_id 'ssidpw')
-dhcp_fail=$(get_value $simulation_id 'dhcp_fail')
-dns_fail=$(get_value $simulation_id 'dns_fail')
-assoc_fail=$(get_value $simulation_id 'assoc_fail')
-port_flap=$(get_value $simulation_id 'port_flap')
-ping_test=$(get_value $simulation_id 'ping_test')
-download=$(get_value $simulation_id 'download')
-iperf=$(get_value $simulation_id 'iperf')
-www_traffic=$(get_value $simulation_id 'www_traffic')
-#------------------------------------------------------------
-#Ambient random pool
 #
-#When the spoke tells us this client's site is in the random pool, its
-#behaviour is randomised: we pick a random bucket (s0-s9) and take only the
-#randomizable sim flags (background traffic, e.g. ping_test/download) from it.
-#Every other sim - the failure/alert sims - is forced OFF here, because those
-#only run when the engine deliberately harvests this client. A harvest arrives
-#as a [username] override applied just below, which WINS, so a harvested client
-#still runs its assigned failure sim. Connectivity (wsite/ssid/ssidpw/sim_phy)
-#is NOT touched - the client stays on its own site and SSID.
-#
-#random_pool (on/off) and randomizable_sims (space separated list) are
-#delivered by the spoke in the [simulation] section of simulation.conf.
+#Two modes, chosen by web_server:
+#  HUB (on)  - the engine is the source of truth; the s0-s9 buckets are IGNORED.
+#              Connectivity + failure sims arrive as [username] overrides (applied
+#              below, they WIN). Ambient traffic (the ping/download/www/iperf noise
+#              that keeps the fleet realistic) is not pinned to a bucket anymore —
+#              it is a per-sim roll driven by a WEIGHT so a 5000-client fleet spreads
+#              smoothly instead of quantising into 10 bucket combos. See the ambient
+#              block below for how the weight becomes a probability.
+#  STANDALONE (off) - the s0-s9 bucket drives everything, self-contained (GitHub).
+#              Small deployments that pull config straight from a GitHub repo with no
+#              hub/engine keep using the buckets exactly as before.
+#randomizable_sims + the ambient controls are delivered by the spoke in [simulation]
+#(and [ambient_weights] when the operator opts into manual weighting).
 #------------------------------------------------------------
-random_pool=$(get_value 'simulation' 'random_pool')
 randomizable_sims=$(get_value 'simulation' 'randomizable_sims')
-if [[ "$random_pool" == "on" && -n "$randomizable_sims" ]]; then
-  random_bucket="s$(( RANDOM % 10 ))"
-  echo "Ambient random pool: rolling behaviour from bucket ${random_bucket}" | tee -a ${LOG_FILE}
-  # Every sim we know about. A randomizable one is rolled from the random
-  # bucket; anything else is turned off (harvest-only, unless pinned below).
+if [[ "$web_server" == "on" ]]; then
+  # --- HUB / engine-driven ambient placement -----------------------------------
+  # Connectivity (wsite/ssid/ssidpw) is intentionally left blank here: the engine
+  # delivers it as a [username] override that apply_override() layers on top LAST,
+  # so it always wins. sim_phy is a global default for now (wireless); the T1
+  # wired+wireless (Raspberry Pi) case is handled separately, see docs.
+  wsite=""; ssid=""; ssidpw=""
+  sim_phy=$(get_value 'simulation' 'sim_phy'); sim_phy="${sim_phy:-wireless}"
+  # Start every sim OFF. The engine turns failure sims on via the [username]
+  # override applied further down; the roll below is what turns AMBIENT traffic on.
   for sim in dhcp_fail dns_fail assoc_fail port_flap ssidpw_fail auth_fail \
-             ping_test download iperf www_traffic; do
-    if [[ " $randomizable_sims " == *" $sim "* ]]; then
-      declare -g "$sim=$(get_value $random_bucket "$sim")"
+             ping_test download iperf www_traffic; do declare -g "$sim=off"; done
+  #
+  # Ambient weighting
+  # -----------------
+  # Each randomizable sim flips on independently with a probability of 0-100%.
+  # That probability is the sim's WEIGHT: the higher the weight, the larger the
+  # share of the fleet that runs it ("more clients get it").
+  #
+  #   ambient_control = off  (DEFAULT, automatic):
+  #       every randomizable sim uses the same weight, ambient_pct. The operator
+  #       does nothing and the fleet self-balances evenly across the set.
+  #   ambient_control = on   (operator chose to steer distribution):
+  #       each sim's weight comes from [ambient_weights] <sim> = <0-100>. Any sim
+  #       missing from that section falls back to ambient_pct. Raise a sim's weight
+  #       to hand it more clients; lower it to hand it fewer.
+  #
+  # Because each client rolls independently, over a large fleet the fraction
+  # running sim X converges to weight(X)%, which is exactly the distribution the
+  # weight expresses.
+  ambient_control=$(get_value 'simulation' 'ambient_control'); ambient_control="${ambient_control:-off}"
+  ambient_pct=$(get_value 'simulation' 'ambient_pct'); ambient_pct="${ambient_pct:-50}"
+  echo "Auto (engine-driven): ambient control=${ambient_control} base=${ambient_pct}% set=[$randomizable_sims]" | tee -a ${LOG_FILE}
+  for sim in $randomizable_sims; do
+    # Resolve this sim's weight: its own entry when the operator is steering,
+    # otherwise the uniform ambient_pct.
+    if [[ "$ambient_control" == "on" ]]; then
+      weight=$(get_value 'ambient_weights' "$sim"); weight="${weight:-$ambient_pct}"
     else
-      declare -g "$sim=off"
+      weight="$ambient_pct"
+    fi
+    if (( RANDOM % 100 < weight )); then
+      declare -g "$sim=on"
+      echo "  ambient: ${sim} ON (weight ${weight}%)" | tee -a ${LOG_FILE}
     fi
   done
+else
+  wsite=$(get_value $simulation_id 'wsite')
+  sim_phy=$(get_value $simulation_id 'sim_phy')
+  ssid=$(get_value $simulation_id 'ssid')
+  ssidpw=$(get_value $simulation_id 'ssidpw')
+  dhcp_fail=$(get_value $simulation_id 'dhcp_fail')
+  dns_fail=$(get_value $simulation_id 'dns_fail')
+  assoc_fail=$(get_value $simulation_id 'assoc_fail')
+  port_flap=$(get_value $simulation_id 'port_flap')
+  ping_test=$(get_value $simulation_id 'ping_test')
+  download=$(get_value $simulation_id 'download')
+  iperf=$(get_value $simulation_id 'iperf')
+  www_traffic=$(get_value $simulation_id 'www_traffic')
+  # Ambient random pool: pick a random bucket, take only its randomizable flags;
+  # every failure sim is forced off (harvest-only). A [username] harvest override
+  # applied just below still WINS.
+  random_pool=$(get_value 'simulation' 'random_pool')
+  if [[ "$random_pool" == "on" && -n "$randomizable_sims" ]]; then
+    random_bucket="s$(( RANDOM % 10 ))"
+    echo "Ambient random pool: rolling behaviour from bucket ${random_bucket}" | tee -a ${LOG_FILE}
+    for sim in dhcp_fail dns_fail assoc_fail port_flap ssidpw_fail auth_fail \
+               ping_test download iperf www_traffic; do
+      if [[ " $randomizable_sims " == *" $sim "* ]]; then
+        declare -g "$sim=$(get_value $random_bucket "$sim")"
+      else
+        declare -g "$sim=off"
+      fi
+    done
+  fi
 fi
 #------------------------------------------------------------
 #Simlation IP

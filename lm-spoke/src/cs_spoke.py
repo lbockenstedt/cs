@@ -1257,6 +1257,17 @@ class CSSpoke(BaseSpoke):
             if isinstance(rp, dict):
                 self.local_store.set_random_pool(rp)
                 applied.append("random_pool")
+        if "ambient_pct" in patch:
+            self.local_store.set_ambient_pct(patch.get("ambient_pct"))
+            applied.append("ambient_pct")
+        if "ambient_control" in patch:
+            self.local_store.set_ambient_control(patch.get("ambient_control"))
+            applied.append("ambient_control")
+        if "ambient_weights" in patch:
+            aw = patch.get("ambient_weights")
+            if isinstance(aw, dict):
+                self.local_store.set_ambient_weights(aw)
+                applied.append("ambient_weights")
         if "ssid_matrix" in patch:
             sm = patch.get("ssid_matrix")
             if isinstance(sm, list):

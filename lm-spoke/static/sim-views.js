@@ -2336,6 +2336,9 @@ async function csRenderConfigSimulation() {
     } else {
         // Known sections rendered as labeled field grids; unknown sections fall
         // back to raw textareas so a fork's extra sections aren't dropped.
+        // Hub / engine mode: web_server=on means the engine drives placement and
+        // the s0–s9 buckets are dead config, so the bucket editor is hidden below.
+        const webServerOn = String((sections.simulation || {}).web_server || '').trim().toLowerCase() === 'on';
         const simFields = csSimSectionFields('simulation', CS_SIM_SECTION_FIELDS.simulation, sections.simulation);
         const serverFields = csSimSectionFields('server', CS_SIM_SECTION_FIELDS.server, sections.server);
         const addressFields = csSimSectionFields('address', CS_SIM_SECTION_FIELDS.address, sections.address);
@@ -2368,8 +2371,13 @@ async function csRenderConfigSimulation() {
               <div class="grid grid-cols-1 md:grid-cols-2 gap-3">${serverFields}${addressFields}</div>
             </div>
           </div>
-          <p class="text-[11px] font-bold text-slate-400 uppercase tracking-wider mb-2">Per-bucket profiles [s0]–[s9]</p>
-          ${bucketCards}
+          ${webServerOn
+            ? `<div class="border border-slate-200 rounded-lg p-3 bg-slate-50/60">
+                 <p class="text-[11px] font-bold text-slate-400 uppercase tracking-wider mb-1">Per-bucket profiles [s0]–[s9]</p>
+                 <p class="text-xs text-slate-500 leading-snug">This deployment runs in <span class="font-semibold">hub / engine mode</span> (<code>web_server=on</code>), so the engine drives placement and ambient distribution and the <span class="font-semibold">s0–s9 buckets are ignored</span> (and stripped from the served config). Sim distribution is configured centrally in the hub's <span class="font-semibold">Sim Quotas → Pool &amp; SSID</span>. The buckets only apply to standalone (GitHub-synced) deployments with <code>web_server=off</code>.</p>
+               </div>`
+            : `<p class="text-[11px] font-bold text-slate-400 uppercase tracking-wider mb-2">Per-bucket profiles [s0]–[s9]</p>
+          ${bucketCards}`}
           ${extras.length ? `<p class="text-[11px] font-bold text-slate-400 uppercase tracking-wider mt-3 mb-2">Extra sections</p>${extraBlocks}` : ''}
           <details class="mt-3 text-xs"><summary class="cursor-pointer text-slate-400">Raw merged simulation.conf</summary><pre class="mt-2 p-2 bg-slate-50 rounded font-mono text-[11px] whitespace-pre-wrap break-all">${csEscape(raw)}</pre></details>`;
     }

@@ -287,6 +287,21 @@ def build_client_api_app(spoke) -> FastAPI:
             if rand_sims:
                 sim_conf.set("simulation", "randomizable_sims",
                              " ".join(str(s) for s in rand_sims))
+            # Ambient weighting (HUB mode). ambient_pct is the automatic uniform
+            # weight; when the operator opts into steering, ambient_control=on and
+            # the per-sim weights ride in the [ambient_weights] section.
+            sim_conf.set("simulation", "ambient_pct",
+                         str(spoke.local_store.get_ambient_pct()))
+            control_on = spoke.local_store.get_ambient_control()
+            sim_conf.set("simulation", "ambient_control",
+                         "on" if control_on else "off")
+            if control_on:
+                weights = spoke.local_store.get_ambient_weights()
+                if weights:
+                    if not sim_conf.has_section("ambient_weights"):
+                        sim_conf.add_section("ambient_weights")
+                    for _sim, _w in weights.items():
+                        sim_conf.set("ambient_weights", str(_sim), str(_w))
         except Exception:  # noqa: BLE001
             pass
         # Deliver the engine/registry overrides into the client's [username]
@@ -314,7 +329,22 @@ def build_client_api_app(spoke) -> FastAPI:
                 if k in human_keys:
                     continue  # human per-user override wins (Model A)
                 sim_conf.set(uname, str(k), str(v))
-        text = sim_config.render_ini_for_client(sim_conf, hostname, overrides or None)
+        # HUB mode (web_server=on): the client ignores the s0–s9 buckets entirely
+        # — the engine drives placement through the [username] override written
+        # above, which simulation.sh resolves LAST. Strip the dead bucket sections
+        # from the served config: a smaller payload at 5000-client scale and no way
+        # a stale bucket flag can be read. The overrides already live in [username],
+        # so skip the redundant crc32-[sX] bake too. STANDALONE (web_server=off)
+        # keeps the buckets + bake exactly as before (GitHub-synced deployments
+        # still resolve their sims from the bucket).
+        ws_on = str(sim_conf.get("simulation", "web_server", fallback="") or "").strip().lower() == "on"
+        if ws_on:
+            for _b in (f"s{i}" for i in range(10)):
+                if sim_conf.has_section(_b):
+                    sim_conf.remove_section(_b)
+            text = sim_config.render_ini_for_client(sim_conf, hostname, None)
+        else:
+            text = sim_config.render_ini_for_client(sim_conf, hostname, overrides or None)
         return PlainTextResponse(text)
 
     @app.get("/api/config/overrides")

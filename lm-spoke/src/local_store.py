@@ -364,6 +364,62 @@ class LocalStore:
                 if isinstance(mapping, dict) else {}
             self._save()
 
+    # ambient_pct: in HUB mode (web_server=on) each randomizable sim flips on with
+    # this probability (0-100) — the direct roll that replaces the s0-s9 bucket
+    # combos. Default 50.
+    def get_ambient_pct(self) -> int:
+        try:
+            v = int(self._data.get("ambient_pct", 50))
+        except (TypeError, ValueError):
+            v = 50
+        return max(0, min(100, v))
+
+    def set_ambient_pct(self, pct) -> None:
+        with self._lock:
+            try:
+                self._data["ambient_pct"] = max(0, min(100, int(pct)))
+            except (TypeError, ValueError):
+                self._data["ambient_pct"] = 50
+            self._save()
+
+    # ambient_control: off (default) = automatic, every randomizable sim uses the
+    # uniform ambient_pct. on = the operator is steering distribution and per-sim
+    # weights in ambient_weights take over. Toggle is surfaced in the Quota UI.
+    def get_ambient_control(self) -> bool:
+        return bool(self._data.get("ambient_control", False))
+
+    def set_ambient_control(self, on) -> None:
+        with self._lock:
+            self._data["ambient_control"] = bool(on)
+            self._save()
+
+    # ambient_weights: {sim_id: 0-100}. A sim's weight is the share of the fleet
+    # that runs it — higher weight, more clients. Only consulted when
+    # ambient_control is on; missing sims fall back to ambient_pct on the client.
+    def get_ambient_weights(self) -> dict:
+        v = self._data.get("ambient_weights")
+        if not isinstance(v, dict):
+            return {}
+        out = {}
+        for k, w in v.items():
+            try:
+                out[str(k)] = max(0, min(100, int(w)))
+            except (TypeError, ValueError):
+                continue
+        return out
+
+    def set_ambient_weights(self, mapping: dict) -> None:
+        with self._lock:
+            clean = {}
+            if isinstance(mapping, dict):
+                for k, w in mapping.items():
+                    try:
+                        clean[str(k)] = max(0, min(100, int(w)))
+                    except (TypeError, ValueError):
+                        continue
+            self._data["ambient_weights"] = clean
+            self._save()
+
     # ssid_matrix: the defined cells [{site, auth, ssid, ssidpw, enabled, weight}].
     def get_ssid_matrix(self) -> list:
         v = self._data.get("ssid_matrix")

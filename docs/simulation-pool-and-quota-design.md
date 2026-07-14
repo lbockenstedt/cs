@@ -178,14 +178,49 @@ Everything not harvested and not on a targeted SSID:
 
 - **Site** is pinned (from §4) and **frozen** — no jumping.
 - **Sims** are a **live client-side roll** each iteration, from the randomizable
-  set (via the curated buckets). Cadence = the client's natural config-reload on
-  sim completion (approximate/organic, deliberately not exact).
+  set. Cadence = the client's natural config-reload on sim completion
+  (approximate/organic, deliberately not exact).
 - **No tracking. No per-client config. No engine ledger entry.** The ~4,900
-  ambient boxes are config-only (site source + randomizable set), applied
-  statelessly.
+  ambient boxes are config-only (site source + randomizable set + ambient
+  weights), applied statelessly.
 
-Buckets rotate **sim flags only**; `wsite`/`ssid`/`ssidpw`/`sim_phy` come from
-the stable site/SSID layer and win via `[username]` (§12).
+The site/SSID layer wins via `[username]` (§12): `wsite`/`ssid`/`ssidpw`/`sim_phy`
+come from the stable connectivity layer, never from the ambient roll.
+
+### 7.1 Ambient weighting — how the roll picks sims
+
+In HUB mode (`web_server=on`, §12) the s0–s9 buckets are **retired**: the client
+rolls each randomizable sim **independently** with a probability equal to that
+sim's **weight** (0–100%). Higher weight → a larger share of the fleet runs it.
+Because every client rolls independently, over a large fleet the fraction running
+sim *X* converges to `weight(X)%` — the weight *is* the distribution.
+
+Two operator modes, surfaced in **Config → Sim Quotas → Pool & SSID → Simulation
+distribution**:
+
+- **Automatic (default, `ambient_control=off`)** — every randomizable sim uses
+  the same weight, `ambient_pct` (default 50). The operator does nothing and the
+  fleet self-balances evenly across the randomizable set.
+- **Weight control (`ambient_control=on`)** — the operator opts in and sets a
+  per-sim weight in `ambient_weights` (`{sim_id: 0-100}`). A sim missing from the
+  map falls back to `ambient_pct`. Raise a weight to hand a sim more clients,
+  lower it to hand it fewer.
+
+Delivery: the hub flattens `ambient_pct` / `ambient_control` / `ambient_weights`
+from `central_sites_config` into the `CS_CONFIG_UPDATE` pool push
+(`_pool_config`); the spoke stores them (`local_store`) and serves them to the
+client as `[simulation]` globals plus an `[ambient_weights]` section
+(`client_api`). `clients/linux/simulation.sh` reads them in the `web_server=on`
+branch and rolls each randomizable sim against its weight. The API also **strips
+the `[s0]`–`[s9]` sections from the served `simulation.conf`** in hub mode (they
+are dead config the client never reads) — a smaller payload at 5000-client scale
+and no chance a stale bucket flag leaks in.
+
+**Standalone mode (`web_server=off`, GitHub-synced small deployments)** keeps the
+legacy behavior: the client rolls a random `s0`–`s9` bucket and takes that
+bucket's randomizable flags. The bucket editor is only shown in the WebUI when
+`web_server=off`; in hub mode it is replaced by a pointer to the distribution
+controls above (buckets are dead config there).
 
 ---
 
