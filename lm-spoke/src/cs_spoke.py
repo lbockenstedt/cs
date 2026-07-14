@@ -1272,6 +1272,11 @@ class CSSpoke(BaseSpoke):
             if isinstance(sw, list):
                 self.local_store.set_ssid_weights(sw)
                 applied.append("ssid_weights")
+        if "ignored_hostnames" in patch:
+            ih = patch.get("ignored_hostnames")
+            if isinstance(ih, list):
+                self.local_store.set_ignored_hostnames(ih)
+                applied.append("ignored_hostnames")
         for key in self._HUB_DIRECT_KEYS:
             if key in patch:
                 update[key] = patch[key]

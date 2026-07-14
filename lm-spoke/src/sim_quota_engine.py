@@ -136,12 +136,15 @@ class SimQuotaEngine:
         """Hostnames the operator flagged to ignore (hub_config.ignored_hostnames)
         — e.g. a client being spun up or decommissioned. Excluded from the pool,
         harvest, counts, and ledger so it's never assigned or shown."""
+        out: set = set()
         try:
-            hc = self.spoke.local_store.get_hub_config() or {}
-            return {str(h).strip().lower()
-                    for h in (hc.get("ignored_hostnames") or []) if str(h).strip()}
+            ls = self.spoke.local_store
+            names = list(ls.get_ignored_hostnames() or [])          # pushed via _pool_config
+            names += list((ls.get_hub_config() or {}).get("ignored_hostnames") or [])  # hub-SoT copy
+            out = {str(h).strip().lower() for h in names if str(h).strip()}
         except Exception:  # noqa: BLE001
             return set()
+        return out
 
     def _all_clients(self) -> Dict[str, Dict[str, Any]]:
         reg = self._registry()
@@ -854,15 +857,20 @@ class SimQuotaEngine:
                         producing.append(h)
                         actions["assigned"] += 1
 
-                # Trim producing extras when over N (release the most recently
-                # added — the substitute, not a returning original that's earlier
-                # in the ledger). Offline-but-kept clients are NOT trimmed here
-                # (they're not in ``producing``); they simply don't count toward
-                # N until they come back.
-                if len(producing) > target:
-                    extras = producing[target:]
-                    for h in extras:
-                        from_site = assigned.pop(h)
+                # Cap the TOTAL ledger at N — "max means max." When a client flaps
+                # offline we keep it AND add an online substitute, which can push
+                # the ledger over N; trim the excess so ASSIGNED never exceeds the
+                # target. Release OFFLINE-kept extras first (they're not producing
+                # anyway), then the most-recently-added producing (the substitute,
+                # not a returning original earlier in the ledger).
+                over = len(assigned) - target
+                if over > 0:
+                    offline_extras = [h for h in assigned if h not in producing]
+                    to_release = offline_extras[:over]
+                    if len(to_release) < over:
+                        to_release += producing[target:][:over - len(to_release)]
+                    for h in to_release:
+                        from_site = assigned.pop(h, "")
                         await self._release(h, sim_id, from_site, key)
                         actions["released"] += 1
 

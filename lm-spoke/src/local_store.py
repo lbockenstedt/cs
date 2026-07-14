@@ -400,3 +400,17 @@ class LocalStore:
             self._data["ssid_weights"] = [dict(r) for r in rules if isinstance(r, dict)] \
                 if isinstance(rules, list) else []
             self._save()
+
+    # ignored_hostnames: clients excluded from the quota engine (pool, ledger,
+    # counts). Pushed via _pool_config so it reaches the spoke regardless of the
+    # hub-source-of-truth toggle (the Hub Config card's copy is dropped by
+    # _apply_hub_config). The engine unions this with any hub_config copy.
+    def get_ignored_hostnames(self) -> list:
+        v = self._data.get("ignored_hostnames")
+        return [str(x).strip() for x in v if str(x).strip()] if isinstance(v, list) else []
+
+    def set_ignored_hostnames(self, hosts: list) -> None:
+        with self._lock:
+            self._data["ignored_hostnames"] = [str(x).strip() for x in hosts if str(x).strip()] \
+                if isinstance(hosts, list) else []
+            self._save()
