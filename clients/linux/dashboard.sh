@@ -1,5 +1,5 @@
 #!/bin/bash
-version=.09
+version=.10
 # WHY: dashboard.sh is a read-only live monitor. It runs in its own terminal
 # window (launched by startup.desktop) so the operator can always see
 # what's happening without interrupting the simulation loop in the other pane.
@@ -141,33 +141,53 @@ run_cache_worker() {
 
     # Heartbeat POST — reads from cache files so no extra nmcli/ping calls
     if [[ "$web_server" == "on" && -n "$server_url" ]]; then
-      local connected_ssid gateway_reachable=false active_sims_json="[]"
+      local connected_ssid gateway_reachable=false
       connected_ssid=$(cat "$CACHE_DIR/wifi_ssid" 2>/dev/null)
       [[ "$(cat "$CACHE_DIR/gateway_ok" 2>/dev/null)" == "up" ]] && gateway_reachable=true
 
-      local active_sims=()
-      [[ "$dhcp_fail"   == "on" ]] && active_sims+=("dhcp_fail")
-      [[ "$dns_fail"    == "on" ]] && active_sims+=("dns_fail")
-      [[ "$assoc_fail"  == "on" ]] && active_sims+=("assoc_fail")
-      [[ "$port_flap"   == "on" ]] && active_sims+=("port_flap")
-      [[ "$ping_test"   == "on" ]] && active_sims+=("ping_test")
-      [[ "$download"    == "on" ]] && active_sims+=("download")
-      [[ "$iperf"       == "on" ]] && active_sims+=("iperf")
-      [[ "$www_traffic" == "on" ]] && active_sims+=("www_traffic")
-      [[ "$ssidpw_fail" == "on" ]] && active_sims+=("ssidpw_fail")
-      [[ "$auth_fail"   == "on" ]] && active_sims+=("auth_fail")
-      if [[ ${#active_sims[@]} -gt 0 ]]; then
-        active_sims_json=$(printf '"%s",' "${active_sims[@]}" | sed 's/,$//')
-        active_sims_json="[$active_sims_json]"
+      # simulation.sh owns the authoritative status: it does the weighted-ambient
+      # pick + applies [username] overrides and writes the full payload (incl.
+      # active_simulations) to client-status.json every loop. In HUB mode
+      # (web_server=on) the s0-s9 slot sections are STRIPPED from the pushed
+      # simulation.conf, so recomputing active_simulations here from those flags
+      # yields [] for EVERY client — the "no active simulations" bug. Forward
+      # simulation.sh's payload, overlaying only our freshest SSID/gateway (the
+      # dashboard is the non-blocking network courier). Fall back to a locally-
+      # built payload only when the file is absent (sim loop not up yet).
+      local payload="" status_file="/usr/local/scripts/client-status.json"
+      if [[ -s "$status_file" ]]; then
+        payload=$(_SF="$status_file" _SSID="$connected_ssid" _GWOK="$gateway_reachable" \
+          python3 -c 'import json,os,sys
+try:
+    d=json.load(open(os.environ["_SF"]))
+except Exception:
+    sys.exit(1)
+d["connected_ssid"]=os.environ.get("_SSID") or None
+d["gateway_reachable"]=os.environ.get("_GWOK")=="true"
+sys.stdout.write(json.dumps(d))' 2>/dev/null)
       fi
-
-      local ssid_json="null"
-      [[ -n "$connected_ssid" ]] && ssid_json="\"$connected_ssid\""
-
-      local resp throttle_secs
-      resp=$(curl -s -X POST "${server_url%/}/api/status" \
-        -H "Content-Type: application/json" \
-        -d "{
+      if [[ -z "$payload" ]]; then
+        # Fallback (no client-status.json yet): build from the dashboard's own
+        # flags. In hub mode these are empty (stripped slots) — that's the pre-
+        # sim-loop window only; once simulation.sh writes the file we forward it.
+        local active_sims=() active_sims_json="[]"
+        [[ "$dhcp_fail"   == "on" ]] && active_sims+=("dhcp_fail")
+        [[ "$dns_fail"    == "on" ]] && active_sims+=("dns_fail")
+        [[ "$assoc_fail"  == "on" ]] && active_sims+=("assoc_fail")
+        [[ "$port_flap"   == "on" ]] && active_sims+=("port_flap")
+        [[ "$ping_test"   == "on" ]] && active_sims+=("ping_test")
+        [[ "$download"    == "on" ]] && active_sims+=("download")
+        [[ "$iperf"       == "on" ]] && active_sims+=("iperf")
+        [[ "$www_traffic" == "on" ]] && active_sims+=("www_traffic")
+        [[ "$ssidpw_fail" == "on" ]] && active_sims+=("ssidpw_fail")
+        [[ "$auth_fail"   == "on" ]] && active_sims+=("auth_fail")
+        if [[ ${#active_sims[@]} -gt 0 ]]; then
+          active_sims_json=$(printf '"%s",' "${active_sims[@]}" | sed 's/,$//')
+          active_sims_json="[$active_sims_json]"
+        fi
+        local ssid_json="null"
+        [[ -n "$connected_ssid" ]] && ssid_json="\"$connected_ssid\""
+        payload="{
           \"hostname\": \"$HOSTNAME\",
           \"simulation_id\": \"$simulation_id\",
           \"platform\": \"linux\",
@@ -182,7 +202,13 @@ run_cache_worker() {
             \"wsite\": \"$wsite\"
           },
           \"errors\": []
-        }" 2>/dev/null) || true
+        }"
+      fi
+
+      local resp throttle_secs
+      resp=$(curl -s -X POST "${server_url%/}/api/status" \
+        -H "Content-Type: application/json" \
+        -d "$payload" 2>/dev/null) || true
       # Honor server throttle_interval so HTTP clients back off under load.
       if [[ -n "$resp" ]]; then
         throttle_secs=$(echo "$resp" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('throttle_interval',''))" 2>/dev/null || true)
