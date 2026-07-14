@@ -519,6 +519,10 @@ if [ "$kill_switch" != "on" ]; then
     echo "Config changed — reloading simulation" | tee -a ${LOG_FILE}
     break
   fi
+  # Beacon the CURRENT config at the TOP of the loop so the dashboard reflects it
+  # right away — the report_status at the bottom only fires after all the sims
+  # (each a 30s run) finish, which is minutes of staleness.
+  report_status $z
   #------------------------------------------------------------
   #SSID Incorrect Password Simulation or Auth Failure Simulation
   #since these are very similar they are in the same section one
