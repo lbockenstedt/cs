@@ -129,6 +129,11 @@ web_server=$(get_value 'simulation' 'web_server')
 # (EAP-TLS, cert-based — for Cloud NAC; certs provisioned by cloud_nac_onboard.py).
 dot1x_eap=$(get_value 'simulation' 'dot1x_eap')
 dot1x_eap="${dot1x_eap:-peap}"
+# Per-user PEAP password for Cloud NAC: the hub JIT-creates an Entra account for a
+# client the moment the engine moves it onto a 1X SSID and delivers that account's
+# random password here as a [username] override (apply_override, above). Falls back
+# to $ssidpw when unset (a non-cloud-NAC 1X SSID that uses a shared password).
+dot1x_password=$(get_value 'simulation' 'dot1x_password')
 dot1x_client_cert=$(get_value 'simulation' 'dot1x_client_cert')
 dot1x_private_key=$(get_value 'simulation' 'dot1x_private_key')
 dot1x_ca_cert=$(get_value 'simulation' 'dot1x_ca_cert')
@@ -270,7 +275,7 @@ override_keys=(kill_switch sim_load github_repo repo_location site_based_ssid ip
   wsite sim_phy ssid ssidpw dhcp_fail dns_fail assoc_fail port_flap ping_test download iperf \
   www_traffic ssidpw_fail auth_fail smb_address ping_address dns_latency_1 dns_latency_2 \
   dns_latency_3 dns_bad_ip_1 dns_bad_ip_2 dns_bad_ip_3 dns_bad_record_1 dns_bad_record_2 \
-  dns_bad_record_3 iperf_server)
+  dns_bad_record_3 iperf_server dot1x_password)
 for key in "${override_keys[@]}"; do
   apply_override "$key"
 done
@@ -448,7 +453,7 @@ connect_1x() {
       802-1x.eap "$eap" \
       802-1x.phase2-auth mschapv2 \
       802-1x.identity "$username" \
-      802-1x.password "$ssidpw" \
+      802-1x.password "${dot1x_password:-$ssidpw}" \
       802-1x.system-ca-certs no
   fi
 
@@ -631,9 +636,14 @@ if [ "$kill_switch" != "on" ]; then
      # client associates to. Re-resolve here — apply_override's $ssidpw may have
      # been clobbered by a prior iteration's restore.
      real_ssidpw=$(get_value $username 'ssidpw'); [[ -z "$real_ssidpw" ]] && real_ssidpw=$(get_value $simulation_id 'ssidpw')
+     # Cloud-NAC (1X) clients authenticate with their per-user dot1x_password, not
+     # $ssidpw — so corrupt THAT too when it's set, otherwise connect_1x would use
+     # the correct password and the wrong-password sim wouldn't actually fail.
+     real_dot1x=$(get_value $username 'dot1x_password')
      for i in {1..100}; do
       echo Running SSID Incorrect Password | tee -a ${LOG_FILE}
       ssidpw="${real_ssidpw}_fail"
+      [[ -n "$real_dot1x" ]] && dot1x_password="${real_dot1x}_fail"
       echo Iteration $i of 100 | tee -a ${LOG_FILE}
       delete_matching_connections
       connect_wifi 5
