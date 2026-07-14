@@ -859,6 +859,37 @@ class CSSpoke(BaseSpoke):
         # These handlers sit BEFORE the NOT_IMPLEMENTED matcher below so the
         # matcher's {"QUEUE","GET",...} set doesn't swallow them.
         if cmd == "CS_QUEUE_COMMAND":
+            # Bulk path: an ``items`` list enqueues MANY commands from ONE message
+            # (e.g. a multi-VM delete/start/stop from the UI). Each item carries
+            # its own target so VMs route to their own host (VMIDs collide across
+            # hosts); we enqueue them all locally then live-push once per unique
+            # host. This replaces the UI's old one-WS-message-per-VM burst (which
+            # flooded the queue/WS) — one message, N local enqueues, no flood.
+            _items = d.get("items")
+            if isinstance(_items, list) and _items:
+                results = []
+                errors = []
+                for it in _items:
+                    if not isinstance(it, dict):
+                        continue
+                    itgt = str(it.get("target") or "proxmox").strip() or "proxmox"
+                    iact = str(it.get("action") or "").strip()
+                    if not iact:
+                        errors.append("missing 'action'")
+                        continue
+                    try:
+                        res = await self.queue.enqueue(itgt, iact,
+                                                       it.get("args") or {},
+                                                       command_type=it.get("type"))
+                        results.append(res)
+                    except ValueError as exc:
+                        errors.append(str(exc))
+                for _tgt in {str(it.get("target") or "proxmox").strip() or "proxmox"
+                             for it in _items if isinstance(it, dict)}:
+                    await client_api.push_pending(self, _tgt)
+                return {"status": "SUCCESS",
+                        "created": sum(1 for r in results if r.get("created")),
+                        "queued": len(results), "errors": errors}
             target = str(d.get("target") or "proxmox").strip() or "proxmox"
             action = str(d.get("action") or "").strip()
             if not action:
