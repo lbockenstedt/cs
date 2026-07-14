@@ -371,6 +371,16 @@ Client `username = $HOSTNAME | cut -d- -f1` matches server `username_for`.
 > within **`HARVEST_WINDOW_S = 1800s` (30 min)** — real-ish clients flap in/out, so
 > a tight "online now" window would collapse the pool to a handful.
 
+> **Propagation is SLOW — change things slowly.** The Quota-State ledger reflects
+> engine *intent* within ~60s, but the **end-to-end effect takes ≥30 minutes**:
+> clients poll `/api/config` on a cycle and only re-read config between sims, and
+> **Central reports alerts with ~30-min latency**. Consequences:
+> - Don't judge a change (new quota, reset, reshuffle) as broken before ~30 min.
+> - The **adaptive controller already respects this** — its settle window is
+>   floored at 30 min (§9), so it never ramps up/down faster than Central can
+>   confirm firing. Operator changes should follow the same rhythm: adjust, then
+>   wait a full propagation window before adjusting again.
+
 ---
 
 ## 13. Config surfaces (all fleet-size-independent)
