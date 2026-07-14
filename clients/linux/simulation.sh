@@ -59,6 +59,16 @@ init_simulation_context() {
   require_config_value "simulation_id" "$simulation_id"
 }
 
+# Snapshot our OWN script's mtime so the loop can self-re-exec into a NEW
+# simulation.sh the instant update.sh replaces it on disk. A sourced `while true`
+# loop cannot reload its own CODE (only its config) — re-exec (same PID, no
+# reboot, no sudo) is the reliable, immediate activator. This replaces the old
+# "schedule a reboot from update.sh" approach, which failed silently whenever the
+# sim user lacked passwordless sudo, leaving the box on stale code with the new
+# code already on disk (update.sh then reports "no files updated" forever).
+_self_path="/usr/local/scripts/simulation.sh"
+_self_mtime=$(stat -c %Y "$_self_path" 2>/dev/null)
+
 while true; do
   #------------------------------------------------------------
   # If a USR1 arrived (agent.sh restart_sim/kill_switch), note the
@@ -576,6 +586,23 @@ if [ "$kill_switch" != "on" ]; then
   # silently never ran for those clients.
   #------------------------------------------------------------
   if [[ "$rapid_update" == "on" ]]; then source '/usr/local/scripts/update.sh'; fi
+  #------------------------------------------------------------
+  # Self-re-exec: if update.sh (or anything) just replaced simulation.sh on disk,
+  # relaunch into the NEW code in place — same PID, no reboot, no sudo. A running
+  # sourced loop otherwise keeps executing the OLD code no matter how many times
+  # update.sh runs. Validate syntax first so a truncated/partial copy can't kill
+  # the loop; on failure keep the current code and re-check next pass.
+  #------------------------------------------------------------
+  _now_mtime=$(stat -c %Y "$_self_path" 2>/dev/null)
+  if [[ -n "$_self_mtime" && -n "$_now_mtime" && "$_now_mtime" != "$_self_mtime" ]]; then
+    if bash -n "$_self_path" 2>/dev/null; then
+      echo "simulation.sh changed on disk — re-exec'ing into new code" | tee -a ${LOG_FILE}
+      exec bash "$_self_path"
+    else
+      echo "simulation.sh changed but failed syntax check — staying on current code" | tee -a ${LOG_FILE}
+      _self_mtime=$_now_mtime
+    fi
+  fi
   #------------------------------------------------------------
   # Break-to-reload: if update.sh just pulled a CHANGED simulation.conf (its mtime
   # moved) or a USR1 reload was requested, break out so the outer loop re-runs

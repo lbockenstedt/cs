@@ -228,12 +228,13 @@ check_api_up() {
     return 0
 }
 
-# Snapshot simulation.sh before any update so we can reboot ONLY if IT changed.
-# simulation.sh is sourced once and runs the long-lived loop, so a running process
-# can't pick up its new code without a restart. The other scripts don't need one:
-# the sub-sims (dns_fail.sh etc.) are re-invoked fresh from disk on every call, and
-# update.sh is re-sourced each loop. Config (.conf) is excluded too — applied
-# in-loop; rebooting on every config push would storm.
+# Snapshot simulation.sh before any update. If THIS run replaces it, we re-exec
+# the running loop into the new code at the end (no reboot, no sudo). Because
+# update.sh is SOURCED fresh by simulation.sh's loop every pass, this recovery
+# runs even inside a client still executing an OLD simulation.sh — which is how a
+# box stuck on stale code (its scheduled reboot silently failed) gets unstuck the
+# next time scripts sync. The sub-sims + config are re-read live, so only
+# simulation.sh needs this.
 _pre_simsh=$(md5sum /usr/local/scripts/simulation.sh 2>/dev/null | awk '{print $1}')
 
 #============================================================
@@ -636,17 +637,24 @@ suppress_nm_applet
 echo "Update complete" | tee -a "$debug"
 
 #============================================================
-# Reboot on simulation.sh change (staggered across the fleet)
+# Activate a new simulation.sh WITHOUT a reboot (sudo-free)
 #============================================================
-# simulation.sh is the long-lived sourced loop — a running process can't reload it
-# without a restart. If it changed this run, schedule a reboot at a RANDOM time
-# within 15 minutes so clients don't all reboot at once (which would crush the
-# pool). Cancel any pending reboot first so the newest change wins. Other scripts
-# don't get a reboot — they are re-invoked fresh from disk on each use.
+# If this run replaced simulation.sh, re-exec the running loop into the new code.
+# update.sh is SOURCED by simulation.sh's loop, so `exec` here replaces THAT
+# process (same PID) with the new script — instant, no reboot, no sudo. This is
+# what update.sh used to do with `sudo shutdown -r`, which failed silently when
+# the sim user's sudo was command-scoped (nmcli/ip allowed, shutdown not),
+# stranding boxes on stale code while update.sh reported "no files updated".
+# Guard: only re-exec when SOURCED by the loop (``$0`` is simulation.sh, not
+# update.sh) — a standalone ``bash update.sh`` (agent update_now) must NOT spawn a
+# duplicate loop; the running loop picks the change up on its next pass instead.
 _post_simsh=$(md5sum /usr/local/scripts/simulation.sh 2>/dev/null | awk '{print $1}')
-if [[ -n "$_pre_simsh" && "$_pre_simsh" != "$_post_simsh" ]]; then
-    reboot_delay=$(( RANDOM % 16 ))
-    echo "simulation.sh changed — scheduling reboot in ${reboot_delay} min" | tee -a "$debug" "$log"
-    sudo shutdown -c 2>/dev/null || true
-    sudo shutdown -r +"${reboot_delay}" 2>/dev/null || true
+if [[ -n "$_pre_simsh" && "$_pre_simsh" != "$_post_simsh" && "$0" != *update.sh ]]; then
+    if bash -n /usr/local/scripts/simulation.sh 2>/dev/null; then
+        echo "simulation.sh changed — re-exec'ing loop into new code (no reboot)" | tee -a "$debug" "$log"
+        sudo shutdown -c 2>/dev/null || true   # cancel any legacy pending reboot
+        exec bash /usr/local/scripts/simulation.sh
+    else
+        echo "simulation.sh changed but failed syntax check — keeping current code" | tee -a "$debug" "$log"
+    fi
 fi
