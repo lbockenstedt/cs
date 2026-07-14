@@ -229,6 +229,41 @@ check_api_up() {
 }
 
 #============================================================
+# Config sync from the spoke — ALWAYS, independent of the script update tier
+#============================================================
+# The [username] engine/quota assignments are injected by the spoke at
+# /api/config serve time; they live ONLY on the spoke, never in GitHub. Tier 1
+# below pulls the config when web_server=on — but a web_server=off client updates
+# its SCRIPTS from GitHub (Tier 2) and would then NEVER receive its engine
+# assignment. So pull the config from the spoke here whenever Tier 1 won't.
+if [[ "$web_server" != "on" && -n "$server_url" ]] && check_api_up "$server_url"; then
+    echo "Config sync from spoke ($server_url) — web_server off, pulling /api/config anyway" | tee -a "$debug" "$log"
+    _cfg_tmp=$(mktemp)
+    _cfg_code=$(curl -sS --max-time 10 -o "$_cfg_tmp" -w "%{http_code}" \
+        "$server_url/api/config?hostname=$(hostname)" 2>/dev/null)
+    if [[ "$_cfg_code" == "200" && -s "$_cfg_tmp" ]]; then
+        if ! diff -q "$_cfg_tmp" /usr/local/scripts/simulation.conf >/dev/null 2>&1; then
+            echo "simulation.conf changed (spoke) — updating" | tee -a "$debug" "$log"
+            mv -f -- "$_cfg_tmp" /usr/local/scripts/simulation.conf
+        else
+            rm -f "$_cfg_tmp"
+        fi
+    else
+        echo "Config fetch failed (code: $_cfg_code) — keeping existing" | tee -a "$debug"
+        rm -f "$_cfg_tmp"
+    fi
+    # Human per-user pins (user-overrides.conf) — 404 is acceptable.
+    _ov_tmp=$(mktemp)
+    _ov_code=$(curl -sS --max-time 10 -o "$_ov_tmp" -w "%{http_code}" \
+        "$server_url/api/config/overrides" 2>/dev/null)
+    if [[ "$_ov_code" == "200" && -s "$_ov_tmp" ]] && ! diff -q "$_ov_tmp" /usr/local/scripts/user-overrides.conf >/dev/null 2>&1; then
+        mv -f -- "$_ov_tmp" /usr/local/scripts/user-overrides.conf
+    else
+        rm -f "$_ov_tmp"
+    fi
+fi
+
+#============================================================
 # TIER 1 — Web Server
 #============================================================
 echo "Updating Scripts" | tee -a "$debug" "$log"
