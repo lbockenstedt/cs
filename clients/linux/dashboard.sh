@@ -4,11 +4,6 @@ version=.09
 # window (launched by startup.desktop) so the operator can always see
 # what's happening without interrupting the simulation loop in the other pane.
 source '/usr/local/scripts/ini-parser.sh'
-# Load simulation.conf only — process_ini_file resets ALL section data on every
-# call. A second call for user-overrides.conf would wipe [simulation]/[s0-s9].
-# Per-user overrides are defined in the [username] section of simulation.conf
-# and applied via apply_override() below.
-process_ini_file '/usr/local/scripts/simulation.conf'
 #------------------------------------------------------------
 # Simulation Dashboard (Read-only live monitor)
 #------------------------------------------------------------
@@ -23,45 +18,8 @@ CYN=$(tput setaf 6 2>/dev/null || true)
 BOLD=$(tput bold 2>/dev/null || true)
 RST=$(tput sgr0 2>/dev/null || true)
 
-# Derive username the same way startup.sh does — hostname prefix before first "-"
-# WHY: username is used by apply_override() to check per-device config sections.
-username=$(echo "$HOSTNAME" | cut -d "-" -f 1)
-
-server_url=$(get_value 'server' 'server_url')
-server_url="${server_url:-http://169.253.1.1:8080}"
-bucket=$(python3 -c "import zlib; print(zlib.crc32('${HOSTNAME}'.encode()) % 10)")
-simulation_id="s${bucket}"
-user_sim_id=$(get_value "$username" 'simulation_id')
-# Only accept valid slot IDs (s0-s9) from user overrides; ignore malformed values
-[[ "$user_sim_id" =~ ^s[0-9]$ ]] && simulation_id="$user_sim_id"
-kill_switch=$(get_value 'simulation' 'kill_switch')
-rapid_update=$(get_value 'simulation' 'rapid_update')
-sim_load=$(get_value 'simulation' 'sim_load')
-github_repo=$(get_value 'simulation' 'github_repo')
-repo_location=$(get_value 'simulation' 'repo_location')
-site_based_ssid=$(get_value 'simulation' 'site_based_ssid')
-iperf_bw=$(get_value 'simulation' 'iperf_bw')
-auth_fail=$(get_value 'simulation' 'auth_fail')
-ssidpw_fail=$(get_value 'simulation' 'ssidpw_fail')
-allow_offline=$(get_value 'simulation' 'allow_offline')
-web_server=$(get_value 'simulation' 'web_server')
-#------------------------------------------------------------
-# Device-specific settings
-#------------------------------------------------------------
-wsite=$(get_value "$simulation_id" 'wsite')
-sim_phy=$(get_value "$simulation_id" 'sim_phy')
-ssid=$(get_value "$simulation_id" 'ssid')
-dhcp_fail=$(get_value "$simulation_id" 'dhcp_fail')
-dns_fail=$(get_value "$simulation_id" 'dns_fail')
-assoc_fail=$(get_value "$simulation_id" 'assoc_fail')
-port_flap=$(get_value "$simulation_id" 'port_flap')
-ping_test=$(get_value "$simulation_id" 'ping_test')
-download=$(get_value "$simulation_id" 'download')
-iperf=$(get_value "$simulation_id" 'iperf')
-www_traffic=$(get_value "$simulation_id" 'www_traffic')
-#------------------------------------------------------------
-# Per-device config overrides (same logic as simulation.sh)
-#------------------------------------------------------------
+# Per-device config override (same logic as simulation.sh). Defined before
+# refresh_config so refresh_config can call it.
 apply_override() {
   local var=$1
   local val
@@ -71,9 +29,58 @@ apply_override() {
 override_keys=(kill_switch sim_load github_repo repo_location site_based_ssid iperf_bw \
   wsite sim_phy ssid dhcp_fail dns_fail assoc_fail port_flap ping_test download iperf \
   www_traffic ssidpw_fail auth_fail web_server)
-for key in "${override_keys[@]}"; do
-  apply_override "$key"
-done
+
+# refresh_config — re-parse simulation.conf and re-derive every flag so the
+# dashboard reflects the CURRENT config, not a launch-time snapshot. The
+# engine/spoke can push a new simulation.conf mid-run with an [username]
+# override (e.g. ssidpw_fail=on); simulation.sh re-reads each outer loop and
+# acts on it, but the dashboard used to read the flags ONCE at launch and keep
+# showing stale bucket flags (DNS/Download/WWW) forever — ssidpw_fail/auth_fail
+# are inline in simulation.sh's loop (no separate .sh to pgrep), so the flag
+# table is the ONLY place they can surface. Called at launch and at the top of
+# every display + cache-worker cycle. Load simulation.conf ONLY — process_ini_file
+# resets ALL section data on each call, so a second call for user-overrides.conf
+# would wipe [simulation]/[s0-s9]; per-user overrides live in the [username]
+# section of simulation.conf and are applied via apply_override() below.
+refresh_config() {
+  process_ini_file '/usr/local/scripts/simulation.conf'
+  # Derive username the same way startup.sh does — hostname prefix before "-".
+  username=$(echo "$HOSTNAME" | cut -d "-" -f 1)
+  server_url=$(get_value 'server' 'server_url')
+  server_url="${server_url:-http://169.253.1.1:8080}"
+  bucket=$(python3 -c "import zlib; print(zlib.crc32('${HOSTNAME}'.encode()) % 10)")
+  simulation_id="s${bucket}"
+  user_sim_id=$(get_value "$username" 'simulation_id')
+  # Only accept valid slot IDs (s0-s9) from user overrides; ignore malformed values
+  [[ "$user_sim_id" =~ ^s[0-9]$ ]] && simulation_id="$user_sim_id"
+  kill_switch=$(get_value 'simulation' 'kill_switch')
+  rapid_update=$(get_value 'simulation' 'rapid_update')
+  sim_load=$(get_value 'simulation' 'sim_load')
+  github_repo=$(get_value 'simulation' 'github_repo')
+  repo_location=$(get_value 'simulation' 'repo_location')
+  site_based_ssid=$(get_value 'simulation' 'site_based_ssid')
+  iperf_bw=$(get_value 'simulation' 'iperf_bw')
+  auth_fail=$(get_value 'simulation' 'auth_fail')
+  ssidpw_fail=$(get_value 'simulation' 'ssidpw_fail')
+  allow_offline=$(get_value 'simulation' 'allow_offline')
+  web_server=$(get_value 'simulation' 'web_server')
+  # Device-specific settings
+  wsite=$(get_value "$simulation_id" 'wsite')
+  sim_phy=$(get_value "$simulation_id" 'sim_phy')
+  ssid=$(get_value "$simulation_id" 'ssid')
+  dhcp_fail=$(get_value "$simulation_id" 'dhcp_fail')
+  dns_fail=$(get_value "$simulation_id" 'dns_fail')
+  assoc_fail=$(get_value "$simulation_id" 'assoc_fail')
+  port_flap=$(get_value "$simulation_id" 'port_flap')
+  ping_test=$(get_value "$simulation_id" 'ping_test')
+  download=$(get_value "$simulation_id" 'download')
+  iperf=$(get_value "$simulation_id" 'iperf')
+  www_traffic=$(get_value "$simulation_id" 'www_traffic')
+  for key in "${override_keys[@]}"; do
+    apply_override "$key"
+  done
+}
+refresh_config
 #------------------------------------------------------------
 # Helper: webUI API reachability — reads from cache (no blocking curl).
 #------------------------------------------------------------
@@ -105,6 +112,9 @@ get_api_status() {
 run_cache_worker() {
   mkdir -p "$CACHE_DIR"
   while true; do
+    # Re-read config so the heartbeat's active_sims + the API-health gate track
+    # a freshly-pushed simulation.conf instead of the launch-time snapshot.
+    refresh_config
     # WiFi SSID
     nmcli -t -f active,ssid dev wifi 2>/dev/null \
       | awk -F: '$1=="yes"{print $2}' \
@@ -314,6 +324,10 @@ _cache_pid=$!
 
 while true; do
   clear
+  # Re-read config each refresh so the flag table reflects the current
+  # simulation.conf (engine-pushed [username] overrides land immediately,
+  # e.g. ssidpw_fail=on) instead of the launch-time snapshot.
+  refresh_config
   # Re-detect the WiFi adapter each refresh.
   wladapter=$(ip -br a | grep "wlx\|wlan" | cut -d ' ' -f '1')
   # Global kill switch comes from kill_switch.txt, synced from the GitHub repo by update.sh.
