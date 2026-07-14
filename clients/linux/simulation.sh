@@ -470,6 +470,8 @@ fi
 #------------------------------------------------------------
 echo Kill Switch is $kill_switch | tee -a ${LOG_FILE}
 if [ "$kill_switch" != "on" ]; then
+ # Snapshot the config's mtime so the loop can spot a pushed change mid-cycle.
+ _cfg_mtime=$(stat -c %Y /usr/local/scripts/simulation.conf 2>/dev/null)
  for z in {1..100}; do
   #------------------------------------------------------------
   # Rapid update — MUST fire every iteration REGARDLESS of which
@@ -482,6 +484,16 @@ if [ "$kill_switch" != "on" ]; then
   # silently never ran for those clients.
   #------------------------------------------------------------
   if [[ "$rapid_update" == "on" ]]; then source '/usr/local/scripts/update.sh'; fi
+  #------------------------------------------------------------
+  # Break-to-reload: if update.sh just pulled a CHANGED simulation.conf (its mtime
+  # moved) or a USR1 reload was requested, break out so the outer loop re-runs
+  # init_simulation_context and re-reads every flag. A pushed change then lands on
+  # the next pass instead of waiting out the full 100-iteration cycle.
+  #------------------------------------------------------------
+  if [[ "${_sim_reload:-0}" == 1 || "$(stat -c %Y /usr/local/scripts/simulation.conf 2>/dev/null)" != "$_cfg_mtime" ]]; then
+    echo "Config changed — reloading simulation" | tee -a ${LOG_FILE}
+    break
+  fi
   #------------------------------------------------------------
   #SSID Incorrect Password Simulation or Auth Failure Simulation
   #since these are very similar they are in the same section one
