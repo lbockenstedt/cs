@@ -455,8 +455,19 @@ connect_wifi() {
       fi
       # Pin the spoof (or the real MAC when dhcp_fail=off → restore) and
       # activate via `connection up`, which honors cloned-mac-address.
-      nmcli connection modify "$target_ssid" 802-11-wireless.cloned-mac-address "$mac" 2>/dev/null
-      nmcli -w $1 connection up "$target_ssid" >/dev/null 2>&1
+      # Capture the nmcli outcomes to the sim log so a MAC-spoof that doesn't
+      # land can be diagnosed from the logs alone (no manual qm guest exec).
+      local _mod_rc _mod_err _up_rc _cur_mac
+      _mod_err=$(nmcli connection modify "$target_ssid" \
+        802-11-wireless.cloned-mac-address "$mac" 2>&1); _mod_rc=$?
+      _up_rc=0
+      [[ $_mod_rc -eq 0 ]] && \
+        { nmcli -w $1 connection up "$target_ssid" >/dev/null 2>&1 || _up_rc=$?; }
+      _cur_mac=$(cat /sys/class/net/"$wladapter"/address 2>/dev/null)
+      echo "DHCP Fail: connect_wifi target=$target_ssid mac=$mac " \
+           "modify_rc=$_mod_rc up_rc=$_up_rc iface_mac=$_cur_mac" >> ${LOG_FILE}
+      [[ $_mod_rc -ne 0 ]] && \
+        echo "DHCP Fail: nmcli modify stderr: ${_mod_err:-<none>}" >> ${LOG_FILE}
       return
     fi
   fi
@@ -636,14 +647,20 @@ wifi_dhcp_fail_cloned_mac() {
     if [[ -f "$savefile" ]]; then real=$(cat "$savefile"); elif [[ "$cur" != 00:01:00:00:* ]]; then real=$cur; fi
   fi
   [[ -n "$real" && "$real" != 00:01:00:00:* ]] && echo "$real" > "$savefile" 2>/dev/null
-  [[ -z "$real" ]] && { echo "DHCP Fail: cannot resolve permanent MAC for $iface — spoof skipped" | tee -a ${LOG_FILE}; return 1; }
+  [[ -z "$real" ]] && { echo "DHCP Fail: cannot resolve permanent MAC for $iface — spoof skipped" >> ${LOG_FILE}; return 1; }
   if [[ "$dhcp_fail" == "on" ]]; then
     local target="00:01:00:00:$(echo "$real" | awk -F: '{print $5":"$6}')"
-    echo "DHCP Fail: pinning $iface cloned-mac -> $target" | tee -a ${LOG_FILE}
+    # Log to the file ONLY — this function's stdout is captured by the caller
+    # (mac=$(wifi_dhcp_fail_cloned_mac)) as the MAC value. A `tee` here would
+    # put the log line on stdout too, so $mac would become a multi-line
+    # "<log text>\n<mac>" blob → nmcli connection modify ... cloned-mac "$mac"
+    # rejects it as invalid → cloned-mac never lands → adapter stays on the
+    # permanent MAC (the dhcp_fail spoof silently no-op'd). Use >>, not tee.
+    echo "DHCP Fail: pinning $iface cloned-mac -> $target" >> ${LOG_FILE}
     echo "$target"
     return 0
   else
-    echo "DHCP Fail off: pinning $iface cloned-mac -> $real (restore)" | tee -a ${LOG_FILE}
+    echo "DHCP Fail off: pinning $iface cloned-mac -> $real (restore)" >> ${LOG_FILE}
     echo "$real"
     return 2
   fi
