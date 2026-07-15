@@ -400,6 +400,11 @@ connect_wifi() {
   nmcli radio wifi off
   nmcli radio wifi on
   sleep 15
+  # Re-apply the dhcp_fail MAC spoof AFTER the radio cycle (which reset the
+  # wifi adapter's MAC to permanent) and BEFORE associating — so the client
+  # associates with the spoofed MAC and DHCP fails. No-op when dhcp_fail is off
+  # (cur already == permanent real MAC).
+  if [[ "$sim_phy" == "wireless" ]]; then apply_dhcp_fail_mac; fi
   if [[ "$site_based_ssid" == "on" ]]; then
     nmcli -w $1 device wifi connect $wsite"-"$ssid password $ssidpw
   else
@@ -427,6 +432,8 @@ connect_1x() {
   nmcli radio wifi off
   nmcli radio wifi on
   sleep 15
+  # Re-apply the dhcp_fail MAC spoof AFTER the radio cycle (see connect_wifi).
+  if [[ "$sim_phy" == "wireless" ]]; then apply_dhcp_fail_mac; fi
 
   # Rebuild the profile each run so identity / password / SSID always re-apply.
   nmcli -t -f NAME connection show | grep -Fxq "$target_ssid" && nmcli connection delete "$target_ssid"
@@ -468,6 +475,10 @@ manage_connection() {
   nmcli radio wifi off
   nmcli radio wifi on
   sleep 15
+  # Re-apply the dhcp_fail MAC spoof AFTER the radio cycle — manage_connection
+  # is called from the main loop (e.g. sim_load under threshold), and each
+  # radio off/on here would otherwise revert the spoof mid-simulation.
+  if [[ "$sim_phy" == "wireless" ]]; then apply_dhcp_fail_mac; fi
   if [[ "$site_based_ssid" == "on" ]]; then
     nmcli -w $wait_time connection $action $wsite"-"$ssid
   else
@@ -522,7 +533,13 @@ apply_dhcp_fail_mac() {
     sudo ip link set dev "$iface" up
   fi
 }
-apply_dhcp_fail_mac
+# Ethernet: apply now — connect_wifi's radio cycle only touches the wifi
+# adapter, so the ethernet MAC spoof set here survives. Wireless is applied
+# INSIDE connect_wifi/connect_1x/manage_connection AFTER their `nmcli radio
+# wifi on` (which resets the wifi adapter's MAC to permanent) and BEFORE the
+# associate — otherwise the radio toggle reverts the spoof and dhcp_fail's
+# unrecognized MAC never takes effect.
+if [[ "$sim_phy" != "wireless" ]]; then apply_dhcp_fail_mac; fi
 #------------------------------------------------------------
 #Attempting WiFi connection
 #------------------------------------------------------------
