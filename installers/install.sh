@@ -378,6 +378,30 @@ apt_run install -y --quiet python3-websockets \
   || warn "Could not install python3-websockets — agent.sh hub connection will be unavailable"
 APT_TIMEOUT=300
 
+info "Disabling NetworkManager MAC randomization"
+# WHY: NM's defaults randomize the wifi MAC (scan-rand-mac-address + a
+# stable-random cloned-mac on new profiles) — "Privacy"/"Random MAC". That
+# breaks two things on a sim client: (1) the AP/ClearPass/NetBox see an
+# inconsistent MAC per scan/associate so device identity & dhcp_fail telemetry
+# are unreliable, and (2) dhcp_fail's spoof is driven through the profile's
+# 802-11-wireless.cloned-mac-address (see simulation.sh connect_wifi) — a
+# random default there would race the spoof. Pin both legs to PERMANENT: the
+# device uses its real factory MAC unless dhcp_fail explicitly pins a spoof.
+# connect_wifi always sets cloned-mac on the profile (spoof OR real), so this
+# default only governs the bootstrap window before the first associate.
+mkdir -p /etc/NetworkManager/conf.d
+cat >/etc/NetworkManager/conf.d/99-client-sim-no-mac-random.conf <<'NM_EOF'
+# Managed by client-sim-install.sh — do not edit manually
+# Disable MAC randomization on sim clients (deterministic device identity).
+[device]
+wifi.scan-rand-mac-address=no
+
+[connection]
+wifi.cloned-mac-address=permanent
+ethernet.cloned-mac-address=permanent
+NM_EOF
+chmod 644 /etc/NetworkManager/conf.d/99-client-sim-no-mac-random.conf
+
 info "Restarting network stack"
 systemctl restart NetworkManager 2>/dev/null || true
 sleep 3

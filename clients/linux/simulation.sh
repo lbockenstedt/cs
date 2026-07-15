@@ -69,6 +69,32 @@ init_simulation_context() {
 _self_path="/usr/local/scripts/simulation.sh"
 _self_mtime=$(stat -c %Y "$_self_path" 2>/dev/null)
 
+# One-time self-heal: disable NetworkManager MAC randomization. NM's defaults
+# randomize the wifi MAC (scan-rand + stable-random cloned-mac on new profiles),
+# which breaks device identity (AP/ClearPass/NetBox see a different MAC per
+# scan) and races dhcp_fail's cloned-mac spoof. install.sh deploys the same conf
+# at install time; this catches ALREADY-deployed clients without a reinstall.
+# Best-effort `sudo -n` (no TTY hang): the sim user has full sudo on most boxes;
+# on scoped-user boxes it silently no-ops and install.sh remains the backstop.
+# Runs ONCE per process (before the loop) — reloading NM mid-loop would disrupt
+# every associate. Idempotent: skips when the conf is already present + correct.
+_no_rand_conf=/etc/NetworkManager/conf.d/99-client-sim-no-mac-random.conf
+_no_rand_body='# Managed by client-sim-install.sh — do not edit manually
+[device]
+wifi.scan-rand-mac-address=no
+[connection]
+wifi.cloned-mac-address=permanent
+ethernet.cloned-mac-address=permanent'
+if ! grep -qs 'wifi.scan-rand-mac-address=no' "$_no_rand_conf" 2>/dev/null; then
+  if printf '%s\n' "$_no_rand_body" | sudo -n tee "$_no_rand_conf" >/dev/null 2>&1; then
+    sudo -n chmod 644 "$_no_rand_conf" 2>/dev/null || true
+    sudo -n nmcli general reload 2>/dev/null || sudo -n systemctl reload NetworkManager 2>/dev/null || true
+    echo "Disabled NM MAC randomization (self-heal)" | tee -a ${LOG_FILE}
+  else
+    echo "MAC-randomization self-heal skipped (no sudo — install.sh backstop)" | tee -a ${LOG_FILE}
+  fi
+fi
+
 while true; do
   #------------------------------------------------------------
   # If a USR1 arrived (agent.sh restart_sim/kill_switch), note the
@@ -751,7 +777,7 @@ if [ "$kill_switch" != "on" ]; then
       [[ -n "$real_dot1x" ]] && dot1x_password="${real_dot1x}_fail"
       echo Iteration $i of 100 | tee -a ${LOG_FILE}
       delete_matching_connections
-      connect_wifi 10
+      connect_wifi 30
      done
     fi
     if [[ "$auth_fail" == "on" ]]; then

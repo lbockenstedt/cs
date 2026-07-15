@@ -7,7 +7,7 @@ source '/usr/local/scripts/ini-parser.sh'
 #------------------------------------------------------------
 # Simulation Dashboard (Read-only live monitor)
 #------------------------------------------------------------
-refresh_rate=5
+refresh_rate=60
 CACHE_DIR="/tmp/client-sim-dash"
 
 # Terminal colors — degrade gracefully if tput is unavailable (e.g. SSH without TERM)
@@ -212,7 +212,10 @@ sys.stdout.write(json.dumps(d))' 2>/dev/null)
       # Honor server throttle_interval so HTTP clients back off under load.
       if [[ -n "$resp" ]]; then
         throttle_secs=$(echo "$resp" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('throttle_interval',''))" 2>/dev/null || true)
-        if [[ "$throttle_secs" =~ ^[0-9]+$ ]] && (( throttle_secs > 0 )); then
+        # Honor the server's backoff ONLY to increase the interval — never let
+        # it pull below the 60s floor (the dashboard is a read-only monitor; a
+        # faster refresh adds load without operational value).
+        if [[ "$throttle_secs" =~ ^[0-9]+$ ]] && (( throttle_secs > refresh_rate )); then
           refresh_rate=$throttle_secs
         fi
       fi
