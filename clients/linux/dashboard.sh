@@ -295,6 +295,27 @@ print_script_row() {
   fi
 }
 #------------------------------------------------------------
+# Helper: print one INLINE sim row. dhcp_fail/assoc_fail/port_flap/
+# ssidpw_fail/auth_fail run INSIDE simulation.sh (no separate .sh script to
+# pgrep), so they never appeared in the Simulations table. Surface them as
+# [RUNNING] when their config flag is on — the runtime shown is the driving
+# simulation.sh loop's elapsed time (the process actually executing them).
+# Returns 0 (and prints a row) when the sim is active, 1 otherwise so the
+# caller can count it toward "shown".
+#------------------------------------------------------------
+print_inline_sim_row() {
+  local sim_name="$1" flag_val="$2"
+  [[ "$flag_val" != "on" ]] && return 1
+  local pid runtime="-"
+  pid=$(pgrep -f "simulation\.sh" | head -n 1)
+  if [[ -n "$pid" ]]; then
+    runtime=$(ps -p "$pid" -o etime= 2>/dev/null | tr -d ' ')
+    [[ -z "$runtime" ]] && runtime="-"
+  fi
+  printf "  %s%-12s%s %-22s %-10s\n" "$GRN" "[RUNNING]" "$RST" "$sim_name" "$runtime"
+  return 0
+}
+#------------------------------------------------------------
 # Helper: simulation process table — two sections:
 #   Infrastructure: always-shown scripts (agent.sh etc.)
 #   Simulations:    flag-controlled scripts (only shown when flag=on)
@@ -336,6 +357,13 @@ get_sim_status() {
       (( shown++ ))
     fi
   done
+  # Inline sims (run inside simulation.sh — no separate script to pgrep).
+  # Shown as [RUNNING] when their flag is on; runtime = simulation.sh loop etime.
+  print_inline_sim_row "dhcp_fail"   "$dhcp_fail"   && (( shown++ ))
+  print_inline_sim_row "assoc_fail"  "$assoc_fail"  && (( shown++ ))
+  print_inline_sim_row "port_flap"   "$port_flap"   && (( shown++ ))
+  print_inline_sim_row "ssidpw_fail" "$ssidpw_fail" && (( shown++ ))
+  print_inline_sim_row "auth_fail"   "$auth_fail"   && (( shown++ ))
   (( shown == 0 )) && printf "  ${GRN}None active${RST}\n"
 }
 #------------------------------------------------------------
