@@ -500,6 +500,23 @@ if retry git clone --depth=1 "$CLIENT_SIM_REPO" "$CLIENT_SIM_DIR" >>"$LOG" 2>&1;
       warn "No .desktop files found in $LINUX_DIR"
     fi
 
+    # ── PATH drop-in so 'bash update.sh' works from any login shell ──────────
+    # /usr/local/scripts on PATH for every login shell (SSH, terminal, console).
+    # startup.sh re-applies this best-effort at boot (self-heal for already-
+    # deployed clients); this is the canonical install-time drop.
+    info "Adding /usr/local/scripts to PATH (profile.d)"
+    mkdir -p /etc/profile.d
+    cat >/etc/profile.d/client-sim-path.sh <<'PATH_EOF'
+# Managed by client-sim-install.sh — do not edit manually
+# Put the sim scripts on PATH for every login shell.
+case ":$PATH:" in
+  *:/usr/local/scripts:*) ;;
+  *) export PATH="$PATH:/usr/local/scripts" ;;
+esac
+PATH_EOF
+    chmod 644 /etc/profile.d/client-sim-path.sh
+    ok "/usr/local/scripts on PATH for login shells"
+
     # ── Shell scripts ────────────────────────────────────────────────────────
     info "Copying shell scripts to /usr/local/scripts"
     if compgen -G "*.sh" &>/dev/null; then

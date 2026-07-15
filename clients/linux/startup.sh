@@ -5,6 +5,30 @@ echo Startup Script Version $version | tee -a /usr/local/scripts/sim.log
 echo $(date) | tee -a /usr/local/scripts/sim.log
 echo ------------------------------| tee -a /usr/local/scripts/sim.log
 #------------------------------------------------------------
+# Put /usr/local/scripts on PATH so 'bash update.sh' / 'bash dns_fail.sh
+# --verbose' work from any login shell without typing the full path. This
+# startup terminal is busy running the sim loop, so an export here alone
+# wouldn't reach a separate SSH/manual shell — also drop a profile.d fragment
+# (sourced by every login shell) via best-effort sudo -n (no TTY hang).
+# install.sh deploys the same fragment at install time; this catches already-
+# deployed clients. Idempotent: skip when it already contains the path.
+#------------------------------------------------------------
+case ":$PATH:" in *:/usr/local/scripts:*) ;; *) export PATH="$PATH:/usr/local/scripts" ;; esac
+_profile_d=/etc/profile.d/client-sim-path.sh
+if ! grep -qs '/usr/local/scripts' "$_profile_d" 2>/dev/null; then
+  if printf '%s\n' '# Managed by client-sim — do not edit manually' \
+                    '# Put the sim scripts on PATH for every login shell.' \
+                    'case ":$PATH:" in' \
+                    '  *:/usr/local/scripts:*) ;;' \
+                    '  *) export PATH="$PATH:/usr/local/scripts" ;;' \
+                    'esac' | sudo -n tee "$_profile_d" >/dev/null 2>&1; then
+    sudo -n chmod 644 "$_profile_d" 2>/dev/null || true
+    echo "Added /usr/local/scripts to PATH (profile.d self-heal)" | tee -a /usr/local/scripts/sim.log
+  else
+    echo "PATH profile.d self-heal skipped (no sudo — install.sh backstop)" | tee -a /usr/local/scripts/sim.log
+  fi
+fi
+#------------------------------------------------------------
 #Check Logs Script
 #------------------------------------------------------------
 bash /usr/local/scripts/sys_mon.sh --log-monitor &
