@@ -31,7 +31,12 @@ Operationally:
 - ``sim_config.load_configs`` reads ``configs/*.conf`` from disk on demand, so
   a pulled-in ``simulation.conf`` / ``user-overrides.conf`` is picked up
   naturally — no explicit reload/teardown is needed (mirrors the push path's
-  local-write semantics).
+  local-write semantics). A pull that advances SPOKE CODE (``lm-spoke/src/``),
+  however, is NOT picked up — the running process has the old Python in memory
+  — so ``_sync_once`` reloads the spoke itself (``_prepare_service_restart`` +
+  ``os._exit(3)``) when ``lm-spoke/src/`` changed, closing the ≤300s stale
+  window the code-drift watchdog would otherwise cover. Config-only advances
+  (the common case, incl. the spoke's own pushed config commits) do not exit.
 - Never raises: a bad fetch logs a WARNING and the loop continues.
 """
 from __future__ import annotations
@@ -132,11 +137,42 @@ class RepoSync:
                         "GITHUB_TOKEN": token}
             async with spoke._git_lock:
                 await spoke._git("remote", "set-url", "origin", repo_url)
+                head_before = await spoke._git("rev-parse", "HEAD")
                 await spoke._git("fetch", "--prune", "origin", env=push_env)
                 await spoke._git("checkout", "-B", branch, f"origin/{branch}")
                 new_head = await spoke._git("rev-parse", "HEAD")
+                # Reload the spoke ONLY when the pull advanced SPOKE CODE
+                # (lm-spoke/src/). Config-only advances are the common case —
+                # a WebUI edit the spoke itself just pushed
+                # (_push_files_to_github commits configs/*.conf), or an operator
+                # edit made directly on GitHub — and must NOT restart:
+                # sim_config.load_configs reads configs/*.conf from disk on
+                # demand, so the new config is picked up on the next
+                # /api/config read. Restarting on every config advance would
+                # storm the spoke (every save → reset 60s later → exit). Only a
+                # src/ change needs a process reload: the running process has
+                # the old Python in memory. Mirrors
+                # RoleConnection._update_sibling_repo's pull+exit(3), gated on
+                # a code diff so config edits stay non-disruptive. The 300s
+                # code-drift watchdog (BaseControlPlane) remains the backstop.
+                if new_head != head_before:
+                    try:
+                        changed = await spoke._git(
+                            "diff", "--name-only", head_before, new_head,
+                            "--", "lm-spoke/src/")
+                    except Exception:  # noqa: BLE001 — diff failure → don't restart
+                        changed = ""
+                else:
+                    changed = ""
             logger.info("repo sync[%s]: reset to origin/%s @ %s",
                         sid, branch, new_head[:12])
+            if changed.strip():
+                logger.info("repo sync[%s]: code changed (lm-spoke/src/) "
+                            "%s → %s; reloading spoke", sid,
+                            head_before[:12], new_head[:12])
+                if spoke._prepare_service_restart(reason="repo-sync"):
+                    await spoke._flush_log_relay_async()
+                    os._exit(3)
         except Exception as exc:  # noqa: BLE001 — never let a bad fetch kill the loop
             logger.warning("repo sync[%s]: FAILED — %s", sid, exc)
         finally:
