@@ -397,18 +397,32 @@ connect_wifi() {
     connect_1x "$1"
     return
   fi
+  local target_ssid
+  if [[ "$site_based_ssid" == "on" ]]; then target_ssid="$wsite-$ssid"; else target_ssid="$ssid"; fi
   nmcli radio wifi off
   nmcli radio wifi on
   sleep 15
-  # Re-apply the dhcp_fail MAC spoof AFTER the radio cycle (which reset the
-  # wifi adapter's MAC to permanent) and BEFORE associating — so the client
-  # associates with the spoofed MAC and DHCP fails. No-op when dhcp_fail is off
-  # (cur already == permanent real MAC).
-  if [[ "$sim_phy" == "wireless" ]]; then apply_dhcp_fail_mac; fi
+  # Connect first — `device wifi connect` creates/uses the profile with the
+  # correct security (handles PSK vs open) and associates with the permanent MAC.
   if [[ "$site_based_ssid" == "on" ]]; then
     nmcli -w $1 device wifi connect $wsite"-"$ssid password $ssidpw
   else
     nmcli -w $1 device wifi connect $ssid password $ssidpw
+  fi
+  # dhcp_fail MAC spoof is driven through NetworkManager, NOT `ip link set
+  # address`: on wifi the driver/NM reverts a raw ip-link-set MAC on associate,
+  # so the spoof never appeared in `ip a` (the log showed "setting … -> 00:01…"
+  # but the MAC never changed). Pin the spoof on the connection profile's
+  # cloned-mac-address and re-associate — NM applies it at association time and
+  # it survives. wifi_dhcp_fail_cloned_mac prints the target when dhcp_fail=on,
+  # the real MAC when off (restore), and returns rc=1 when unresolvable (skip).
+  if [[ "$sim_phy" == "wireless" ]]; then
+    local mac df_rc=0
+    mac=$(wifi_dhcp_fail_cloned_mac) || df_rc=$?
+    if [[ $df_rc -ne 1 && -n "$mac" ]]; then
+      nmcli connection modify "$target_ssid" 802-11-wireless.cloned-mac-address "$mac" 2>/dev/null
+      nmcli -w $1 connection up "$target_ssid" >/dev/null 2>&1
+    fi
   fi
 }
 #------------------------------------------------------------
@@ -432,8 +446,16 @@ connect_1x() {
   nmcli radio wifi off
   nmcli radio wifi on
   sleep 15
-  # Re-apply the dhcp_fail MAC spoof AFTER the radio cycle (see connect_wifi).
-  if [[ "$sim_phy" == "wireless" ]]; then apply_dhcp_fail_mac; fi
+  # dhcp_fail spoof via NM cloned-mac-address (see connect_wifi — a raw ip-link
+  # MAC is reverted by the wifi driver on associate). wifi_dhcp_fail_cloned_mac
+  # prints the spoof target when on, the real MAC when off (restore).
+  local cloned="" df_rc=0
+  if [[ "$sim_phy" == "wireless" ]]; then
+    cloned=$(wifi_dhcp_fail_cloned_mac) || df_rc=$?
+    [[ $df_rc -eq 1 ]] && cloned=""
+  fi
+  local cloned_arg=()
+  [[ -n "$cloned" ]] && cloned_arg=(802-11-wireless.cloned-mac-address "$cloned")
 
   # Rebuild the profile each run so identity / password / SSID always re-apply.
   nmcli -t -f NAME connection show | grep -Fxq "$target_ssid" && nmcli connection delete "$target_ssid"
@@ -452,7 +474,8 @@ connect_1x() {
       802-1x.client-cert "$dot1x_client_cert" \
       802-1x.private-key "$dot1x_private_key" \
       802-1x.ca-cert "$dot1x_ca_cert" \
-      802-1x.system-ca-certs no
+      802-1x.system-ca-certs no \
+      "${cloned_arg[@]}"
   else
     # PEAP-MSCHAPv2 (username/password) — the legacy default.
     nmcli connection add type wifi con-name "$target_ssid" ifname "$wladapter" ssid "$target_ssid" \
@@ -461,7 +484,8 @@ connect_1x() {
       802-1x.phase2-auth mschapv2 \
       802-1x.identity "$username" \
       802-1x.password "${dot1x_password:-$ssidpw}" \
-      802-1x.system-ca-certs no
+      802-1x.system-ca-certs no \
+      "${cloned_arg[@]}"
   fi
 
   nmcli -w "$wait_time" connection up "$target_ssid"
@@ -475,10 +499,18 @@ manage_connection() {
   nmcli radio wifi off
   nmcli radio wifi on
   sleep 15
-  # Re-apply the dhcp_fail MAC spoof AFTER the radio cycle — manage_connection
-  # is called from the main loop (e.g. sim_load under threshold), and each
-  # radio off/on here would otherwise revert the spoof mid-simulation.
-  if [[ "$sim_phy" == "wireless" ]]; then apply_dhcp_fail_mac; fi
+  # dhcp_fail spoof via NM cloned-mac-address on the existing profile (see
+  # connect_wifi). Modify before `connection up` so NM re-associates with the
+  # spoofed/real MAC; harmless on `connection down`.
+  local target_ssid
+  if [[ "$site_based_ssid" == "on" ]]; then target_ssid="$wsite-$ssid"; else target_ssid="$ssid"; fi
+  if [[ "$sim_phy" == "wireless" ]]; then
+    local mac df_rc=0
+    mac=$(wifi_dhcp_fail_cloned_mac) || df_rc=$?
+    if [[ $df_rc -ne 1 && -n "$mac" ]]; then
+      nmcli connection modify "$target_ssid" 802-11-wireless.cloned-mac-address "$mac" 2>/dev/null
+    fi
+  fi
   if [[ "$site_based_ssid" == "on" ]]; then
     nmcli -w $wait_time connection $action $wsite"-"$ssid
   else
@@ -533,12 +565,51 @@ apply_dhcp_fail_mac() {
     sudo ip link set dev "$iface" up
   fi
 }
-# Ethernet: apply now — connect_wifi's radio cycle only touches the wifi
-# adapter, so the ethernet MAC spoof set here survives. Wireless is applied
-# INSIDE connect_wifi/connect_1x/manage_connection AFTER their `nmcli radio
-# wifi on` (which resets the wifi adapter's MAC to permanent) and BEFORE the
-# associate — otherwise the radio toggle reverts the spoof and dhcp_fail's
-# unrecognized MAC never takes effect.
+#------------------------------------------------------------
+# Wireless dhcp_fail MAC — NetworkManager cloned-mac-address
+#------------------------------------------------------------
+# A raw `ip link set dev $iface address <mac>` is reverted by the wifi
+# driver / NetworkManager when the interface associates (the log showed
+# "DHCP Fail: setting … -> 00:01:00:00:…" but `ip a` kept the permanent
+# MAC). NetworkManager owns wifi bring-up, so the spoof must be driven
+# through the connection profile's 802-11-wireless.cloned-mac-address —
+# NM applies it at association time and it survives (it's the only spoof
+# that shows up in `ip a`). The connect functions pin the returned MAC
+# on the profile (via `connection modify` / `connection add`) and
+# re-activate. Prints the SPOOF target (00:01:00:00:<o5>:<o6>) when
+# dhcp_fail=on (rc=0), the REAL permanent MAC when off (rc=2, so the
+# caller restores it), and nothing + rc=1 when the permanent MAC can't
+# be resolved (ethtool unavailable, no savefile, already spoofed) — in
+# which case the caller skips (can't compute a stable target).
+#------------------------------------------------------------
+wifi_dhcp_fail_cloned_mac() {
+  local iface="$wladapter"
+  [[ -z "$iface" ]] && return 1
+  local savefile="/usr/local/scripts/.real_mac_${iface}"
+  local cur=$(cat /sys/class/net/"$iface"/address 2>/dev/null)
+  local real=$(ethtool -P "$iface" 2>/dev/null | grep -oiE '([0-9a-f]{2}:){5}[0-9a-f]{2}')
+  [[ "$real" == "00:00:00:00:00:00" ]] && real=""
+  if [[ -z "$real" ]]; then
+    if [[ -f "$savefile" ]]; then real=$(cat "$savefile"); elif [[ "$cur" != 00:01:00:00:* ]]; then real=$cur; fi
+  fi
+  [[ -n "$real" && "$real" != 00:01:00:00:* ]] && echo "$real" > "$savefile" 2>/dev/null
+  [[ -z "$real" ]] && { echo "DHCP Fail: cannot resolve permanent MAC for $iface — spoof skipped" | tee -a ${LOG_FILE}; return 1; }
+  if [[ "$dhcp_fail" == "on" ]]; then
+    local target="00:01:00:00:$(echo "$real" | awk -F: '{print $5":"$6}')"
+    echo "DHCP Fail: pinning $iface cloned-mac -> $target" | tee -a ${LOG_FILE}
+    echo "$target"
+    return 0
+  else
+    echo "DHCP Fail off: pinning $iface cloned-mac -> $real (restore)" | tee -a ${LOG_FILE}
+    echo "$real"
+    return 2
+  fi
+}
+# Ethernet: apply the spoof now via `ip link` — ethernet drivers respect a
+# raw set-address (unlike wifi, where NM reverts it), and connect_wifi's radio
+# cycle only touches the wifi adapter so this survives. Wireless is applied
+# INSIDE connect_wifi/connect_1x/manage_connection via NM cloned-mac-address
+# (see wifi_dhcp_fail_cloned_mac) — NOT here.
 if [[ "$sim_phy" != "wireless" ]]; then apply_dhcp_fail_mac; fi
 #------------------------------------------------------------
 #Attempting WiFi connection
