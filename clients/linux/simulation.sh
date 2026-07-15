@@ -289,6 +289,7 @@ dns_bad_record_1=$(get_value 'address' 'dns_bad_record_1')
 dns_bad_record_2=$(get_value 'address' 'dns_bad_record_2')
 dns_bad_record_3=$(get_value 'address' 'dns_bad_record_3')
 iperf_server=$(get_value 'address' 'iperf_server')
+collab_server=$(get_value 'address' 'collab_server')
 #------------------------------------------------------------
 #User/Device Specific Overrides
 #------------------------------------------------------------
@@ -301,7 +302,8 @@ override_keys=(kill_switch sim_load github_repo repo_location site_based_ssid ip
   wsite sim_phy ssid ssidpw dhcp_fail dns_fail assoc_fail port_flap ping_test download iperf \
   www_traffic ssidpw_fail auth_fail smb_address ping_address dns_latency_1 dns_latency_2 \
   dns_latency_3 dns_bad_ip_1 dns_bad_ip_2 dns_bad_ip_3 dns_bad_record_1 dns_bad_record_2 \
-  dns_bad_record_3 iperf_server dot1x_password)
+  dns_bad_record_3 iperf_server dot1x_password \
+  collab collab_app collab_bw collab_time collab_server)
 for key in "${override_keys[@]}"; do
   apply_override "$key"
 done
@@ -322,6 +324,7 @@ echo DHCP Fail: $dhcp_fail | tee -a ${LOG_FILE}
 echo DNS Fail: $dns_fail | tee -a ${LOG_FILE}
 echo WWW Traffic: $www_traffic | tee -a ${LOG_FILE}
 echo iPerf: $iperf | tee -a ${LOG_FILE}
+echo "Collab: $collab app=${collab_app:-teams} server=${collab_server:-unset}" | tee -a ${LOG_FILE}
 echo Download: $download | tee -a ${LOG_FILE}
 echo Port Flap: $port_flap | tee -a ${LOG_FILE}
 echo Incorrect SSID PW: $ssidpw_fail | tee -a ${LOG_FILE}
@@ -386,7 +389,7 @@ report_status() {
   local connected_ssid gateway_json=false first=true active_simulations=""
   connected_ssid=$(nmcli -t -f active,ssid dev wifi 2>/dev/null | grep '^yes' | cut -d: -f2 | head -n1)
   [[ "${gateway_reachable:-}" == "true" ]] && gateway_json=true
-  for sim in dns_fail iperf download www_traffic ping_test ssidpw_fail auth_fail dhcp_fail; do
+  for sim in dns_fail iperf download www_traffic ping_test ssidpw_fail auth_fail dhcp_fail collab; do
     if [[ "${!sim}" == "on" ]]; then
       [[ $first == true ]] && first=false || active_simulations+=","
       active_simulations+="\"$sim\""
@@ -400,12 +403,13 @@ report_status() {
   fi
   local payload
   printf -v payload \
-    '{"hostname":"%s","simulation_id":"%s","platform":"%s","iteration":%s,"connected_ssid":"%s","gateway_reachable":%s,"active_simulations":[%s],"errors":%s,"config":{"kill_switch":"%s","dns_fail":"%s","iperf":"%s","www_traffic":"%s","download":"%s","ping_test":"%s","ssidpw_fail":"%s","auth_fail":"%s","dhcp_fail":"%s"}}' \
+    '{"hostname":"%s","simulation_id":"%s","platform":"%s","iteration":%s,"connected_ssid":"%s","gateway_reachable":%s,"active_simulations":[%s],"errors":%s,"config":{"kill_switch":"%s","dns_fail":"%s","iperf":"%s","www_traffic":"%s","download":"%s","ping_test":"%s","ssidpw_fail":"%s","auth_fail":"%s","dhcp_fail":"%s","collab":"%s"}}' \
     "$(json_escape "$hostname")" "$(json_escape "${simulation_id:-}")" "$(json_escape "$platform")" \
     "$iteration" "$(json_escape "${connected_ssid:-}")" "$gateway_json" "$active_simulations" "$errors_json" \
     "$(json_escape "${kill_switch:-off}")" "$(json_escape "${dns_fail:-off}")" "$(json_escape "${iperf:-off}")" \
     "$(json_escape "${www_traffic:-off}")" "$(json_escape "${download:-off}")" "$(json_escape "${ping_test:-off}")" \
-    "$(json_escape "${ssidpw_fail:-off}")" "$(json_escape "${auth_fail:-off}")" "$(json_escape "${dhcp_fail:-off}")"
+    "$(json_escape "${ssidpw_fail:-off}")" "$(json_escape "${auth_fail:-off}")" "$(json_escape "${dhcp_fail:-off}")" \
+    "$(json_escape "${collab:-off}")"
   local status_file="/usr/local/scripts/client-status.json"
   printf '%s\n' "$payload" > "$status_file" 2>/dev/null && \
     { [[ -z "${_in_report_error:-}" ]] && error_log=(); } || true
@@ -727,6 +731,14 @@ if [ "$kill_switch" != "on" ]; then
     #------------------------------------------------------------
     if [[ "$iperf" == "on" ]]; then
      run_simulation "iperf.sh" 30
+    fi
+    #------------------------------------------------------------
+    #Running Collaboration (Teams/Zoom/WebEx) UDP media simulation
+    #------------------------------------------------------------
+    # Raw UDP to collab_server (hub sink) over the wired/USB path — the media
+    # never rides the WS control plane. See collab.sh / collab.py.
+    if [[ "$collab" == "on" ]]; then
+     run_simulation "collab.sh" 30
     fi
     #------------------------------------------------------------
     #Running download simulation
