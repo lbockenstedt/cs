@@ -1,8 +1,21 @@
 #!/bin/bash
-version=.04
+version=.05
 log="/usr/local/scripts/sim.log"
 debug="/usr/local/scripts/debug-update.log"
 echo DNS Failure Script Version $version | tee "$debug"
+#------------------------------------------------------------
+# Verbose / manual mode: pass --verbose (or export VERBOSE=1) to watch each
+# lookup on stdout. Normal sim runs use fire-and-forget background digs with
+# suppressed output (Central's DNS-fail alarm is rate-based — see below), which
+# makes a manual `bash dns_fail.sh` silent. Verbose runs each dig in the
+# FOREGROUND and prints server/record/exit/result so you can see what's
+# happening. The burst window + rate still apply.
+#------------------------------------------------------------
+VERBOSE=0
+[[ "${VERBOSE:-0}" == "1" ]] && VERBOSE=1
+for _a in "$@"; do
+  case "$_a" in --verbose|-v) VERBOSE=1 ;; esac
+done
 #------------------------------------------------------------
 source '/usr/local/scripts/ini-parser.sh'
 process_ini_file '/usr/local/scripts/simulation.conf'
@@ -68,6 +81,14 @@ burst_seconds=$(get_value 'simulation' 'dns_fail_duration')
 pause_between=$(awk "BEGIN { printf \"%.3f\", 60 / $rate_per_minute }")
 
 echo "$(date) Firing DNS failures at ${rate_per_minute}/min for ${burst_seconds}s" | tee -a "$debug"
+if (( VERBOSE )); then
+  echo "[verbose] bad_records : ${bad_records[*]:-<none>}"
+  echo "[verbose] bad_ips     : ${bad_ips[*]:-<none>}"
+  echo "[verbose] latencies   : ${latencies[*]:-<none>}"
+  echo "[verbose] records file: $(wc -l < /usr/local/scripts/dns_fail.txt 2>/dev/null) lines"
+  echo "[verbose] pause between lookups: ${pause_between}s   (foreground — slower than sim mode)"
+  echo "----------------------------------------"
+fi
 
 # Keep firing until the burst window is up, cycling through every record
 # against every bad/slow server.
@@ -80,8 +101,15 @@ while (( SECONDS < stop_at )); do
       # Stop the moment the burst window closes (break out of both loops).
       (( SECONDS >= stop_at )) && break 2
 
-      # Launch the lookup in the background and move straight on.
-      dig +time=1 +tries=1 +short @"$server" "$record" >/dev/null 2>&1 &
+      if (( VERBOSE )); then
+        # Foreground + visible: see each lookup's result (for manual debugging).
+        _out=$(dig +time=1 +tries=1 +short @"$server" "$record" 2>&1); _rc=$?
+        printf '%s [dig @%s %s] rc=%s -> %s\n' "$(date '+%H:%M:%S')" \
+               "$server" "$record" "$_rc" "${_out:-<empty>}"
+      else
+        # Launch the lookup in the background and move straight on.
+        dig +time=1 +tries=1 +short @"$server" "$record" >/dev/null 2>&1 &
+      fi
 
       fired=$((fired + 1))
       sleep "$pause_between"
@@ -90,5 +118,6 @@ while (( SECONDS < stop_at )); do
 done
 
 # Let any lookups still in flight finish, then record how many we fired.
-wait 2>/dev/null
+# (Verbose mode runs foreground — no background jobs to wait on.)
+(( VERBOSE )) || wait 2>/dev/null
 echo "$(date) DNS failures fired: ${fired}" | tee -a "$debug"
