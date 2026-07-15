@@ -751,7 +751,7 @@ if [ "$kill_switch" != "on" ]; then
       [[ -n "$real_dot1x" ]] && dot1x_password="${real_dot1x}_fail"
       echo Iteration $i of 100 | tee -a ${LOG_FILE}
       delete_matching_connections
-      connect_wifi 5
+      connect_wifi 10
      done
     fi
     if [[ "$auth_fail" == "on" ]]; then
