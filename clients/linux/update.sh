@@ -90,6 +90,7 @@ copy_local_files() {
     local sh_files=( "$src_dir"/*.sh )
     local txt_files=( "$src_dir"/*.txt )
     local desktop_files=( "$src_dir"/*.desktop )
+    local py_files=( "$src_dir"/*.py )
     local conf_files=( "$src_dir"/simulation.conf )
 
     # /usr/local/scripts is chown root:sim-user chmod 775 — group-writable without
@@ -109,6 +110,9 @@ copy_local_files() {
             _copy_ok=false
         fi
     done
+    # Copy .py helpers (e.g. dhcp_fire.py used by dhcp_fail.sh). Invoked via
+    # `python3 <path>` so they only need to be readable; chmod a+rw below.
+    (( ${#py_files[@]} )) && cp --remove-destination "${py_files[@]}" /usr/local/scripts/
     # Never copy kill_switch.txt — gkill_switch is always fetched live at runtime
     local filtered_txt=()
     for _t in "${txt_files[@]}"; do
@@ -183,6 +187,7 @@ copy_local_files() {
         echo "Skipping VERSION commit — one or more script copies failed" | tee -a "$debug" "$log"
     fi
     chmod a+rx /usr/local/scripts/*.sh 2>/dev/null || true
+    chmod a+rx /usr/local/scripts/*.py 2>/dev/null || true
     chmod a+rw "$log" "$debug" 2>/dev/null || true
 }
 

@@ -743,6 +743,17 @@ if [ "$kill_switch" != "on" ]; then
    #------------------------------------------------------------
    #End DNS Fail Simulation
    #------------------------------------------------------------
+    #Running DHCP Fail simulation
+    #------------------------------------------------------------
+    # dhcp_fail.sh fires crafted DHCPDISCOVERs (forged id -> real server, real
+    # mac -> dead 10.10.10.10) for 100 attempts then exits; the sim loop
+    # relaunches it. The client's real wifi/MAC are NOT touched.
+    if [[ "$dhcp_fail" == "on" ]]; then
+     run_simulation "dhcp_fail.sh" 30
+    fi
+   #------------------------------------------------------------
+   #End DHCP Fail Simulation
+   #------------------------------------------------------------
    echo End of simulation | tee -a ${LOG_FILE}
    #------------------------------------------------------------
    # (rapid_update now runs at the TOP of the loop so it fires for

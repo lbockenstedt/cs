@@ -526,6 +526,15 @@ PATH_EOF
       warn "No .sh files found in $LINUX_DIR"
     fi
 
+    # ── Python helpers (invoked by the .sh scripts, e.g. dhcp_fire.py) ────────
+    info "Copying Python helpers to /usr/local/scripts"
+    if compgen -G "*.py" &>/dev/null; then
+      cp *.py /usr/local/scripts/ >>"$LOG" 2>&1
+      ok "Python helpers copied"
+    else
+      warn "No .py files found in $LINUX_DIR"
+    fi
+
     # ── Flat text files ──────────────────────────────────────────────────────
     info "Copying text files to /usr/local/scripts"
     if compgen -G "*.txt" &>/dev/null; then
