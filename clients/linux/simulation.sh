@@ -280,25 +280,6 @@ for key in "${override_keys[@]}"; do
   apply_override "$key"
 done
 #------------------------------------------------------------
-# dhcp_fail is an EXCLUSIVE simulation.
-#------------------------------------------------------------
-# dhcp_fail spoofs the adapter MAC so the client gets no DHCP lease → no
-# gateway → no other sim can run there (the loop's `! ping $dfgw` gate skips
-# the sim body entirely). But the ambient pick (HUB mode) and bucket flags
-# (standalone) can still set another sim on alongside it, and report_status
-# would then list it as "active" on a client that can't actually run it — the
-# dashboard would show e.g. dns_fail for a client that's really doing dhcp_fail.
-# So once the final dhcp_fail value is known (after the ambient roll + the
-# [username] override above), force EVERY other sim off so the dashboard
-# reports only dhcp_fail for this client.
-if [[ "${dhcp_fail:-}" == "on" ]]; then
-  for sim in dns_fail assoc_fail port_flap ssidpw_fail auth_fail \
-             ping_test download iperf www_traffic; do
-    declare -g "$sim=off"
-  done
-  echo "dhcp_fail is exclusive — other sims suppressed" | tee -a ${LOG_FILE}
-fi
-#------------------------------------------------------------
 #End User/Device Specific Overrides
 #------------------------------------------------------------
 echo $(date) | tee -a ${LOG_FILE}

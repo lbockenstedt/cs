@@ -124,6 +124,39 @@ def _require_key_dep(spoke):
     return _dep
 
 
+def _exclusive_sim_ids() -> set:
+    """The sim_ids that are EXCLUSIVE (``multi_capable=False``) — a failure sim
+    that monopolizes its client (dhcp_fail, dns_fail, assoc_fail, auth_fail,
+    ssidpw_fail, port_flap). Per ``SIM_META`` in ``sim_quota``."""
+    try:
+        from sim_quota import SIM_META
+    except Exception:  # noqa: BLE001
+        return set()
+    return {s for s, m in SIM_META.items() if not bool(m.get("multi_capable"))}
+
+
+def _exclusive_sim_active(overrides: Dict[str, str], user_conf, uname: str) -> bool:
+    """An EXCLUSIVE sim is ON for this client — in the engine/registry override
+    (the spoke's quota-engine assignment, e.g. dhcp_fail) OR a human per-user
+    pin in user-overrides.conf ``[uname]``. An exclusive sim monopolizes the
+    client (no gateway → no other sim can run), so the client-side ambient
+    traffic pick must NOT stack a shareable sim onto it. This is the
+    ``multi_capable`` contract the quota engine already enforces for quota
+    sims; the ambient pick is client-side, so the spoke suppresses it here
+    (serve-time) rather than hard-coding ``if dhcp_fail`` in the client."""
+    excl = _exclusive_sim_ids()
+    if not excl:
+        return False
+    for sim_id in excl:
+        if str(overrides.get(sim_id, "")).strip().lower() == "on":
+            return True
+    if user_conf is not None and uname and user_conf.has_section(uname):
+        for sim_id in excl:
+            if str(user_conf.get(uname, sim_id, fallback="")).strip().lower() == "on":
+                return True
+    return False
+
+
 # ── scripts path resolution (module-level so the traversal guard is testable) ─
 def resolve_script_path(platform: str, filename: str) -> Path:
     """Resolve ``clients/{platform}/{filename}`` with a path-traversal guard.
@@ -298,7 +331,16 @@ def build_client_api_app(spoke) -> FastAPI:
             control_on = spoke.local_store.get_ambient_control()
             sim_conf.set("simulation", "ambient_control",
                          "on" if control_on else "off")
-            if control_on:
+            # multi_capable contract: an EXCLUSIVE sim (dhcp_fail / dns_fail /
+            # assoc_fail / auth_fail / ssidpw_fail / port_flap) monopolizes this
+            # client, so the client-side ambient traffic pick must NOT stack a
+            # shareable sim onto it. Suppress ambient_pct for this client
+            # (serve-time, driven by SIM_META.multi_capable) — the client's roll
+            # gate `RANDOM % 100 < ambient_pct` is then always false → inactive.
+            _uname = sim_config.username_for(hostname) if hostname else ""
+            if _exclusive_sim_active(overrides, user_conf, _uname):
+                sim_conf.set("simulation", "ambient_pct", "0")
+            elif control_on:
                 # Scale THIS client's level by its site's load weight (default 1),
                 # so a site weighted 3 has 3x the ambient-active clients. Folded
                 # here so the client just rolls the served level.

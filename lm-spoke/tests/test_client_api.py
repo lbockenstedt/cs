@@ -132,6 +132,34 @@ def test_config_renders_host_bucket(client):
     assert f"[{bucket}]" in text
 
 
+def _ambient_pct(text):
+    import re
+    m = re.search(r"(?m)^ambient_pct\s*=\s*(\S+)", text)
+    return m.group(1) if m else None
+
+
+def test_exclusive_sim_suppresses_ambient(client, spoke):
+    """multi_capable contract: an EXCLUSIVE sim (multi_capable=False, e.g.
+    dhcp_fail) monopolizes its client — no gateway, so no other sim can run.
+    The spoke must suppress ambient_pct for THAT client (serve-time, driven by
+    SIM_META.multi_capable) so the client-side ambient pick does not stack a
+    shareable traffic sim onto it. A SHAREABLE sim (iperf) does NOT suppress
+    ambient — it may stack."""
+    import re
+    spoke.local_store.set_ambient_pct(50)
+    spoke.local_store.set_ambient_control(False)
+    h = "sim-1"
+    # Baseline: no exclusive sim → ambient_pct is the served base (50).
+    assert _ambient_pct(client.get("/api/config", params={"hostname": h}).text) == "50"
+    # Assign an EXCLUSIVE sim via the registry override (the engine's path).
+    client.post(f"/api/clients/{h}/control", json={"overrides": {"dhcp_fail": "on"}})
+    assert _ambient_pct(client.get("/api/config", params={"hostname": h}).text) == "0"
+    # A SHAREABLE sim does not suppress ambient — it may stack.
+    client.delete(f"/api/clients/{h}/control")
+    client.post(f"/api/clients/{h}/control", json={"overrides": {"iperf": "on"}})
+    assert _ambient_pct(client.get("/api/config", params={"hostname": h}).text) == "50"
+
+
 def test_config_overrides_and_parsed(client):
     assert client.get("/api/config/overrides").status_code == 200
     parsed = client.get("/api/config/parsed").json()
