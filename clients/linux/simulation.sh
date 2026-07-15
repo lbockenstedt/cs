@@ -402,27 +402,44 @@ connect_wifi() {
   nmcli radio wifi off
   nmcli radio wifi on
   sleep 15
-  # Connect first — `device wifi connect` creates/uses the profile with the
-  # correct security (handles PSK vs open) and associates with the permanent MAC.
-  if [[ "$site_based_ssid" == "on" ]]; then
-    nmcli -w $1 device wifi connect $wsite"-"$ssid password $ssidpw
-  else
-    nmcli -w $1 device wifi connect $ssid password $ssidpw
-  fi
   # dhcp_fail MAC spoof is driven through NetworkManager, NOT `ip link set
   # address`: on wifi the driver/NM reverts a raw ip-link-set MAC on associate,
-  # so the spoof never appeared in `ip a` (the log showed "setting … -> 00:01…"
-  # but the MAC never changed). Pin the spoof on the connection profile's
-  # cloned-mac-address and re-associate — NM applies it at association time and
-  # it survives. wifi_dhcp_fail_cloned_mac prints the target when dhcp_fail=on,
-  # the real MAC when off (restore), and returns rc=1 when unresolvable (skip).
+  # so the spoof never appeared in `ip a`. The spoof is pinned on the profile's
+  # 802-11-wireless.cloned-mac-address. KEY GOTCHA (observed live): `nmcli
+  # connection up <con>` HONORS cloned-mac (associates with the spoof), but
+  # `nmcli device wifi connect <ssid>` RESETS the wifi MAC to permanent every
+  # call — so calling device-wifi-connect every loop alternated the MAC
+  # permanent↔spoof each pass ("keeps changing"). Fix: use `device wifi connect`
+  # ONLY to bootstrap the profile once (it auto-negotiates WPA2/WPA3/open
+  # security, which an explicit `connection add` can't), then drive EVERY
+  # association through `connection up` — spoofed, stable, no per-loop reset.
   if [[ "$sim_phy" == "wireless" ]]; then
     local mac df_rc=0
     mac=$(wifi_dhcp_fail_cloned_mac) || df_rc=$?
     if [[ $df_rc -ne 1 && -n "$mac" ]]; then
+      # Bootstrap the profile once (first run) via device-wifi-connect — it
+      # creates the profile with the right security. On later runs the profile
+      # already exists, so skip this (it would reset the MAC to permanent).
+      if ! nmcli -t -f NAME con show 2>/dev/null | grep -Fxq "$target_ssid"; then
+        if [[ "$site_based_ssid" == "on" ]]; then
+          nmcli -w $1 device wifi connect $wsite"-"$ssid password $ssidpw
+        else
+          nmcli -w $1 device wifi connect $ssid password $ssidpw
+        fi
+      fi
+      # Pin the spoof (or the real MAC when dhcp_fail=off → restore) and
+      # activate via `connection up`, which honors cloned-mac-address.
       nmcli connection modify "$target_ssid" 802-11-wireless.cloned-mac-address "$mac" 2>/dev/null
       nmcli -w $1 connection up "$target_ssid" >/dev/null 2>&1
+      return
     fi
+  fi
+  # No dhcp_fail spoof (sim_phy=ethernet, or the permanent MAC was unresolvable):
+  # plain `device wifi connect` — the permanent MAC is correct here.
+  if [[ "$site_based_ssid" == "on" ]]; then
+    nmcli -w $1 device wifi connect $wsite"-"$ssid password $ssidpw
+  else
+    nmcli -w $1 device wifi connect $ssid password $ssidpw
   fi
 }
 #------------------------------------------------------------
