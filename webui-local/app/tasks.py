@@ -748,6 +748,14 @@ async def aruba_poller() -> None:
                                 out[kk] = out.get(kk, 0) + int(v or 0)
                             return out
                         _alert_ci, _insight_ci = _ci(alert_type_counts), _ci(insight_cat_counts)
+                        # DIAG: what the engine looks for vs what Central actually
+                        # returned for this site. A monitored id absent from BOTH
+                        # lists = a site-drop (poll_site_data filtered it) or a name
+                        # diff; present = should fire now.
+                        logger.info("central-check diag [%s→%s]: monitored=%s alert_keys=%s insight_keys=%s",
+                                    wsite, central_site,
+                                    [str(c.get("id")) for c in hub_monitored_checks if isinstance(c, dict) and c.get("id")],
+                                    sorted(_alert_ci), sorted(_insight_ci))
 
                         for check in hub_monitored_checks:
                             if not isinstance(check, dict):

@@ -263,6 +263,13 @@ class CentralPoller:
                     out[kk] = out.get(kk, 0) + int(v or 0)
                 return out
             alert_ci, insight_ci = _ci(alert_counts), _ci(insight_counts)
+            # DIAG: what the engine looks for vs what Central actually returned for
+            # this site. A monitored id absent from BOTH key lists = a site-drop
+            # (poll_site_data filtered it) or a name diff; present = should fire.
+            logger.info("central-check diag [%s→%s]: monitored=%s alert_keys=%s insight_keys=%s",
+                        wireless_site, central_site,
+                        [str(c.get("id")) for c in monitored if isinstance(c, dict) and c.get("id")],
+                        sorted(alert_ci), sorted(insight_ci))
             checks: Dict[str, Any] = {}
             for chk in monitored:
                 cid = str(chk.get("id") or "")
