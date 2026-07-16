@@ -35,7 +35,7 @@ logger = logging.getLogger("CSSimQuota")
 # A sim-quota record, stored as a list under central_sites_config["sim_quotas"].
 # Backward-compatible: an absent "sim_quotas" key = no quotas (today's behavior).
 SIM_QUOTA_KEYS = ("alert_id", "alert_type", "sim_id", "count", "site",
-                  "multi_capable", "rehome", "enabled")
+                  "multi_capable", "rehome", "enabled", "learning")
 ALERT_TYPES = ("alert", "insight")
 
 # Per-sim metadata defaults. category: "failure" sims produce a network condition
@@ -110,7 +110,7 @@ def normalize_quota(raw: Any) -> Dict[str, Any]:
     if alert_type not in ALERT_TYPES:
         alert_type = "alert"
     is_presence = not sim_id
-    return {
+    q = {
         "alert_id": str(raw.get("alert_id") or "").strip(),
         "alert_type": alert_type,
         "sim_id": sim_id,
@@ -122,7 +122,21 @@ def normalize_quota(raw: Any) -> Dict[str, Any]:
         else _as_bool(raw.get("multi_capable"), bool(meta.get("multi_capable", False))),
         "rehome": _as_bool(raw.get("rehome"), False),
         "enabled": _as_bool(raw.get("enabled"), False),
+        # `learning` ON = this row is the "learning lab" that runs the full
+        # thermostat (down-ratchet to find the floor, settle floor+20%, record a
+        # publishable learned_op). OFF (default) = a consumer: up-only, seeds/lifts
+        # from the tenant/global learned operating point, never down-ratchets (never
+        # risks stopping a firing alert). See design doc §9 / adaptive_step.
+        "learning": _as_bool(raw.get("learning"), False),
     }
+    # Adaptive-controller fields (design doc §9) — carried through only when the
+    # quota declares them, so a fixed-count quota stays exactly as before. The
+    # hub-side controller reads min/max/step/settle/buffer and modulates `count`;
+    # the spoke only consumes `count` but preserves these for schema symmetry.
+    for k in ("min", "max", "step", "settle", "buffer"):
+        if raw.get(k) is not None:
+            q[k] = raw.get(k)
+    return q
 
 
 def quota_dedup_key(q: Dict[str, Any]) -> str:
