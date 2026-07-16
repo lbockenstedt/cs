@@ -2846,7 +2846,7 @@ async function csRenderSimQuotaState() {
 // server is in MIA. Mirrored in both sim-views.js copies (hub + spoke).
 let csPxmxSiteMap = {};
 let csPxmxAgents = [];
-let csPxmxSites = [];
+let csSites = [];
 
 async function csRenderPxmxSiteMap() {
     csSetToolbar('');
@@ -2857,7 +2857,7 @@ async function csRenderPxmxSiteMap() {
         ]);
         csPxmxSiteMap = (mapRes && mapRes.pxmx_site_map) || {};
         csPxmxAgents = Array.isArray(mapRes && mapRes.agents) ? mapRes.agents : [];
-        csPxmxSites = (cat && cat.sites) || [];
+        csSites = (cat && cat.sites) || [];
         csRenderPxmxSiteMapEditor();
     } catch (e) {
         console.error('csRenderPxmxSiteMap: load failed', e);
@@ -2883,7 +2883,7 @@ function csRenderPxmxSiteMapEditor() {
     rows.sort((a, b) => a.host.localeCompare(b.host));
     const siteOpts = (sel) =>
         `<option value="" ${(!sel) ? 'selected' : ''}>— unassigned —</option>` +
-        csPxmxSites.map(s => `<option value="${csEscape(s)}" ${s === sel ? 'selected' : ''}>${csEscape(s)}</option>`).join('');
+        csSites.map(s => `<option value="${csEscape(s)}" ${s === sel ? 'selected' : ''}>${csEscape(s)}</option>`).join('');
     const rowHtml = rows.map((r, i) => {
         const sel = csPxmxSiteMap[r.host] || '';
         const badge = r.connected
