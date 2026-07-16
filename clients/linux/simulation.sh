@@ -437,6 +437,27 @@ connect_wifi() {
   fi
 }
 #------------------------------------------------------------
+#Fast WiFi connection for the wrong-PSK (ssidpw_fail) loop
+#------------------------------------------------------------
+# The normal connect_wifi() cycles the radio + sleeps 15s + waits up to 30s per
+# attempt, capping the wrong-password loop at ~4 attempts/min. To trigger the
+# "WPA Passphrase is Incorrect" insight at least 10x/min we need <=6s/attempt.
+# The AP records the failed WPA 4-way handshake within ~1-2s of the association
+# request, so a SHORT nmcli cap still registers the event — we drop the 15s
+# settle and cap nmcli at $1 sec. delete_matching_connections first forces a
+# fresh association each iteration (every attempt is a distinct AP/Central
+# event, not a cached reuse). $1 defaults to 5 → worst case ~5.5s/attempt ≈ 10/min.
+#------------------------------------------------------------
+connect_wifi_fail() {
+  local cap="${1:-5}"
+  delete_matching_connections
+  if [[ "$site_based_ssid" == "on" ]]; then
+    nmcli -w "$cap" device wifi connect "$wsite-$ssid" password "$ssidpw"
+  else
+    nmcli -w "$cap" device wifi connect "$ssid" password "$ssidpw"
+  fi
+}
+#------------------------------------------------------------
 #WiFi 802.1X (WPA-Enterprise / PEAP-MSCHAPv2) connection
 #------------------------------------------------------------
 # nmcli's "device wifi connect" is PSK-only, so 802.1X needs an explicit profile
@@ -445,7 +466,23 @@ connect_wifi() {
 # validation (lab). ssidpw_fail flows through here too: it sets $ssidpw to the
 # wrong password before connecting, so PEAP auth fails and Central logs the insight.
 connect_1x() {
-  local wait_time=$1
+  _connect_1x_core "$1" 0
+}
+#------------------------------------------------------------
+#Fast 802.1X connection for the wrong-password (ssidpw_fail) loop
+#------------------------------------------------------------
+# Separate from connect_wifi_fail (PSK): 1X rebuilds an explicit profile and
+# brings it up, so the fast path is its own function. Like the PSK fast path it
+# drops the 15s radio settle and caps nmcli at $1 sec so the loop sustains
+# >=10 auth-failure attempts/min — RADIUS logs the failed EAP within ~1-2s, so a
+# short cap still registers the event. $1 defaults to 5.
+#------------------------------------------------------------
+connect_1x_fail() {
+  _connect_1x_core "${1:-5}" 1
+}
+
+_connect_1x_core() {
+  local wait_time=$1 fast=$2
   local eap="${dot1x_eap:-peap}"
   local target_ssid
   if [[ "$site_based_ssid" == "on" ]]; then
@@ -454,12 +491,17 @@ connect_1x() {
     target_ssid="$ssid"
   fi
 
-  nmcli radio wifi off
-  nmcli radio wifi on
-  sleep 15
-
-  # Rebuild the profile each run so identity / password / SSID always re-apply.
-  nmcli -t -f NAME connection show | grep -Fxq "$target_ssid" && nmcli connection delete "$target_ssid"
+  if [[ "$fast" == "1" ]]; then
+    # No radio cycle / 15s settle — the profile delete + rebuild below forces a
+    # fresh association so each attempt is a distinct AP/RADIUS event.
+    nmcli -t -f NAME connection show | grep -Fxq "$target_ssid" && nmcli connection delete "$target_ssid"
+  else
+    nmcli radio wifi off
+    nmcli radio wifi on
+    sleep 15
+    # Rebuild the profile each run so identity / password / SSID always re-apply.
+    nmcli -t -f NAME connection show | grep -Fxq "$target_ssid" && nmcli connection delete "$target_ssid"
+  fi
 
   if [[ "$eap" == "tls" ]]; then
     # EAP-TLS (cert-based) — for Cloud NAC. Certs are provisioned headlessly by
@@ -645,8 +687,15 @@ if [ "$kill_switch" != "on" ]; then
       ssidpw="${real_ssidpw}_fail"
       [[ -n "$real_dot1x" ]] && dot1x_password="${real_dot1x}_fail"
       echo Iteration $i of 100 | tee -a ${LOG_FILE}
-      delete_matching_connections
-      connect_wifi 30
+      # Fast wrong-password attempt (>=10 failures/min): the PSK and 1X fail
+      # functions are separate — pick by SSID type. Each drops the 15s settle and
+      # caps nmcli at 5s; the AP/RADIUS records the failed handshake/auth within
+      # ~1-2s, so a short cap still registers every attempt as a distinct event.
+      if [[ "$ssid" == "1X" ]]; then
+        connect_1x_fail 5
+      else
+        connect_wifi_fail 5
+      fi
      done
     fi
     if [[ "$auth_fail" == "on" ]]; then
