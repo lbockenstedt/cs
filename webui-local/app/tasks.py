@@ -733,6 +733,22 @@ async def aruba_poller() -> None:
                         site_hw_devices = raw.get("hw_devices", {}) if isinstance(raw.get("hw_devices"), dict) else {}
                         site_status: dict[str, Any] = {}
 
+                        # Case-insensitive lookup across BOTH the alert and insight
+                        # buckets. The dashboard's alert/insight query is merged, so
+                        # a check must fire whether Central classifies the named
+                        # condition as an alert or an insight — e.g. "DNS Server
+                        # Failed to Respond" returns as an INSIGHT, but its quota is
+                        # typed "alert". Reading only the typed bucket (case-
+                        # sensitively) reported a live condition as absent → the
+                        # adaptive controller ramped forever + exhausted the pool.
+                        def _ci(d):
+                            out: dict[str, int] = {}
+                            for k, v in (d or {}).items():
+                                kk = str(k).strip().lower()
+                                out[kk] = out.get(kk, 0) + int(v or 0)
+                            return out
+                        _alert_ci, _insight_ci = _ci(alert_type_counts), _ci(insight_cat_counts)
+
                         for check in hub_monitored_checks:
                             if not isinstance(check, dict):
                                 continue
@@ -741,12 +757,12 @@ async def aruba_poller() -> None:
                             check_name = str(check.get("name") or check_id)
                             if not check_id:
                                 continue
-                            if check_type == "alert":
-                                count = int(alert_type_counts.get(check_id, 0) or 0)
-                            elif check_type == "insight":
-                                count = int(insight_cat_counts.get(check_id, 0) or 0)
-                            else:
+                            if check_type not in ("alert", "insight"):
                                 continue
+                            _key = check_id.lower()
+                            _primary, _other = ((_alert_ci, _insight_ci) if check_type == "alert"
+                                                else (_insight_ci, _alert_ci))
+                            count = int(_primary.get(_key, 0) or _other.get(_key, 0) or 0)
                             site_status[check_id] = {
                                 "status": "OK" if count > 0 else "ERROR",
                                 "count": count,
