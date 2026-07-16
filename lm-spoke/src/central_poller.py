@@ -394,6 +394,9 @@ class CentralPoller:
             current = int(data.get("client_count", 0) or 0)
             self._cc.record(_CC_SCOPE, wireless_site, current)
             cc_entry = self._cc.entry(_CC_SCOPE, wireless_site, central_site)
+            # Break out wired vs wireless (Central reports both; total = their sum).
+            cc_entry["wired"] = int(data.get("wired_clients", 0) or 0)
+            cc_entry["wireless"] = int(data.get("wireless_clients", 0) or 0)
             client_count_status[wireless_site] = cc_entry
             # Surface the site's client-count monitor as a CHECK so "everything
             # monitored" shows on the dashboard Checks view. Direct (NOT inverted)
