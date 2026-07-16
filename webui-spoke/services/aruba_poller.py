@@ -644,19 +644,35 @@ async def _poll_central_once(client: httpx.AsyncClient) -> None:
                 logger.warning("Central insights fetch failed for site %s: %s", central_site, exc)
 
         # ── Evaluate each monitored check ─────────────────────────
+        # Case-insensitive, match across BOTH the alert+insight buckets (typed
+        # bucket first, fall back). Central returns some named conditions as
+        # INSIGHTS (e.g. "DNS Server Failed to Respond") while the quota is typed
+        # "alert"; reading only the typed bucket case-sensitively reported a live
+        # condition as absent → the adaptive controller ramped forever and
+        # exhausted the client pool.
+        def _ci(d):
+            out = {}
+            for k, v in (d or {}).items():
+                kk = str(k).strip().lower()
+                out[kk] = out.get(kk, 0) + int(v or 0)
+            return out
+        _alert_ci, _insight_ci = _ci(alert_type_counts), _ci(insight_cat_counts)
+        logger.info("central-check diag [%s]: monitored=%s alert_keys=%s insight_keys=%s",
+                    central_site,
+                    [str(c.get("id")) for c in monitored if isinstance(c, dict) and c.get("id")],
+                    sorted(_alert_ci), sorted(_insight_ci))
         for check in monitored:
             check_type = check.get("type", "")
             check_id = check.get("id", "")
             check_name = check.get("name", check_id)
             if not check_id:
                 continue
-
-            if check_type == "alert":
-                count = alert_type_counts.get(check_id, 0)
-            elif check_type == "insight":
-                count = insight_cat_counts.get(check_id, 0)
-            else:
+            if check_type not in ("alert", "insight"):
                 continue
+            _key = str(check_id).strip().lower()
+            _primary, _other = ((_alert_ci, _insight_ci) if check_type == "alert"
+                                else (_insight_ci, _alert_ci))
+            count = int(_primary.get(_key, 0) or _other.get(_key, 0) or 0)
 
             status = "OK" if count > 0 else "ERROR"
             site_check_status[check_id] = {
