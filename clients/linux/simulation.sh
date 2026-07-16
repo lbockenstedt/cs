@@ -420,6 +420,67 @@ report_status() {
 #------------------------------------------------------------
 #WiFi connections
 #------------------------------------------------------------
+# Replaces the blind `sleep 15` settle that used to follow every radio cycle.
+# Polls NetworkManager for a wifi device that's past the post-power-on
+# "unavailable" limbo and ready to associate; returns the instant one is ready
+# (usually <15s, often ~1-2s). $1 = backstop cap (sec); on timeout returns 1 and
+# the caller proceeds anyway (nmcli -w handles a not-yet-ready device itself).
+_wait_radio_ready() {
+  local cap="${1:-15}" i st
+  for ((i=0; i<cap; i++)); do
+    st=$(nmcli -t -f DEVICE,TYPE,STATE device status 2>/dev/null | grep ':wifi:' | head -1)
+    if [[ -n "$st" && "$st" != *":unavailable" ]]; then return 0; fi
+    sleep 1
+  done
+  return 1
+}
+# Race an in-flight nmcli activation (pid $2) against a background `iw event`
+# deauth watcher — no blind `nmcli -w N` / `sleep N` wait. Returns the instant
+# EITHER lands:
+#   * nmcli exits → nmcli's own exit code. nmcli returns only once NetworkManager
+#     reaches the activated state (full association + DHCP/IP), so this is the
+#     reliable SUCCESS signal (iw events are L2-only and would race DHCP, so we
+#     do NOT kill nmcli on a L2 "connected" event — we let it finish IP config).
+#   * AP deauth/disassoc/disconn fires → kill nmcli, return 1 (FAILURE: wrong PSK /
+#     blocked MAC / RADIUS reject), detected the instant the kernel sees it.
+# $1 = backstop cap (sec). Used by every connect path so success AND failure are
+# event-driven instead of blindly waiting out the nmcli -w cap. Falls back to
+# just waiting on nmcli (the old behavior) when iw / $wladapter is unavailable.
+_connect_outcome() {
+  local cap="${1:-30}" nm_pid="$2"
+  if [[ -z "${wladapter:-}" ]] || ! command -v iw >/dev/null 2>&1; then
+    wait "$nm_pid" 2>/dev/null; return $?
+  fi
+  timeout "$cap" bash -c 'iw event -m -t 2>/dev/null | grep -m1 -E "$1: (deauth|disassoc|disconn)"' \
+    _ "$wladapter" >/dev/null 2>&1 &
+  local ev_pid=$! i
+  for ((i=0; i<cap; i++)); do
+    if ! kill -0 "$nm_pid" 2>/dev/null; then
+      wait "$nm_pid" 2>/dev/null; local rc=$?
+      kill "$ev_pid" 2>/dev/null; wait "$ev_pid" 2>/dev/null || true
+      return "$rc"
+    fi
+    if ! kill -0 "$ev_pid" 2>/dev/null; then
+      kill "$nm_pid" 2>/dev/null; wait "$nm_pid" 2>/dev/null || true
+      return 1
+    fi
+    sleep 1
+  done
+  kill "$nm_pid" "$ev_pid" 2>/dev/null; wait 2>/dev/null || true
+  return 1
+}
+# Wait for a wlan adapter to appear — replaces the blind `sleep 15` that used to
+# precede `wladapter=$(...)` re-detection in the recovery paths. Polls up to $1
+# sec; sets wladapter and returns 0 the instant one is present, 1 on timeout.
+_wait_wlan_adapter() {
+  local cap="${1:-15}" i
+  for ((i=0; i<cap; i++)); do
+    wladapter=$(ip -br a 2>/dev/null | grep "wlx\|wlan" | cut -d ' ' -f '1')
+    [[ -n "$wladapter" ]] && return 0
+    sleep 1
+  done
+  return 1
+}
 connect_wifi() {
   # An 802.1X (enterprise) SSID is flagged by ssid=="1X" in the Pool/SSID matrix —
   # route it to connect_1x(); every other SSID is PSK below.
@@ -429,12 +490,14 @@ connect_wifi() {
   fi
   nmcli radio wifi off
   nmcli radio wifi on
-  sleep 15
-  if [[ "$site_based_ssid" == "on" ]]; then
-    nmcli -w $1 device wifi connect $wsite"-"$ssid password $ssidpw
-  else
-    nmcli -w $1 device wifi connect $ssid password $ssidpw
-  fi
+  _wait_radio_ready 15   # was: blind `sleep 15` — now returns when the radio is ready
+  local target_ssid
+  if [[ "$site_based_ssid" == "on" ]]; then target_ssid="$wsite-$ssid"
+  else target_ssid="$ssid"; fi
+  # Event-driven: returns the instant nmcli finishes activating (success) or the
+  # AP drops the link (failure) — no blind `nmcli -w $1` wait for the whole window.
+  nmcli -w "$1" device wifi connect "$target_ssid" password "$ssidpw" >/dev/null 2>&1 &
+  _connect_outcome "$1" $! || true
 }
 #------------------------------------------------------------
 #Fast WiFi connection for the wrong-PSK (ssidpw_fail) loop
@@ -451,11 +514,15 @@ connect_wifi() {
 connect_wifi_fail() {
   local cap="${1:-5}"
   delete_matching_connections
-  if [[ "$site_based_ssid" == "on" ]]; then
-    nmcli -w "$cap" device wifi connect "$wsite-$ssid" password "$ssidpw"
-  else
-    nmcli -w "$cap" device wifi connect "$ssid" password "$ssidpw"
-  fi
+  # Fire the association and return the instant the AP rejects the bad PSK
+  # (deauth/disassoc — the real "WPA Passphrase Incorrect" event) instead of
+  # blocking on `nmcli -w $cap` for the whole window. $cap is only a backstop for
+  # a silent AP. PSK-only (no 1X dispatch) — connect_1x_fail is the separate path.
+  local target_ssid
+  if [[ "$site_based_ssid" == "on" ]]; then target_ssid="$wsite-$ssid"
+  else target_ssid="$ssid"; fi
+  nmcli -w "$cap" device wifi connect "$target_ssid" password "$ssidpw" >/dev/null 2>&1 &
+  _connect_outcome "$cap" $! || true
 }
 #------------------------------------------------------------
 #WiFi 802.1X (WPA-Enterprise / PEAP-MSCHAPv2) connection
@@ -492,13 +559,13 @@ _connect_1x_core() {
   fi
 
   if [[ "$fast" == "1" ]]; then
-    # No radio cycle / 15s settle — the profile delete + rebuild below forces a
+    # No radio cycle / settle — the profile delete + rebuild below forces a
     # fresh association so each attempt is a distinct AP/RADIUS event.
     nmcli -t -f NAME connection show | grep -Fxq "$target_ssid" && nmcli connection delete "$target_ssid"
   else
     nmcli radio wifi off
     nmcli radio wifi on
-    sleep 15
+    _wait_radio_ready 15   # was: blind `sleep 15` — now returns when radio is ready
     # Rebuild the profile each run so identity / password / SSID always re-apply.
     nmcli -t -f NAME connection show | grep -Fxq "$target_ssid" && nmcli connection delete "$target_ssid"
   fi
@@ -529,7 +596,12 @@ _connect_1x_core() {
       802-1x.system-ca-certs no
   fi
 
-  nmcli -w "$wait_time" connection up "$target_ssid"
+  # Event-driven: returns the instant nmcli finishes activating (success) OR the
+  # AP/RADIUS rejects the creds (deauth/disassoc — failure). $wait_time backstop.
+  # Both fast (wrong-password) and normal paths use the same watcher — the bad
+  # password is what makes the fast path fail fast on the deauth event.
+  nmcli -w "$wait_time" connection up "$target_ssid" >/dev/null 2>&1 &
+  _connect_outcome "$wait_time" $! || true
 }
 #------------------------------------------------------------
 #Connection management
@@ -539,11 +611,22 @@ manage_connection() {
   local wait_time=$2
   nmcli radio wifi off
   nmcli radio wifi on
-  sleep 15
+  _wait_radio_ready 15   # was: blind `sleep 15` — now returns when radio is ready
+  local target_ssid
   if [[ "$site_based_ssid" == "on" ]]; then
-    nmcli -w $wait_time connection $action $wsite"-"$ssid
+    target_ssid="$wsite-$ssid"
   else
-    nmcli -w $wait_time connection $action $ssid
+    target_ssid="$ssid"
+  fi
+  if [[ "$action" == "up" ]]; then
+    # Event-driven: returns the instant nmcli finishes activating (success) or
+    # the AP drops the link (failure — e.g. a blocked-MAC deauth in the auth_fail
+    # flap loop) instead of blocking on `nmcli -w $wait_time`. $wait_time backstop.
+    nmcli -w "$wait_time" connection up "$target_ssid" >/dev/null 2>&1 &
+    _connect_outcome "$wait_time" $! || true
+  else
+    # down: nmcli deactivates immediately (no long wait) — no event watch needed.
+    nmcli -w "$wait_time" connection down "$target_ssid" >/dev/null 2>&1 || true
   fi
 }
 #------------------------------------------------------------
@@ -589,10 +672,8 @@ if [[ "$sim_phy" == "wireless" ]]; then
     echo Successful network connection | tee -a ${LOG_FILE}
   else
     echo Network connection failed | tee -a ${LOG_FILE}
-    sleep 15
-    wladapter=$(ip -br a | grep "wlx\|wlan" | cut -d ' ' -f '1')
+    _wait_wlan_adapter 15   # was: blind `sleep 15` — polls until the adapter appears
     connect_wifi 180
-    sleep 15
     dfgw=$(ip route | grep -oP 'default via \K\S+')
   fi
 else
@@ -610,9 +691,8 @@ if [[ "$sim_load" -lt "$rn_sim_load" ]]; then
   echo Simulation load under threshold | tee -a ${LOG_FILE}
   echo Skipping Simulations but staying associated | tee -a ${LOG_FILE}
   if [[ "$ssidpw_fail" != "on" ]] && [[ -n ${wladapter} ]]; then
-    manage_connection up 180
+    manage_connection up 180   # event-driven: returns on activation (no post-connect sleep needed)
   fi
-  sleep 5
 fi
 #------------------------------------------------------------
 #End Setting up simulation load
@@ -704,8 +784,10 @@ if [ "$kill_switch" != "on" ]; then
       echo Enable/Disable WLAN interface | tee -a ${LOG_FILE}
       echo Iteration $i of 100 | tee -a ${LOG_FILE}
       delete_matching_connections
+      # Event-driven flap: `manage_connection up` returns the instant the AP
+      # rejects the blocked MAC / invalid creds (deauth) instead of blocking on
+      # nmcli -w 5 + a blind sleep 5; `down` deactivates immediately.
       manage_connection up 5
-      sleep 5
       manage_connection down 5
      done
     fi
@@ -724,12 +806,10 @@ if [ "$kill_switch" != "on" ]; then
    #------------------------------------------------------------
    if ! ping -c2 "$dfgw"; then
      echo Attempting to reset adapter | tee -a ${LOG_FILE}
-     sleep 15
-     wladapter=$(ip -br a | grep "wlx\|wlan" | cut -d ' ' -f '1')
+     _wait_wlan_adapter 15   # was: blind `sleep 15` — polls until the adapter appears
      delete_matching_connections
      connect_wifi 180
      echo WLAN Adapter name $wladapter | tee -a ${LOG_FILE}
-     sleep 15
     fi
     dfgw=$(ip route | grep -oP 'default via \K\S+')
     if ping -c2 "$dfgw"; then
