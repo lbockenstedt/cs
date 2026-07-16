@@ -29,6 +29,7 @@ from .aruba import (
     DEFAULT_NEW_CENTRAL_MONITORED_CHECKS,
     validate_cluster_url,
 )
+from .check_eval import count_for_check, normalize_counts
 from .crypto import decrypt_dict
 from .data_models import AuditEntry, Command
 from .config import get_settings
@@ -741,13 +742,10 @@ async def aruba_poller() -> None:
                         # typed "alert". Reading only the typed bucket (case-
                         # sensitively) reported a live condition as absent → the
                         # adaptive controller ramped forever + exhausted the pool.
-                        def _ci(d):
-                            out: dict[str, int] = {}
-                            for k, v in (d or {}).items():
-                                kk = str(k).strip().lower()
-                                out[kk] = out.get(kk, 0) + int(v or 0)
-                            return out
-                        _alert_ci, _insight_ci = _ci(alert_type_counts), _ci(insight_cat_counts)
+                        # Shared with the other three deployments via check_eval
+                        # (single source of truth for this matching).
+                        _alert_ci = normalize_counts(alert_type_counts)
+                        _insight_ci = normalize_counts(insight_cat_counts)
                         # DIAG: what the engine looks for vs what Central actually
                         # returned for this site. A monitored id absent from BOTH
                         # lists = a site-drop (poll_site_data filtered it) or a name
@@ -767,10 +765,7 @@ async def aruba_poller() -> None:
                                 continue
                             if check_type not in ("alert", "insight"):
                                 continue
-                            _key = check_id.lower()
-                            _primary, _other = ((_alert_ci, _insight_ci) if check_type == "alert"
-                                                else (_insight_ci, _alert_ci))
-                            count = int(_primary.get(_key, 0) or _other.get(_key, 0) or 0)
+                            count = count_for_check(check, _alert_ci, _insight_ci)
                             site_status[check_id] = {
                                 "status": "OK" if count > 0 else "ERROR",
                                 "count": count,

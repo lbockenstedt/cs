@@ -29,6 +29,7 @@ import time
 from typing import Any, Dict, Optional
 
 from aruba import ArubaClient
+from check_eval import count_for_check, normalize_counts
 
 logger = logging.getLogger("CentralPoller")
 
@@ -255,14 +256,9 @@ class CentralPoller:
             # bucket (case-sensitively) reported a live condition as absent, so the
             # adaptive controller ramped forever and exhausted the client pool.
             # Typed bucket wins; fall back to the other so a type mismatch never
-            # hides a present condition.
-            def _ci(d):
-                out: Dict[str, int] = {}
-                for k, v in (d or {}).items():
-                    kk = str(k).strip().lower()
-                    out[kk] = out.get(kk, 0) + int(v or 0)
-                return out
-            alert_ci, insight_ci = _ci(alert_counts), _ci(insight_counts)
+            # hides a present condition. Shared with the other three deployments
+            # via check_eval (single source of truth for this matching).
+            alert_ci, insight_ci = normalize_counts(alert_counts), normalize_counts(insight_counts)
             # DIAG: what the engine looks for vs what Central actually returned for
             # this site. A monitored id absent from BOTH key lists = a site-drop
             # (poll_site_data filtered it) or a name diff; present = should fire.
@@ -281,10 +277,7 @@ class CentralPoller:
                 chk_site = str(chk.get("site") or "").strip().lower()
                 if chk_site and chk_site not in (str(central_site).lower(), str(wireless_site).lower(), "all sites"):
                     continue
-                key = cid.strip().lower()
-                is_alert = (chk.get("type") or "alert") == "alert"
-                primary, other = (alert_ci, insight_ci) if is_alert else (insight_ci, alert_ci)
-                n = int(primary.get(key, 0) or other.get(key, 0) or 0)
+                n = count_for_check(chk, alert_ci, insight_ci)
                 # INVERTED semantics: this is a demo/simulation platform that is
                 # SUPPOSED to be generating these alerts/insights. A monitored check
                 # is HEALTHY (ok) when its error IS present, and FAILING (error) when

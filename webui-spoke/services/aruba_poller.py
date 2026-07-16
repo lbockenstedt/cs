@@ -1,6 +1,7 @@
 """Aruba Poller (helpers moved verbatim from server.py; shared deps imported from server)."""
 from __future__ import annotations
 
+from check_eval import count_for_check, normalize_counts
 from server import (
     Any,
     CENTRAL_POLL_INTERVAL,
@@ -650,13 +651,10 @@ async def _poll_central_once(client: httpx.AsyncClient) -> None:
         # "alert"; reading only the typed bucket case-sensitively reported a live
         # condition as absent → the adaptive controller ramped forever and
         # exhausted the client pool.
-        def _ci(d):
-            out = {}
-            for k, v in (d or {}).items():
-                kk = str(k).strip().lower()
-                out[kk] = out.get(kk, 0) + int(v or 0)
-            return out
-        _alert_ci, _insight_ci = _ci(alert_type_counts), _ci(insight_cat_counts)
+        # Shared with the other three deployments via check_eval (single source
+        # of truth for this matching).
+        _alert_ci = normalize_counts(alert_type_counts)
+        _insight_ci = normalize_counts(insight_cat_counts)
         logger.info("central-check diag [%s]: monitored=%s alert_keys=%s insight_keys=%s",
                     central_site,
                     [str(c.get("id")) for c in monitored if isinstance(c, dict) and c.get("id")],
@@ -669,10 +667,7 @@ async def _poll_central_once(client: httpx.AsyncClient) -> None:
                 continue
             if check_type not in ("alert", "insight"):
                 continue
-            _key = str(check_id).strip().lower()
-            _primary, _other = ((_alert_ci, _insight_ci) if check_type == "alert"
-                                else (_insight_ci, _alert_ci))
-            count = int(_primary.get(_key, 0) or _other.get(_key, 0) or 0)
+            count = count_for_check(check, _alert_ci, _insight_ci)
 
             status = "OK" if count > 0 else "ERROR"
             site_check_status[check_id] = {
