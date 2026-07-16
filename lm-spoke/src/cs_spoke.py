@@ -1082,6 +1082,20 @@ class CSSpoke(BaseSpoke):
         if cmd in ("CS_CENTRAL_BROWSE",):
             return await self.central_poller.browse()
 
+        if cmd == "CS_GET_HEALTH":
+            # 30-day per-check health for a DISTRIBUTED tenant. Daily summaries ride
+            # in central_status already; this serves the on-hover HOURLY breakdown
+            # for one check (site+check in the payload).
+            h = getattr(self.central_poller, "_health", None)
+            if h is None:
+                return {"hourly": []}
+            site = d.get("site")
+            check = d.get("check")
+            from central_poller import _CC_SCOPE
+            if site and check:
+                return {"hourly": h.hourly(_CC_SCOPE, site, check)}
+            return {"daily": h.summary(_CC_SCOPE)}
+
         if cmd == "CS_GET_SIM_QUOTA_CATALOG":
             # The Sim-Quota UI (Config → Sim Quotas) renders against this: the
             # sims/sites derived from this tenant's simulation.conf + the global

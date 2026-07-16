@@ -147,6 +147,18 @@ def build_local_ui_router(spoke) -> APIRouter:
             return {"spokes": [], "mode": "standalone"}
         return {"spokes": [_central_spoke_entry()], "mode": "standalone"}
 
+    @router.get("/aggregate/central-health")
+    async def aggregate_central_health(site: str = None, check: str = None):
+        """30-day per-check health for the spoke's own Checks view: DAILY summaries
+        for every check, or one check's HOURLY buckets with ?site=&check=."""
+        h = getattr(getattr(spoke, "central_poller", None), "_health", None)
+        if h is None:
+            return {"daily": {}, "hourly": []}
+        from central_poller import _CC_SCOPE
+        if site and check:
+            return {"hourly": h.hourly(_CC_SCOPE, site, check)}
+        return {"daily": h.summary(_CC_SCOPE)}
+
     @router.get("/aggregate/central-status")
     async def aggregate_central_status():
         cc = spoke.local_store.get_central_config()

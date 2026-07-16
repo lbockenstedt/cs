@@ -197,6 +197,90 @@ def _build_config(central_config: Dict[str, Any]) -> Dict[str, Any]:
     return cfg
 
 
+_HEALTH_IDX = {"ok": 0, "warning": 1, "error": 2}  # else (no_data/pending/unknown) -> 3
+
+
+class CheckHealthHistory:
+    """Rolling 30-day per-check status history in HOURLY buckets [ok,warn,error,other]
+    (green/yellow/red/grey). Mirror of lm central_hub_poller.CheckHealthHistory — keep
+    in sync. summary() rolls hourly up to 30 DAILY buckets; hourly() returns raw."""
+
+    def __init__(self, path: str) -> None:
+        self._path = path
+        self._h: Dict[str, Dict[int, list]] = {}
+        self._load()
+
+    @staticmethod
+    def _key(tenant: str, site: str, check_id: str) -> str:
+        return f"{tenant}{_CC_KEYSEP}{site}{_CC_KEYSEP}{check_id}"
+
+    def _load(self) -> None:
+        try:
+            with open(self._path, encoding="utf-8") as f:
+                raw = json.load(f) or {}
+            cutoff = time.time() - _CC_30DAY_WINDOW
+            self._h = {
+                k: {int(b): list(v) for b, v in buckets.items() if int(b) >= cutoff}
+                for k, buckets in raw.items()
+            }
+        except Exception:  # noqa: BLE001 — absent/corrupt → start empty
+            self._h = {}
+
+    def record(self, tenant: str, site: str, check_id: str, status: str) -> None:
+        now = time.time()
+        buckets = self._h.setdefault(self._key(tenant, site, check_id), {})
+        bucket = int(now // 3600 * 3600)
+        cell = buckets.get(bucket)
+        if cell is None:
+            cell = [0, 0, 0, 0]
+            buckets[bucket] = cell
+        cell[_HEALTH_IDX.get(str(status).strip().lower(), 3)] += 1
+        cutoff = now - _CC_30DAY_WINDOW
+        for b in [b for b in buckets if b < cutoff]:
+            del buckets[b]
+
+    def save(self) -> None:
+        try:
+            tmp = self._path + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump({k: {str(b): v for b, v in bk.items()}
+                           for k, bk in self._h.items()}, f, default=str)
+            os.replace(tmp, self._path)
+        except Exception:  # noqa: BLE001
+            pass
+
+    def summary(self, tenant: str) -> Dict[str, Any]:
+        now = time.time()
+        floor = int(now // 86400 * 86400) - 29 * 86400
+        prefix = f"{tenant}{_CC_KEYSEP}"
+        out: Dict[str, Any] = {}
+        for key, buckets in self._h.items():
+            if not key.startswith(prefix):
+                continue
+            parts = key.split(_CC_KEYSEP, 2)
+            if len(parts) != 3:
+                continue
+            _, site, check_id = parts
+            days: Dict[int, list] = {}
+            for b, cell in buckets.items():
+                d = int(b // 86400 * 86400)
+                if d < floor:
+                    continue
+                acc = days.setdefault(d, [0, 0, 0, 0])
+                for i in range(4):
+                    acc[i] += cell[i]
+            out.setdefault(site, {})[check_id] = [
+                {"d": d, "o": v[0], "w": v[1], "e": v[2], "n": v[3]}
+                for d, v in sorted(days.items())
+            ]
+        return out
+
+    def hourly(self, tenant: str, site: str, check_id: str) -> list:
+        buckets = self._h.get(self._key(tenant, site, check_id), {})
+        return [{"h": b, "o": v[0], "w": v[1], "e": v[2], "n": v[3]}
+                for b, v in sorted(buckets.items())]
+
+
 class CentralPoller:
     """Drives ``ArubaClient`` on a 5-minute loop, writing
     ``spoke.central_status`` in the shape ``sim-views.js``'s Checks/Hardware/
@@ -214,6 +298,8 @@ class CentralPoller:
             os.path.join(ddir, "client_count_baseline.json"),
             os.path.join(ddir, "client_count_7day.json"),
         )
+        # 30-day per-check status history (green/yellow/red) for the health graphs.
+        self._health = CheckHealthHistory(os.path.join(ddir, "check_health_history.json"))
         self.reload()
 
     # ── (re)build the ArubaClient from the current stored config ───────────
@@ -355,15 +441,26 @@ class CentralPoller:
              "total": total}
             for aid, total in hw_totals.items()
         ]
+        # Record each check's status into the 30-day health history (hourly bucket),
+        # then relay the DAILY summary so the hub dashboard can show the strip for a
+        # distributed tenant (hourly-on-hover is fetched on demand via CS_GET_HEALTH).
+        for wsite, checks_map in status.items():
+            if not isinstance(checks_map, dict):
+                continue
+            for cid, info in checks_map.items():
+                st = (info.get("status") if isinstance(info, dict) else info) or "no_data"
+                self._health.record(_CC_SCOPE, wsite, cid, st)
         self.spoke.central_status = {
             "status": status,
             "hardware_alerts": hardware_alerts,
             "client_count_status": client_count_status,
+            "health": self._health.summary(_CC_SCOPE),
             "fetched_at": time.time(),
         }
         # Append the hourly snapshot to the 7-day baseline history (self-gated to
         # once per hour) and persist — the stable reference sustained drops flag against.
         self._cc.maybe_snapshot()
+        self._health.save()
 
     # ── on-demand actions (Setup → Central API tab) ─────────────────────────
 
