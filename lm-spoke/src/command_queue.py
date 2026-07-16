@@ -101,6 +101,20 @@ COMMAND_RESULT_RETENTION_SECS = _env_int("CS_COMMAND_RESULT_RETENTION_SECS", 864
 # needless re-sends that double-execute an idempotent-but-noisy op).
 STALE_DELIVERED_SECS = _env_int("CS_STALE_DELIVERED_SECS", 30, 5)
 
+# Verified-report safety net for delete_vm / reclone_vm: a delivered long op
+# that hasn't been TOUCHED (the bridge refreshes updated_at on every ACCEPTED
+# re-ack while the agent is alive) or acked for this long is treated as LOST —
+# the agent crashed, the WS dropped, or the long-op task died with no terminal.
+# The verify-sweep requeues it (bounded) so it genuinely re-runs instead of
+# spinning until the 2h COMMAND_EXPIRE_SECS (the "some VMs never get deleted
+# on a bulk delete" symptom). 5 min/try × 2 tries ≈ 10 min max safety net; a
+# healthy delete finishes in well under a minute so this only fires on real
+# stalls. The bridge's touch keeps a slow-but-alive delete from being penalized.
+DELETE_VERIFY_TIMEOUT_SECS = _env_int("CS_DELETE_VERIFY_TIMEOUT_S", 300, 30)
+DELETE_VERIFY_MAX_RETRIES = _env_int("CS_DELETE_MAX_RETRIES", 2, 1)
+# Actions covered by the verify-report net (the long teardown ops).
+_VERIFY_ACTIONS = {"delete_vm", "reclone_vm"}
+
 # Single-VM actions that take a ``vmid`` arg and must respect the sim range +
 # protected-VMID guard at enqueue time (defense-in-depth; the agent's cs_guard
 # enforces the same at execution).
@@ -506,6 +520,13 @@ class CommandQueue:
             "status": "pending",
             "created_at": now,
             "updated_at": now,
+            # Last REAL agent contact for this command: refreshed by an ACCEPTED
+            # touch (CS_TOUCH_COMMAND from the bridge), a progress frame, or the
+            # terminal ack. NOT refreshed by the 30s stale re-probe or a requeue,
+            # so it ages while the agent is silent and the delete-verify sweep
+            # (DELETE_VERIFY_TIMEOUT_SECS) can bound a lost long op. Old persisted
+            # commands without this key fall back to created_at via .get().
+            "last_contact": now,
             "expires_at": now + COMMAND_EXPIRE_SECS,
             "purge_after": None,
             "result": None,
@@ -659,6 +680,17 @@ class CommandQueue:
                 if cmd.get("status") == "delivered" and \
                         (now - float(cmd.get("updated_at", now))) > STALE_DELIVERED_SECS and \
                         self._command_matches_agent(cmd, hn):
+                    # delete_vm / reclone_vm: the 30s reset is a non-budgeted
+                    # RE-PROBE ("is the agent back yet?"), not a give-up step.
+                    # The few-minutes bound is owned by the verify-sweep below
+                    # (which uses last_contact, not updated_at) so these periodic
+                    # re-probes don't consume the retry budget or refresh the
+                    # verify window. Other actions keep the old bounded behavior.
+                    if cmd.get("action") in _VERIFY_ACTIONS:
+                        cmd["status"] = "pending"
+                        cmd["updated_at"] = now
+                        reset += 1
+                        continue
                     attempts = int(cmd.get("relay_attempts", 0)) + 1
                     cmd["relay_attempts"] = attempts
                     if max_retries > 0 and attempts >= max_retries:
@@ -674,6 +706,48 @@ class CommandQueue:
                         cmd["updated_at"] = now
                         reset += 1
 
+            # Verified-report safety net for delete_vm / reclone_vm: a delivered
+            # long op with no REAL agent contact (ACCEPTED touch / progress /
+            # terminal → last_contact) for longer than DELETE_VERIFY_TIMEOUT_SECS
+            # is LOST. Requeue it (bounded) so it genuinely re-runs — the agent
+            # re-spawns a dead task (liveness-aware dedup) instead of dedup-
+            # suppressing forever. last_contact is NOT refreshed by the 30s
+            # re-probe above, so a silent agent ages toward this bound while a
+            # slow-but-alive delete (re-acked every 30s → touched) does not.
+            verify_requeued = 0
+            verify_gave_up = 0
+            for cmd in self.commands:
+                if cmd.get("status") != "delivered" or \
+                        cmd.get("action") not in _VERIFY_ACTIONS or \
+                        not self._command_matches_agent(cmd, hn):
+                    continue
+                last_contact = float(cmd.get("last_contact",
+                                             cmd.get("updated_at", now)))
+                if (now - last_contact) <= DELETE_VERIFY_TIMEOUT_SECS:
+                    continue
+                attempts = int(cmd.get("relay_attempts", 0)) + 1
+                cmd["relay_attempts"] = attempts
+                if attempts < DELETE_VERIFY_MAX_RETRIES:
+                    cmd["status"] = "pending"
+                    cmd["message"] = (f"no verified report after "
+                                      f"{DELETE_VERIFY_TIMEOUT_SECS}s — requeuing "
+                                      f"(attempt {attempts}/{DELETE_VERIFY_MAX_RETRIES})")
+                    cmd["updated_at"] = now
+                    # Reset the verify window so the re-send gets a fresh
+                    # DELETE_VERIFY_TIMEOUT_SECS to earn a touch/terminal before
+                    # the next attempt — otherwise the sweep would fire on the
+                    # very next poll (last_contact still old) and exhaust the
+                    # budget in seconds, not minutes.
+                    cmd["last_contact"] = now
+                    verify_requeued += 1
+                else:
+                    cmd["status"] = "failed"
+                    cmd["message"] = (f"no verified report after {attempts} "
+                                      f"attempt(s) — gave up")
+                    cmd["updated_at"] = now
+                    cmd["purge_after"] = now + COMMAND_RESULT_RETENTION_SECS
+                    verify_gave_up += 1
+
             pending = [c for c in self.commands
                        if c.get("status") == "pending" and self._command_matches_agent(c, hn)]
             delivered_ids = [c["id"] for c in pending]
@@ -682,7 +756,8 @@ class CommandQueue:
                     cmd["status"] = "delivered"
                     cmd["updated_at"] = now
 
-            if reset or delivered_ids or expired or purged or gave_up:
+            if reset or delivered_ids or expired or purged or gave_up \
+                    or verify_requeued or verify_gave_up:
                 await self._asave()
 
             return {
@@ -692,6 +767,8 @@ class CommandQueue:
                 "reset": reset,
                 "delivered": delivered_ids,
                 "gave_up": gave_up,
+                "verify_requeued": verify_requeued,
+                "verify_gave_up": verify_gave_up,
             }
 
     async def ack_command(self, cmd_id: str, status: str,
@@ -711,6 +788,7 @@ class CommandQueue:
             cmd["message"] = str(message) if message is not None else (cmd.get("message") or "")
             cmd["result"] = result if result is not None else cmd.get("result")
             cmd["updated_at"] = time.time()
+            cmd["last_contact"] = cmd["updated_at"]
             cmd["purge_after"] = cmd["updated_at"] + COMMAND_RESULT_RETENTION_SECS
             await self._asave()
             return {"ok": True, "id": cmd_id, "status": status}
@@ -790,7 +868,11 @@ class CommandQueue:
             if cmd.get("status") != "delivered":
                 return {"ok": True, "id": cmd_id, "status": cmd.get("status"),
                         "touched": False}
-            cmd["updated_at"] = time.time()
+            now = time.time()
+            cmd["updated_at"] = now
+            # Real agent contact (ACCEPTED / progress) → refresh last_contact,
+            # the timestamp the delete-verify sweep watches.
+            cmd["last_contact"] = now
             if message:
                 cmd["message"] = str(message)
             return {"ok": True, "id": cmd_id, "status": "delivered",

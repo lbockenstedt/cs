@@ -5068,30 +5068,70 @@ function csVmFlash(msg) {
 // POST /api/pxmx/shell mints a session; the agent spawns a PTY bash on the host
 // and the browser drives it over /ws/console-shell/{id}. Gated hub-side (opt-in
 // toggle + Global/Tenant admin + audit). xterm via the shared _consoleLoadXterm().
-let _csVmShell = null;
+// One xterm session per in-scope host, keyed by host id. The Terminal tab
+// renders a tab strip (one tab per host) and does NOT auto-connect when
+// several hosts are in scope — the user clicks a tab to open that shell.
+// Single-host scope keeps the old convenient auto-connect.
+let _csVmShell = {};                 // hostId → {term, ws}
+let _csVmShellActiveHost = '';
 async function csRenderVmServerTerminal() {
     csSetToolbar('');
-    const h = csVmSelectedHost();
-    if (!h) { csSet(csEmpty('No host selected.')); return; }
-    const agentId = h.agent_id || '';
-    const hostLabel = h.hostname || csVmHostId(h) || 'pxmx host';
+    csVmShellClose();
+    const hosts = csVmSelectedHosts();
+    if (!hosts.length) { csSet(csEmpty('No host selected.')); return; }
+    const single = hosts.length === 1;
+    const tabs = hosts.map(h => {
+        const id = csVmHostId(h);
+        const label = h.hostname || id || 'pxmx host';
+        return `<button data-cs-term-host="${csEscape(id)}" onclick="csVmShellTab('${csEscape(id)}')"
+            class="cs-term-tab flex items-center gap-1.5 px-3 py-1.5 text-xs font-mono border-b-2 border-transparent text-slate-400 hover:text-slate-200 whitespace-nowrap">
+            ${csOnlineDot(h.spoke_online)}${csEscape(label)}</button>`;
+    }).join('');
+    const bodies = hosts.map(h =>
+        `<div id="cs-vm-term-body-${csEscape(csVmHostId(h))}" class="cs-term-body hidden" style="height:60vh"></div>`
+    ).join('');
     csSet(`<div>${csVmHostBanner()}
       <div class="hpe-card rounded-lg overflow-hidden shadow-sm" style="background:#1e1e1e">
-        <div class="px-4 py-2 flex justify-between items-center bg-[#2d2d2d] text-slate-200">
-          <div class="text-sm font-mono">⌨️ ${csEscape(hostLabel)} — root shell ${helpIcon('cs', null, 'Simulations help')}</div>
-          <button onclick="csVmShellReconnect()" class="text-[11px] px-2 py-1 rounded bg-[#01A982]/10 hover:bg-[#01A982]/20 text-[#01A982] border border-[#01A982] font-bold">↻ Reconnect</button>
+        <div class="flex flex-wrap items-center justify-between bg-[#2d2d2d]">
+          <div class="flex flex-wrap items-center gap-1 px-1">${tabs}</div>
+          <div class="flex items-center gap-2 px-3 py-1.5">
+            <span id="cs-vm-term-status" class="text-[11px] text-slate-400 font-mono">${single ? 'Connecting…' : 'Select a host to connect.'}</span>
+            <button onclick="csVmShellReconnect()" class="text-[11px] px-2 py-1 rounded bg-[#01A982]/10 hover:bg-[#01A982]/20 text-[#01A982] border border-[#01A982] font-bold">↻ Reconnect</button>
+          </div>
         </div>
-        <div id="cs-vm-term-body" style="height:60vh" class="p-1"></div>
-        <div id="cs-vm-term-status" class="px-4 py-1 text-[11px] text-slate-400 bg-[#2d2d2d] font-mono">Connecting…</div>
+        <div class="p-1">${bodies}</div>
       </div></div>`);
-    window.__csVmShellCtx = { agentId };
-    await csVmShellConnect(agentId);
+    if (single) { await csVmShellTab(csVmHostId(hosts[0])); }
 }
 
-async function csVmShellConnect(agentId) {
-    csVmShellClose();
+// Activate a host tab: highlight it, reveal its body, and connect if not
+// already live. Switching tabs does NOT tear down the others — each open
+// shell keeps its PTY so you can hop between hosts without reconnecting.
+window.csVmShellTab = async function (hostId) {
+    _csVmShellActiveHost = hostId;
+    document.querySelectorAll('.cs-term-tab').forEach(b => {
+        const on = b.getAttribute('data-cs-term-host') === hostId;
+        b.classList.toggle('border-[#01A982]', on);
+        b.classList.toggle('text-slate-200', on);
+        b.classList.toggle('text-slate-400', !on);
+    });
+    document.querySelectorAll('.cs-term-body').forEach(el => {
+        el.classList.toggle('hidden', el.id !== 'cs-vm-term-body-' + hostId);
+    });
+    const live = _csVmShell[hostId];
+    if (live && live.ws && live.ws.readyState === 1) {
+        try { live.term.focus(); } catch (e) {}
+        return;
+    }
+    const h = csVmSelectedHosts().find(x => csVmHostId(x) === hostId);
+    if (h) await csVmShellConnect(h.agent_id || '', hostId);
+};
+
+async function csVmShellConnect(agentId, hostId) {
+    if (!hostId) return;
+    csVmShellClose(hostId);
+    const body = document.getElementById('cs-vm-term-body-' + hostId);
     const statusEl = document.getElementById('cs-vm-term-status');
-    const body = document.getElementById('cs-vm-term-body');
     if (!body) return;
     const setStatus = (t) => { if (statusEl) statusEl.textContent = t; };
     const mod = (typeof _consoleLoadXterm === 'function') ? await _consoleLoadXterm() : null;
@@ -5118,17 +5158,23 @@ async function csVmShellConnect(agentId) {
     ws.onclose = (ev) => { setStatus('Disconnected' + (ev.reason ? ': ' + ev.reason : '') + ' — click Reconnect'); try { term.write('\r\n\x1b[33m[disconnected]\x1b[0m\r\n'); } catch (e) {} };
     term.onData(d => { if (ws.readyState === 1) ws.send(d); });
     if (term.onResize) term.onResize(() => sendResize());
-    _csVmShell = { term, ws };
+    _csVmShell[hostId] = { term, ws };
 }
 
-function csVmShellClose() {
-    if (_csVmShell) {
-        try { _csVmShell.ws.close(); } catch (e) {}
-        try { _csVmShell.term.dispose(); } catch (e) {}
-        _csVmShell = null;
-    }
+function csVmShellClose(hostId) {
+    const closeOne = (id) => {
+        const s = _csVmShell[id];
+        if (s) { try { s.ws.close(); } catch (e) {} try { s.term.dispose(); } catch (e) {} delete _csVmShell[id]; }
+    };
+    if (hostId) closeOne(hostId);
+    else { Object.keys(_csVmShell).forEach(closeOne); _csVmShell = {}; _csVmShellActiveHost = ''; }
 }
-function csVmShellReconnect() { csVmShellConnect((window.__csVmShellCtx || {}).agentId); }
+function csVmShellReconnect() {
+    const id = _csVmShellActiveHost;
+    if (!id) return;
+    const h = csVmSelectedHosts().find(x => csVmHostId(x) === id);
+    if (h) csVmShellConnect(h.agent_id || '', id);
+}
 
 // ── USB (certified / uncertified + certify-ignore) ───────────────────────────
 // The cs-spoke relay payload carries each dongle as {vidpid:"vid:pid", name|product,

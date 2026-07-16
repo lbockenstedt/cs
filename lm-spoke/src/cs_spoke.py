@@ -939,6 +939,18 @@ class CSSpoke(BaseSpoke):
                 return {"status": "ERROR", "message": res.get("message", "ack failed")}
             return {"status": "SUCCESS", **res}
 
+        if cmd == "CS_TOUCH_COMMAND":
+            # Hub CSBridgePoller: a long op returned ACCEPTED. Refresh the
+            # delivered command's updated_at + last_contact (in-memory) so the
+            # STALE_DELIVERED reset + the delete-verify sweep don't re-send a
+            # still-running op. See command_queue.touch_command. Surface the
+            # COMMAND's status as queue_status so this handler's own SUCCESS
+            # isn't clobbered by touch_command's status field.
+            res = await self.queue.touch_command(d.get("id"), d.get("message"))
+            return {"status": "SUCCESS", "id": res.get("id"),
+                    "queue_status": res.get("status"),
+                    "touched": res.get("touched")}
+
         if cmd == "CS_REQUEUE_COMMAND":
             # Hub CSBridgePoller: a command's relay to the agent TIMED OUT (the
             # agent was too busy to ACCEPT within CS_RELAY_TIMEOUT_S). Re-queue
