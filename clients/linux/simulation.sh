@@ -18,9 +18,13 @@ source '/usr/local/scripts/ini-parser.sh'
 #------------------------------------------------------------
 echo $$ > /usr/local/scripts/simulation.pid 2>/dev/null || true
 _sim_reload=0
+_sleep_pid=""
 # USR1 (from agent.sh restart_sim / kill_switch) triggers a config re-read
 # on the next outer-loop iteration instead of default-terminating the process.
-trap '_sim_reload=1' USR1
+# If we're inside an interruptible sleep (_isleep, e.g. the offline window),
+# kill that sleep child so the loop wakes immediately and re-reads config — an
+# offline client is otherwise deaf to updates for up to 4h.
+trap '_sim_reload=1; [[ -n "${_sleep_pid:-}" ]] && kill "$_sleep_pid" 2>/dev/null' USR1
 
 require_config_value() {
   local name="$1" value="${2:-}"
@@ -139,6 +143,9 @@ echo Parsing Config File | tee -a ${LOG_FILE}
 kill_switch=$(get_value 'simulation' 'kill_switch')
 rapid_update=$(get_value 'simulation' 'rapid_update')
 sim_load=$(get_value 'simulation' 'sim_load')
+# sim_load MUST be numeric — the `-lt` gate below throws "integer expression
+# expected" on an empty/non-numeric value. Coerce: strip to digits, default 0.
+[[ "$sim_load" =~ ^[0-9]+$ ]] || sim_load=0
 github_repo=$(get_value 'simulation' 'github_repo')
 repo_location=$(get_value 'simulation' 'repo_location')
 site_based_ssid=$(get_value 'simulation' 'site_based_ssid')
@@ -307,6 +314,9 @@ override_keys=(kill_switch sim_load github_repo repo_location site_based_ssid ip
 for key in "${override_keys[@]}"; do
   apply_override "$key"
 done
+# A [username] override can re-set sim_load to non-numeric — re-coerce so the
+# `-lt` gate stays safe.
+[[ "$sim_load" =~ ^[0-9]+$ ]] || sim_load=0
 #------------------------------------------------------------
 #End User/Device Specific Overrides
 #------------------------------------------------------------
@@ -329,7 +339,7 @@ echo Download: $download | tee -a ${LOG_FILE}
 echo Port Flap: $port_flap | tee -a ${LOG_FILE}
 echo Incorrect SSID PW: $ssidpw_fail | tee -a ${LOG_FILE}
 echo ------------------------------| tee -a ${LOG_FILE}
-sleep 5
+_rsleep 5
 #------------------------------------------------------------
 #Checking global kill switch config
 #------------------------------------------------------------
@@ -356,7 +366,14 @@ rn_sim_load=$((1 + RANDOM % 99))
 #changing DHCP Client configuration to send the username as the hostname
 #Pure aesthetics so the usernames in Central look good
 #------------------------------------------------------------
-sudo sed -i "s/gethostname()/\"$(sed_escape "$username")\"/g" /etc/dhcp/dhclient.conf
+# Run ONCE per boot: after the first sed, gethostname() is gone so the
+# substitution is idempotent — but we still forked sudo+sed every cycle for
+# nothing. Guard with a marker so we skip the work once it's done. username
+# never changes, so a single substitution is correct.
+if [[ ! -f /usr/local/scripts/.dhcp_hostname_done ]]; then
+  sudo sed -i "s/gethostname()/\"$(sed_escape "$username")\"/g" /etc/dhcp/dhclient.conf
+  touch /usr/local/scripts/.dhcp_hostname_done 2>/dev/null || true
+fi
 #------------------------------------------------------------
 # WebUI dashboard reporting
 #------------------------------------------------------------
@@ -481,6 +498,62 @@ _wait_wlan_adapter() {
   done
   return 1
 }
+# Wait for the default gateway to answer — replaces the blind `ping -c2 $dfgw`
+# liveness check. _connect_outcome already confirms nmcli reached activated
+# (association + DHCP + IP), so the route is present; the remaining unknown is
+# whether the gateway has answered ARP / is pingable yet. A fixed `ping -c2`
+# can false-negative on a slow ARP (triggering the spurious `continue 2`
+# recovery) or waste time when it's already up. Polls `ping -c1 -W1` and
+# returns 0 the instant it replies, 1 on $1-sec (default 10) timeout.
+_wait_gateway() {
+  local gw="$1" cap="${2:-10}" i
+  [[ -z "$gw" ]] && return 1
+  for ((i=0; i<cap; i++)); do
+    ping -c1 -W1 "$gw" >/dev/null 2>&1 && return 0
+    sleep 1
+  done
+  return 1
+}
+# Is the wlan adapter currently activated (associated + has IP)? Used by the
+# "skip sims but stay associated" path to decide whether a reconnect is actually
+# needed — avoids tearing down a working link every iteration the sim-load gate
+# trips. NM-managed wifi reports STATE=connected once activated.
+_is_wifi_connected() {
+  [[ -n "${wladapter:-}" ]] || return 1
+  nmcli -t -f DEVICE,STATE device status 2>/dev/null | grep -q "^${wladapter}:connected"
+}
+# Randomized sleep — desynchronizes the fleet so 1000 clients don't all step
+# in lockstep. Sleeps a uniformly random duration in [N, 2N]: _rsleep 30 sleeps
+# 30-60s, _rsleep 5 sleeps 5-10s. Used for the pacing/stagger timers only (the
+# poll loops above use a fixed 1s cadence on purpose; the offline window and
+# kill-switch sleep are handled separately).
+_rsleep() {
+  local base="${1:-1}"
+  sleep $(( base + RANDOM % (base + 1) ))
+}
+# Interruptible sleep — broken early by USR1 (the trap kills this sleep child).
+# Used for the offline window so a config update / repurpose lands immediately
+# instead of waiting out up to 4h with the interfaces down (deaf to updates).
+# Returns when the sleep finishes OR USR1 arrives; caller checks _sim_reload.
+_isleep() {
+  local secs="${1:-1}"
+  sleep "$secs" & _sleep_pid=$!
+  wait "$_sleep_pid" 2>/dev/null || true
+  _sleep_pid=""
+}
+# Fire apt_update.sh once per outer cycle, the FIRST time we know the network is
+# up — not blindly at the end of the loop (which may be after the network
+# dropped or after the offline sleep). _apt_done is reset once per outer cycle;
+# the first caller launches apt_update.sh in the background and sets the guard,
+# every later caller no-ops. The end-of-cycle call is the "at least once per
+# cycle" fallback for the case where the network never came up.
+_run_apt_once() {
+  if [[ "${_apt_done:-0}" == 0 ]]; then
+    echo Running Updates | tee -a ${LOG_FILE}
+    bash /usr/local/scripts/apt_update.sh &
+    _apt_done=1
+  fi
+}
 connect_wifi() {
   # An 802.1X (enterprise) SSID is flagged by ssid=="1X" in the Pool/SSID matrix —
   # route it to connect_1x(); every other SSID is PSK below.
@@ -497,7 +570,7 @@ connect_wifi() {
   # Event-driven: returns the instant nmcli finishes activating (success) or the
   # AP drops the link (failure) — no blind `nmcli -w $1` wait for the whole window.
   nmcli -w "$1" device wifi connect "$target_ssid" password "$ssidpw" >/dev/null 2>&1 &
-  _connect_outcome "$1" $! || true
+  _connect_outcome "$1" $!
 }
 #------------------------------------------------------------
 #Fast WiFi connection for the wrong-PSK (ssidpw_fail) loop
@@ -601,7 +674,7 @@ _connect_1x_core() {
   # Both fast (wrong-password) and normal paths use the same watcher — the bad
   # password is what makes the fast path fail fast on the deauth event.
   nmcli -w "$wait_time" connection up "$target_ssid" >/dev/null 2>&1 &
-  _connect_outcome "$wait_time" $! || true
+  _connect_outcome "$wait_time" $!
 }
 #------------------------------------------------------------
 #Connection management
@@ -637,7 +710,7 @@ run_simulation() {
  local sleep_time=$2
  if [ -f "/usr/local/scripts/$script" ]; then
   nohup bash "/usr/local/scripts/$script" >> /usr/local/scripts/sim.log 2>&1 &
-  sleep $sleep_time
+  _rsleep "$sleep_time"
  fi
 }
 #------------------------------------------------------------
@@ -651,7 +724,11 @@ run_simulation() {
 #------------------------------------------------------------
 #Attempting WiFi connection
 #------------------------------------------------------------
-connect_wifi 30
+# Ethernet sims don't use wifi — skip the association+teardown so we don't key
+# the radio and burn a full connect cycle just to immediately shut it down.
+if [[ "$sim_phy" != "ethernet" ]]; then
+  connect_wifi 30
+fi
 #------------------------------------------------------------
 #Dumping Current Device List
 #------------------------------------------------------------
@@ -661,15 +738,19 @@ if [[ "$sim_phy" == "wireless" ]]; then ea_down; fi
 #------------------------------------------------------------
 #Checking to see if the default gateway is reachable
 #------------------------------------------------------------
+_apt_done=0
+gateway_reachable=false
 wladapter=$(ip -br a | grep "wlx\|wlan" | cut -d ' ' -f '1')
 sudo rfkill unblock wifi; sudo rfkill unblock all
 dfgw=$(ip route | grep -oP 'default via \K\S+')
-if ping -c2 "$dfgw"; then gw_ok=true; else gw_ok=false; fi
+if _wait_gateway "$dfgw"; then gw_ok=true; else gw_ok=false; fi
 if [[ "$sim_phy" == "wireless" ]]; then
   # Wireless still requires the wlan adapter to be present; on failure
   # reconnect the WiFi as before.
   if [[ "$gw_ok" == true && -n "${wladapter}" ]]; then
     echo Successful network connection | tee -a ${LOG_FILE}
+    gateway_reachable=true
+    _run_apt_once
   else
     echo Network connection failed | tee -a ${LOG_FILE}
     _wait_wlan_adapter 15   # was: blind `sleep 15` — polls until the adapter appears
@@ -680,6 +761,8 @@ else
   # Ethernet just needs the gateway ping to succeed — no WiFi fallback.
   if [[ "$gw_ok" == true ]]; then
     echo Successful network connection | tee -a ${LOG_FILE}
+    gateway_reachable=true
+    _run_apt_once
   else
     echo Network connection failed | tee -a ${LOG_FILE}
   fi
@@ -690,8 +773,12 @@ fi
 if [[ "$sim_load" -lt "$rn_sim_load" ]]; then
   echo Simulation load under threshold | tee -a ${LOG_FILE}
   echo Skipping Simulations but staying associated | tee -a ${LOG_FILE}
-  if [[ "$ssidpw_fail" != "on" ]] && [[ -n ${wladapter} ]]; then
-    manage_connection up 180   # event-driven: returns on activation (no post-connect sleep needed)
+  if [[ "$ssidpw_fail" != "on" ]] && [[ -n ${wladapter} ]] && ! _is_wifi_connected; then
+    # Only reconnect if we're NOT already associated. manage_connection up is
+    # event-driven (iw event + nmcli exit) — the 180 is just the silent-AP
+    # backstop, not a blind wait: it returns the instant activation completes or
+    # the AP deauths.
+    manage_connection up 180
   fi
 fi
 #------------------------------------------------------------
@@ -701,6 +788,16 @@ echo Kill Switch is $kill_switch | tee -a ${LOG_FILE}
 if [ "$kill_switch" != "on" ]; then
  # Snapshot the config's mtime so the loop can spot a pushed change mid-cycle.
  _cfg_mtime=$(stat -c %Y /usr/local/scripts/simulation.conf 2>/dev/null)
+ # Pick up to 5 random iteration indices (1..100) to open a web page on, so the
+ # fleet spreads web traffic across the loop instead of opening a single page at
+ # the first iteration. The page just generates a request for stats — it does
+ # nothing with the content and may hang; all instances are killed at loop end.
+ declare -a _www_iters=()
+ if [[ "$www_traffic" == "on" ]]; then
+  for (( _wi=0; _wi<5; _wi++ )); do
+   _www_iters+=("$(( 1 + RANDOM % 100 ))")
+  done
+ fi
  for z in {1..100}; do
   #------------------------------------------------------------
   # Rapid update — MUST fire every iteration REGARDLESS of which
@@ -795,6 +892,11 @@ if [ "$kill_switch" != "on" ]; then
    #Resetting the WIFI Password so it can connect correctly for updates/maintenance
    #------------------------------------------------------------
    ssidpw=$(get_value $username 'ssidpw'); [[ -z "$ssidpw" ]] && ssidpw=$(get_value $simulation_id 'ssidpw')
+   # Restore dot1x_password too — the fail loop corrupts it for 1X clients
+   # (${real_dot1x}_fail), and without a restore the maintenance connect_wifi 5
+   # below would authenticate with the bad password. Falls back to [simulation]
+   # (dot1x_password lives there, not in [s0-s9]).
+   dot1x_password=$(get_value $username 'dot1x_password'); [[ -z "$dot1x_password" ]] && dot1x_password=$(get_value 'simulation' 'dot1x_password')
    connect_wifi 5
    #------------------------------------------------------------
    #End SSID Incorrect Password Simualtion or Auth Failure Simulation
@@ -804,17 +906,19 @@ if [ "$kill_switch" != "on" ]; then
    #If SSID Incorrect Password Sim is not triggered then check
    #for the other simualtions
    #------------------------------------------------------------
-   if ! ping -c2 "$dfgw"; then
+   _conn_ok=0
+   if ! _wait_gateway "$dfgw"; then
      echo Attempting to reset adapter | tee -a ${LOG_FILE}
      _wait_wlan_adapter 15   # was: blind `sleep 15` — polls until the adapter appears
      delete_matching_connections
+     # Event-driven success signal: connect_wifi returns 0 only when nmcli reaches
+     # activated (association + DHCP + IP) — the same iw-event outcome we trust
+     # everywhere else. Replaces the blind `ping -c2 $dfgw` re-check below.
      connect_wifi 180
+     _conn_ok=$?
      echo WLAN Adapter name $wladapter | tee -a ${LOG_FILE}
     fi
-    dfgw=$(ip route | grep -oP 'default via \K\S+')
-    if ping -c2 "$dfgw"; then
-     echo Successful network connection | tee -a ${LOG_FILE}
-    else
+    if [[ "$_conn_ok" -ne 0 ]]; then
     echo Connection failed muiltiple times | tee -a ${LOG_FILE}
     echo Resetting configuration | tee -a ${LOG_FILE}
     #------------------------------------------------------------
@@ -824,26 +928,41 @@ if [ "$kill_switch" != "on" ]; then
     #------------------------------------------------------------
     #Looping Script - Network Connectivity Failed
     #------------------------------------------------------------
+    gateway_reachable=false
     continue 2
    fi
+   echo Successful network connection | tee -a ${LOG_FILE}
+   gateway_reachable=true
+   _run_apt_once
    #------------------------------------------------------------
    #End Connecting to Network
    #------------------------------------------------------------
    #Running WWW Traffic Simulation
    #------------------------------------------------------------
-    if [[ "$www_traffic" == "on" ]]; then
-     echo Running WWW Traffic simulation
+    if [[ "$www_traffic" == "on" ]] && [[ " ${_www_iters[*]} " == *" $z "* ]]; then
+     echo Running WWW Traffic simulation | tee -a ${LOG_FILE}
      wwwfile=($(< /usr/local/scripts/websites.txt))
-     rn_www=$((RANDOM % ${#wwwfile[@]}))
-     url="${wwwfile[$rn_www]}"
+     if [[ ${#wwwfile[@]} -eq 0 ]]; then
+      echo "No websites listed in /usr/local/scripts/websites.txt — skipping" | tee -a ${LOG_FILE}
+     else
+      rn_www=$((RANDOM % ${#wwwfile[@]}))
+      url="${wwwfile[$rn_www]}"
      echo $(date) | tee -a ${LOG_FILE}
      echo ------------------------------| tee -a ${LOG_FILE}
      echo Phy: $sim_phy | tee -a ${LOG_FILE}
      echo Simulation Load: $sim_load | tee -a ${LOG_FILE}
      echo Website: $url | tee -a ${LOG_FILE}
      echo ------------------------------| tee -a ${LOG_FILE}
-     cpulimit -l 25 -- firefox-esr --headless "$url" &
-     www_traffic=off
+     # cpulimit is installed by apt_update.sh, which runs at the END of the outer
+     # loop — so on a fresh box it may not be present yet on the first cycle. Fall
+     # back to a plain launch so the stats request always fires; the throttle is a
+     # nice-to-have, not required for the page to generate its request.
+     if command -v cpulimit >/dev/null 2>&1; then
+      cpulimit -l 10 -- firefox-esr --headless "$url" &
+     else
+      firefox-esr --headless "$url" >/dev/null 2>&1 &
+     fi
+     fi
     fi
    #------------------------------------------------------------
    #End WWW Traffic Simulation
@@ -901,9 +1020,9 @@ if [ "$kill_switch" != "on" ]; then
    # every client regardless of simulation — see above.)
    #------------------------------------------------------------
    report_status $z
-   echo Sleeping for 5 seconds | tee -a ${LOG_FILE}
+   echo Sleeping for 5-10 seconds | tee -a ${LOG_FILE}
    echo Loop iteration $z of 100 | tee -a ${LOG_FILE}
-   sleep 5
+   _rsleep 5
    #------------------------------------------------------------
    #End of 100 Loop Count
    #------------------------------------------------------------
@@ -924,15 +1043,19 @@ fi
 #Killing Firefox simulation
 #------------------------------------------------------------
 echo Closing Firefox | tee -a ${LOG_FILE}
-pkill -f firefox &
+# Scoped to our headless instances (firefox-esr --headless) so we never touch an
+# interactive firefox, and to the cpulimit wrappers that spawn them. Foreground
+# so the kill is confirmed before we proceed to apt_update / offline sleep.
+pkill -f 'firefox-esr.*--headless' || true
 #------------------------------------------------------------
-#End Kill switch Check 
+#End Kill switch Check
 #------------------------------------------------------------
 #------------------------------------------------------------
-#Running apt update & apt upgrade
+#Running apt update & apt upgrade — fallback: if the network never came up
+# this cycle (so _run_apt_once never fired above), attempt it once here so the
+# box still tries to patch each cycle. No-ops if it already ran.
 #------------------------------------------------------------
-echo Running Updates | tee -a ${LOG_FILE}
-bash /usr/local/scripts/apt_update.sh &
+_run_apt_once
 if [[ "$allow_offline" == "yes" ]]; then
   #------------------------------------------------------------
   #Bringing all interfaces down to make it look like the device is offline.
@@ -941,12 +1064,15 @@ if [[ "$allow_offline" == "yes" ]]; then
   echo Bringing all interfaces down | tee -a ${LOG_FILE}
   if [[ -n ${wladapter} ]]; then sudo ip link set dev $wladapter down; fi
   if [[ -n ${eadapter} ]]; then sudo ip link set dev $eadapter down; fi
-  echo Sleeping for $rn_offline_time seconds
+  echo Sleeping for $rn_offline_time seconds \(interruptible by update signal\)
   echo ------------------------------| tee -a ${LOG_FILE}
   #------------------------------------------------------------
-  #Sleep for up to 4 hours to show the device left
+  #Sleep for up to 4 hours to show the device left. Interruptible: a USR1 from
+  #agent.sh (restart_sim / kill_switch) kills this sleep early so a pushed
+  #config change / repurpose lands immediately instead of after the offline
+  #window — the interfaces come back up below and the outer loop re-reads config.
   #------------------------------------------------------------
-  sleep $rn_offline_time
+  _isleep "$rn_offline_time"
   #------------------------------------------------------------
   #Bringing all interfaces back up to call home/update scripts
   #------------------------------------------------------------

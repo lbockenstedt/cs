@@ -1,7 +1,7 @@
 #!/bin/bash
 version=.05
 log="/usr/local/scripts/sim.log"
-debug="/usr/local/scripts/debug-update.log"
+debug="/usr/local/scripts/debug-dns-fail.log"
 echo DNS Failure Script Version $version | tee "$debug"
 #------------------------------------------------------------
 # Verbose / manual mode: pass --verbose (or export VERBOSE=1) to watch each

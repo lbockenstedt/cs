@@ -1,7 +1,7 @@
 #!/bin/bash
 version=.01
 log="/usr/local/scripts/sim.log"
-debug="/usr/local/scripts/debug-update.log"
+debug="/usr/local/scripts/debug-dhcp-fail.log"
 echo "DHCP Fail Script Version $version" | tee "$debug"
 #------------------------------------------------------------
 # dhcp_fail — intentional DHCP-failure generator (replaces the old MAC spoof).

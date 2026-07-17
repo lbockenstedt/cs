@@ -116,9 +116,16 @@ fi
 #------------------------------------------------------------
 #Scheduling Reboot
 #------------------------------------------------------------
-rn=$(($reboot_schedule + RANDOM % 600))
-echo Scheduling reboot $rn minutes | tee -a /usr/local/scripts/sim.log
-shutdown -r $rn
+# reboot_schedule is in MINUTES. Guard: if it's missing/non-numeric/<=0, skip
+# scheduling (an empty value used to eval as 0 → shutdown -r +0 = immediate
+# reboot). shutdown -r +N schedules N minutes from now (a bare N is seconds).
+if [[ "$reboot_schedule" =~ ^[0-9]+$ ]] && (( reboot_schedule > 0 )); then
+  rn=$(( reboot_schedule + RANDOM % 600 ))
+  echo Scheduling reboot $rn minutes | tee -a /usr/local/scripts/sim.log
+  shutdown -r +$rn
+else
+  echo "Skipping reboot schedule (reboot_schedule missing/invalid: '${reboot_schedule}')" | tee -a /usr/local/scripts/sim.log
+fi
 #Making sure eth0 and wlan0 are online
 echo Bringing up all interfaces online | tee -a /usr/local/scripts/sim.log
 #------------------------------------------------------------
