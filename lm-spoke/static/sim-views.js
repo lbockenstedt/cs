@@ -3836,6 +3836,26 @@ async function csRenderSetupCentralApi() {
         ${f('cs-csc-clientsecret', 'Client Secret', hc.client_secret, 'password')}
         ${f('cs-csc-accesstoken', 'Access Token (classic)', hc.access_token, 'password')}
         ${f('cs-csc-refreshtoken', 'Refresh Token (classic)', hc.refresh_token, 'password')}
+        <div class="md:col-span-2 mt-1 pt-3 border-t border-slate-200">
+          <p class="text-xs font-bold text-slate-500 uppercase tracking-wider mb-1">Client-count check thresholds</p>
+          <p class="text-[11px] text-slate-400 mb-2">Controls how the <b>Steady Client Count</b> dashboard check colours a site. Two independent rules: a drop vs the recent hourly average, and a sustained fall below the site's historical peak.</p>
+        </div>
+        <label class="text-xs text-slate-500">Warning — drop vs recent average (%)
+          <input id="cs-csc-cc-warn" type="number" min="0" max="100" step="1" value="${(hc.cc_thresholds && hc.cc_thresholds.warn_pct != null) ? hc.cc_thresholds.warn_pct : 20}" class="w-full bg-white border border-slate-300 rounded-md px-3 py-2 text-sm mt-1">
+          <span class="block text-[11px] text-slate-400 mt-1">Amber when a site's count is this % below its last-hour average (default 20).</span>
+        </label>
+        <label class="text-xs text-slate-500">Error — drop vs recent average (%)
+          <input id="cs-csc-cc-error" type="number" min="0" max="100" step="1" value="${(hc.cc_thresholds && hc.cc_thresholds.error_pct != null) ? hc.cc_thresholds.error_pct : 50}" class="w-full bg-white border border-slate-300 rounded-md px-3 py-2 text-sm mt-1">
+          <span class="block text-[11px] text-slate-400 mt-1">Red when the drop reaches this % (default 50; kept ≥ warning).</span>
+        </label>
+        <label class="text-xs text-slate-500">Sustained die-off — % of peak
+          <input id="cs-csc-cc-dieoff" type="number" min="0" max="100" step="1" value="${(hc.cc_thresholds && hc.cc_thresholds.die_off_pct != null) ? hc.cc_thresholds.die_off_pct : 20}" class="w-full bg-white border border-slate-300 rounded-md px-3 py-2 text-sm mt-1">
+          <span class="block text-[11px] text-slate-400 mt-1">Red when the hourly average falls below this % of the 7/30-day peak, even without a fresh drop (default 20). <b>Set 0 to disable</b> — this is the rule that reddens sites sitting well below their peak.</span>
+        </label>
+        <label class="text-xs text-slate-500">Die-off — minimum peak (clients)
+          <input id="cs-csc-cc-minpeak" type="number" min="1" step="1" value="${(hc.cc_thresholds && hc.cc_thresholds.min_peak != null) ? hc.cc_thresholds.min_peak : 5}" class="w-full bg-white border border-slate-300 rounded-md px-3 py-2 text-sm mt-1">
+          <span class="block text-[11px] text-slate-400 mt-1">Only arm die-off when the peak is at least this many clients, so a quiet site can't false-trigger (default 5).</span>
+        </label>
       </div>
       <div class="flex gap-2 mt-4">
         <button onclick="csSaveCentralConn()" class="bg-[#01A982] hover:bg-[#018a6c] text-white px-4 py-2 rounded-md text-sm font-bold">Save Connection</button>
@@ -4008,6 +4028,15 @@ window.csSaveCentralConn = async function () {
     if (v('cs-csc-clientsecret')) hub_central_config.client_secret = v('cs-csc-clientsecret');
     if (v('cs-csc-accesstoken'))  hub_central_config.access_token  = v('cs-csc-accesstoken');
     if (v('cs-csc-refreshtoken')) hub_central_config.refresh_token = v('cs-csc-refreshtoken');
+    // Client-count check thresholds → central_config.cc_thresholds. Sent as-is;
+    // the hub coerces + clamps (warn/error 0-100, error≥warn, die-off 0-100, peak≥1).
+    const _ccNum = (id, dflt) => { const n = parseFloat(v(id)); return isNaN(n) ? dflt : n; };
+    hub_central_config.cc_thresholds = {
+        warn_pct: _ccNum('cs-csc-cc-warn', 20),
+        error_pct: _ccNum('cs-csc-cc-error', 50),
+        die_off_pct: _ccNum('cs-csc-cc-dieoff', 20),
+        min_peak: _ccNum('cs-csc-cc-minpeak', 5),
+    };
     try {
         const r = await csFetch('/aggregate/central', { method: 'POST', body: JSON.stringify({ mode, hub_central_config }) });
         csPushToast(r, 'Saved');

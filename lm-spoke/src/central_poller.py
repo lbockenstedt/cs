@@ -55,6 +55,34 @@ _CC_KEYSEP = "\x1f"
 _CC_SCOPE = "_"  # single-tenant spoke → one fixed scope key
 
 
+def _cc_thresholds(central_config):
+    """Per-tenant client-count CHECK thresholds, read from
+    ``central_config['cc_thresholds']`` (Setup → Central API) with the module
+    defaults as fallback and clamped to sane ranges. Keys: ``warn_pct`` /
+    ``error_pct`` = amber/red when the count is that % below the recent hourly
+    average; ``die_off_pct`` = red when the hourly average falls below that % of
+    the rolling 7/30-day peak (0 disables the die-off rule); ``min_peak`` = the
+    peak floor that arms the die-off rule. Returns resolved values with the
+    die-off as a 0-1 fraction; ``error_pct`` is coerced up to ``warn_pct`` so red
+    can never trip before amber. Mirror of the lm central_hub_poller copy."""
+    t = (central_config or {}).get("cc_thresholds") or {}
+
+    def _num(val, dflt, lo, hi):
+        try:
+            x = float(val)
+        except (TypeError, ValueError):
+            return dflt
+        return max(lo, min(hi, x))
+
+    warn = _num(t.get("warn_pct"), _CC_WARN_PCT, 0.0, 100.0)
+    err = _num(t.get("error_pct"), _CC_ERROR_PCT, 0.0, 100.0)
+    if err < warn:
+        err = warn
+    die = _num(t.get("die_off_pct"), _CC_MAX_FRACTION * 100.0, 0.0, 100.0) / 100.0
+    peak = int(_num(t.get("min_peak"), _CC_MAX_MIN_PEAK, 1, 1_000_000))
+    return {"warn_pct": warn, "error_pct": err, "die_off_frac": die, "min_peak": peak}
+
+
 class ClientCountTracker:
     """Per-(scope, wsite) client-count baseline + drop detection, ported
     faithfully from the source webui-spoke (server.py ``_client_count_payload`` /
@@ -112,14 +140,22 @@ class ClientCountTracker:
         cutoff = now - _CC_WINDOW
         self._samples[key] = [s for s in samples if s[0] >= cutoff]
 
-    def entry(self, scope: str, wsite: str, central_site: str) -> Dict[str, Any]:
+    def entry(self, scope: str, wsite: str, central_site: str, thresholds=None) -> Dict[str, Any]:
         """Per-site client-count status (doubles as a dashboard CHECK). Tiered:
-          - WITHIN-HOUR drop (current vs the last-hour average): WARNING at >20%
-            below, ERROR at >50% below — catches sim-client die-off inside the hour.
-          - SUSTAINED die-off: the current hour < 20% (``_CC_MAX_FRACTION``) of the
-            7-DAY or 30-DAY rolling PEAK (max hourly-avg) → ERROR. Gated on a peak
-            of at least ``_CC_MAX_MIN_PEAK`` so a quiet site can't false-trigger.
-        The 7d/30d peaks are recorded for display regardless of status."""
+          - WITHIN-HOUR drop (current vs the last-hour average): WARNING / ERROR
+            at ``warn_pct`` / ``error_pct`` below — catches sim-client die-off
+            inside the hour.
+          - SUSTAINED die-off: the current hour < ``die_off_frac`` of the 7-DAY or
+            30-DAY rolling PEAK (max hourly-avg) → ERROR. Gated on a peak of at
+            least ``min_peak`` so a quiet site can't false-trigger; die_off_frac=0
+            disables it.
+        ``thresholds`` (from _cc_thresholds → central_config) overrides the module
+        defaults per tenant. The 7d/30d peaks are recorded regardless of status."""
+        _t = thresholds or {}
+        warn_pct = _t.get("warn_pct", _CC_WARN_PCT)
+        error_pct = _t.get("error_pct", _CC_ERROR_PCT)
+        die_off_frac = _t.get("die_off_frac", _CC_MAX_FRACTION)
+        min_peak = _t.get("min_peak", _CC_MAX_MIN_PEAK)
         now = time.time()
         key = self._key(scope, wsite)
         samples = self._samples.get(key, [])
@@ -142,14 +178,15 @@ class ClientCountTracker:
                 drop_pct = max(0.0, (hourly_avg - current) / hourly_avg * 100.0)
             else:
                 drop_pct = 0.0
-            if drop_pct > _CC_ERROR_PCT:
+            if drop_pct > error_pct:
                 status = "error"
-            elif drop_pct > _CC_WARN_PCT:
+            elif drop_pct > warn_pct:
                 status = "warning"
             else:
                 status = "ok"
-            if ((max_7day >= _CC_MAX_MIN_PEAK and hourly_avg < _CC_MAX_FRACTION * max_7day)
-                    or (max_30day >= _CC_MAX_MIN_PEAK and hourly_avg < _CC_MAX_FRACTION * max_30day)):
+            if (die_off_frac > 0
+                    and ((max_7day >= min_peak and hourly_avg < die_off_frac * max_7day)
+                         or (max_30day >= min_peak and hourly_avg < die_off_frac * max_30day))):
                 status = "error"
         return {"site_name": central_site, "current": current,
                 "hourly_avg": round(hourly_avg, 1), "drop_pct": round(drop_pct, 1),
@@ -334,6 +371,7 @@ class CentralPoller:
         if not self._client or not self._client.is_configured():
             self.spoke.central_status = {}
             return
+        cc_thresh = _cc_thresholds(self.spoke.local_store.get_central_config())
         sites_cfg = self.spoke.local_store.get_central_sites_config()
         site_mappings: Dict[str, str] = sites_cfg.get("site_mappings") or {}
         monitored: list = sites_cfg.get("monitored_checks") or []
@@ -393,7 +431,7 @@ class CentralPoller:
             status[wireless_site] = checks
             current = int(data.get("client_count", 0) or 0)
             self._cc.record(_CC_SCOPE, wireless_site, current)
-            cc_entry = self._cc.entry(_CC_SCOPE, wireless_site, central_site)
+            cc_entry = self._cc.entry(_CC_SCOPE, wireless_site, central_site, cc_thresh)
             # Break out wired vs wireless (Central reports both; total = their sum).
             cc_entry["wired"] = int(data.get("wired_clients", 0) or 0)
             cc_entry["wireless"] = int(data.get("wireless_clients", 0) or 0)
