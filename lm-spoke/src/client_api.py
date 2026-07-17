@@ -29,6 +29,7 @@ agent fetches ``/api/client/key`` first when a key is set.
 
 from __future__ import annotations
 
+import copy
 import logging
 import secrets
 from pathlib import Path
@@ -249,22 +250,71 @@ def build_client_api_app(spoke) -> FastAPI:
         return {"client_api_key": _client_key(spoke)}
 
     # ── config delivery ────────────────────────────────────────────────────
+    # /api/config render cache. Every client fetch used to deep-copy BOTH
+    # parsers (sim_config.load_configs), merge every user-overrides section and
+    # render the full INI — per request, for every rapid_update poll of every
+    # client. Two layers now:
+    #   1. _config_base: the load_configs pair with user-overrides merged into
+    #      the sim parser, rebuilt only when the config files' mtime key moves
+    #      (sim_config.configs_cache_key). The pair is canonical — the user
+    #      parser is only ever READ; the sim parser is deep-copied per render.
+    #   2. _cfg_text_cache: the final rendered text per hostname, keyed by
+    #      (base key, local-store fingerprint, overrides, resolved site) — a
+    #      repeat fetch with unchanged state returns cached bytes untouched.
+    # The per-request mutation SEQUENCE below is unchanged from the uncached
+    # code, so a rendered response is byte-identical to the old path (pinned by
+    # tests/test_config_render_cache.py).
+    _cfg_base: Dict[str, Any] = {"key": None, "sim": None, "user": None}
+    _cfg_text_cache: Dict[str, tuple] = {}
+    _CFG_TEXT_CACHE_MAX = 5000
+
+    def _config_base(base_key):
+        if _cfg_base["key"] != base_key:
+            sim_conf, user_conf = sim_config.load_configs(CONFIGS_DIR)
+            # Merge the file-based user-overrides.conf [username] sections INTO
+            # the served config. The client parses ONLY simulation.conf, and its
+            # apply_override() reads per-user overrides via `get_value $username`
+            # from those [username] sections — so they must be present in the
+            # delivered config. Later keys win (user-overrides is authoritative
+            # over the base bucket).
+            for section in user_conf.sections():
+                if not sim_conf.has_section(section):
+                    sim_conf.add_section(section)
+                for k, v in user_conf.items(section):
+                    sim_conf.set(section, k, v)
+            _cfg_base["key"] = base_key
+            _cfg_base["sim"] = sim_conf
+            _cfg_base["user"] = user_conf
+            _cfg_text_cache.clear()
+        return _cfg_base["sim"], _cfg_base["user"]
+
+    def _local_store_fingerprint():
+        """Everything the [simulation] serve-time overlay reads from the local
+        store, flattened for the render-cache key. A read failure returns a
+        unique object so that request bypasses (and does not poison) the
+        cache."""
+        ls = getattr(spoke, "local_store", None)
+        if ls is None:
+            return ("no-local-store",)
+        try:
+            return (
+                tuple(sorted((str(k), bool(v)) for k, v in (ls.get_random_pool() or {}).items())),
+                tuple(str(s) for s in (ls.get_randomizable_sims() or [])),
+                tuple(sorted((str(k), str(v)) for k, v in (ls.get_sim_knob_overrides() or {}).items())),
+                ls.get_ambient_pct(),
+                bool(ls.get_ambient_control()),
+                tuple(sorted((str(k), str(v)) for k, v in (ls.get_ambient_site_weights() or {}).items())),
+                tuple(sorted((str(k), str(v)) for k, v in (ls.get_ambient_weights() or {}).items())),
+            )
+        except Exception:  # noqa: BLE001
+            return object()
+
     @app.get("/api/config")
     async def api_config(hostname: str = Query("")) -> PlainTextResponse:
-        sim_conf, user_conf = sim_config.load_configs(CONFIGS_DIR)
-        # Merge the file-based user-overrides.conf [username] sections INTO the
-        # served config. The client parses ONLY simulation.conf, and its
-        # apply_override() reads per-user overrides via `get_value $username`
-        # from those [username] sections — so they must be present in the
-        # delivered config. The port loaded user-overrides.conf (user_conf) but
-        # never included it in the rendered output, silently dropping every
-        # file-based per-user override (site/phy/sim_id/ssid/…). Later keys win
-        # (user-overrides is authoritative over the base bucket).
-        for section in user_conf.sections():
-            if not sim_conf.has_section(section):
-                sim_conf.add_section(section)
-            for k, v in user_conf.items(section):
-                sim_conf.set(section, k, v)
+        base_key = sim_config.configs_cache_key(CONFIGS_DIR)
+        # base_sim is canonical (deep-copied before mutation below);
+        # user_conf is canonical and READ-ONLY from here on.
+        base_sim, user_conf = _config_base(base_key)
         overrides: Dict[str, str] = {}
         if hostname and spoke.registry is not None:
             entry = spoke.registry.get(hostname)
@@ -308,6 +358,19 @@ def build_client_api_app(spoke) -> FastAPI:
             _un = sim_config.username_for(hostname)
             if user_conf.has_section(_un):
                 resolved_site = str(user_conf.get(_un, "wsite", fallback="") or "").strip()
+        # Render cache: everything below is deterministic given (config files,
+        # local-store state, overrides, resolved site) — serve the cached bytes
+        # when nothing changed for this client.
+        _ls_fp = _local_store_fingerprint()
+        _cache_key = (base_key, _ls_fp, hostname,
+                      tuple(sorted((str(k), str(v)) for k, v in overrides.items())),
+                      resolved_site)
+        _hit = _cfg_text_cache.get(hostname)
+        if _hit is not None and _hit[0] == _cache_key:
+            return PlainTextResponse(_hit[1])
+        # Miss: ONE deepcopy of the merged base (instead of load_configs' two +
+        # the re-merge), then the identical mutation sequence as before.
+        sim_conf = copy.deepcopy(base_sim)
         # Deliver the ambient random-pool policy for this site + the randomizable
         # sim set as [simulation] globals the client rotation reads (Slice 5).
         try:
@@ -407,6 +470,9 @@ def build_client_api_app(spoke) -> FastAPI:
             text = sim_config.render_ini_for_client(sim_conf, hostname, None)
         else:
             text = sim_config.render_ini_for_client(sim_conf, hostname, overrides or None)
+        if len(_cfg_text_cache) >= _CFG_TEXT_CACHE_MAX:
+            _cfg_text_cache.clear()
+        _cfg_text_cache[hostname] = (_cache_key, text)
         return PlainTextResponse(text)
 
     @app.get("/api/config/overrides")

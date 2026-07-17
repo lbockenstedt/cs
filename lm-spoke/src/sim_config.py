@@ -140,6 +140,21 @@ def _mtime_ns(path: Path) -> int:
         return 0
 
 
+def configs_cache_key(config_dir: os.PathLike | str
+                      ) -> Tuple[str, Tuple[int, int, int, int, int]]:
+    """The mtime-tuple cache key for *config_dir* — the same key
+    :func:`load_configs` uses internally. Exposed so callers layering their own
+    derived caches on top (client_api's /api/config render cache) can key them
+    to the exact generation of the underlying config files. Cheap: one ``stat``
+    per file."""
+    d = Path(config_dir)
+    return (str(d), (_mtime_ns(d / "simulation.conf"),
+                     _mtime_ns(d / "user-overrides.conf"),
+                     _mtime_ns(d / "hub-sim-overrides.conf"),
+                     _mtime_ns(d / "hub-user-overrides.conf"),
+                     _mtime_ns(d / "hub-config-source")))
+
+
 def load_configs(config_dir: os.PathLike | str) -> Tuple[configparser.ConfigParser, configparser.ConfigParser]:
     """Load ``(simulation.conf, user-overrides.conf)`` from *config_dir*.
 
@@ -167,8 +182,7 @@ def load_configs(config_dir: os.PathLike | str) -> Tuple[configparser.ConfigPars
     hsim_path = d / "hub-sim-overrides.conf"
     huser_path = d / "hub-user-overrides.conf"
     src_path = d / "hub-config-source"
-    key = (str(d), (_mtime_ns(sim_path), _mtime_ns(user_path),
-                    _mtime_ns(hsim_path), _mtime_ns(huser_path), _mtime_ns(src_path)))
+    key = configs_cache_key(d)
     cached = _LOAD_CACHE.get(key)
     if cached is not None:
         return copy.deepcopy(cached[0]), copy.deepcopy(cached[1])
