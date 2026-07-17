@@ -1,0 +1,114 @@
+"""Shared client-row builder for the two Clients views.
+
+``control_plane._cs_telemetry_relay_loop`` (hub telemetry) and
+``local_ui_routes.aggregate_clients`` (local dashboard) both built the
+identical ~75-line client row — each carrying a "mirrors the other path"
+comment. This module is the single source: both callers now call
+:func:`build_client_rows` and add only their own envelope fields
+(``payload["clients"]`` vs the per-row ``spoke_*`` keys).
+
+Row semantics (unchanged from both originals):
+
+* ``online`` — last_seen within 300 s.
+* Sim-ID / Site / PHY resolved server-side from the hostname's bucket profile
+  (``sim_config.effective_client_fields``) — the client's own report can be
+  stale ("sl" from the old character-position hashing) or incomplete.
+* Tier join (client → VM → USB dongle): a client whose Proxmox VM has a dongle
+  assigned is T2; when the host/agent is offline (vmid unresolvable) the row
+  falls back to the last-known persisted tier/has_usb so it doesn't drop to T1.
+* ``tier_updates`` collects the authoritative tier/has_usb for clients whose VM
+  is currently reporting; the CALLER awaits
+  ``registry.record_tiers_batch(tier_updates)`` (async, change-gated).
+"""
+from __future__ import annotations
+
+import logging
+import time
+from pathlib import Path
+from typing import Any, Dict, List, Tuple
+
+import sim_config
+
+logger = logging.getLogger("CSClientRows")
+
+# configs/ lives at <repo>/configs (this file is <repo>/lm-spoke/src/…) —
+# matches control_plane._CONFIGS_DIR / local_ui_routes._CONFIGS_DIR.
+_CONFIGS_DIR = Path(__file__).resolve().parent.parent.parent / "configs"
+
+
+def build_client_rows(spoke, now: float | None = None
+                      ) -> Tuple[List[Dict[str, Any]], Dict[str, Dict[str, Any]]]:
+    """Build the Clients-view rows for *spoke* (a ``CSSpoke``).
+
+    Returns ``(rows, tier_updates)``. Never raises for a missing/degraded
+    deploy or config load — degrades to reported values, like both originals.
+    The caller is responsible for persisting ``tier_updates`` via
+    ``await spoke.registry.record_tiers_batch(tier_updates)``.
+    """
+    if now is None:
+        now = time.time()
+    registry = getattr(spoke, "registry", None)
+    if registry is None:
+        return [], {}
+
+    deploy = getattr(spoke, "deploy", None)
+    if deploy is not None:
+        usb_vmids, name_to_vmid = deploy.usb_vmid_index()
+        tier_index = deploy.vm_tier_index()
+    else:
+        usb_vmids, name_to_vmid, tier_index = set(), {}, {}
+
+    # Load the sim configs ONCE per call (mtime-cached) so each client's
+    # authoritative Site/PHY/Sim-ID can be resolved from its hostname.
+    try:
+        _sim_conf, _user_conf = sim_config.load_configs(_CONFIGS_DIR)
+    except Exception as _e:  # noqa: BLE001 — degrade to reported values
+        _sim_conf = _user_conf = None
+        logger.debug("build_client_rows: config load failed: %s", _e)
+
+    rows: List[Dict[str, Any]] = []
+    tier_updates: Dict[str, Dict[str, Any]] = {}
+    for hostname, c in registry.get_all().items():
+        last_seen = c.get("last_seen")
+        eff_sim_id, eff_cfg = sim_config.effective_client_fields(
+            hostname, _sim_conf, _user_conf,
+            c.get("simulation_id") or "", c.get("config"))
+        if deploy is not None:
+            vmid, has_usb = deploy.client_has_usb(
+                hostname, c, usb_vmids, name_to_vmid)
+        else:
+            vmid, has_usb = None, False
+        tier = tier_index.get(str(vmid)) if vmid else None
+        if vmid and tier:
+            tier_updates[hostname] = {"tier": tier, "has_usb": has_usb}
+        if vmid is None:
+            # Host/agent offline or VM aged out of proxmox_states: the live
+            # join can't classify it. Fall back to the last-known authoritative
+            # tier/has_usb persisted while it WAS reporting, so
+            # csClassifyClient (which prefers c.tier) keeps it T2 instead of
+            # dropping to T1.
+            tier = tier or c.get("tier")
+            has_usb = has_usb or bool(c.get("last_known_has_usb"))
+        rows.append({
+            "hostname": hostname, "id": hostname,
+            "platform": c.get("platform") or "—",
+            "hw_type": c.get("platform") or "",
+            "online": bool(last_seen and (now - last_seen) < 300),
+            "connected_ssid": c.get("connected_ssid") or "—",
+            "simulation_id": eff_sim_id,
+            "active_simulations": c.get("active_simulations") or [],
+            "last_seen": last_seen if last_seen is not None else "—",
+            "error_count": len(c.get("recent_errors") or []),
+            "recent_errors": c.get("recent_errors") or [],
+            "vmid": vmid,
+            "has_usb": has_usb,
+            # Authoritative tier (t1/t2/t3) from the agent's per-VM passthrough
+            # classification; csClassifyClient prefers this over has_usb.
+            "tier": tier,
+            # Carry the persisted per-client sim overrides + config up so the
+            # WebUI's per-sim override buttons reflect what's SET (not just
+            # what's running) and STAY across refreshes.
+            "config": eff_cfg,
+            "overrides": c.get("overrides") or {},
+        })
+    return rows, tier_updates

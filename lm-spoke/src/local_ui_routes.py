@@ -33,6 +33,7 @@ from typing import Any, Dict, Optional
 from fastapi import APIRouter, Request
 
 import sim_config
+from client_rows import build_client_rows
 
 logger = logging.getLogger("CSLocalUI")
 
@@ -54,74 +55,15 @@ def build_local_ui_router(spoke) -> APIRouter:
 
     @router.get("/aggregate/clients")
     async def aggregate_clients():
-        rows = []
-        now = time.time()
-        # Tier join (client → VM → USB dongle): a client whose Proxmox VM has a
-        # dongle assigned — or that reported its own USB WiFi adapter — is T2.
-        # has_usb is what sim-views.js's csClassifyClient reads; without it every
-        # row falls through to the T1 default (the "everything shows T1" bug).
-        # Mirrors control_plane.py's hub-telemetry path so the local dashboard
-        # and hub Clients views agree.
-        deploy = getattr(spoke, "deploy", None)
-        if deploy is not None:
-            usb_vmids, name_to_vmid = deploy.usb_vmid_index()
-            tier_index = deploy.vm_tier_index()
-        else:
-            usb_vmids, name_to_vmid, tier_index = set(), {}, {}
-        # Load sim configs once (mtime-cached) so each client's authoritative
-        # Site/PHY/Sim-ID resolves from its hostname — mirrors control_plane's
-        # hub-telemetry path so the local and hub Clients views agree.
-        try:
-            _sim_conf, _user_conf = sim_config.load_configs(_CONFIGS_DIR)
-        except Exception as _e:  # noqa: BLE001 — degrade to reported values
-            _sim_conf = _user_conf = None
-            logger.debug("aggregate_clients: config load failed: %s", _e)
-        tier_updates: Dict[str, Dict[str, Any]] = {}
-        for hostname, c in spoke.registry.get_all().items():
-            last_seen = c.get("last_seen")
-            eff_sim_id, eff_cfg = sim_config.effective_client_fields(
-                hostname, _sim_conf, _user_conf,
-                c.get("simulation_id") or "", c.get("config"))
-            online = bool(last_seen and (now - last_seen) < 300)
-            if deploy is not None:
-                vmid, has_usb = deploy.client_has_usb(
-                    hostname, c, usb_vmids, name_to_vmid)
-            else:
-                vmid, has_usb = None, False
-            tier = tier_index.get(str(vmid)) if vmid else None
-            if vmid and tier:
-                tier_updates[hostname] = {"tier": tier, "has_usb": has_usb}
-            if vmid is None:
-                # Host/agent offline or VM aged out: fall back to the last-known
-                # authoritative tier/has_usb persisted while it WAS reporting, so
-                # the row keeps T2 (etc.) instead of dropping to T1. Mirrors
-                # control_plane.py's hub-telemetry path.
-                tier = tier or c.get("tier")
-                has_usb = has_usb or bool(c.get("last_known_has_usb"))
-            rows.append({
-                "spoke_id": spoke.spoke_id, "spoke_name": spoke.spoke_id,
-                "spoke_online": True,
-                "hostname": hostname, "id": hostname,
-                "platform": c.get("platform") or "—",
-                "hw_type": c.get("platform") or "",
-                "online": online,
-                "connected_ssid": c.get("connected_ssid") or "—",
-                "simulation_id": eff_sim_id,
-                "active_simulations": c.get("active_simulations") or [],
-                "last_seen": last_seen if last_seen is not None else "—",
-                "error_count": len(c.get("recent_errors") or []),
-                "recent_errors": c.get("recent_errors") or [],
-                "vmid": vmid,
-                "has_usb": has_usb,
-                "tier": tier,
-                # Carry the persisted per-client sim overrides + config so the
-                # local dashboard's per-sim override buttons reflect what's SET
-                # (not just what's running) and STAY across refreshes — mirrors
-                # the hub-telemetry path (control_plane.py) so the local Clients
-                # view and the hub's agree.
-                "config": eff_cfg,
-                "overrides": c.get("overrides") or {},
-            })
+        # Row shape + tier join + Site/PHY/Sim-ID resolution live in the SHARED
+        # builder (client_rows.build_client_rows) so this local dashboard and
+        # the hub-telemetry path (control_plane.py) can never diverge. Only the
+        # local-view envelope (per-row spoke_* identity) is added here.
+        rows, tier_updates = build_client_rows(spoke)
+        for row in rows:
+            row["spoke_id"] = spoke.spoke_id
+            row["spoke_name"] = spoke.spoke_id
+            row["spoke_online"] = True
         if tier_updates:
             try:
                 await spoke.registry.record_tiers_batch(tier_updates)

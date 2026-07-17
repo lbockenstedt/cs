@@ -42,11 +42,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from cs_spoke import CSSpoke
 from client_api import build_client_api_app
-import sim_config
-
-# configs/ lives at <repo>/configs (control_plane.py is <repo>/lm-spoke/src/…).
-# Used to resolve each client's authoritative Site/PHY/Sim-ID for the relay.
-_CONFIGS_DIR = Path(__file__).resolve().parent.parent.parent / "configs"
+from client_rows import build_client_rows
 try:
     from core.src.messaging.agent_hosting import AgentHostingControlPlane
 except ImportError:
@@ -481,82 +477,11 @@ class CSControlPlane(AgentHostingControlPlane):
                 # seen within 300s) so the hub and local Clients views match.
                 registry = getattr(cs_mod, "registry", None)
                 if registry is not None:
-                    now = time.time()
-                    # Tier join (client → VM → USB): a client whose Proxmox VM has
-                    # a dongle assigned is T2, else T1 — mirrors the original
-                    # webui-hub classifyClient(client, usbVmids). usb_state carries
-                    # {vmid,bus_path}; a sim client's hostname equals its VM name,
-                    # so match hostname→vm→vmid and test membership in the
-                    # USB-assigned vmid set. has_usb is what csClassifyClient reads.
-                    usb_vmids, name_to_vmid = deploy.usb_vmid_index()
-                    tier_index = deploy.vm_tier_index()
-                    # Load the sim configs ONCE per tick (mtime-cached) so each
-                    # client's authoritative Site/PHY/Sim-ID can be resolved from
-                    # its hostname below. This is the original hub's
-                    # effective_config: the bash client's status write omits
-                    # wsite/sim_phy and can carry a stale simulation_id (old
-                    # character-position hashing → letters like "sl"), so the
-                    # server-resolved bucket profile is the source of truth.
-                    try:
-                        _sim_conf, _user_conf = sim_config.load_configs(_CONFIGS_DIR)
-                    except Exception as _e:  # noqa: BLE001 — degrade to reported values
-                        _sim_conf = _user_conf = None
-                        logger.debug("client relay: config load failed: %s", _e)
-                    clients = []
-                    # Collect authoritative tier/has_usb for clients whose VM is
-                    # currently reporting, then batch-persist once after the loop
-                    # (single lock + single persist, change-gated in the registry).
-                    # On a later tick where the host/agent is offline (vmid is
-                    # None), the builder falls back to this cached tier so the row
-                    # keeps T2 instead of dropping to T1.
-                    tier_updates: Dict[str, Dict[str, Any]] = {}
-                    for hn, c in registry.get_all().items():
-                        ls = c.get("last_seen")
-                        # Resolve authoritative Sim-ID (fixes stale "sl") + Site
-                        # + PHY from the hostname's bucket profile — the original
-                        # hub's effective_config. Shared helper so this and the
-                        # local dashboard (local_ui_routes) never diverge.
-                        eff_sim_id, eff_cfg = sim_config.effective_client_fields(
-                            hn, _sim_conf, _user_conf,
-                            c.get("simulation_id") or "", c.get("config"))
-                        vmid, has_usb = deploy.client_has_usb(
-                            hn, c, usb_vmids, name_to_vmid)
-                        cur_tier = tier_index.get(str(vmid)) if vmid else None
-                        if vmid and cur_tier:
-                            tier_updates[hn] = {"tier": cur_tier, "has_usb": has_usb}
-                        if vmid is None:
-                            # Host/agent offline or VM aged out of proxmox_states:
-                            # the live join can't classify it. Fall back to the
-                            # last-known authoritative tier/has_usb persisted while
-                            # it WAS reporting, so csClassifyClient (which prefers
-                            # c.tier) keeps it T2 instead of dropping to T1.
-                            cur_tier = cur_tier or c.get("tier")
-                            has_usb = has_usb or bool(c.get("last_known_has_usb"))
-                        clients.append({
-                            "hostname": hn, "id": hn,
-                            "platform": c.get("platform") or "—",
-                            "hw_type": c.get("platform") or "",
-                            "online": bool(ls and (now - ls) < 300),
-                            "connected_ssid": c.get("connected_ssid") or "—",
-                            "simulation_id": eff_sim_id,
-                            "active_simulations": c.get("active_simulations") or [],
-                            "last_seen": ls if ls is not None else "—",
-                            "error_count": len(c.get("recent_errors") or []),
-                            "recent_errors": c.get("recent_errors") or [],
-                            "vmid": vmid,
-                            "has_usb": has_usb,
-                            # Authoritative tier (t1/t2/t3) from the agent's per-VM
-                            # passthrough classification; csClassifyClient prefers
-                            # this over has_usb. Absent → falls back to has_usb.
-                            "tier": cur_tier,
-                            # Carry the persisted per-client sim overrides + config
-                            # up so the WebUI's per-sim override buttons reflect
-                            # what's SET (not just what's running) and STAY across
-                            # refreshes. Without this the override round-trip is
-                            # invisible and the buttons revert on the next frame.
-                            "config": eff_cfg,
-                            "overrides": c.get("overrides") or {},
-                        })
+                    # Row shape + tier join + Site/PHY/Sim-ID resolution live in
+                    # the SHARED builder (client_rows.build_client_rows) so this
+                    # hub-telemetry path and the local dashboard
+                    # (local_ui_routes.aggregate_clients) can never diverge.
+                    clients, tier_updates = build_client_rows(cs_mod)
                     payload["clients"] = clients
                     if tier_updates:
                         try:
