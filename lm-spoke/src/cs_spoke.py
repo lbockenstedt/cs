@@ -281,16 +281,29 @@ class CSSpoke(BaseSpoke):
             return {"status": "ERROR", "message": "not connected to a control plane"}
         connected = dict(self.control_plane.connected_agents or {})
         explicit = d.get("agent_id") or d.get("identifier")
-        if explicit:
-            if explicit not in connected:
-                return {"status": "ERROR",
-                        "message": f"agent {explicit} not connected"}
+        if explicit and explicit in connected:
+            # A specific, currently-connected agent (per-node target).
             agent_ids = [explicit]
         else:
+            # No explicit agent, OR the identifier is NOT a connected agent id.
+            # The wildcard fan-out sends the SPOKE id as ``identifier`` (never an
+            # agent id), which used to hard-fail "agent <spoke> not connected" even
+            # though the spoke AND its agents were up (the reported bug). Treat any
+            # non-agent identifier as a spoke/group-level target and deploy to
+            # EVERY connected agent — correct for the fleet-wide wildcard device
+            # cert, and a specific-but-offline node falls through to the fleet too.
+            if explicit and explicit not in connected:
+                logger.info("INSTALL_CERT: identifier %r is not a connected agent — "
+                            "broadcasting to all %d connected agent(s)",
+                            explicit, len(connected))
             agent_ids = list(connected.keys())
         if not agent_ids:
-            return {"status": "ERROR",
-                    "message": "no managed pxmx agents connected"}
+            # No agents connected at all → DEFER, don't fail. The hub retries
+            # failed/deferred targets each distribution sweep, so this installs
+            # itself on the agents' reconnect; surfacing it as a hard FAILED just
+            # alarms the operator about a transient, self-healing condition.
+            return {"status": "DEFERRED",
+                    "message": "no managed pxmx agents connected — deferred, retries on reconnect"}
 
         relay_timeout = 620.0  # > agent 600s pvenode wait; < hub 640s timeout
 
