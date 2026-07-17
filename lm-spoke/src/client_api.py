@@ -317,6 +317,13 @@ def build_client_api_app(spoke) -> FastAPI:
                 sim_conf.add_section("simulation")
             pool_on = bool(pool_map.get(resolved_site, pool_map.get("*", False)))
             sim_conf.set("simulation", "random_pool", "on" if pool_on else "off")
+            # Knob-floor learner: overlay the hub-learned [simulation] intensity
+            # knob values (e.g. dns_fail_rate/duration) — tenant-wide global
+            # scalars every matching client reads. The learner ratchets these to
+            # the floor that still fires the alert; setting them here wins over the
+            # base simulation.conf value (same live-overlay pattern as ambient_pct).
+            for _kk, _kv in (spoke.local_store.get_sim_knob_overrides() or {}).items():
+                sim_conf.set("simulation", str(_kk), str(_kv))
             if rand_sims:
                 sim_conf.set("simulation", "randomizable_sims",
                              " ".join(str(s) for s in rand_sims))

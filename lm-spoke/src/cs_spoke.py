@@ -1343,6 +1343,14 @@ class CSSpoke(BaseSpoke):
             if isinstance(sh, dict):
                 self.local_store.set_sim_shareable(sh)
                 applied.append("sim_shareable")
+        # Knob-floor learner: the hub-computed [simulation] intensity knob values
+        # (e.g. {"dns_fail_rate": 400}). Layered onto the served config at serve
+        # time by client_api — see local_store.get_sim_knob_overrides.
+        if "sim_knob_overrides" in patch:
+            ko = patch.get("sim_knob_overrides")
+            if isinstance(ko, dict):
+                self.local_store.set_sim_knob_overrides(ko)
+                applied.append("sim_knob_overrides")
         # Pool / SSID config (docs/simulation-pool-and-quota-design.md).
         if "site_source" in patch:
             self.local_store.set_site_source(str(patch.get("site_source") or "pxmx"))

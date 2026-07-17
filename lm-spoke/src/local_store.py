@@ -393,6 +393,25 @@ class LocalStore:
             self._data["ambient_control"] = bool(on)
             self._save()
 
+    # sim_knob_overrides: {simulation.conf [simulation] key: int} the hub's
+    # knob-floor learner pushes (e.g. {"dns_fail_rate": 400, "dns_fail_duration": 300}).
+    # Layered onto the SERVED config at serve time (client_api), NOT written into
+    # the stored simulation.conf — same live-overlay pattern as ambient_pct.
+    def get_sim_knob_overrides(self) -> dict:
+        v = self._data.get("sim_knob_overrides")
+        return dict(v) if isinstance(v, dict) else {}
+
+    def set_sim_knob_overrides(self, mapping: dict) -> None:
+        with self._lock:
+            clean = {}
+            for k, val in (mapping or {}).items():
+                try:
+                    clean[str(k)] = int(val)
+                except (TypeError, ValueError):
+                    continue
+            self._data["sim_knob_overrides"] = clean
+            self._save()
+
     # ambient_weights: {sim_id: relative int, default 1}. Among the ambient-active
     # clients (see ambient_pct = the level), each runs ONE randomizable sim chosen
     # by weighted random pick — a sim weighted 3 runs on 3x the clients of one

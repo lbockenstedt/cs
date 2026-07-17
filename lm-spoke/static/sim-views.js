@@ -2560,6 +2560,7 @@ function csSimQuotaRowFromServer(q) {
         multi_capable: !!q.multi_capable,
         rehome: !!q.rehome,
         enabled: !!q.enabled,
+        learn_knobs: !!q.learn_knobs,
         tied: !!(q.sim_id && q.alert_id),
     };
 }
@@ -2612,6 +2613,9 @@ function csSimQuotaAlertIdOptions(alertType, selectedId) {
 function csRenderSimQuotaEditor() {
     const cat = csSimQuotaCatalog || { sims: [], sites: [], suggested: {}, meta: {} };
     const simIds = (cat.sims || []).map(s => s.sim_id);
+    // Sims that expose tunable [simulation] intensity knobs (e.g. dns_fail) — the
+    // per-row "Learn" toggle only shows for these (the knob-floor learner).
+    const knobSims = new Set((cat.sims || []).filter(s => s.has_knobs).map(s => s.sim_id));
     const sites = cat.sites || [];
     const meta = cat.meta || {};
     const suggested = cat.suggested || {};
@@ -2667,6 +2671,7 @@ function csRenderSimQuotaEditor() {
             <span class="flex items-center gap-1"><input data-cs-sq="multi_capable" type="checkbox" ${isPresence ? 'checked disabled' : (r.multi_capable ? 'checked' : '')}> Multi-capable</span>
             <span class="flex items-center gap-1"><input data-cs-sq="rehome" type="checkbox" ${r.rehome ? 'checked' : ''}> Re-home</span>
             <span class="flex items-center gap-1"><input data-cs-sq="enabled" type="checkbox" ${r.enabled ? 'checked' : ''}> Enabled</span>
+            ${(!isPresence && knobSims.has(r.sim_id)) ? `<span class="flex items-center gap-1" title="Ratchet this sim's intensity knobs (e.g. dns_fail_rate/duration) down to the minimum that still fires the alert."><input data-cs-sq="learn_knobs" type="checkbox" ${r.learn_knobs ? 'checked' : ''}> Learn floor</span>` : ''}
           </label>
           <button onclick="csSimQuotaDel(${i})" class="text-red-600 hover:text-red-800 text-xs font-bold py-1">Remove</button>
         </div>`;
@@ -2714,6 +2719,7 @@ function csSimQuotaSyncFromDom() {
             multi_capable: !!g('multi_capable').checked,
             rehome: !!g('rehome').checked,
             enabled: !!g('enabled').checked,
+            learn_knobs: !!((g('learn_knobs') || {}).checked),
             tied,
         });
     });
