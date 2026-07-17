@@ -641,6 +641,11 @@ suppress_nm_applet
 
 echo "Update complete" | tee -a "$debug"
 
+# Refresh the rapid_update time-gate stamp (see simulation.sh _update_due) so
+# ANY completed update run — sourced from the sim loop, startup.sh, or a
+# standalone `bash update.sh` (agent update_now) — counts toward the 60s gate.
+date +%s > /tmp/client-sim-update.stamp 2>/dev/null || true
+
 #============================================================
 # Activate a new simulation.sh WITHOUT a reboot (sudo-free)
 #============================================================

@@ -73,6 +73,38 @@ init_simulation_context() {
 _self_path="/usr/local/scripts/simulation.sh"
 _self_mtime=$(stat -c %Y "$_self_path" 2>/dev/null)
 
+#------------------------------------------------------------
+# rapid_update time gate — with rapid_update=on the 100-iteration loop used to
+# source the FULL update.sh on EVERY pass (config re-parse + TCP probe + curl
+# /api/health each time, every ~5-10s). The update source stays exactly where
+# it is in the loop (its placement fixed a real bug — see the comment there);
+# this gate just skips it until 60s have elapsed since the last run. The
+# last-run epoch lives in a variable AND a /tmp stamp file so a re-exec'd
+# script (same PID, fresh variables) doesn't immediately re-run the update;
+# update.sh refreshes the stamp itself on completion so standalone runs
+# (startup.sh, agent update_now) count toward the gate too.
+#------------------------------------------------------------
+_UPD_STAMP="/tmp/client-sim-update.stamp"
+_upd_last=""
+_update_due() {
+  local now=""
+  # Fork-free epoch on bash >=4.2; date fallback + fail-OPEN (run the update)
+  # if the time can't be read — never wedge rapid_update off.
+  printf -v now '%(%s)T' -1 2>/dev/null || true
+  [[ "${now:-}" =~ ^[0-9]+$ ]] || now=$(date +%s 2>/dev/null)
+  [[ "${now:-}" =~ ^[0-9]+$ ]] || return 0
+  if [[ ! "${_upd_last:-}" =~ ^[0-9]+$ ]]; then
+    _upd_last=$(cat "$_UPD_STAMP" 2>/dev/null)
+    [[ "${_upd_last:-}" =~ ^[0-9]+$ ]] || _upd_last=0
+  fi
+  if (( now - _upd_last < 60 )); then
+    return 1
+  fi
+  _upd_last=$now
+  printf '%s' "$now" > "$_UPD_STAMP" 2>/dev/null || true
+  return 0
+}
+
 # One-time self-heal: disable NetworkManager MAC randomization. NM's defaults
 # randomize the wifi MAC (scan-rand + stable-random cloned-mac on new profiles),
 # which breaks device identity (AP/ClearPass/NetBox see a different MAC per
@@ -807,9 +839,11 @@ if [ "$kill_switch" != "on" ]; then
   # used to live at the bottom of the non-auth-fail branch, where an
   # auth_fail/ssidpw_fail client (which takes the other branch) or any
   # connectivity `continue 2` skipped it entirely — so rapid_update
-  # silently never ran for those clients.
+  # silently never ran for those clients. _update_due (defined above the
+  # loop) rate-limits the actual source to once per 60s — the check still
+  # runs every iteration, only the expensive update.sh work is gated.
   #------------------------------------------------------------
-  if [[ "$rapid_update" == "on" ]]; then source '/usr/local/scripts/update.sh'; fi
+  if [[ "$rapid_update" == "on" ]] && _update_due; then source '/usr/local/scripts/update.sh'; fi
   #------------------------------------------------------------
   # Self-re-exec: if update.sh (or anything) just replaced simulation.sh on disk,
   # relaunch into the NEW code in place — same PID, no reboot, no sudo. A running
