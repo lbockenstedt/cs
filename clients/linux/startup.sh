@@ -45,10 +45,6 @@ xset -dpms
 xset s off
 sudo rfkill unblock wifi; sudo rfkill unblock all
 #------------------------------------------------------------
-#Figuring out username from hostname used to parse config
-#------------------------------------------------------------
-username=$(echo $HOSTNAME | cut -d "-" -f 1)
-#------------------------------------------------------------
 #Calling config parser script
 #------------------------------------------------------------
 echo Reading Simulation Config File | tee -a /usr/local/scripts/sim.log
@@ -57,6 +53,13 @@ echo Reading Simulation Config File | tee -a /usr/local/scripts/sim.log
 #For values assinged to script variables
 #------------------------------------------------------------
 source '/usr/local/scripts/ini-parser.sh'
+# Shared helpers (derive_username/derive_bucket/adapter detection) — canonical
+# source clients/lib/common.sh.
+source '/usr/local/scripts/common.sh'
+#------------------------------------------------------------
+#Figuring out username from hostname used to parse config
+#------------------------------------------------------------
+derive_username
 #------------------------------------------------------------
 #Setting config file location
 #------------------------------------------------------------
@@ -68,7 +71,8 @@ echo Parsing Config File | tee -a /usr/local/scripts/sim.log
 #Settings read from the local config file
 #Global Simulation settings
 #------------------------------------------------------------
-bucket=$(python3 -c "import zlib; print(zlib.crc32('${HOSTNAME}'.encode()) % 10)")
+# cached once per boot — see common.sh derive_bucket
+derive_bucket
 simulation_id="s${bucket}"
 user_sim_id=$(get_value "$username" 'simulation_id')
 # Only accept valid slot IDs (s0-s9); old scripts used character-position hashing
@@ -137,8 +141,8 @@ echo Bringing up all interfaces online | tee -a /usr/local/scripts/sim.log
 #------------------------------------------------------------
 #Finding adapter names and setting usable variables for interfaces
 #------------------------------------------------------------
-wladapter=$(ip -br a | grep "wlx\|wlan" | cut -d ' ' -f '1')
-eadapter=$(ip -br a | grep "enp\|eno\|eth0\|eth1\|eth2\|eth3\|eth4\|eth5\|eth6\|ens" | cut -d ' ' -f '1')
+detect_wlan_adapter
+detect_eth_adapter
 if [[ -n ${wladapter} ]]; then echo WLAN Adapter name $wladapter | tee -a /usr/local/scripts/sim.log; fi
 if [[ -n ${eadapter} ]]; then echo Wired Adapter name $eadapter | tee -a /usr/local/scripts/sim.log; fi
 if [[ -n ${wladapter} ]]; then sudo ip link set dev $wladapter up; fi

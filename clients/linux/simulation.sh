@@ -9,6 +9,9 @@ echo Simulation Script Version $version | tee -a ${LOG_FILE}
 #DO NOT EDIT BELOW THIS LINE UNLESS YOU KNOW WHAT YOU ARE DOING
 #------------------------------------------------------------
 source '/usr/local/scripts/ini-parser.sh'
+# Shared helpers (derive_username/derive_bucket/adapter detection/
+# apply_overrides/json_escape) — canonical source clients/lib/common.sh.
+source '/usr/local/scripts/common.sh'
 
 #------------------------------------------------------------
 # Remote-control support — let agent.sh find and signal this loop.
@@ -50,9 +53,10 @@ init_simulation_context() {
   # Username-section overrides are defined in simulation.conf; apply_override()
   # reads them from there via get_value $username.
   process_ini_file '/usr/local/scripts/simulation.conf'
-  username=$(echo "$HOSTNAME" | cut -d "-" -f 1)
+  derive_username
   # Hash the hostname to assign a bucket — produces s0-s9 deterministically.
-  bucket=$(python3 -c "import zlib; print(zlib.crc32('${HOSTNAME}'.encode()) % 10)")
+  # (cached once per boot — see common.sh derive_bucket)
+  derive_bucket
   simulation_id="s${bucket}"
   # Allow user-overrides.conf to pin a specific bucket via simulation_id key.
   # Only accept valid slot IDs (s0-s9); ignore malformed values.
@@ -149,9 +153,9 @@ while true; do
 #set int he simulation.conf
 #------------------------------------------------------------
 #------------------------------------------------------------
-wladapter=$(ip -br a | grep "wlx\|wlan" | cut -d ' ' -f '1')
+detect_wlan_adapter
 if [[ -n ${wladapter} ]]; then echo WLAN Adapter name $wladapter | tee -a ${LOG_FILE}; fi
-eadapter=$(ip -br a | grep "enp\|eno\|eth0\|eth1\|eth2\|eth3\|eth4\|eth5\|eth6" | cut -d ' ' -f '1')
+detect_eth_adapter
 #------------------------------------------------------------
 # Management IP guard — prevents shutting down the mgmt interface
 #------------------------------------------------------------
@@ -186,6 +190,11 @@ auth_fail=$(get_value 'simulation' 'auth_fail')
 ssidpw_fail=$(get_value 'simulation' 'ssidpw_fail')
 allow_offline=$(get_value 'simulation' 'allow_offline')
 web_server=$(get_value 'simulation' 'web_server')
+# A [username] override may flip web_server (CS_OVERRIDE_KEYS superset —
+# dashboard.sh always honored it, this script didn't). Apply it BEFORE the
+# hub/standalone branch below reads it, so the mode decision and the later
+# apply_overrides pass agree.
+apply_override web_server
 # Hub mode (web_server=on): the engine drives placement + harvest and the s0-s9
 # buckets are ignored — report "Auto" as the simulation_id so the dashboard shows
 # the client is engine-driven rather than pinned to a bucket.
@@ -330,22 +339,10 @@ dns_bad_record_3=$(get_value 'address' 'dns_bad_record_3')
 iperf_server=$(get_value 'address' 'iperf_server')
 collab_server=$(get_value 'address' 'collab_server')
 #------------------------------------------------------------
-#User/Device Specific Overrides
+#User/Device Specific Overrides — apply_override + the shared SUPERSET
+#CS_OVERRIDE_KEYS list live in common.sh (kept in sync with dashboard.sh).
 #------------------------------------------------------------
-apply_override() {
-  local var=$1
-  local val=$(get_value $username "$var")
-  [[ -n ${val} ]] && declare -g "$var=$val"
-}
-override_keys=(kill_switch sim_load github_repo repo_location site_based_ssid iperf_bw \
-  wsite sim_phy ssid ssidpw dhcp_fail dns_fail assoc_fail port_flap ping_test download iperf \
-  www_traffic ssidpw_fail auth_fail smb_address ping_address dns_latency_1 dns_latency_2 \
-  dns_latency_3 dns_bad_ip_1 dns_bad_ip_2 dns_bad_ip_3 dns_bad_record_1 dns_bad_record_2 \
-  dns_bad_record_3 iperf_server dot1x_password \
-  collab collab_app collab_bw collab_time collab_server)
-for key in "${override_keys[@]}"; do
-  apply_override "$key"
-done
+apply_overrides
 # A [username] override can re-set sim_load to non-numeric — re-coerce so the
 # `-lt` gate stays safe.
 [[ "$sim_load" =~ ^[0-9]+$ ]] || sim_load=0
@@ -413,15 +410,7 @@ hostname=$HOSTNAME
 platform=linux
 declare -a error_log=()
 
-json_escape() {
-  local value="${1-}"
-  value=${value//\\/\\\\}
-  value=${value//\"/\\\"}
-  value=${value//$'\n'/\\n}
-  value=${value//$'\r'/\\r}
-  value=${value//$'\t'/\\t}
-  printf '%s' "$value"
-}
+# json_escape lives in common.sh (shared).
 
 report_error() {
   local msg="$1" severity="${2:-error}"
@@ -524,7 +513,7 @@ _connect_outcome() {
 _wait_wlan_adapter() {
   local cap="${1:-15}" i
   for ((i=0; i<cap; i++)); do
-    wladapter=$(ip -br a 2>/dev/null | grep "wlx\|wlan" | cut -d ' ' -f '1')
+    detect_wlan_adapter
     [[ -n "$wladapter" ]] && return 0
     sleep 1
   done
@@ -772,7 +761,7 @@ if [[ "$sim_phy" == "wireless" ]]; then ea_down; fi
 #------------------------------------------------------------
 _apt_done=0
 gateway_reachable=false
-wladapter=$(ip -br a | grep "wlx\|wlan" | cut -d ' ' -f '1')
+detect_wlan_adapter
 sudo rfkill unblock wifi; sudo rfkill unblock all
 dfgw=$(ip route | grep -oP 'default via \K\S+')
 if _wait_gateway "$dfgw"; then gw_ok=true; else gw_ok=false; fi

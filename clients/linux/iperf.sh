@@ -11,6 +11,7 @@ echo iPerf Script Version $version | tee "$debug"
 # own random values.
 #------------------------------------------------------------
 source '/usr/local/scripts/ini-parser.sh'
+source '/usr/local/scripts/common.sh'
 process_ini_file '/usr/local/scripts/simulation.conf'
 iperf_server=$(get_value 'address' 'iperf_server')
 iperf_bw=$(get_value 'simulation' 'iperf_bw')
@@ -18,7 +19,7 @@ iperf_bw=$(get_value 'simulation' 'iperf_bw')
 # user-overrides.conf [username] override of iperf_server / iperf_bw reaches the
 # iperf run. Without this iperf.sh used ONLY the global [address]/[simulation]
 # values and ignored the per-user override simulation.sh honors.
-username=$(echo "$HOSTNAME" | cut -d "-" -f 1)
+derive_username
 apply_override() { local v; v=$(get_value "$username" "$1"); [[ -n "$v" ]] && declare -g "$1=$v"; }
 apply_override iperf_server
 apply_override iperf_bw

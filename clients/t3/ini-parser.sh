@@ -1,12 +1,35 @@
 #!/usr/bin/env bash
-
+# ============================================================================ #
+# GENERATED-COPY NOTICE — canonical source: clients/lib/ini-parser.sh          #
+# clients/linux/ini-parser.sh and clients/t3/ini-parser.sh are byte-identical  #
+# generated copies (the client deploy paths only ship flat per-platform files, #
+# so the lib cannot be served directly). Edit clients/lib/ini-parser.sh, then  #
+# re-sync:  cp clients/lib/ini-parser.sh clients/linux/ini-parser.sh           #
+#           cp clients/lib/ini-parser.sh clients/t3/ini-parser.sh              #
+# Verify:   cmp clients/lib/ini-parser.sh clients/linux/ini-parser.sh          #
+# Test:     bash clients/tests/ini_parser_test.sh                              #
+# ============================================================================ #
 # -------------------------------------------------------------------------------- #
 # Description                                                                      #
 # -------------------------------------------------------------------------------- #
 # A 'complete' ini file parsers written in pure bash (4), it was written for no    #
 # other reason that one did not exist. It is completely pointless apart from some  #
 # clever tricks.                                                                   #
+#                                                                                  #
+# Fork-free: the parse loop and get_value use only bash builtins / parameter       #
+# expansion — no tr/sed/echo subshells. The sim loop calls get_value dozens of     #
+# times per cycle on small hardware, so every fork counts.                         #
 # -------------------------------------------------------------------------------- #
+
+# -------------------------------------------------------------------------------- #
+# Shell options                                                                    #
+# -------------------------------------------------------------------------------- #
+# extglob is needed by the *( ) / +( ) patterns in the parameter expansions        #
+# below. Enable it at SOURCE time — get_value can legitimately be called before    #
+# process_ini_file (which used to be the only place it was set).                   #
+# -------------------------------------------------------------------------------- #
+
+shopt -s extglob
 
 # -------------------------------------------------------------------------------- #
 # Global Variables                                                                 #
@@ -21,11 +44,11 @@
 # show_config_errors      - should we show config errors                           #
 # -------------------------------------------------------------------------------- #
 
-declare case_sensitive_sections
-declare case_sensitive_keys
-declare default_to_uppercase
-declare show_config_warnings
-declare show_config_errors
+declare case_sensitive_sections=""
+declare case_sensitive_keys=""
+declare default_to_uppercase=""
+declare show_config_warnings=""
+declare show_config_errors=""
 
 # -------------------------------------------------------------------------------- #
 # Default Section                                                                  #
@@ -48,14 +71,120 @@ sections=()
 # local_case_sensitive_keys     - should key names be case sensitive               #
 # default_to_uppercase          - should we default to uppercase                   #
 # local_show_config_warnings    - should we show config warnings                   #
-# local_show_config_errors      - should we show config errors                     #
+# local_show_config_errors     - should we show config errors                      #
 # -------------------------------------------------------------------------------- #
 
 local_case_sensitive_sections=true
 local_case_sensitive_keys=true
 local_default_to_uppercase=false
-local_show_config_warnings=true
+local_show_config_warnings=false
 local_show_config_errors=true
+
+# -------------------------------------------------------------------------------- #
+# Internal fork-free helpers                                                       #
+# -------------------------------------------------------------------------------- #
+# Each helper leaves its output in _ini_result instead of echoing, so callers      #
+# never need a $( ) command substitution (each of which forks a subshell). The     #
+# public process_* / handle_default_case wrappers below keep the old echo API.     #
+# -------------------------------------------------------------------------------- #
+
+_ini_result=''
+
+# ASCII case conversion without `tr`. Inputs are already cleansed to               #
+# [a-zA-Z0-9_] wherever this is used, so ASCII-only handling is equivalent.        #
+_ini_tolower()
+{
+    local str=${1-} out='' ch pre
+    local U='ABCDEFGHIJKLMNOPQRSTUVWXYZ' L='abcdefghijklmnopqrstuvwxyz'
+    # NOTE: [[:upper:]]/[[:lower:]] classes, never [A-Z]/[a-z] ranges — glob
+    # ranges are locale-collation-dependent and can match BOTH cases.
+    if [[ ${str} != *[[:upper:]]* ]]; then
+        _ini_result=${str}
+        return 0
+    fi
+    local i len=${#str}
+    for (( i=0; i<len; i++ )); do
+        ch=${str:i:1}
+        pre=${U%%"${ch}"*}
+        if [[ ${pre} != "${U}" ]]; then
+            ch=${L:${#pre}:1}
+        fi
+        out+=${ch}
+    done
+    _ini_result=${out}
+}
+
+_ini_toupper()
+{
+    local str=${1-} out='' ch pre
+    local U='ABCDEFGHIJKLMNOPQRSTUVWXYZ' L='abcdefghijklmnopqrstuvwxyz'
+    if [[ ${str} != *[[:lower:]]* ]]; then
+        _ini_result=${str}
+        return 0
+    fi
+    local i len=${#str}
+    for (( i=0; i<len; i++ )); do
+        ch=${str:i:1}
+        pre=${L%%"${ch}"*}
+        if [[ ${pre} != "${L}" ]]; then
+            ch=${U:${#pre}:1}
+        fi
+        out+=${ch}
+    done
+    _ini_result=${out}
+}
+
+# Case-fold per local_default_to_uppercase — the fork-free core of                 #
+# handle_default_case.                                                             #
+_ini_default_case()
+{
+    if [[ "${local_default_to_uppercase}" = false ]]; then
+        _ini_tolower "${1-}"
+    else
+        _ini_toupper "${1-}"
+    fi
+}
+
+# Cleanse a section/key name: trim spaces, squash runs of punctuation/blanks to    #
+# a single underscore, drop anything not [a-zA-Z0-9_]. Same transform the old      #
+# `tr -s '[:punct:] [:blank:]' '_' | sed 's/[^a-zA-Z0-9_]//g'` pipeline did.       #
+_ini_cleanse_name()
+{
+    local str=${1-}
+    str="${str##*( )}"                        # Remove leading spaces
+    str="${str%%*( )}"                        # Remove trailing spaces
+    str="${str//+([[:punct:][:blank:]])/_}"   # Runs of :punct:/:blank: -> one underscore
+    str="${str//[!a-zA-Z0-9_]/}"              # Remove non-alphanumerics (except underscore)
+    _ini_result=${str}
+}
+
+_ini_section_name()
+{
+    _ini_cleanse_name "${1-}"
+    if [[ "${local_case_sensitive_sections}" = false ]]; then
+        _ini_default_case "${_ini_result}"
+    fi
+}
+
+_ini_key_name()
+{
+    _ini_cleanse_name "${1-}"
+    if [[ "${local_case_sensitive_keys}" = false ]]; then
+        _ini_default_case "${_ini_result}"
+    fi
+}
+
+# Cleanse a value: strip inline comments, trim, escape single quotes.              #
+_ini_value()
+{
+    local value=${1-}
+    value="${value%%\;*}"                     # Remove in line right comments
+    value="${value%%\#*}"                     # Remove in line right comments
+    value="${value##*( )}"                    # Remove leading spaces
+    value="${value%%*( )}"                    # Remove trailing spaces
+    value=${value//\'/SINGLE_QUOTE}           # escape_string
+    _ini_result=${value}
+}
 
 # -------------------------------------------------------------------------------- #
 # Set Global Variables                                                             #
@@ -88,7 +217,8 @@ function setup_global_variables
          local_show_config_errors=${show_config_errors}
     fi
 
-    DEFAULT_SECTION=$(handle_default_case "${DEFAULT_SECTION}")
+    _ini_default_case "${DEFAULT_SECTION}"
+    DEFAULT_SECTION=${_ini_result}
 
     # Move to from global settting to handle default uppercase option
     sections+=("${DEFAULT_SECTION}")
@@ -105,7 +235,7 @@ function in_array()
     local haystack="${1}[@]"
     local needle=${2}
 
-    for i in ${!haystack}; do
+    for i in ${!haystack:-}; do
         if [[ ${i} == "${needle}" ]]; then
             return 0
         fi
@@ -157,14 +287,8 @@ function show_error()
 
 function handle_default_case()
 {
-    local str=$1
-
-    if [[ "${local_default_to_uppercase}" = false ]]; then
-        str=$(echo -e "${str}" | tr '[:upper:]' '[:lower:]')               # Lowercase the string
-    else
-        str=$(echo -e "${str}" | tr '[:lower:]' '[:upper:]')               # Uppercase the str
-    fi
-    echo "${str}"
+    _ini_default_case "${1-}"
+    echo "${_ini_result}"
 }
 
 
@@ -177,17 +301,8 @@ function handle_default_case()
 
 function process_section_name()
 {
-    local section=$1
-
-    section="${section##*( )}"                                                     # Remove leading spaces
-    section="${section%%*( )}"                                                     # Remove trailing spaces
-    section=$(echo -e "${section}" | tr -s '[:punct:] [:blank:]' '_')              # Replace all :punct: and :blank: with underscore and squish
-    section=$(echo -e "${section}" | sed 's/[^a-zA-Z0-9_]//g')                     # Remove non-alphanumberics (except underscore)
-
-    if [[ "${local_case_sensitive_sections}" = false ]]; then
-        section=$(handle_default_case "${section}")
-    fi
-    echo "${section}"
+    _ini_section_name "${1-}"
+    echo "${_ini_result}"
 }
 
 # -------------------------------------------------------------------------------- #
@@ -198,17 +313,8 @@ function process_section_name()
 
 function process_key_name()
 {
-    local key=$1
-
-    key="${key##*( )}"                                                             # Remove leading spaces
-    key="${key%%*( )}"                                                             # Remove trailing spaces
-    key=$(echo -e "${key}" | tr -s '[:punct:] [:blank:]' '_')                      # Replace all :punct: and :blank: with underscore and squish
-    key=$(echo -e "${key}" | sed 's/[^a-zA-Z0-9_]//g')                             # Remove non-alphanumberics (except underscore)
-
-    if [[ "${local_case_sensitive_keys}" = false ]]; then
-        key=$(handle_default_case "${key}")
-    fi
-    echo "${key}"
+    _ini_key_name "${1-}"
+    echo "${_ini_result}"
 }
 
 # -------------------------------------------------------------------------------- #
@@ -219,16 +325,8 @@ function process_key_name()
 
 function process_value()
 {
-    local value=$1
-
-    value="${value%%\;*}"                                                          # Remove in line right comments
-    value="${value%%\#*}"                                                          # Remove in line right comments
-    value="${value##*( )}"                                                         # Remove leading spaces
-    value="${value%%*( )}"                                                         # Remove trailing spaces
-
-    value=$(escape_string "${value}")
-
-    echo "${value}"
+    _ini_value "${1-}"
+    echo "${_ini_result}"
 }
 
 # -------------------------------------------------------------------------------- #
@@ -267,16 +365,37 @@ function unescape_string()
 
 function process_ini_file()
 {
+    # Reset all section data from any previous call to prevent value accumulation
+    for _reset_s in "${sections[@]:-}"; do
+        [[ -n "$_reset_s" ]] || continue
+        # Unset every ${section}_${key} scalar from the previous parse too, so
+        # get_value's scalar lookup can never serve a stale value for a key
+        # that no longer exists in the re-parsed file.
+        _reset_keys=()
+        eval "_reset_keys=( \"\${${_reset_s}_keys[@]:-}\" )"
+        for _reset_k in "${_reset_keys[@]:-}"; do
+            [[ -n "$_reset_k" ]] && eval "unset ${_reset_s}_${_reset_k}"
+        done
+        eval "unset ${_reset_s}_keys ${_reset_s}_values"
+    done
+    unset _reset_keys
+    sections=()
     local line_number=0
     local section="${DEFAULT_SECTION}"
     local key_array_name=''
 
     setup_global_variables
 
+    # If the config file is missing/unreadable, return without populating so the
+    # redirect below does not error out (fatal under a 'set -e'/'set -u' caller).
+    if [[ ! -r "$1" ]]; then
+        return
+    fi
+
     shopt -s extglob
 
-    while IFS= read -r line || [ -n "$line" ]; do
-        line=$(echo "$line" | tr -d '\r')  # Remove carriage return if present
+    while IFS= read -r line || [ -n "${line:-}" ]; do
+        line="${line%$'\r'}"  # Remove trailing carriage return if present (CRLF)
         line_number=$((line_number+1))
 
         if [[ ${line} =~ ^# || ${line} =~ ^\; || -z ${line} ]]; then  # Ignore comments / empty lines
@@ -284,7 +403,8 @@ function process_ini_file()
         fi
 
         if [[ ${line} =~ ^"["(.+)"]"$ ]]; then  # Match pattern for a 'section'
-            section=$(process_section_name "${BASH_REMATCH[1]}")
+            _ini_section_name "${BASH_REMATCH[1]}"
+            section=${_ini_result}
 
             if ! in_array sections "${section}"; then
                 eval "${section}_keys=()"  # Use eval to declare the keys array
@@ -292,8 +412,10 @@ function process_ini_file()
                 sections+=("${section}")  # Add the section name to the list
             fi
         elif [[ ${line} =~ ^(.*)"="(.*) ]]; then  # Match pattern for a key=value pair
-            key=$(process_key_name "${BASH_REMATCH[1]}")
-            value=$(process_value "${BASH_REMATCH[2]}")
+            _ini_key_name "${BASH_REMATCH[1]}"
+            key=${_ini_result}
+            _ini_value "${BASH_REMATCH[2]}"
+            value=${_ini_result}
 
             if [[ -z ${key} ]]; then
                 show_error 'line %d: No key name\n' "${line_number}"
@@ -306,10 +428,14 @@ function process_ini_file()
 
                 if in_array "${key_array_name}" "${key}"; then
                     show_warning 'key %s - Defined multiple times within section %s\n' "${key}" "${section}"
+                else
+                    # First occurrence wins: the ${section}_${key} scalar is what
+                    # get_value reads, and the old array scan returned the FIRST
+                    # match — so only the first occurrence may set the scalar.
+                    eval "${section}_${key}='${value}'"  # Use eval to declare a variable
                 fi
                 eval "${section}_keys+=(${key})"  # Use eval to add to the keys array
                 eval "${section}_values+=('${value}')"  # Use eval to add to the values array
-                eval "${section}_${key}='${value}'"  # Use eval to declare a variable
             fi
         fi
     done < "$1"
@@ -319,31 +445,35 @@ function process_ini_file()
 # Get Value                                                                        #
 # -------------------------------------------------------------------------------- #
 # Retrieve a value for a specific key from a named section.                        #
+#                                                                                  #
+# Pure-bash indirect lookup on the ${section}_${key} scalar process_ini_file       #
+# sets (first occurrence only — preserves the old array scan's first-match-only    #
+# semantics, which prevents "offoff" doubling on re-parse). Zero subshells.        #
 # -------------------------------------------------------------------------------- #
 
 function get_value()
 {
     local section=''
     local key=''
+    local var=''
     local value=''
-    local keys=''
-    local values=''
 
-    section=$(process_section_name "${1}")
-    key=$(process_key_name "${2}")
+    _ini_section_name "${1-}"
+    _ini_default_case "${_ini_result}"
+    section=${_ini_result}
 
-    section=$(handle_default_case "${section}")
-    key=$(handle_default_case "${key}")
+    _ini_key_name "${2-}"
+    _ini_default_case "${_ini_result}"
+    key=${_ini_result}
 
-    eval "keys=( \"\${${section}_keys[@]}\" )"
-    eval "values=( \"\${${section}_values[@]}\" )"
-
-    for i in "${!keys[@]}"; do
-        if [[ "${keys[${i}]}" = "${key}" ]]; then
-            orig=$(unescape_string "${values[${i}]}")
-            printf '%s' "${orig}"
-        fi
-    done
+    var="${section}_${key}"
+    # nounset-safe + identifier guard (replaces the old `declare -p
+    # ${section}_keys` section check): an unknown or invalid name returns
+    # empty output instead of aborting a 'set -u' caller.
+    [[ ${var} =~ ^[a-zA-Z_][a-zA-Z0-9_]*$ ]] || return 0
+    value=${!var-}
+    value=${value//SINGLE_QUOTE/\'}   # unescape_string, inline
+    printf '%s' "${value}"
 }
 
 # -------------------------------------------------------------------------------- #

@@ -4,6 +4,9 @@ version=.10
 # window (launched by startup.desktop) so the operator can always see
 # what's happening without interrupting the simulation loop in the other pane.
 source '/usr/local/scripts/ini-parser.sh'
+# Shared helpers (derive_username/derive_bucket/adapter detection/
+# apply_overrides) — canonical source clients/lib/common.sh.
+source '/usr/local/scripts/common.sh'
 #------------------------------------------------------------
 # Simulation Dashboard (Read-only live monitor)
 #------------------------------------------------------------
@@ -18,17 +21,9 @@ CYN=$(tput setaf 6 2>/dev/null || true)
 BOLD=$(tput bold 2>/dev/null || true)
 RST=$(tput sgr0 2>/dev/null || true)
 
-# Per-device config override (same logic as simulation.sh). Defined before
-# refresh_config so refresh_config can call it.
-apply_override() {
-  local var=$1
-  local val
-  val=$(get_value "$username" "$var")
-  [[ -n "${val}" ]] && declare -g "$var=$val"
-}
-override_keys=(kill_switch sim_load github_repo repo_location site_based_ssid iperf_bw \
-  wsite sim_phy ssid dhcp_fail dns_fail assoc_fail port_flap ping_test download iperf \
-  www_traffic ssidpw_fail auth_fail web_server)
+# Per-device config override: apply_override + the shared SUPERSET
+# CS_OVERRIDE_KEYS list live in common.sh (same list simulation.sh applies —
+# the local copy here used to be missing the collab_*/dns_*/address keys).
 
 # refresh_config — re-parse simulation.conf and re-derive every flag so the
 # dashboard reflects the CURRENT config, not a launch-time snapshot. The
@@ -45,10 +40,11 @@ override_keys=(kill_switch sim_load github_repo repo_location site_based_ssid ip
 refresh_config() {
   process_ini_file '/usr/local/scripts/simulation.conf'
   # Derive username the same way startup.sh does — hostname prefix before "-".
-  username=$(echo "$HOSTNAME" | cut -d "-" -f 1)
+  derive_username
   server_url=$(get_value 'server' 'server_url')
   server_url="${server_url:-http://169.253.1.1:8080}"
-  bucket=$(python3 -c "import zlib; print(zlib.crc32('${HOSTNAME}'.encode()) % 10)")
+  # cached once per boot — see common.sh derive_bucket
+  derive_bucket
   simulation_id="s${bucket}"
   user_sim_id=$(get_value "$username" 'simulation_id')
   # Only accept valid slot IDs (s0-s9) from user overrides; ignore malformed values
@@ -76,9 +72,7 @@ refresh_config() {
   download=$(get_value "$simulation_id" 'download')
   iperf=$(get_value "$simulation_id" 'iperf')
   www_traffic=$(get_value "$simulation_id" 'www_traffic')
-  for key in "${override_keys[@]}"; do
-    apply_override "$key"
-  done
+  apply_overrides
 }
 refresh_config
 #------------------------------------------------------------
@@ -388,7 +382,7 @@ while true; do
   # e.g. ssidpw_fail=on) instead of the launch-time snapshot.
   refresh_config
   # Re-detect the WiFi adapter each refresh.
-  wladapter=$(ip -br a | grep "wlx\|wlan" | cut -d ' ' -f '1')
+  detect_wlan_adapter
   # Global kill switch comes from kill_switch.txt, synced from the GitHub repo by update.sh.
   # To kill all simulations globally, set linux/kill_switch.txt = "on" in the repo.
   gkill=$(cat /usr/local/scripts/kill_switch.txt 2>/dev/null || echo "off")

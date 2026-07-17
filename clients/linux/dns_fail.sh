@@ -18,6 +18,7 @@ for _a in "$@"; do
 done
 #------------------------------------------------------------
 source '/usr/local/scripts/ini-parser.sh'
+source '/usr/local/scripts/common.sh'
 process_ini_file '/usr/local/scripts/simulation.conf'
 dnsfile=$(< /usr/local/scripts/dns_fail.txt)
 dns_latency_1=$(get_value 'address' 'dns_latency_1')
@@ -37,7 +38,7 @@ dns_bad_record_3=$(get_value 'address' 'dns_bad_record_3')
 # per-user override that simulation.sh honors. Username = hostname prefix
 # before the first '-' (same derivation as simulation.sh).
 #------------------------------------------------------------
-username=$(echo "$HOSTNAME" | cut -d "-" -f 1)
+derive_username
 apply_override() {
   local var=$1
   local val

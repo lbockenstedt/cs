@@ -11,6 +11,7 @@ echo Collab Script Version $version | tee "$debug"
 # then exec the python sender (mirror of iperf.sh's sourcing pattern).
 #------------------------------------------------------------
 source '/usr/local/scripts/ini-parser.sh'
+source '/usr/local/scripts/common.sh'
 process_ini_file '/usr/local/scripts/simulation.conf'
 collab_server=$(get_value 'address' 'collab_server')
 collab_app=$(get_value 'simulation' 'collab_app')
@@ -18,7 +19,7 @@ collab_bw=$(get_value 'simulation' 'collab_bw')
 collab_time=$(get_value 'simulation' 'collab_time')
 # Per-user overrides — mirror iperf.sh so a user-overrides.conf [username]
 # override of collab_* reaches this run.
-username=$(echo "$HOSTNAME" | cut -d "-" -f 1)
+derive_username
 apply_override() { local v; v=$(get_value "$username" "$1"); [[ -n "$v" ]] && declare -g "$1=$v"; }
 apply_override collab_server
 apply_override collab_app

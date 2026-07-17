@@ -10,12 +10,13 @@ echo Ping_Test Script Version $version | tee "$debug"
 # Fix: source ini-parser to read ping_address from config, generate own random values.
 #------------------------------------------------------------
 source '/usr/local/scripts/ini-parser.sh'
+source '/usr/local/scripts/common.sh'
 process_ini_file '/usr/local/scripts/simulation.conf'
 ping_address=$(get_value 'address' 'ping_address')
 # Per-user override — mirror simulation.sh's apply_override so a
 # user-overrides.conf [username] override of ping_address reaches the ping.
 # Without this ping_test.sh used ONLY the global [address] value.
-username=$(echo "$HOSTNAME" | cut -d "-" -f 1)
+derive_username
 apply_override() { local v; v=$(get_value "$username" "$1"); [[ -n "$v" ]] && declare -g "$1=$v"; }
 apply_override ping_address
 rn=$((1 + RANDOM % 60))
