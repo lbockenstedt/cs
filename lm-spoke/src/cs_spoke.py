@@ -501,6 +501,36 @@ class CSSpoke(BaseSpoke):
                                 + (f": {webui.get('message', '')}" if webui.get("message") else ""))
             return relay
 
+        if cmd == "PXMX_RETAG_TENANT":
+            # Cross-tenant migration, split topology: THIS cs spoke hosts the
+            # pxmx agents, so re-tag (old_tag -> new_tag) by broadcasting to each
+            # connected agent (mirrors _install_cert_relay's fan-out).
+            if not self.control_plane:
+                return {"status": "ERROR", "message": "not connected to a control plane"}
+            connected = dict(self.control_plane.connected_agents or {})
+            if not connected:
+                return {"status": "DEFERRED", "count": 0,
+                        "message": "no managed pxmx agents connected — deferred, retries on reconnect"}
+
+            async def _retag_one(aid: str) -> Dict[str, Any]:
+                try:
+                    r = await self.control_plane.send_to_agent(
+                        "PXMX_RETAG_TENANT", d, agent_id=aid, timeout=120.0)
+                except Exception as exc:  # noqa: BLE001 - one node must not abort the rest
+                    return {"agent_id": aid, "status": "ERROR", "count": 0, "message": str(exc)}
+                rret = (r.get("payload", {}).get("data", r) if isinstance(r, dict) else {})
+                if not isinstance(rret, dict):
+                    rret = {}
+                return {"agent_id": aid, "status": rret.get("status", "ERROR"),
+                        "count": int(rret.get("count", 0) or 0), "message": rret.get("message", "")}
+
+            nodes = list(await asyncio.gather(*[_retag_one(a) for a in connected]))
+            total = sum(n["count"] for n in nodes)
+            any_err = any(n["status"] not in ("SUCCESS", None) for n in nodes)
+            return {"status": "PARTIAL" if any_err else "SUCCESS",
+                    "count": total, "retagged": total, "nodes": nodes,
+                    "message": f"re-tagged {total} VM(s) across {len(nodes)} node(s)"}
+
         # ── VNC console relay (agent-terminates-WSS) ────────────────────────
         # PORT of ProxmoxSpoke.VNC_START/FRAME_DOWN/DISCONNECT. In the all-cs-
         # hosted topology the pxmx agents dial THIS cs spoke, so the cs spoke —
