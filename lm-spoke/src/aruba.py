@@ -374,11 +374,14 @@ class ArubaClient:
                 site_health = int(good_pct or 0)
                 break
 
+            # Per-cycle site index: O(1) lookup instead of rescanning each full
+            # list per site. Bucketing mirrors the original per-site filters.
+            idx = await self._nc_site_index()
+
             DEVICE_ALERT = {"ACCESS_POINT": "AP_DOWN", "SWITCH": "SWITCH_DOWN", "GATEWAY": "GATEWAY_DOWN"}
-            for device in await self._nc_devices():
-                dev_site_id = str(device.get("siteId") or device.get("site_id") or "").strip()
-                if site_id and dev_site_id and dev_site_id != site_id:
-                    continue
+            devices_for_site = (idx["dev_by_site"].get(site_id, []) + idx["dev_global"]
+                                if site_id else idx["devices"])
+            for device in devices_for_site:
                 device_type = str(device.get("deviceType") or "").upper()
                 status = str(device.get("status") or "").upper()
                 if status in {"UP", "ONLINE"}:
@@ -395,12 +398,10 @@ class ArubaClient:
                     if device_name:
                         hw_devices.setdefault(alert_id, {})[device_name] = hw_devices.setdefault(alert_id, {}).get(device_name, 0) + 1
 
-            # Count all clients (wired + wireless) for the site from the global clients list
-            for cl in await self._nc_clients():
-                cl_site_id = str(cl.get("siteId") or cl.get("site_id") or "").strip()
-                matches = (site_id and cl_site_id and cl_site_id == site_id) or (not site_id)
-                if not matches:
-                    continue
+            # Count all clients (wired + wireless) for the site from the indexed
+            # clients list (all clients when the site has no resolved id).
+            clients_for_site = idx["cli_by_site"].get(site_id, []) if site_id else idx["clients"]
+            for cl in clients_for_site:
                 conn_type = str(cl.get("clientConnectionType") or cl.get("connection_type") or "").lower()
                 if conn_type == "wired":
                     wired_clients += 1
@@ -412,10 +413,7 @@ class ArubaClient:
             # name||category to match the WebUI monitored-check id. Insights carry
             # a site NAME (or "All Sites" for global); _new_central_insights is
             # cached so this adds no extra API call within the TTL.
-            for ins in await self._new_central_insights():
-                ins_site = str(ins.get("site") or "").strip()
-                if ins_site and ins_site.lower() not in (site.lower(), "all sites"):
-                    continue
+            for ins in (idx["ins_by_site"].get(site.lower(), []) + idx["ins_global"]):
                 cat = str(ins.get("name") or ins.get("category") or "").strip()
                 if cat:
                     insight_cat_counts[cat] = insight_cat_counts.get(cat, 0) + 1
@@ -424,13 +422,10 @@ class ArubaClient:
             # (Central -> Alerts Monitor button) evaluate on the dashboard. Alerts
             # aren't reliably site-scoped, so an active alert counts for EVERY
             # monitored site; key name||category = the WebUI monitored-check id.
-            for al in await self._new_central_alerts():
-                al_site = str(al.get("site") or "").strip()
-                # Count an alert for THIS site when it is pinned here (name match)
-                # or has no site ("-" = global -> every site). Enables per-site
-                # alert monitoring; the monitored check id is name||category.
-                if al_site and al_site not in ("-", "—") and al_site.lower() != site.lower():
-                    continue
+            # Count an alert for THIS site when it is pinned here (name match) or
+            # has no site ("-" = global -> every site). Enables per-site alert
+            # monitoring; the monitored check id is name||category.
+            for al in (idx["al_by_site"].get(site.lower(), []) + idx["al_global"]):
                 nm = str(al.get("name") or al.get("category") or "").strip()
                 if nm:
                     alert_type_counts[nm] = alert_type_counts.get(nm, 0) + 1
@@ -663,6 +658,73 @@ class ArubaClient:
         return alerts
 
     # ── new_central cached global fetchers ────────────────────────────────────
+
+    async def _nc_site_index(self) -> dict[str, Any]:
+        """Bucket the cached global device/client/insight/alert lists by site so
+        ``poll_site_data`` looks each site up in O(1) instead of rescanning every
+        full list per site (was O(sites×items)).
+
+        Memoized on the instance and keyed by the identity of the four cached
+        source lists (held alive by the module-level caches). Within a poll cycle
+        the cached fetchers return the SAME list objects, so every site reuses one
+        index; when a module cache expires and refetches, a new list object is
+        returned → the key changes → the index is rebuilt. This ties freshness to
+        the existing cache TTLs and introduces no extra staleness.
+
+        The bucketing mirrors ``poll_site_data``'s original filters exactly:
+          * devices — matched by siteId; a device with NO site id counted for
+            every site (``dev_global``); when a site has no resolved id, ALL
+            devices are used (``devices``).
+          * clients — matched by siteId; when a site has no id, ALL clients used.
+          * insights — matched by site NAME; empty or "all sites" → every site.
+          * alerts — matched by site NAME; empty or "-"/"—" → every site.
+        """
+        devices = await self._nc_devices()
+        clients = await self._nc_clients()
+        insights = await self._new_central_insights()
+        alerts = await self._new_central_alerts()
+        key = (id(devices), id(clients), id(insights), id(alerts))
+        memo = getattr(self, "_site_index_memo", None)
+        if memo is not None and memo["key"] == key:
+            return memo["idx"]
+
+        dev_by_site: dict[str, list[dict[str, Any]]] = {}
+        dev_global: list[dict[str, Any]] = []
+        for device in devices:
+            sid = str(device.get("siteId") or device.get("site_id") or "").strip()
+            (dev_by_site.setdefault(sid, []) if sid else dev_global).append(device)
+
+        cli_by_site: dict[str, list[dict[str, Any]]] = {}
+        for cl in clients:
+            sid = str(cl.get("siteId") or cl.get("site_id") or "").strip()
+            if sid:
+                cli_by_site.setdefault(sid, []).append(cl)
+
+        ins_by_site: dict[str, list[dict[str, Any]]] = {}
+        ins_global: list[dict[str, Any]] = []
+        for ins in insights:
+            s = str(ins.get("site") or "").strip().lower()
+            (ins_global if (not s or s == "all sites")
+             else ins_by_site.setdefault(s, [])).append(ins)
+
+        al_by_site: dict[str, list[dict[str, Any]]] = {}
+        al_global: list[dict[str, Any]] = []
+        for al in alerts:
+            s = str(al.get("site") or "").strip()
+            (al_global if (not s or s in ("-", "—"))
+             else al_by_site.setdefault(s.lower(), [])).append(al)
+
+        idx = {
+            "devices": devices, "clients": clients,
+            "dev_by_site": dev_by_site, "dev_global": dev_global,
+            "cli_by_site": cli_by_site,
+            "ins_by_site": ins_by_site, "ins_global": ins_global,
+            "al_by_site": al_by_site, "al_global": al_global,
+        }
+        # Hold refs to the source lists so their ids can't be reused while memoized.
+        self._site_index_memo = {"key": key, "idx": idx,
+                                 "_refs": (devices, clients, insights, alerts)}
+        return idx
 
     async def _nc_sites_health(self) -> list[dict[str, Any]]:
         """Return cached sites-health list; one API call shared across all site queries."""
