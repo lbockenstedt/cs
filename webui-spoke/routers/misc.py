@@ -8,6 +8,7 @@ from server import (
     Body,
     CLIENT_COUNT_BASELINE_FILE,
     CLIENT_HISTORY_FILE,
+    CLIENT_HISTORY_JSONL,
     COMMAND_QUEUE_FILE,
     FileResponse,
     HISTORY_FILE,
@@ -311,6 +312,7 @@ async def api_setup_clear_cache() -> dict[str, Any]:
     # 1. Delete cached data files
     for path in [
         CLIENT_HISTORY_FILE,
+        CLIENT_HISTORY_JSONL,
         STATE_CACHE_FILE,
         COMMAND_QUEUE_FILE,
         RECLONE_STATE_FILE,

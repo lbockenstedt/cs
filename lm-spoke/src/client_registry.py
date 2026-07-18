@@ -11,19 +11,27 @@ This is the lm-spoke equivalent of the webui-spoke ``clients`` dict +
 state — covered by ``.gitignore``, never committed).
 
 All public mutators are async and serialize through a single ``asyncio.Lock``
-so the WS receive loop and HTTP handlers can't tear each other's writes. The
-per-mutation persist runs on every client beacon (~20 sim clients) on the SAME
-event loop as the hub connection + uvicorn API, so the disk write is offloaded
-to a thread (``_apersist`` → ``asyncio.to_thread``); the list is snapshotted on
-the loop under the lock so the write sees a consistent state.
+so the WS receive loop and HTTP handlers can't tear each other's writes.
+
+Persistence is DEBOUNCED: every mutation used to rewrite all of clients.json
+(one full O(N) serialize + write per client beacon — with N clients beaconing
+every ~15 s that's N full-file rewrites per interval). ``_apersist`` now only
+marks the registry dirty and arms a coalescing flush task, so disk sees at
+most one write per ``_FLUSH_INTERVAL_S`` (~5 s) regardless of beacon rate.
+The flush snapshots under the lock and does the ``json.dumps`` + write in a
+worker thread (``asyncio.to_thread``) so neither stalls the shared event
+loop. A process-exit hook flushes any pending dirty state (best-effort; the
+in-memory registry stays authoritative between flushes).
 """
 
 from __future__ import annotations
 
 import asyncio
+import atexit
 import json
 import logging
 import time
+import weakref
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
@@ -32,6 +40,26 @@ logger = logging.getLogger("ClientRegistry")
 # Keep at most this many recent error strings per client (rolling window).
 _MAX_RECENT_ERRORS = 20
 _STATE_FILE = "clients.json"
+# Coalescing window for the debounced persist: at most one clients.json write
+# per this many seconds, no matter how many beacons/mutations land.
+_FLUSH_INTERVAL_S = 5.0
+
+# Flush-on-shutdown: every live registry gets a best-effort synchronous flush
+# of pending dirty state at interpreter exit (the event loop is gone by then,
+# so the async flush task can't run). WeakSet so test registries can be GC'd.
+_REGISTRIES: "weakref.WeakSet[ClientRegistry]" = weakref.WeakSet()
+
+
+def _flush_all_at_exit() -> None:
+    for reg in list(_REGISTRIES):
+        try:
+            if reg._dirty:
+                reg._persist()
+        except Exception:  # noqa: BLE001 — never break interpreter shutdown
+            pass
+
+
+atexit.register(_flush_all_at_exit)
 
 
 class ClientRegistry:
@@ -55,6 +83,11 @@ class ClientRegistry:
         # off sim reverts to the bucket instead of accumulating a redundant
         # `flag:"off"` entry. None = no pruning (tests / standalone registry).
         self._bucket_resolver = bucket_resolver
+        # Debounced-persist state: _dirty marks unflushed in-memory changes;
+        # _flush_task is the armed coalescing flusher (None/done = disarmed).
+        self._dirty = False
+        self._flush_task: Optional[asyncio.Task] = None
+        _REGISTRIES.add(self)
         self._load()
 
     # ── persistence ────────────────────────────────────────────────────────
@@ -71,32 +104,74 @@ class ClientRegistry:
             self.clients = {}
 
     def _persist(self) -> None:
+        """Synchronous full write (load-time repair / atexit flush only —
+        the hot path goes through the debounced ``_apersist``)."""
         try:
+            self._dirty = False
             self._path.write_text(
-                json.dumps(self.clients, indent=2, sort_keys=True),
+                json.dumps(self.clients, sort_keys=True),
                 encoding="utf-8")
         except Exception as exc:  # noqa: BLE001
             logger.warning("could not persist %s: %s", self._path, exc)
 
     async def _apersist(self) -> None:
-        """Persist off the event loop. apply_status runs on every client beacon
-        (~20 sim clients), on the SAME loop as the hub connection + uvicorn API,
-        so a synchronous write here contributed to the hub's Request Timeouts.
-        The caller (apply_status) holds ``self._lock`` across this await, so
-        ``self.clients`` cannot mutate while the worker runs — do BOTH the
-        O(N) ``json.dumps`` AND the file write in the worker thread so neither
-        the serialization CPU nor the disk I/O blocks the shared event loop.
-        Drops indent to shrink serialization + file size."""
-        try:
-            clients = self.clients  # stable: caller holds self._lock
+        """Mark dirty + arm the coalescing flush — does NOT write.
 
-            def _write() -> None:
-                self._path.write_text(
-                    json.dumps(clients, sort_keys=True), encoding="utf-8")
+        Every mutator calls this under ``self._lock`` on every client beacon;
+        rewriting all of clients.json each time serialized N clients to disk N
+        times per beacon interval. Instead the write is deferred to
+        ``_delayed_flush``, so at most one write happens per
+        ``_FLUSH_INTERVAL_S`` no matter the mutation rate. Readers always see
+        the in-memory ``self.clients`` (authoritative); the file is a warm-load
+        snapshot, so a bounded staleness window is safe — a crash loses at most
+        the last ~5 s of last_seen updates."""
+        self._dirty = True
+        if self._flush_task is None or self._flush_task.done():
+            self._flush_task = asyncio.get_running_loop().create_task(
+                self._delayed_flush())
 
-            await asyncio.to_thread(_write)
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("could not persist %s: %s", self._path, exc)
+    async def _delayed_flush(self) -> None:
+        # Loop: a mutation landing while _flush_now is writing re-marks dirty
+        # but may see this task as not-done and skip re-arming — so re-check
+        # after each flush instead of exiting immediately.
+        while True:
+            await asyncio.sleep(_FLUSH_INTERVAL_S)
+            await self._flush_now()
+            if not self._dirty:
+                return
+
+    async def _flush_now(self) -> None:
+        """Write clients.json if dirty. Snapshot under the lock; the O(N)
+        ``json.dumps`` AND the file write run in a worker thread so neither
+        the serialization CPU nor the disk I/O blocks the shared event loop
+        (the lock is held across the await, so ``self.clients`` is stable)."""
+        async with self._lock:
+            if not self._dirty:
+                return
+            self._dirty = False
+            try:
+                clients = self.clients  # stable: we hold self._lock
+
+                def _write() -> None:
+                    self._path.write_text(
+                        json.dumps(clients, sort_keys=True), encoding="utf-8")
+
+                await asyncio.to_thread(_write)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("could not persist %s: %s", self._path, exc)
+
+    async def aclose(self) -> None:
+        """Cancel the armed flusher and flush any pending state to disk.
+        Call on orderly shutdown (tests, service stop); the atexit hook is the
+        last-resort backstop for paths that skip this."""
+        task, self._flush_task = self._flush_task, None
+        if task is not None and not task.done():
+            task.cancel()
+            try:
+                await task
+            except (asyncio.CancelledError, Exception):  # noqa: BLE001
+                pass
+        await self._flush_now()
 
     # ── status upsert ──────────────────────────────────────────────────────
     async def apply_status(self, hostname: str, payload: Dict[str, Any]) -> Dict[str, Any]:
@@ -360,6 +435,9 @@ class ClientRegistry:
         async with self._lock:
             n = len(self.clients)
             self.clients = {}
+            # Clear the dirty flag so a pending debounced flush can't
+            # resurrect clients.json right after the unlink below.
+            self._dirty = False
             try:
                 await asyncio.to_thread(self._path.unlink, missing_ok=True)
             except Exception as exc:  # noqa: BLE001

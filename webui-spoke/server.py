@@ -21,6 +21,7 @@ import ssl
 import struct
 import subprocess
 import termios
+import threading
 import time
 import uuid
 from dataclasses import dataclass
@@ -84,7 +85,12 @@ UPDATE_STATE_FILE = BASE_DIR / "update_state.json"
 VM_WATCHDOG_FILE = BASE_DIR / "vm_watchdog.json"
 RESOURCE_CACHE_FILE = BASE_DIR / "resource_cache.json"
 HISTORY_FILE = BASE_DIR / "central_history.jsonl"
+# Legacy full-snapshot store (still read for migration + deleted on purge).
 CLIENT_HISTORY_FILE = BASE_DIR / "client_history.json"
+# Append-only JSONL store: one {"hostname":…, "record":…} line per CHANGED
+# client per save; compacted (one line per live client) when it grows.
+CLIENT_HISTORY_JSONL = BASE_DIR / "client_history.jsonl"
+CLIENT_HISTORY_MAX_BYTES = 5 * 1024 * 1024  # compact threshold
 CLIENT_COUNT_BASELINE_FILE = BASE_DIR / "client_count_baseline.json"
 CLIENT_COUNT_7DAY_FILE = BASE_DIR / "client_count_7day.json"
 CLIENT_COUNT_7DAY_WINDOW = 7 * 24 * 3600   # 7 days of hourly history
@@ -962,12 +968,39 @@ def _client_history_cutoff() -> datetime:
     return datetime.now(tz=timezone.utc) - timedelta(days=CLIENT_HISTORY_DAYS)
 
 
+def _client_history_raw_records() -> dict[str, dict[str, Any]]:
+    """Latest raw (JSON-typed) record per hostname from disk.
+
+    Prefers the append-only JSONL store (last line per hostname wins); falls
+    back to the legacy full-snapshot ``client_history.json`` for migration.
+    """
+    if CLIENT_HISTORY_JSONL.exists():
+        raw: dict[str, dict[str, Any]] = {}
+        for line in CLIENT_HISTORY_JSONL.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                wrapper = json.loads(line)
+                hostname = str(wrapper.get("hostname") or "")
+                record = wrapper.get("record")
+                if hostname and isinstance(record, dict):
+                    raw[hostname] = record
+            except json.JSONDecodeError:
+                pass
+        return raw
+    if CLIENT_HISTORY_FILE.exists():
+        legacy = json.loads(CLIENT_HISTORY_FILE.read_text(encoding="utf-8"))
+        return legacy if isinstance(legacy, dict) else {}
+    return {}
+
+
 def _load_client_history() -> dict[str, dict[str, Any]]:
     """Load persisted client records from disk, dropping entries older than 7 days."""
-    if not CLIENT_HISTORY_FILE.exists():
-        return {}
     try:
-        raw = json.loads(CLIENT_HISTORY_FILE.read_text(encoding="utf-8"))
+        raw = _client_history_raw_records()
+        if not raw:
+            return {}
         cutoff = _client_history_cutoff()
         kept: dict[str, dict[str, Any]] = {}
         for hostname, record in raw.items():
@@ -992,26 +1025,85 @@ def _load_client_history() -> dict[str, dict[str, Any]]:
         return {}
 
 
+# Serialized-record fingerprints of what is already flushed to the JSONL store
+# (hostname → line text) — lets each save append ONLY changed clients instead
+# of rewriting the whole snapshot every 60 s. Guarded by a plain lock because
+# _save_client_history runs via asyncio.to_thread and can overlap with the
+# route-triggered saves.
+_client_history_flushed: dict[str, str] = {}
+_client_history_io_lock = threading.Lock()
+
+
+def _client_history_line(hostname: str, c: dict[str, Any]) -> str | None:
+    """One JSONL line for *hostname*, or None when the entry is expired
+    (same 7-day pruning rule the old full-snapshot writer applied)."""
+    cutoff = _client_history_cutoff()
+    ls = c.get("last_seen")
+    if isinstance(ls, datetime):
+        if ls.tzinfo is None:
+            ls = ls.replace(tzinfo=timezone.utc)
+        if ls < cutoff:
+            return None  # expired — do not persist
+        entry = dict(c)
+        entry["last_seen"] = ls.isoformat()
+    else:
+        entry = dict(c)
+    return json.dumps({"hostname": hostname, "record": entry},
+                      default=str, sort_keys=True)
+
+
 def _save_client_history() -> None:
-    """Serialise the in-memory clients dict to disk, pruning entries older than 7 days."""
+    """Persist the in-memory clients dict — append-only + periodic compaction.
+
+    The old writer serialized and rewrote the FULL snapshot every 60 s (and on
+    every route-triggered save). Now each save appends one JSONL line per
+    client whose serialized record CHANGED since the last flush; a steady-state
+    save with no changes writes nothing. The file is compacted back to one
+    line per live client when it exceeds CLIENT_HISTORY_MAX_BYTES or when
+    clients were removed (purge — the load path is last-line-wins, so removal
+    requires a rewrite). Retention is unchanged: entries older than
+    CLIENT_HISTORY_DAYS are never persisted and are dropped on load/compact.
+    """
     try:
-        cutoff = _client_history_cutoff()
-        snapshot: dict[str, Any] = {}
-        for hostname, c in clients.items():
-            ls = c.get("last_seen")
-            if isinstance(ls, datetime):
-                if ls.tzinfo is None:
-                    ls = ls.replace(tzinfo=timezone.utc)
-                if ls < cutoff:
-                    continue  # expired — do not persist
-                entry = dict(c)
-                entry["last_seen"] = ls.isoformat()
-            else:
-                entry = dict(c)
-            snapshot[hostname] = entry
-        CLIENT_HISTORY_FILE.write_text(json.dumps(snapshot, default=str), encoding="utf-8")
+        with _client_history_io_lock:
+            snapshot = list(clients.items())
+            lines: dict[str, str] = {}
+            for hostname, c in snapshot:
+                line = _client_history_line(hostname, c)
+                if line is not None:
+                    lines[hostname] = line
+            removed = set(_client_history_flushed) - set(lines)
+            changed = {h: l for h, l in lines.items()
+                       if _client_history_flushed.get(h) != l}
+            if removed or not CLIENT_HISTORY_JSONL.exists():
+                # A deleted/purged client can't be expressed by appending —
+                # rewrite the whole (small) per-client snapshot atomically.
+                _compact_client_history_locked(lines)
+            elif changed:
+                with CLIENT_HISTORY_JSONL.open("a", encoding="utf-8") as fh:
+                    for line in changed.values():
+                        fh.write(line + "\n")
+                _client_history_flushed.update(changed)
+                if CLIENT_HISTORY_JSONL.stat().st_size > CLIENT_HISTORY_MAX_BYTES:
+                    _compact_client_history_locked(lines)
     except Exception as exc:
         logger.warning("Could not save client history: %s", exc)
+
+
+def _compact_client_history_locked(lines: dict[str, str]) -> None:
+    """Rewrite the JSONL store as exactly one line per live client (atomic:
+    temp + replace). Caller holds _client_history_io_lock. Also retires the
+    legacy full-snapshot file so stale purged clients can't resurrect."""
+    tmp = CLIENT_HISTORY_JSONL.with_suffix(CLIENT_HISTORY_JSONL.suffix + ".tmp")
+    tmp.write_text(("\n".join(lines.values()) + "\n") if lines else "",
+                   encoding="utf-8")
+    tmp.replace(CLIENT_HISTORY_JSONL)
+    _client_history_flushed.clear()
+    _client_history_flushed.update(lines)
+    try:
+        CLIENT_HISTORY_FILE.unlink(missing_ok=True)
+    except OSError:
+        pass
 
 
 async def client_history_saver() -> None:

@@ -82,10 +82,11 @@ def test_client_key_default_empty(client):
 
 
 def test_apersist_round_trips_to_disk(tmp_path):
-    """_apersist does json.dumps + write in a worker thread (off the event loop
-    so neither the O(N) serialization nor the disk I/O stalls the shared loop).
-    Verify it still lands valid JSON on disk that a fresh ClientRegistry loads
-    back — the offload refactor must not change the on-disk contract."""
+    """_apersist is now a DEBOUNCED dirty-mark (coalesced flush, ≤1 write per
+    ~5s); the actual write still runs json.dumps + write in a worker thread.
+    Verify that after an explicit flush (aclose — the orderly-shutdown path)
+    valid JSON lands on disk that a fresh ClientRegistry loads back — the
+    debounce must not change the on-disk contract."""
     import asyncio
     # Earlier tests (test_kill_switch) call asyncio.set_event_loop(None), which
     # on Py3.9 poisons the process so the TestClient-based tests later in this
@@ -107,6 +108,8 @@ def test_apersist_round_trips_to_disk(tmp_path):
             "hostname": "sim-1", "platform": "linux", "iteration": 7,
             "connected_ssid": "corp", "gateway_reachable": True,
             "active_simulations": ["www_traffic"], "errors": ["boom"]}))
+        # Debounced: flush explicitly (shutdown path) instead of waiting ~5s.
+        loop.run_until_complete(reg.aclose())
         # The persist file exists and round-trips through a fresh instance.
         assert (data / "clients.json").exists()
         reloaded = ClientRegistry(data)

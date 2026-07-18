@@ -172,6 +172,9 @@ def test_purge_clients_clears_memory_and_disk(spoke_loop):
     for h in ("host-a", "host-b", "host-c"):
         _run(loop, spoke.registry.set_overrides(h, {"sim_load": "100"}))
     assert spoke.registry.count() == 3
+    # Persistence is debounced (~5s coalesced flush) — flush explicitly so the
+    # on-disk file exists before the purge deletes it.
+    _run(loop, spoke.registry.aclose())
     assert spoke.registry._path.exists()
     resp = _run(loop, spoke.handle_command("CS_PURGE_CLIENTS", {}))
     assert resp["status"] == "SUCCESS"
@@ -194,11 +197,13 @@ def test_purge_clients_when_empty_reports_zero(spoke_loop):
 
 def test_purge_then_repopulate_works(spoke_loop):
     """After a purge the registry is fresh-empty and accepts new clients again
-    (the file is recreated on the next persist)."""
+    (the file is recreated on the next flush)."""
     spoke, loop = spoke_loop
     _run(loop, spoke.registry.set_overrides("host-a", {"dns_fail": "on"}))
     _run(loop, spoke.handle_command("CS_PURGE_CLIENTS", {}))
     _run(loop, spoke.registry.set_overrides("host-b", {"kill_switch": "on"}))
     assert spoke.registry.count() == 1
     assert spoke.registry.get("host-b")["overrides"] == {"kill_switch": "on"}
+    # Debounced persistence: flush explicitly, then the file is recreated.
+    _run(loop, spoke.registry.aclose())
     assert spoke.registry._path.exists()
