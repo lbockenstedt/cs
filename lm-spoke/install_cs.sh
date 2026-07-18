@@ -783,6 +783,17 @@ python3 -m venv "$LM_DIR/cs/venv"
 CS_REQ="$LM_DIR/cs/lm-spoke/requirements.txt"
 [ -f "$LM_DIR/cs/requirements.txt" ] && CS_REQ="$LM_DIR/cs/requirements.txt"
 "$LM_DIR/cs/venv/bin/pip" install -r "$CS_REQ" -q
+# The spoke runs lm CORE code (messaging/, security/frame_crypto → cryptography,
+# etc.), so the core's runtime deps MUST be in this venv too — the spoke's own
+# requirements.txt does not list them. Install core/requirements.txt when the
+# shared core checkout is present; fall back to an explicit cryptography floor
+# so a missing/partial core tree still can't crash-loop the spoke on import.
+if [ -f "$LM_DIR/core/requirements.txt" ]; then
+    "$LM_DIR/cs/venv/bin/pip" install -r "$LM_DIR/core/requirements.txt" -q \
+        || warn "core requirements install had issues — spoke may miss core deps"
+else
+    "$LM_DIR/cs/venv/bin/pip" install -q 'cryptography>=42,<50'
+fi
 ok "Dependencies installed"
 
 # ── Hub auto-discovery ──────────────────────────────────────────────────────
