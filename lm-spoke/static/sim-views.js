@@ -37,6 +37,43 @@
  * Shared helpers
  * ------------------------------------------------------------------------- */
 
+// ── pollManager fallback shim ───────────────────────────────────────────────
+// The lm hub defines pollManager in WebUI/main.js (visibility-aware recurring
+// timers: every registered poll suspends while the tab is hidden and resumes
+// with an immediate tick when it becomes visible again). The cs LOCAL
+// dashboard does not load lm's main.js, so provide a minimal compatible
+// implementation here; if a real pollManager already exists (hub context),
+// reuse it.
+const pollManager = window.pollManager || (() => {
+    const polls = new Map();   // id -> { fn, ms, timer }
+    let seq = 0;
+    const start = p => { if (p.timer == null) p.timer = setInterval(p.fn, p.ms); };
+    const stop = p => { if (p.timer != null) { clearInterval(p.timer); p.timer = null; } };
+    document.addEventListener('visibilitychange', () => {
+        if (document.hidden) {
+            polls.forEach(stop);
+        } else {
+            polls.forEach(p => {
+                try { p.fn(); } catch (e) { console.error('pollManager: resume tick failed', e); }
+                start(p);
+            });
+        }
+    });
+    return {
+        register(fn, ms) {
+            const id = ++seq;
+            const p = { fn, ms, timer: null };
+            polls.set(id, p);
+            if (!document.hidden) start(p);
+            return id;
+        },
+        unregister(id) {
+            const p = polls.get(id);
+            if (p) { stop(p); polls.delete(id); }
+        },
+    };
+})();
+
 function csEl(id) { return document.getElementById(id); }
 
 // Debounce a keystroke-driven filter so a fast typist doesn't re-render the
@@ -1503,12 +1540,12 @@ function _csFmtCountdown(secs) {
 let _csDemoTicker = null;
 function csDemoStartTicker() {
     if (_csDemoTicker) return;
-    _csDemoTicker = setInterval(csDemoTickCountdowns, 1000);
+    _csDemoTicker = pollManager.register(csDemoTickCountdowns, 1000);
     csDemoTickCountdowns();
 }
 function csDemoTickCountdowns() {
     const spans = document.querySelectorAll('.cs-demo-countdown[data-demo-expires]');
-    if (!spans.length) { if (_csDemoTicker) { clearInterval(_csDemoTicker); _csDemoTicker = null; } return; }
+    if (!spans.length) { if (_csDemoTicker) { pollManager.unregister(_csDemoTicker); _csDemoTicker = null; } return; }
     const now = Date.now() / 1000;
     spans.forEach(el => {
         const exp = parseFloat(el.getAttribute('data-demo-expires')) || 0;
@@ -4855,7 +4892,7 @@ function csFmtDuration(s) {
 // counting them down between pulses so the timer is live, not stepwise.
 function csStartShedTicker() {
     if (window._csShedTicker) return;
-    window._csShedTicker = setInterval(() => {
+    window._csShedTicker = pollManager.register(() => {
         const now = Date.now() / 1000;
         document.querySelectorAll('.cs-shed-countdown').forEach(el => {
             const at = Number(el.getAttribute('data-shed-at'));
