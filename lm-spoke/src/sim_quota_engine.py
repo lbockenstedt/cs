@@ -367,26 +367,37 @@ class SimQuotaEngine:
         # Authoritative per-sim shareable override (hub-pushed via sim_shareable)
         # WINS over the hardcoded SIM_META default — a sim set non-shareable can
         # never be stacked (Config → Sim Quotas → Simulation Sharing tile).
-        try:
-            sh = self.spoke.local_store.get_sim_shareable()
-            if sim_id in sh:
-                return bool(sh[sim_id])
-        except Exception:  # noqa: BLE001
-            pass
-        try:
-            from sim_quota import SIM_META
-        except Exception:  # noqa: BLE001
+        # Uses the per-sweep caches set in reconcile; falls back to a live read
+        # when called outside a sweep (behavior identical to the original).
+        sh = getattr(self, "_sim_shareable", None)
+        if sh is None:
+            try:
+                sh = self.spoke.local_store.get_sim_shareable() or {}
+            except Exception:  # noqa: BLE001
+                sh = {}
+        if sim_id in sh:
+            return bool(sh[sim_id])
+        meta = getattr(self, "_sim_meta", "unset")
+        if meta == "unset":
+            try:
+                from sim_quota import SIM_META
+                meta = SIM_META
+            except Exception:  # noqa: BLE001
+                meta = None
+        if meta is None:
             return False
-        return bool(SIM_META.get(sim_id, {}).get("multi_capable", False))
+        return bool(meta.get(sim_id, {}).get("multi_capable", False))
 
     def _client_active_sims(self, c: Dict[str, Any]) -> set:
         """Sims currently ON for this client — override wins, else bucket default.
         ``off`` overrides suppress a bucket-default-on sim."""
-        try:
-            from sim_quota import SIM_META
-            flags = list(SIM_META.keys())
-        except Exception:  # noqa: BLE001
-            flags = []
+        flags = getattr(self, "_sim_meta_keys", None)
+        if flags is None:
+            try:
+                from sim_quota import SIM_META
+                flags = list(SIM_META.keys())
+            except Exception:  # noqa: BLE001
+                flags = []
         ov = c.get("overrides") or {}
         cfg = c.get("config") or {}
         active = set()
@@ -678,6 +689,23 @@ class SimQuotaEngine:
             clients = self._all_clients()
             eff_keys = {_quota_key(q) for q in quotas}
             self._refresh_host_index()
+            # Per-sweep caches for sim shareability + SIM_META. Both are stable
+            # within a sweep (a config push serializes on the reconcile lock and
+            # re-runs the sweep), so caching them once avoids a local_store read
+            # (get_sim_shareable) and a SIM_META import per client per quota —
+            # O(quotas×clients). A change is still picked up on the next sweep.
+            try:
+                self._sim_shareable = dict(
+                    self.spoke.local_store.get_sim_shareable() or {})
+            except Exception:  # noqa: BLE001
+                self._sim_shareable = {}
+            try:
+                from sim_quota import SIM_META as _SIM_META
+                self._sim_meta = _SIM_META
+                self._sim_meta_keys = list(_SIM_META.keys())
+            except Exception:  # noqa: BLE001
+                self._sim_meta = None
+                self._sim_meta_keys = []
             # SSID-cell index for this sweep. A quota whose `site` names a cell
             # (e.g. "MIA-PSK") scopes to the cell's physical SITE and pins each
             # assigned client's ssid/ssidpw to the cell — a self-contained cell
