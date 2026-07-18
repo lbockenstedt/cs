@@ -112,6 +112,12 @@ INFRA_ONLY=0
 # no pre-shared secret → it lands in "pending admin approval" on the hub (pass
 # --secret alongside to keep it authenticated).
 PURGE_ENV=0
+# --clone: prep this box as a golden image. Full install (packages, venv, deps,
+# DHCP/agent-listener infra, unit) but DO NOT mint identity or start the spoke —
+# strip SPOKE_SECRET/INSTALL_UUID and leave SPOKE_ID hostname-derived, then
+# enable (not start) the unit. On the NEXT boot of each clone the spoke mints a
+# fresh INSTALL_UUID, derives its id from the (renamed) hostname, and connects.
+CLONE_MODE=0
 while [[ "$#" -gt 0 ]]; do
     case $1 in
         --hub)                HUB_URL="$2"; HUB_URL_PINNED=1; shift ;;
@@ -126,12 +132,22 @@ while [[ "$#" -gt 0 ]]; do
         --no-agent-listener)  CS_AGENT_LISTENER=0 ;;
         --infra-only)         INFRA_ONLY=1 ;;
         --purge-env|--reset-identity) PURGE_ENV=1 ;;
+        --clone|--prep-clone) CLONE_MODE=1 ;;
         --admin-token) ;; # deprecated
         --all-prereqs) ;;
         *) echo "Unknown argument: $1"; exit 1 ;;
     esac
     shift
 done
+
+# --clone forces a hostname-derived id (a pinned --id would freeze every clone
+# to the template's name); identity is minted on first boot, not now.
+if [ "$CLONE_MODE" = "1" ]; then
+    if [ "$SPOKE_ID_PINNED" = "1" ]; then
+        echo "⚠️  --clone ignores --id ($SPOKE_ID): each clone derives its id from its own hostname."
+    fi
+    SPOKE_ID=""; SPOKE_ID_PINNED=0
+fi
 
 # Accept a bare hub IP/host for --hub (e.g. `--hub 172.16.1.31` == `--hub
 # wss://172.16.1.31:443`). A ws://|wss:// scheme or the "auto" sentinel is left
@@ -600,8 +616,11 @@ step "Lab Manager — Generic Agent Installer"
 # ── System packages ───────────────────────────────────────────────────────────
 step "Installing system packages"
 apt-get update -qq
+# Full prerequisite set: python runtime+venv+pip, git/curl for clone+discovery,
+# jq for JSON, sudo for the update watchdog, ca-certificates for TLS (git/pip/
+# wss), iproute2 for 2nd-NIC detection, openssl for the agent-listener cert.
 DEBIAN_FRONTEND=noninteractive apt-get install -y -q \
-    python3 python3-venv python3-pip git curl jq sudo
+    python3 python3-venv python3-pip git curl jq sudo ca-certificates iproute2 openssl
 ok "Packages ready"
 
 # ── DHCP on the second NIC (sim-client network) ───────────────────────────────
@@ -653,6 +672,16 @@ if [ -f "$LM_DIR/cs/.env" ] && grep -q "^INSTALL_UUID=" "$LM_DIR/cs/.env"; then
         INSTALL_UUID_LINE="INSTALL_UUID=$EXISTING_UUID"
         ok "Preserving existing install UUID (hub fingerprint)"
     fi
+fi
+
+# --clone: strip minted identity so the .env ships with NO secret and NO
+# INSTALL_UUID. Each clone mints its own on first boot (control_plane
+# _ensure_install_uuid) → distinct hub identity per clone. HUB_URL + HUB_SECRET
+# (PSK) are kept so clones auto-register without manual approval.
+if [ "$CLONE_MODE" = "1" ]; then
+    SPOKE_SECRET=""
+    INSTALL_UUID_LINE=""
+    warn "--clone: identity stripped — each clone mints a fresh UUID + id on first boot."
 fi
 
 # ── Clone / update ────────────────────────────────────────────────────────────
@@ -866,8 +895,15 @@ SYSD
 
 systemctl daemon-reload
 systemctl enable lm-cs
-systemctl restart lm-cs
-ok "Generic Agent service started"
+if [ "$CLONE_MODE" = "1" ]; then
+    # Golden-image prep: enable for next boot but do NOT start now — starting
+    # would mint an INSTALL_UUID on the template and bake it into every clone.
+    systemctl stop lm-cs 2>/dev/null || true
+    ok "Clone template prepped — lm-cs enabled (starts on next boot), identity NOT minted"
+else
+    systemctl restart lm-cs
+    ok "Generic Agent service started"
+fi
 
 # chown the WHOLE lm checkout to the spoke user so the spoke process can
 # `git pull` /opt/lm itself during a hub-driven SPOKE_UPDATE (the shared core
@@ -1075,8 +1111,21 @@ visudo -cf /etc/sudoers.d/lm-component-update >/dev/null 2>&1 || true
 LOCAL_IP=$(hostname -I 2>/dev/null | awk '{print $1}' || echo "this-host")
 echo ""
 echo "════════════════════════════════════════════"
-ok "Generic Agent installation complete!"
+if [ "$CLONE_MODE" = "1" ]; then
+    ok "Clone template prepared!"
+else
+    ok "Generic Agent installation complete!"
+fi
 echo "════════════════════════════════════════════"
+if [ "$CLONE_MODE" = "1" ]; then
+    echo "  CLONE MODE:   lm-cs is ENABLED but NOT started; identity is unset."
+    echo "                → Shut this box down and clone/template it now."
+    echo "                → Each clone, on first boot, mints a fresh UUID, derives"
+    echo "                  its id from its hostname, and connects to the hub."
+    echo "                → Rename each clone's hostname BEFORE first boot for a"
+    echo "                  distinct spoke id."
+    [ -z "${HUB_SECRET:-}" ] && echo "                ⚠ No --hub-secret (PSK): each clone will await manual approval in the WebUI."
+fi
 if [ -n "$HUB_URL" ]; then
     echo "  LM Hub:       $HUB_URL"
 else
