@@ -37,6 +37,13 @@ _sites_health_cache: dict[str, tuple[float, list[dict[str, Any]]]] = {}
 _devices_cache: dict[str, tuple[float, list[dict[str, Any]]]] = {}
 _nc_clients_cache: dict[str, tuple[float, list[dict[str, Any]]]] = {}
 _NC_GLOBAL_CACHE_TTL = 270  # 4.5 min — just under the 5-min poll interval
+
+# Module-level OAuth token cache keyed by config hash (like the data caches
+# above). The *_from_config webui helpers build a FRESH ArubaClient per call; an
+# instance-scoped token cache meant each one did a new token POST. Sharing the
+# cache across instances with the same config reuses the still-valid token.
+# Value: {access_token, expires_at, [refresh_token]} — expiry handling unchanged.
+_token_cache: dict[str, dict[str, Any]] = {}
 _GLP_TOKEN_URL_TEMPLATE = "https://global.api.greenlake.hpe.com/authorization/v2/oauth2/{workspace_id}/token"
 _KNOWN_CENTRAL_GATEWAY_SUFFIXES = (".api.central.arubanetworks.com", ".api.central.arubanetworks.com.cn")
 
@@ -132,14 +139,13 @@ class ArubaClient:
         self._config_hash = hashlib.md5(
             json.dumps(self.config, sort_keys=True, default=str).encode()
         ).hexdigest()[:8]
-        self._token_cache: dict[str, dict[str, Any]] = {self._config_hash: {}}
 
     def is_configured(self) -> bool:
         """Return ``True`` when the minimum Aruba endpoint configuration is present."""
         return bool(self.cluster_url)
 
     def _token_state(self) -> dict[str, Any]:
-        return self._token_cache.setdefault(self._config_hash, {})
+        return _token_cache.setdefault(self._config_hash, {})
 
     def _new_central_token_url(self) -> str:
         workspace_id = str(self.config.get("workspace_id") or "").strip()
