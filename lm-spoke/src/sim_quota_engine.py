@@ -91,6 +91,10 @@ class SimQuotaEngine:
         self._ledger: Dict[str, Dict[str, Any]] = {}
         self._placement_warnings: List[Dict[str, Any]] = []
         self._user_conf = None
+        # Per-sweep sim_config parsers (both halves of load_configs), refreshed at
+        # the top of each reconcile so _site_without_override reuses them instead
+        # of re-reading config off disk for every client (O(quotas×clients) reads).
+        self._sim_conf = None
         self._ledger_path: Optional[Path] = None
         self._loop_task: Optional[asyncio.Task] = None
         self._reconcile_lock = asyncio.Lock()
@@ -183,14 +187,19 @@ class SimQuotaEngine:
         # keeps the engine's ledger honest so it doesn't over-count a client whose
         # human 'off' will actually keep the sim off).
         self._user_conf = None
+        self._sim_conf = None
         try:
             import sim_config
             cd = getattr(self.spoke.settings, "config_dir", None)
             if cd is not None:
-                _, self._user_conf = sim_config.load_configs(cd)
+                # Keep BOTH halves: user_conf for human-pin checks, sim_conf for
+                # the bucket-default wsite fallback in _site_without_override.
+                # One disk read per sweep replaces one-per-client-per-quota.
+                self._sim_conf, self._user_conf = sim_config.load_configs(cd)
         except Exception as exc:  # noqa: BLE001
             logger.debug("SimQuotaEngine: user_conf load failed: %s", exc)
             self._user_conf = None
+            self._sim_conf = None
 
     def _human_pinned_sim(self, hostname: str, sim_id: str) -> bool:
         """True when a human explicitly set this sim flag in the client's
@@ -250,17 +259,19 @@ class SimQuotaEngine:
         w = cfg.get("wsite")
         if w:
             return str(w)
-        # Fall back to the bucket-resolved site via sim_config if available.
-        try:
-            import sim_config
-            cd = getattr(self.spoke.settings, "config_dir", None)
-            if cd is not None:
-                sc, uc = sim_config.load_configs(cd)
+        # Fall back to the bucket-resolved site via sim_config, reusing the
+        # per-sweep parsers cached by _refresh_host_index (refreshed once per
+        # reconcile, so a config change is still picked up within one sweep).
+        sc = getattr(self, "_sim_conf", None)
+        if sc is not None:
+            try:
+                import sim_config
                 _, eff_cfg = sim_config.effective_client_fields(
-                    hostname, sc, uc, c.get("simulation_id") or "", c.get("config"))
+                    hostname, sc, getattr(self, "_user_conf", None),
+                    c.get("simulation_id") or "", c.get("config"))
                 return str(eff_cfg.get("wsite") or "")
-        except Exception:  # noqa: BLE001
-            pass
+            except Exception:  # noqa: BLE001
+                pass
         return ""
 
     def _physical_site_of(self, hostname: str) -> str:
