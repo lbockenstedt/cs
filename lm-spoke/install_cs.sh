@@ -684,6 +684,64 @@ if [ "$CLONE_MODE" = "1" ]; then
     warn "--clone: identity stripped — each clone mints a fresh UUID + id on first boot."
 fi
 
+# ── Retire any legacy lm-generic-agent on this box ───────────────────────────
+# Vendored from lm/agent/install_agent.sh:retire_legacy_agent — keep in sync.
+# The legacy leaf (lm-generic-agent, /opt/lm/generic-agent/src/agent.py) is
+# protocol-incompatible with the session-key-adopting hub: it has no
+# SPOKE_UPDATE_SESSION_KEY / LOAD_ROLE handler, connects + passes mTLS but never
+# adopts a session key, and the hub refuses to dispatch to it (every role on
+# the box times out while the WS stays "online"). Purge it before the clone so
+# even an aborted install can't leave the zombie connecting under this box's
+# id. Idempotent + non-fatal if absent; never touches this installer's own unit
+# ($SERVICE_NAME) — it's (re)written below.
+SERVICE_NAME="lm-cs"
+retire_legacy_agent() {
+    # Match the legacy leaf by BOTH its historical unit name AND any unit whose
+    # definition ExecStarts /opt/lm/generic-agent/src/agent.py (older template
+    # builders named the unit variously). Never touch this installer's own unit.
+    local names="lm-generic-agent"
+    local f
+    for f in /etc/systemd/system/*.service /etc/systemd/system/*/*.service \
+             /run/systemd/system/*.service \
+             /lib/systemd/system/*.service /usr/lib/systemd/system/*.service; do
+        [ -e "$f" ] || continue
+        if grep -qE "/opt/lm/generic-agent" "$f" 2>/dev/null; then
+            names="$names $(basename "$f" .service)"
+        fi
+    done
+    local u
+    for u in $(systemctl list-units --type=service --state=running,failed --no-legend --plain 2>/dev/null | awk '{print $1}'); do
+        if systemctl show "$u" -p ExecStart 2>/dev/null | grep -q "/opt/lm/generic-agent"; then
+            names="$names ${u%.service}"
+        fi
+    done
+    local svc purged=0
+    for svc in $(printf '%s\n' $names | sort -u); do
+        [ -n "$svc" ] || continue
+        [ "$svc" = "$SERVICE_NAME" ] && continue
+        if [ -e "/etc/systemd/system/${svc}.service" ] \
+           || systemctl list-unit-files "${svc}.service" 2>/dev/null | grep -qE "^${svc}\.service"; then
+            systemctl stop    "$svc" 2>/dev/null || true
+            systemctl disable "$svc" 2>/dev/null || true
+            rm -f "/etc/systemd/system/${svc}.service"
+            systemctl mask    "$svc" 2>/dev/null || true
+            echo "🧹  Purged legacy leaf unit ${svc}.service."
+            purged=1
+        fi
+    done
+    if [ -d /opt/lm/generic-agent ]; then
+        pkill -f "/opt/lm/generic-agent/src/agent.py" 2>/dev/null || true
+        rm -rf /opt/lm/generic-agent
+        echo "🧹  Removed legacy leaf dir /opt/lm/generic-agent."
+        purged=1
+    fi
+    if [ "$purged" = 1 ]; then
+        systemctl daemon-reload 2>/dev/null || true
+        echo "    The role-capable ${SERVICE_NAME} now owns this box's spoke connection."
+    fi
+}
+retire_legacy_agent
+
 # ── Clone / update ────────────────────────────────────────────────────────────
 step "Installing Generic Agent"
 mkdir -p "$LM_DIR"
