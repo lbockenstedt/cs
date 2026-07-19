@@ -124,6 +124,11 @@ run_cache_worker() {
     # Re-read config so the heartbeat's active_sims + the API-health gate track
     # a freshly-pushed simulation.conf instead of the launch-time snapshot.
     refresh_config
+    # Detect the ACTIVE phy type dynamically (default-route iface → wireless
+    # standard / ethernet), NOT from simulation.conf's sim_phy. Cheap kernel/
+    # netlink queries (ip route + iw dev link) — no network I/O — so safe here.
+    detect_phy_type
+    echo "$phy_type" > "$CACHE_DIR/phy_type"
     # WiFi SSID
     nmcli -t -f active,ssid dev wifi 2>/dev/null \
       | awk -F: '$1=="yes"{print $2}' \
@@ -242,6 +247,16 @@ get_wifi_status() {
   else
     echo "${RED}DISCONNECTED${RST}"
   fi
+}
+#------------------------------------------------------------
+# Helper: active PHY type — detected dynamically by the cache worker (not read
+# from simulation.conf). Empty until the first worker tick → "…".
+#------------------------------------------------------------
+get_phy_type() {
+  local p
+  p=$(cat "$CACHE_DIR/phy_type" 2>/dev/null)
+  [[ -n "$p" ]] || p="…"
+  echo "$p"
 }
 #------------------------------------------------------------
 # Helper: gateway reachability — reads from cache (no blocking ping).
@@ -407,11 +422,13 @@ while true; do
   printf "%s%s%s\n" "$BOLD" "$(printf '═%.0s' $(seq 1 $(tput cols 2>/dev/null || echo 58)))" "$RST"
   echo ""
   printf "  %sSite:%s    %-22s  %sSim-ID:%s %s\n" "$BOLD" "$RST" "$wsite" "$BOLD" "$RST" "$simulation_id"
-  printf "  %sPHY:%s     %-22s  %sLoad:%s   %s%%\n" "$BOLD" "$RST" "$sim_phy" "$BOLD" "$RST" "$sim_load"
-  # sim-code version on the RIGHT side (under Load, the right column) — the
-  # per-box deploy indicator. 35 leading chars line "Version:" up under "Load:".
-  printf "  %-33s%sVersion:%s %s\n" "" "$BOLD" "$RST" "$simsh_ver"
-  [[ -n "$wladapter" ]] && printf "  %sAdapter:%s %s\n" "$BOLD" "$RST" "$wladapter"
+  printf "  %sPHY:%s     %-22s  %sLoad:%s   %s%%\n" "$BOLD" "$RST" "$(get_phy_type)" "$BOLD" "$RST" "$sim_load"
+  # Adapter (left col, under PHY) + Version (right col, under Load) — folds the
+  # two former standalone lines into one 2-col row so the top block is a tidy
+  # 3-row × 2-col table (whitespace win). "-" placeholder when no wlan adapter;
+  # Version (the per-box deploy indicator) always shows.
+  _adp="${wladapter:--}"
+  printf "  %sAdapter:%s %-22s  %sVersion:%s %s\n" "$BOLD" "$RST" "$_adp" "$BOLD" "$RST" "$simsh_ver"
   echo ""
   printf "  %sWiFi:%s    %s\n" "$BOLD" "$RST" "$(get_wifi_status)"
   printf "  %sGateway:%s %s\n" "$BOLD" "$RST" "$(get_gateway_status)"

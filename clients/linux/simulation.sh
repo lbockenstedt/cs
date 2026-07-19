@@ -1,5 +1,5 @@
 #!/bin/bash
-version=.97
+version=1.0
 LOG_FILE=/usr/local/scripts/sim.log
 
 echo $(date) | tee -a ${LOG_FILE}
@@ -31,6 +31,14 @@ _sleep_pid=""
 # iterations (one sourced while-loop), resets on re-exec. Excludes the fail-sim
 # fast paths and the auth_fail flap (intentional cycling), which pass track=0.
 _reconnect_fails=0
+# How many consecutive genuine-connect failures before we escalate to a HARD
+# radio cycle (nmcli radio off/on). The early retries just ride the scan-wait
+# ramp with the scan cache kept WARM — a radio bounce wipes that cache, so on a
+# slow driver (SSID can take ~1 min to surface) bouncing on every retry reset
+# discovery to zero and the client never landed. Only a persistent failure
+# (>= this many) now triggers the reset. An explicit `reset` arg still forces
+# a cycle immediately (the "reset the adapter" recovery site).
+_RADIO_CYCLE_AFTER=5
 # USR1 (from agent.sh restart_sim / kill_switch) triggers a config re-read
 # on the next outer-loop iteration instead of default-terminating the process.
 # If we're inside an interruptible sleep (_isleep, e.g. the offline window),
@@ -490,11 +498,16 @@ report_status() {
 # the caller proceeds anyway (nmcli -w handles a not-yet-ready device itself).
 _wait_radio_ready() {
   local cap="${1:-15}" i st
+  echo "  [radio] waiting up to ${cap}s for wifi radio to leave 'unavailable'..." | tee -a ${LOG_FILE}
   for ((i=0; i<cap; i++)); do
     st=$(nmcli -t -f DEVICE,TYPE,STATE device status 2>/dev/null | grep ':wifi:' | head -1)
-    if [[ -n "$st" && "$st" != *":unavailable" ]]; then return 0; fi
+    if [[ -n "$st" && "$st" != *":unavailable" ]]; then
+      echo "  [radio] ready after ${i}s (state: ${st##*:})" | tee -a ${LOG_FILE}
+      return 0
+    fi
     sleep 1
   done
+  echo "  [radio] STILL unavailable after ${cap}s — proceeding anyway" | tee -a ${LOG_FILE}
   return 1
 }
 # Wait until the target SSID is present in NetworkManager's scan cache — i.e. at
@@ -513,9 +526,11 @@ _wait_radio_ready() {
 _wait_ssid_seen() {
   local ssid="$1" cap="${2:-20}" i
   [[ -z "$ssid" ]] && return 1
+  echo "  [scan] waiting up to ${cap}s for SSID '${ssid}' to appear (reconnect-fails=${_reconnect_fails:-0})..." | tee -a ${LOG_FILE}
   nmcli device wifi rescan >/dev/null 2>&1 || true
   for ((i=0; i<cap; i++)); do
     if nmcli -t -f SSID device wifi list 2>/dev/null | grep -Fxq "$ssid"; then
+      echo "  [scan] SSID '${ssid}' seen after ${i}s" | tee -a ${LOG_FILE}
       return 0
     fi
     if (( i > 0 && i % 3 == 0 )); then
@@ -523,6 +538,7 @@ _wait_ssid_seen() {
     fi
     sleep 1
   done
+  echo "  [scan] SSID '${ssid}' NOT seen after ${cap}s — connecting blind (nmcli backstop)" | tee -a ${LOG_FILE}
   return 1
 }
 # Race an in-flight nmcli activation (pid $2) against a background `iw event`
@@ -634,11 +650,12 @@ connect_wifi() {
   local target_ssid
   if [[ "$site_based_ssid" == "on" ]]; then target_ssid="$wsite-$ssid"
   else target_ssid="$ssid"; fi
-  # Cycle the radio ONLY as a reset-on-failure: when the caller forces it (reset)
-  # OR we've failed to connect since the last success (a retry, not a fresh
-  # attempt). A fresh connect (counter 0) skips the cycle — cycling wipes the
-  # scan cache and was the primary cause of connect-before-scan thrash.
-  if [[ "$reset" == "reset" || ( "$track" == "1" && "${_reconnect_fails:-0}" -gt 0 ) ]]; then
+  # Cycle the radio only as a LAST resort: when the caller forces it (reset) OR
+  # we've failed _RADIO_CYCLE_AFTER (5) times in a row since the last success.
+  # The early retries just wait longer on the scan-wait ramp with the scan cache
+  # kept WARM — a radio bounce wipes that cache, which stranded slow drivers
+  # (SSID takes ~1 min to surface). Only a persistent failure escalates to reset.
+  if [[ "$reset" == "reset" || ( "$track" == "1" && "${_reconnect_fails:-0}" -ge "${_RADIO_CYCLE_AFTER:-5}" ) ]]; then
     nmcli radio wifi off
     nmcli radio wifi on
     _wait_radio_ready 15
@@ -656,10 +673,17 @@ connect_wifi() {
   # AP drops the link (failure) — no blind `nmcli -w` wait for the whole window.
   nmcli -w "$wait" device wifi connect "$target_ssid" password "$ssidpw" >/dev/null 2>&1 &
   if _connect_outcome "$wait" $!; then
-    [[ "$track" == "1" ]] && _reconnect_fails=0
+    if [[ "$track" == "1" ]]; then
+      _reconnect_fails=0
+      echo "  [connect] SUCCESS — scan-wait ramp reset to 20s" | tee -a ${LOG_FILE}
+    fi
     return 0
   fi
-  [[ "$track" == "1" ]] && _reconnect_fails=$((_reconnect_fails + 1))
+  if [[ "$track" == "1" ]]; then
+    _reconnect_fails=$((_reconnect_fails + 1))
+    _next_cap=$(( 20 + 5 * _reconnect_fails )); (( _next_cap > 60 )) && _next_cap=60
+    echo "  [connect] FAILED — reconnect-fails now ${_reconnect_fails}; next scan-wait up to ${_next_cap}s" | tee -a ${LOG_FILE}
+  fi
   return 1
 }
 #------------------------------------------------------------
@@ -733,10 +757,11 @@ _connect_1x_core() {
     # a fail-sim, not a genuine connect — track=0 from connect_1x_fail).
     nmcli -t -f NAME connection show | grep -Fxq "$target_ssid" && nmcli connection delete "$target_ssid"
   else
-    # Cycle only as a reset-on-failure (caller forces it, or we've failed since
-    # the last success); a fresh attempt skips it. Then wait for the SSID to
-    # appear in the scan cache (beacon heard) before rebuilding/associating.
-    if [[ "$reset" == "reset" || ( "$track" == "1" && "${_reconnect_fails:-0}" -gt 0 ) ]]; then
+    # Cycle only on reset OR after _RADIO_CYCLE_AFTER (5) consecutive failures —
+    # early retries just extend the scan-wait ramp without bouncing the radio
+    # (a bounce wipes the scan cache and strands slow drivers). Then wait for the
+    # SSID to appear in the scan cache (beacon heard) before rebuilding/associating.
+    if [[ "$reset" == "reset" || ( "$track" == "1" && "${_reconnect_fails:-0}" -ge "${_RADIO_CYCLE_AFTER:-5}" ) ]]; then
       nmcli radio wifi off
       nmcli radio wifi on
       _wait_radio_ready 15
@@ -782,10 +807,17 @@ _connect_1x_core() {
   # password is what makes the fast path fail fast on the deauth event.
   nmcli -w "$wait_time" connection up "$target_ssid" >/dev/null 2>&1 &
   if _connect_outcome "$wait_time" $!; then
-    [[ "$track" == "1" ]] && _reconnect_fails=0
+    if [[ "$track" == "1" ]]; then
+      _reconnect_fails=0
+      echo "  [connect] SUCCESS — scan-wait ramp reset to 20s" | tee -a ${LOG_FILE}
+    fi
     return 0
   fi
-  [[ "$track" == "1" ]] && _reconnect_fails=$((_reconnect_fails + 1))
+  if [[ "$track" == "1" ]]; then
+    _reconnect_fails=$((_reconnect_fails + 1))
+    _next_cap=$(( 20 + 5 * _reconnect_fails )); (( _next_cap > 60 )) && _next_cap=60
+    echo "  [connect] FAILED — reconnect-fails now ${_reconnect_fails}; next scan-wait up to ${_next_cap}s" | tee -a ${LOG_FILE}
+  fi
   return 1
 }
 #------------------------------------------------------------
@@ -807,10 +839,11 @@ manage_connection() {
     nmcli -w "$wait_time" connection down "$target_ssid" >/dev/null 2>&1 || true
     return
   fi
-  # action == up. Cycle only as a reset-on-failure (caller forces it, or we've
-  # failed since the last success); a fresh attempt skips it. Then wait for the
-  # SSID to appear in the scan cache (beacon heard) before (re)associating.
-  if [[ "$reset" == "reset" || ( "$track" == "1" && "${_reconnect_fails:-0}" -gt 0 ) ]]; then
+  # action == up. Cycle only on reset OR after _RADIO_CYCLE_AFTER (5) consecutive
+  # failures — early retries just extend the scan-wait ramp without bouncing the
+  # radio (a bounce wipes the scan cache and strands slow drivers). Then wait for
+  # the SSID to appear in the scan cache (beacon heard) before (re)associating.
+  if [[ "$reset" == "reset" || ( "$track" == "1" && "${_reconnect_fails:-0}" -ge "${_RADIO_CYCLE_AFTER:-5}" ) ]]; then
     nmcli radio wifi off
     nmcli radio wifi on
     _wait_radio_ready 15
@@ -825,10 +858,17 @@ manage_connection() {
   # flap loop) instead of blocking on `nmcli -w $wait_time`. $wait_time backstop.
   nmcli -w "$wait_time" connection up "$target_ssid" >/dev/null 2>&1 &
   if _connect_outcome "$wait_time" $!; then
-    [[ "$track" == "1" ]] && _reconnect_fails=0
+    if [[ "$track" == "1" ]]; then
+      _reconnect_fails=0
+      echo "  [connect] SUCCESS — scan-wait ramp reset to 20s" | tee -a ${LOG_FILE}
+    fi
     return 0
   fi
-  [[ "$track" == "1" ]] && _reconnect_fails=$((_reconnect_fails + 1))
+  if [[ "$track" == "1" ]]; then
+    _reconnect_fails=$((_reconnect_fails + 1))
+    _next_cap=$(( 20 + 5 * _reconnect_fails )); (( _next_cap > 60 )) && _next_cap=60
+    echo "  [connect] FAILED — reconnect-fails now ${_reconnect_fails}; next scan-wait up to ${_next_cap}s" | tee -a ${LOG_FILE}
+  fi
   return 1
 }
 #------------------------------------------------------------

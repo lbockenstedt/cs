@@ -58,6 +58,49 @@ detect_eth_adapter() {
   eadapter=$(ip -br a 2>/dev/null | grep "enp\|eno\|eth0\|eth1\|eth2\|eth3\|eth4\|eth5\|eth6\|ens" | cut -d ' ' -f '1')
 }
 
+# Detect the ACTIVE PHY type dynamically — NOT from simulation.conf's sim_phy
+# (which is the configured INTENT). Picks the interface carrying the default
+# route (the box's actual uplink), falling back to the first carrier-up non-lo
+# iface, and classifies it:
+#   wireless  → the negotiated 802.11 standard (ac/ax/n/g) via `iw dev link`
+#               (VHT=ac, HE=ax, HT=n; legacy rates → g), else just "wireless"
+#   ethernet  → "ethernet"
+#   other     → the driver iface prefix (e.g. "br", "ppp")
+# Sets $phy_type. Best-effort + offline-tolerant (no network I/O — `iw`/`ip`
+# read kernel/netlink state). Used by dashboard.sh so the PHY row reflects what
+# is actually connected, not the config's choice.
+detect_phy_type() {
+  phy_type="unknown"
+  local iface=""
+  iface=$(ip route show default 2>/dev/null \
+    | awk '/default/{for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}')
+  if [[ -z "$iface" ]]; then
+    iface=$(ip -br a 2>/dev/null | awk '$1!="lo" && $2 ~ /UP/ {print $1; exit}')
+  fi
+  [[ -z "$iface" ]] && return 0
+  local base="${iface%%@*}"
+  case "$base" in
+    wl*)  phy_type="wireless"; _detect_wifi_std "$iface" ;;
+    en*|eth*) phy_type="ethernet" ;;
+    *)    phy_type="$base" ;;
+  esac
+}
+# Resolve the negotiated 802.11 standard from `iw dev <iface> link`'s TX line.
+# `iw` is present on these boxes (simulation.sh uses `iw event`); if missing or
+# not associated, leaves phy_type as "wireless". VHT checked before HT because
+# "VHT-MCS" contains the "HT-" substring.
+_detect_wifi_std() {
+  local iface="$1" tx
+  tx=$(iw dev "$iface" link 2>/dev/null | awk '/TX:/{print; exit}')
+  case "$tx" in
+    *VHT-*) phy_type="802.11ac" ;;
+    *HE-*)  phy_type="802.11ax" ;;
+    *HT-*)  phy_type="802.11n"  ;;
+    *Bit/s*) phy_type="802.11g" ;;
+    *)      phy_type="wireless" ;;
+  esac
+}
+
 # ── per-user override ───────────────────────────────────────────────────────
 # CS_OVERRIDE_KEYS is the SUPERSET of the per-script lists that had drifted:
 # dashboard.sh was missing the collab_* / dns_* / dot1x_password / address
