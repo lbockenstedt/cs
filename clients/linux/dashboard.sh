@@ -60,9 +60,9 @@ refresh_config() {
   ssidpw_fail=$(get_value 'simulation' 'ssidpw_fail')
   allow_offline=$(get_value 'simulation' 'allow_offline')
   web_server=$(get_value 'simulation' 'web_server')
-  # Default to ON (hub mode) when unset/empty — matches simulation.sh/update.sh so
-  # the dashboard reflects the same effective mode the sim loop acts on.
-  web_server="${web_server:-on}"
+  # Default to ON (hub mode); flip to off ONLY when the conf literally says "off"
+  # — matches simulation.sh/update.sh so the dashboard shows the effective mode.
+  [[ "$web_server" != "off" ]] && web_server="on"
   # Device-specific settings
   wsite=$(get_value "$simulation_id" 'wsite')
   sim_phy=$(get_value "$simulation_id" 'sim_phy')

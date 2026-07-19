@@ -16,10 +16,10 @@ process_ini_file '/usr/local/scripts/simulation.conf'
 # Read config values
 #------------------------------------------------------------
 web_server=$(get_value 'simulation' 'web_server')
-# Default to ON (hub mode) when unset/empty so a client whose simulation.conf is
-# unreadable or missing still ATTEMPTS to update itself out of the bad state via
-# the web-server tier instead of silently going dark. Explicit "off" is honored.
-web_server="${web_server:-on}"
+# Default to ON (hub mode); flip to off ONLY when the conf literally says "off".
+# A missing/unreadable conf (empty value) therefore stays ON so the client still
+# ATTEMPTS to self-update out of a bad state; anything not exactly "off" → on.
+[[ "$web_server" != "off" ]] && web_server="on"
 server_url=$(get_value 'server' 'server_url')
 server_url="${server_url:-http://169.253.1.1:8080}"
 smb_repo=$(get_value 'simulation' 'smb_repo')

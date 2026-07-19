@@ -190,9 +190,9 @@ auth_fail=$(get_value 'simulation' 'auth_fail')
 ssidpw_fail=$(get_value 'simulation' 'ssidpw_fail')
 allow_offline=$(get_value 'simulation' 'allow_offline')
 web_server=$(get_value 'simulation' 'web_server')
-# Default to ON (hub mode) when unset/empty so an unreadable/missing config
-# doesn't silently strand the client; explicit "off" is honored. See update.sh.
-web_server="${web_server:-on}"
+# Default to ON (hub mode); flip to off ONLY when the conf literally says "off"
+# so an unreadable/missing config (empty value) stays ON. See update.sh.
+[[ "$web_server" != "off" ]] && web_server="on"
 # A [username] override may flip web_server (CS_OVERRIDE_KEYS superset —
 # dashboard.sh always honored it, this script didn't). Apply it BEFORE the
 # hub/standalone branch below reads it, so the mode decision and the later
