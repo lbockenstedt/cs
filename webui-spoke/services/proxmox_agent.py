@@ -766,9 +766,12 @@ def _proxmox_usb_config_payload(hostname: str | None = None) -> dict[str, Any]:
     return {
         "vidpids": _parse_json_list(settings.get("usb_vidpids", "[]")),
         "missing_timeout": _setting_int("usb_missing_timeout", 60, 1),
-        "image1_template_id": int(_primary_template_id(image1_template_spec, _legacy_template_id(settings, 1)) or 100),
+        # Template field accepts a vmid OR a name — emit the resolved value as
+        # a STRING (a name can't be int-coerced). Numeric specs come out as a
+        # digit string; the pxmx agent's _resolve_template_vmid handles both.
+        "image1_template_id": _primary_template_id(image1_template_spec, _legacy_template_id(settings, 1)),
         "image1_template_spec": image1_template_spec,
-        "image2_template_id": int(_primary_template_id(image2_template_spec, _legacy_template_id(settings, 2)) or 200),
+        "image2_template_id": _primary_template_id(image2_template_spec, _legacy_template_id(settings, 2)),
         "image2_template_spec": image2_template_spec,
         "template_vmid_specs": [image1_template_spec, image2_template_spec],
         "image1_pct": max(0, min(100, int(str(settings.get("vm_image_1_pct", "50")).strip() or "50"))),
@@ -2572,8 +2575,13 @@ async def _apply_proxmox_telemetry_state(body: dict[str, Any], hostname: str, no
         client_last_seen = client_seen.get(str(enriched.get("name", "")))
         if isinstance(client_last_seen, datetime):
             enriched["last_seen"] = client_last_seen.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
-        # Mark as template if agent flagged it OR if vmid matches a configured template ID
-        if enriched.get("is_template") or str(enriched.get("vmid", "")).strip() in configured_template_ids:
+        # Mark as template if agent flagged it OR if vmid matches a configured
+        # template ID — OR if the VM's NAME matches a configured template name
+        # (the clone-source field accepts a vmid OR a name; a name-configured
+        # template must still be marked here so telemetry/UI stay consistent).
+        if (enriched.get("is_template")
+                or str(enriched.get("vmid", "")).strip() in configured_template_ids
+                or str(enriched.get("name", "")).strip() in configured_template_ids):
             enriched["is_template"] = True
         enriched_vms.append(enriched)
 
