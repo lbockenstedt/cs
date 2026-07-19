@@ -25,6 +25,7 @@ Source of truth: ``cs/webui-spoke/server.py``
 from __future__ import annotations
 
 import logging
+import os
 import time
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -401,18 +402,32 @@ class ProxmoxDeploy:
         ``proxmox_hosts`` list (one entry per known host) that the VM Server
         view expands into one row per Proxmox host. Stale hosts (no frame in
         ``STALE_SECS``) are marked disconnected but retained so a briefly-offline
-        agent keeps its row until it reconnects or ages out.
+        agent keeps its row; hosts silent past ``EVICT_SECS`` are DROPPED so
+        their last-known VM inventory stops being relayed forever.
         """
         STALE_SECS = 180
+        # Hard eviction TTL. Without it, ``proxmox_states`` was write-only: a host
+        # that goes quiet (decommissioned, agent removed, CS disabled) had its LAST
+        # snapshot — still listing any VMs deleted just before it went silent —
+        # re-relayed on every 10s frame indefinitely, so deleted VMs lingered in
+        # the hub VM Server view "way after" deletion. The hub full-replaces its
+        # cache from each frame, so once we stop relaying a host it disappears on
+        # the next tick. (VMs deleted on a still-reporting host already vanish
+        # within one frame — its ``vms`` list is rebuilt live each tick.)
+        EVICT_SECS = int(os.environ.get("CS_PROXMOX_EVICT_SECS", "900") or 900)
         now = time.time()
         hosts: List[Dict[str, Any]] = []
         all_vms: List[Dict[str, Any]] = []
         all_usb: List[Any] = []
         freshest: Optional[Dict[str, Any]] = None
+        _evict: List[str] = []
 
-        for hn, st in self.proxmox_states.items():
+        for hn, st in list(self.proxmox_states.items()):
             st = st or {}
             age = now - float(st.get("last_seen", 0) or 0)
+            if age > EVICT_SECS:
+                _evict.append(hn)
+                continue
             connected = bool(st.get("connected")) and age <= STALE_SECS
             summary = self._host_summary(st)
             summary["connected"] = connected
@@ -430,6 +445,18 @@ class ProxmoxDeploy:
             if freshest is None or float(st.get("last_seen", 0) or 0) > \
                     float((freshest or {}).get("last_seen", 0) or 0):
                 freshest = {**st, "last_seen": st.get("last_seen", 0)}
+
+        # Evict long-silent hosts so their stale VM inventory stops being relayed
+        # (see EVICT_SECS above). Also drop their resource-sample rings so the
+        # dicts don't grow unbounded across the fleet's lifetime.
+        for hn in _evict:
+            self.proxmox_states.pop(hn, None)
+            self.cpu_samples.pop(hn, None)
+            self.mem_samples.pop(hn, None)
+        if _evict:
+            logger.info("CS_RELAY_EVICT: dropped %d host(s) silent > %ds — their "
+                        "VMs are no longer relayed: %s",
+                        len(_evict), EVICT_SECS, ", ".join(_evict))
 
         # Backward-compatible single-host block (freshest host), so legacy
         # single-row readers and the new per-host reader both work.
