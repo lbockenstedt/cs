@@ -92,6 +92,23 @@ sim_phy=$(get_value $simulation_id 'sim_phy')
 rapid_update=$(get_value 'simulation' 'rapid_update')
 syslog=$(get_value 'simulation' 'syslog')
 syslog_server=$(get_value 'address' 'syslog_server')
+#------------------------------------------------------------
+# Cap the GNOME compositor (mutter) CPU — the biggest idle CPU sink on these
+# GPU-less VM desktops (software / llvmpipe compositing). cpulimit -e watches for
+# the process BY NAME and throttles it (SIGSTOP/SIGCONT), backgrounded, and keeps
+# monitoring so it re-attaches if mutter restarts — same tool the www-traffic sim
+# uses (cpulimit is installed by apt_update.sh). Configurable via simulation.conf
+# [simulation] mutter_cpu_limit = percent of ONE core; unset falls back to 40 (a
+# runaway gets throttled; a normally-idle compositor is well under it). Set 0 to
+# disable. Idempotent: drop any prior cap before re-applying on each boot.
+#------------------------------------------------------------
+mutter_cpu_limit=$(get_value 'simulation' 'mutter_cpu_limit')
+[[ "$mutter_cpu_limit" =~ ^[0-9]+$ ]] || mutter_cpu_limit=40
+if (( mutter_cpu_limit > 0 )) && command -v cpulimit >/dev/null 2>&1; then
+  pkill -f 'cpulimit -e mutter' 2>/dev/null || true
+  cpulimit -e mutter -l "$mutter_cpu_limit" -b >/dev/null 2>&1 || true
+  echo "Capping mutter CPU at ${mutter_cpu_limit}% of one core (cpulimit -e)" | tee -a /usr/local/scripts/sim.log
+fi
 tempvar=$(get_value $username 'repo_location')
 #------------------------------------------------------------
 #Checking to see if this device/user has an override
