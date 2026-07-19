@@ -98,12 +98,12 @@ syslog_server=$(get_value 'address' 'syslog_server')
 # the process BY NAME and throttles it (SIGSTOP/SIGCONT), backgrounded, and keeps
 # monitoring so it re-attaches if mutter restarts — same tool the www-traffic sim
 # uses (cpulimit is installed by apt_update.sh). Configurable via simulation.conf
-# [simulation] mutter_cpu_limit = percent of ONE core; unset falls back to 40 (a
-# runaway gets throttled; a normally-idle compositor is well under it). Set 0 to
-# disable. Idempotent: drop any prior cap before re-applying on each boot.
+# [simulation] mutter_cpu_limit = percent of ONE core; unset falls back to 5
+# (aggressive — these are non-interactive sim desktops, so hard-cap the compositor).
+# Set 0 to disable. Idempotent: drop any prior cap before re-applying on each boot.
 #------------------------------------------------------------
 mutter_cpu_limit=$(get_value 'simulation' 'mutter_cpu_limit')
-[[ "$mutter_cpu_limit" =~ ^[0-9]+$ ]] || mutter_cpu_limit=40
+[[ "$mutter_cpu_limit" =~ ^[0-9]+$ ]] || mutter_cpu_limit=5
 if (( mutter_cpu_limit > 0 )) && command -v cpulimit >/dev/null 2>&1; then
   pkill -f 'cpulimit -e mutter' 2>/dev/null || true
   cpulimit -e mutter -l "$mutter_cpu_limit" -b >/dev/null 2>&1 || true
