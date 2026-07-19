@@ -138,6 +138,29 @@ run_command() {
         message="Kill switch deactivated — simulation will restart"
       fi
       ;;
+    debug_mode)
+      # Per-client remote debug mode (immediate, non-persistent). Writes a marker
+      # file the Python WS loop's tailer task polls; 'off' removes it. While the
+      # flag is present the tailer streams sim.log + debug-update.log +
+      # debug-agent.log (level=basic; level=advanced adds journalctl + dmesg) up
+      # to the hub as {"type":"debug_log",...}. Auto-off ~30m via the deadline in
+      # the flag. NOT written to simulation.conf (immediate command, not a
+      # persisted sim flag). See plan: precious-napping-seahorse.md.
+      dbg_flag="/usr/local/scripts/debug-mode.flag"
+      dbg_enabled=$(printf '%s' "$args_json" | jq -r '.enabled // ""' 2>/dev/null || true)
+      [[ -z "$dbg_enabled" ]] && dbg_enabled=$(printf '%s' "$args_json" | python3 -c "import json,sys; d=json.loads(sys.stdin.read() or '{}'); print(d.get('enabled',''))" 2>/dev/null || true)
+      dbg_level=$(printf '%s' "$args_json" | jq -r '.level // "basic"' 2>/dev/null || echo basic)
+      [[ "$dbg_level" != "advanced" ]] && dbg_level="basic"
+      if [[ "$dbg_enabled" == "false" || "$dbg_enabled" == "off" || "$dbg_enabled" == "0" || "$dbg_enabled" == "no" ]]; then
+        rm -f "$dbg_flag" 2>/dev/null || true
+        message="Debug mode disabled"
+      else
+        dbg_deadline=$(( $(date +%s) + 30 * 60 ))
+        printf 'level=%s\ndeadline=%s\nenabled_at=%s\n' "$dbg_level" "$dbg_deadline" "$(date +%s)" > "$dbg_flag" 2>/dev/null || true
+        chmod a+r "$dbg_flag" 2>/dev/null || true
+        message="Debug mode enabled (level=$dbg_level, auto-off in 30m)"
+      fi
+      ;;
     *)
       status="failed"
       message="Unknown action: $action"
@@ -319,6 +342,168 @@ def load_status():
     return payload
 
 
+# ── Remote debug-mode log tailer ────────────────────────────────────────────
+# Activated by the `debug_mode` command (see bash run_command above), which
+# writes /usr/local/scripts/debug-mode.flag with level + deadline. This task
+# polls the flag and streams new log lines up to the hub as
+# {"type":"debug_log","payload":{"lines":[...],"level":...}} so an operator can
+# troubleshoot one box remotely from the WebUI. Auto-off ~30m (deadline in the
+# flag); 'off' removes the flag. Rides the spoke's throttle interval so a
+# throttled client slows the debug stream too.
+DEBUG_FLAG = "/usr/local/scripts/debug-mode.flag"
+BASIC_DEBUG_LOGS = [
+    "/usr/local/scripts/sim.log",
+    "/usr/local/scripts/debug-update.log",
+    "/usr/local/scripts/debug-agent.log",
+]
+DEBUG_BATCH_CAP = 200       # max lines per WS frame
+DEBUG_LOOP_INTERVAL = 2.5   # seconds between tail cycles (floor)
+
+
+def _read_debug_flag():
+    """Return (level, deadline, enabled_at) from the flag file, or None if the
+    flag is absent/unreadable (debug mode off)."""
+    try:
+        p = pathlib.Path(DEBUG_FLAG)
+        if not p.exists():
+            return None
+        kv = {}
+        for line in p.read_text().splitlines():
+            if "=" in line:
+                k, v = line.split("=", 1)
+                kv[k.strip()] = v.strip()
+        level = kv.get("level", "basic")
+        if level != "advanced":
+            level = "basic"
+        return level, int(kv.get("deadline", "0") or 0), int(kv.get("enabled_at", "0") or 0)
+    except Exception:
+        return None
+
+
+def _tail_file(path, offsets):
+    """Return new lines from `path` since the last offset. Handles
+    truncation/rotation (file shrank → reset to 0). Best-effort: never raises."""
+    try:
+        st = os.stat(path)
+    except Exception:
+        return []
+    prev = offsets.get(path, 0)
+    if st.st_size < prev:
+        prev = 0  # truncated/rotated
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            f.seek(prev)
+            chunk = f.read()
+            offsets[path] = f.tell()
+        return [ln for ln in chunk.splitlines() if ln.strip() != ""]
+    except Exception:
+        return []
+
+
+def _new_journal_lines(since_ts):
+    """New journalctl lines since `since_ts` (epoch). Non-blocking poll
+    (--since, no -f). Best-effort: empty on any failure (e.g. no journal)."""
+    try:
+        import datetime
+        iso = datetime.datetime.fromtimestamp(since_ts).strftime("%Y-%m-%d %H:%M:%S")
+        out = subprocess.run(
+            ["journalctl", "--since", iso, "-q", "--no-pager", "-o", "short-iso"],
+            capture_output=True, text=True, timeout=5,
+        )
+        return [ln for ln in out.stdout.splitlines() if ln.strip()]
+    except Exception:
+        return []
+
+
+def _new_dmesg_lines(seen):
+    """Return (new_lines, new_seen_count). `seen` = dmesg line count already
+    sent; we send lines beyond it. Best-effort: ([], seen) on failure."""
+    try:
+        out = subprocess.run(["dmesg", "--color=never"],
+                             capture_output=True, text=True, timeout=5)
+        lines = out.stdout.splitlines()
+        if len(lines) <= seen:
+            return [], seen
+        return lines[seen:], len(lines)
+    except Exception:
+        return [], seen
+
+
+async def debug_log_loop(ws, interval_ref):
+    """Poll the debug-mode flag and stream new log lines up to the hub until the
+    flag is cleared (off) or its deadline passes (auto-off). Cancelling the task
+    (on WS disconnect) stops streaming; the flag file is left in place so a
+    reconnect resumes (the deadline still bounds it)."""
+    offsets = {}
+    journal_since = time.time()
+    dmesg_seen = 0
+    last_enabled_at = 0
+    advanced_ready = False
+    while True:
+        try:
+            flag = _read_debug_flag()
+            if flag is None:
+                await asyncio.sleep(DEBUG_LOOP_INTERVAL)
+                continue
+            level, deadline, enabled_at = flag
+            now = time.time()
+            if now >= deadline:
+                # Auto-off: the previous cycle already flushed available lines,
+                # so just remove the flag and idle. No special final flush needed.
+                try:
+                    pathlib.Path(DEBUG_FLAG).unlink(missing_ok=True)
+                except Exception:
+                    pass
+                log_message("[INFO] Debug mode auto-off (deadline reached)")
+                # Reset session state so a future enable starts clean.
+                offsets = {}
+                journal_since = time.time()
+                dmesg_seen = 0
+                last_enabled_at = 0
+                advanced_ready = False
+                await asyncio.sleep(DEBUG_LOOP_INTERVAL)
+                continue
+            # New session (or re-enabled): reset offsets + advanced state.
+            if enabled_at != last_enabled_at:
+                last_enabled_at = enabled_at
+                offsets = {}
+                journal_since = enabled_at if enabled_at else time.time()
+                dmesg_seen = 0
+                advanced_ready = False
+            lines = []
+            for p in BASIC_DEBUG_LOGS:
+                lines.extend(_tail_file(p, offsets))
+            if level == "advanced":
+                if not advanced_ready:
+                    # Seed dmesg_seen to the current buffer length so we only
+                    # stream NEW kernel lines, not the whole ring buffer.
+                    _dl, dmesg_seen = _new_dmesg_lines(0)
+                    dmesg_seen = dmesg_seen or 0
+                    journal_since = time.time()
+                    advanced_ready = True
+                lines.extend(_new_journal_lines(journal_since))
+                journal_since = time.time()
+                dl, dmesg_seen = _new_dmesg_lines(dmesg_seen)
+                lines.extend(dl)
+            if lines:
+                # Tag advanced system lines so the hub view can tell sim.log
+                # entries apart from journal/dmesg (they share the frame).
+                batch = lines[:DEBUG_BATCH_CAP]
+                try:
+                    await ws.send(json.dumps({
+                        "type": "debug_log",
+                        "payload": {"lines": batch, "level": level},
+                    }))
+                except Exception as exc:
+                    log_message(f"[WARN] debug_log send failed: {exc!r}")
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            log_message(f"[WARN] debug_log_loop error: {exc!r}")
+        # Ride throttle: a throttled client slows the debug stream in step.
+        await asyncio.sleep(max(DEBUG_LOOP_INTERVAL, interval_ref["value"] * 0.5))
+
+
 async def handle_command(ws, command):
     proc = await asyncio.create_subprocess_exec(
         "bash", script_path, "--handle-command", json.dumps(command),
@@ -367,6 +552,10 @@ async def main():
                 # Mutable container so send_loop always reads the current value
                 interval_ref = {"value": 15}
                 sender = asyncio.create_task(send_loop(ws, interval_ref))
+                # Remote debug-mode log tailer — polls debug-mode.flag and streams
+                # log lines up as {"type":"debug_log",...}. No-op when the flag is
+                # absent. Cancelled alongside sender on disconnect.
+                debug_tailer = asyncio.create_task(debug_log_loop(ws, interval_ref))
                 try:
                     async for message in ws:
                         now = time.time()
@@ -388,8 +577,11 @@ async def main():
                                 log_message(f"[INFO] Send interval updated to {new_interval}s (server throttle)")
                 finally:
                     sender.cancel()
+                    debug_tailer.cancel()
                     with contextlib.suppress(asyncio.CancelledError):
                         await sender
+                    with contextlib.suppress(asyncio.CancelledError):
+                        await debug_tailer
                     write_health(state="disconnected", connected=False, last_disconnect=time.time())
         except Exception as exc:
             retry_delay = min(backoff, 30)

@@ -1616,6 +1616,7 @@ async def lifespan(app: FastAPI):  # noqa: ARG001
         try:
             from lm_relay import build_lm_control_plane
             cp = build_lm_control_plane()
+            state._lm_control_plane = cp  # expose for client debug-log relay
         except Exception:
             logger.exception("LM relay bridge failed to build; falling back to legacy relay")
             cp = None
@@ -2092,6 +2093,10 @@ _RELAY_DIAG_MAX = 50
 relay_diag_log: list[dict[str, Any]] = []
 state._relay_ws_send_json = None
 state._relay_ws_spoke_id = None
+# LM-hub control plane (build_lm_control_plane) — set in lifespan when
+# lm_hub_enabled=on. Used to forward client debug-log frames up to the hub as
+# CS_DEBUG_LOG (see _relay_client_debug_log_to_hub). None in legacy-relay mode.
+state._lm_control_plane = None
 _shell_sessions: dict[str, dict[str, Any]] = {}
 state._repo_ver = None
 state._proxmox_reseed_in_progress = False
@@ -5681,6 +5686,40 @@ async def _poll_agent_inbox(hostname: str, approved_hostname: str | None = None)
     return payload
 
 
+async def _relay_client_debug_log_to_hub(hostname: str, level: str, lines: list) -> None:
+    """Forward a cs client's debug-log batch up to the LM hub as a typed
+    ``CS_DEBUG_LOG`` frame. Uses the LM control plane (``build_lm_control_plane``,
+    set in lifespan when ``lm_hub_enabled=on``); falls back to the legacy relay
+    WS (``state._relay_ws_send_json``) otherwise. Best-effort: a no-op + debug
+    log if neither relay is connected — the frame is dropped and the client
+    sends the next batch on the following cycle (debug streaming is
+    opportunistic, not reliable transport). The LM cp's ``send_to_hub`` wraps
+    this as ``{payload:{type:"CS_DEBUG_LOG", data:{hostname,level,lines}}}``,
+    which the hub dispatches in ``handle_connection``."""
+    data = {
+        "hostname": hostname,
+        "level": level if level in ("basic", "advanced") else "basic",
+        "lines": lines if isinstance(lines, list) else [],
+    }
+    cp = getattr(state, "_lm_control_plane", None)
+    if cp is not None:
+        try:
+            await cp.send_to_hub("CS_DEBUG_LOG", data)
+            return
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("client debug_log relay via LM cp failed: %s", exc)
+    if state._relay_ws_send_json is not None:
+        out = {"type": "CS_DEBUG_LOG", "data": data}
+        if state._relay_ws_spoke_id and "spoke_id" not in out:
+            out["spoke_id"] = state._relay_ws_spoke_id
+        try:
+            await state._relay_ws_send_json(out)
+            return
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("client debug_log relay via legacy ws failed: %s", exc)
+    logger.debug("client debug_log dropped — no hub relay connected (hostname=%s)", hostname)
+
+
 @app.websocket("/ws/client")
 async def ws_client_endpoint(
     websocket: WebSocket,
@@ -5726,6 +5765,15 @@ async def ws_client_endpoint(
                 await websocket.send_json({"type": "pong"})
             elif msg_type == "sync":
                 await _push_pending_agent_commands(hostname, websocket)
+            elif msg_type == "debug_log":
+                # Remote debug-mode: the client is streaming log lines up (its
+                # agent.sh debug_log_loop tailer). Forward to the hub as a
+                # CS_DEBUG_LOG frame. Fire-and-forget so the receive loop isn't
+                # blocked by the hub send.
+                payload = data.get("payload") if isinstance(data.get("payload"), dict) else data
+                _dlvl = str(payload.get("level") or "basic")
+                _dlines = payload.get("lines") if isinstance(payload.get("lines"), list) else []
+                asyncio.create_task(_relay_client_debug_log_to_hub(hostname, _dlvl, _dlines))
     except WebSocketDisconnect:
         pass
     finally:
