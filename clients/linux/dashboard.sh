@@ -56,6 +56,14 @@ refresh_config() {
   kill_switch=$(get_value 'simulation' 'kill_switch')
   rapid_update=$(get_value 'simulation' 'rapid_update')
   sim_load=$(get_value 'simulation' 'sim_load')
+  # simulation.sh script version (its `version=` header) — read LIVE from the
+  # file on disk each refresh so the dashboard reports the code build ACTUALLY
+  # deployed on this box, not a hardcoded value. Quick deploy indicator: after
+  # a sim-code push, a box still showing the old version = the update didn't
+  # land there. self-re-exec means the running loop matches this on-disk value.
+  simsh_ver=$(grep -m1 '^version=' /usr/local/scripts/simulation.sh 2>/dev/null \
+              | cut -d= -f2- | tr -d '[:space:]')
+  [[ -n "$simsh_ver" ]] || simsh_ver="?"
   github_repo=$(get_value 'simulation' 'github_repo')
   repo_location=$(get_value 'simulation' 'repo_location')
   site_based_ssid=$(get_value 'simulation' 'site_based_ssid')
@@ -400,6 +408,7 @@ while true; do
   echo ""
   printf "  %sSite:%s    %-22s  %sSim-ID:%s %s\n" "$BOLD" "$RST" "$wsite" "$BOLD" "$RST" "$simulation_id"
   printf "  %sPHY:%s     %-22s  %sLoad:%s   %s%%\n" "$BOLD" "$RST" "$sim_phy" "$BOLD" "$RST" "$sim_load"
+  printf "  %sVersion:%s %s\n" "$BOLD" "$RST" "$simsh_ver"
   [[ -n "$wladapter" ]] && printf "  %sAdapter:%s %s\n" "$BOLD" "$RST" "$wladapter"
   echo ""
   printf "  %sWiFi:%s    %s\n" "$BOLD" "$RST" "$(get_wifi_status)"
