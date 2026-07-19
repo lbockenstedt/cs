@@ -32,6 +32,24 @@ from command_queue import (
 logger = logging.getLogger("CSCommandQueue")
 
 
+def _template_id_or_name(value: Any, default: Any) -> Any:
+    """Coerce a configured clone-source template field to its emitted form.
+
+    The template field accepts EITHER a vmid (numeric) OR a template NAME
+    (text); the pxmx agent's ``_resolve_template_vmid`` does the actual lookup
+    by vmid or by ``qm list`` name. Emit an int when the value is numeric
+    (back-compat for any consumer expecting an int vmid, and the agent's
+    numeric fast-path), else the raw stripped string (a NAME the agent
+    resolves). Empty/None → ``default`` (an int vmid)."""
+    s = str(value).strip() if value is not None else ""
+    if not s:
+        return default
+    try:
+        return int(s)
+    except ValueError:
+        return s
+
+
 class CSSettings:
     """Small persisted store for the USB-provision / watchdog knobs the cs UI
     edits and the agent consumes via ``client_simulation.usb_config``.
@@ -222,8 +240,11 @@ class CSSettings:
         vm_set_override = _sanitize_vm_set_override(self.get("vm_set_override", 0))
         img1_spec = self.get("image1_template_spec")
         img2_spec = self.get("image2_template_spec")
-        img1_id = int(self.get("image1_template_id", 100) or 100)
-        img2_id = int(self.get("image2_template_id", 200) or 200)
+        # Template field accepts a vmid OR a name — emit int when numeric, else
+        # the raw name string (the pxmx agent resolves it). See
+        # _template_id_or_name.
+        img1_id = _template_id_or_name(self.get("image1_template_id", 100), 100)
+        img2_id = _template_id_or_name(self.get("image2_template_id", 200), 200)
 
         # missing_timeout is stored in MINUTES (the UI label is "Destroy after
         # missing (minutes)"); the pxmx agent compares ``now - missing_since`` in

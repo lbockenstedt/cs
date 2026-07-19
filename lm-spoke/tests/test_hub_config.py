@@ -95,6 +95,35 @@ def test_config_update_remaps_vm_image_template_ids(spoke_loop):
     assert cfg["image2_template_id"] == 200
 
 
+def test_config_update_template_name_passes_through_uncoerced(spoke_loop):
+    """The template field accepts EITHER a vmid (numeric) OR a template NAME
+    (text) — the pxmx agent's ``_resolve_template_vmid`` resolves a name to its
+    vmid via ``qm list``. A NAME must survive hub→spoke→usb_config UNCOERCED
+    (the old ``int(... or 100)`` would either crash on a name or, with the
+    try/except, silently drop it to the default). A numeric value still emits
+    an int (back-compat)."""
+    spoke, loop = spoke_loop
+    resp = _run(loop, spoke.handle_command("CS_CONFIG_UPDATE", {
+        "vm_image_1_template_id": "debian-12-template",
+        "vm_image_2_template_id": "win11-golden",
+    }))
+    assert resp["status"] == "SUCCESS"
+    # Stored verbatim (the remap path writes the hub value as-is).
+    assert spoke.settings.get("image1_template_id") == "debian-12-template"
+    assert spoke.settings.get("image2_template_id") == "win11-golden"
+    cfg = spoke.settings.usb_config_payload()
+    # A name passes through as a str; the agent resolves it.
+    assert cfg["image1_template_id"] == "debian-12-template"
+    assert cfg["image2_template_id"] == "win11-golden"
+    # A numeric value still emits an int (back-compat for int-expecting
+    # consumers + the agent's numeric fast-path).
+    resp2 = _run(loop, spoke.handle_command("CS_CONFIG_UPDATE", {
+        "vm_image_1_template_id": "100",
+    }))
+    assert resp2["status"] == "SUCCESS"
+    assert spoke.settings.usb_config_payload()["image1_template_id"] == 100
+
+
 def test_config_update_marks_hub_managed_and_persists(spoke_loop):
     """A hub push marks the spoke hub-managed and persists to cs_settings.json
     so the certified list survives a spoke restart (the bridge re-pushes
