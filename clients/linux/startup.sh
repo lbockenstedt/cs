@@ -40,6 +40,10 @@ bash /usr/local/scripts/sys_mon.sh --log-monitor &
 #------------------------------------------------------------
 echo Disabling screen blanking | tee -a /usr/local/scripts/sim.log
 gsettings set org.gnome.desktop.session idle-delay 0
+# Cut compositor (mutter) CPU on these GPU-less VMs: disable desktop animations
+# so the software (llvmpipe) compositor isn't repainting transitions. Pairs with
+# the 120s dashboard interval to reduce steady mutter CPU across the fleet.
+gsettings set org.gnome.desktop.interface enable-animations false 2>/dev/null || true
 xset s noblank
 xset -dpms
 xset s off
