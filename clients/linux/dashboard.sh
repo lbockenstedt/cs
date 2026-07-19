@@ -10,7 +10,11 @@ source '/usr/local/scripts/common.sh'
 #------------------------------------------------------------
 # Simulation Dashboard (Read-only live monitor)
 #------------------------------------------------------------
-refresh_rate=60
+# 120s (was 60): the dashboard does a full clear + redraw each cycle, and on a
+# desktop client that full-screen repaint churns the compositor (mutter) — a
+# longer interval halves that repaint rate to cut idle CPU. The server
+# throttle_interval can still only RAISE this, never lower it.
+refresh_rate=120
 CACHE_DIR="/tmp/client-sim-dash"
 
 # Terminal colors — degrade gracefully if tput is unavailable (e.g. SSH without TERM)
