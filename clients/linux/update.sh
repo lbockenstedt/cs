@@ -16,6 +16,10 @@ process_ini_file '/usr/local/scripts/simulation.conf'
 # Read config values
 #------------------------------------------------------------
 web_server=$(get_value 'simulation' 'web_server')
+# Default to ON (hub mode) when unset/empty so a client whose simulation.conf is
+# unreadable or missing still ATTEMPTS to update itself out of the bad state via
+# the web-server tier instead of silently going dark. Explicit "off" is honored.
+web_server="${web_server:-on}"
 server_url=$(get_value 'server' 'server_url')
 server_url="${server_url:-http://169.253.1.1:8080}"
 smb_repo=$(get_value 'simulation' 'smb_repo')
@@ -259,6 +263,9 @@ if [[ "$web_server" != "on" && -n "$server_url" ]] && check_api_up "$server_url"
         if ! diff -q "$_cfg_tmp" /usr/local/scripts/simulation.conf >/dev/null 2>&1; then
             echo "simulation.conf changed (spoke) — updating" | tee -a "$debug" "$log"
             mv -f -- "$_cfg_tmp" /usr/local/scripts/simulation.conf
+            # mktemp creates 0600; mv preserves it. The sim/dashboard scripts run
+            # unprivileged, so make the config world-readable or they can't parse it.
+            chmod a+r /usr/local/scripts/simulation.conf 2>/dev/null || true
         else
             rm -f "$_cfg_tmp"
         fi
@@ -272,6 +279,7 @@ if [[ "$web_server" != "on" && -n "$server_url" ]] && check_api_up "$server_url"
         "$server_url/api/config/overrides" 2>/dev/null)
     if [[ "$_ov_code" == "200" && -s "$_ov_tmp" ]] && ! diff -q "$_ov_tmp" /usr/local/scripts/user-overrides.conf >/dev/null 2>&1; then
         mv -f -- "$_ov_tmp" /usr/local/scripts/user-overrides.conf
+        chmod a+r /usr/local/scripts/user-overrides.conf 2>/dev/null || true
     else
         rm -f "$_ov_tmp"
     fi
@@ -313,6 +321,7 @@ if [[ "$web_server" == "on" && -n "$server_url" ]]; then
                     # Atomic write: mv is atomic on the same filesystem, prevents
                     # simulation.sh reading a partial file during rapid_update cycles
                     mv -f -- "$_cfg_tmp" /usr/local/scripts/simulation.conf
+                    chmod a+r /usr/local/scripts/simulation.conf 2>/dev/null || true
                 else
                     echo "simulation.conf unchanged" | tee -a "$debug"
                 fi
@@ -331,6 +340,7 @@ if [[ "$web_server" == "on" && -n "$server_url" ]]; then
                 if ! diff -q "$_ov_tmp" /usr/local/scripts/user-overrides.conf >/dev/null 2>&1; then
                     echo "user-overrides.conf changed — updating" | tee -a "$debug" "$log"
                     mv -f -- "$_ov_tmp" /usr/local/scripts/user-overrides.conf
+                    chmod a+r /usr/local/scripts/user-overrides.conf 2>/dev/null || true
                 else
                     echo "user-overrides.conf unchanged" | tee -a "$debug"
                 fi
@@ -638,6 +648,11 @@ fi
 # when the device was already up to date and copy_local_files() didn't run
 #============================================================
 suppress_nm_applet
+
+# Safety net: guarantee the config files are readable by the unprivileged sim/
+# dashboard scripts no matter which tier wrote them. An unreadable simulation.conf
+# makes the parser bail and every flag (web_server, s0-s9, ...) read as off.
+chmod a+r /usr/local/scripts/simulation.conf /usr/local/scripts/user-overrides.conf 2>/dev/null || true
 
 echo "Update complete" | tee -a "$debug"
 

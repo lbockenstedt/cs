@@ -388,7 +388,13 @@ function process_ini_file()
 
     # If the config file is missing/unreadable, return without populating so the
     # redirect below does not error out (fatal under a 'set -e'/'set -u' caller).
+    # Warn loudly first: an unreadable file (e.g. simulation.conf written 0600 by
+    # a root updater) is otherwise indistinguishable from "all flags off" and
+    # silently disables every simulation. Don't let it hide again.
     if [[ ! -r "$1" ]]; then
+        if [[ -e "$1" ]]; then
+            echo "WARN: ini-parser: '$1' exists but is not readable by $(id -un) — all values will be empty" >&2
+        fi
         return
     fi
 

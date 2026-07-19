@@ -53,6 +53,9 @@ source '/usr/local/scripts/ini-parser.sh'
 process_ini_file '/usr/local/scripts/simulation.conf'
 
 web_server=$(get_value 'simulation' 'web_server')
+# Default to ON (hub mode) when unset/empty so an unreadable/missing config
+# doesn't silently strand the client; explicit "off" is honored. See update.sh.
+web_server="${web_server:-on}"
 server_url=$(get_value 'server' 'server_url')
 platform="${CLIENT_SIM_PLATFORM:-linux}"
 hostname_val=$(hostname)
