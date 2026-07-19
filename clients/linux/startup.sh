@@ -93,21 +93,39 @@ rapid_update=$(get_value 'simulation' 'rapid_update')
 syslog=$(get_value 'simulation' 'syslog')
 syslog_server=$(get_value 'address' 'syslog_server')
 #------------------------------------------------------------
-# Cap the GNOME compositor (mutter) CPU — the biggest idle CPU sink on these
-# GPU-less VM desktops (software / llvmpipe compositing). cpulimit -e watches for
-# the process BY NAME and throttles it (SIGSTOP/SIGCONT), backgrounded, and keeps
-# monitoring so it re-attaches if mutter restarts — same tool the www-traffic sim
-# uses (cpulimit is installed by apt_update.sh). Configurable via simulation.conf
-# [simulation] mutter_cpu_limit = percent of ONE core; unset falls back to 5
-# (aggressive — these are non-interactive sim desktops, so hard-cap the compositor).
-# Set 0 to disable. Idempotent: drop any prior cap before re-applying on each boot.
+# Cap the GNOME compositor CPU — the biggest idle CPU sink on these GPU-less VM
+# desktops (software / llvmpipe compositing). On modern GNOME the compositor
+# process is `gnome-shell` (mutter is a library linked INTO gnome-shell, NOT a
+# separate process), so `cpulimit -e mutter` matched nothing and the cap never
+# attached — the compositor ran uncapped at ~40% CPU. Target gnome-shell by name,
+# with mutter as a fallback for older GNOME where it IS a separate process. This
+# script runs INSIDE the GNOME session (gsettings works above), so the compositor
+# is already up and cpulimit finds it immediately. cpulimit is installed by
+# apt_update.sh. Configurable via simulation.conf [simulation] mutter_cpu_limit =
+# percent of ONE core; unset falls back to 5 (aggressive — these are non-
+# interactive sim desktops, so hard-cap the compositor). Set 0 to disable.
+# Idempotent: drop any prior cap before re-applying on each boot.
 #------------------------------------------------------------
 mutter_cpu_limit=$(get_value 'simulation' 'mutter_cpu_limit')
 [[ "$mutter_cpu_limit" =~ ^[0-9]+$ ]] || mutter_cpu_limit=5
-if (( mutter_cpu_limit > 0 )) && command -v cpulimit >/dev/null 2>&1; then
-  pkill -f 'cpulimit -e mutter' 2>/dev/null || true
-  cpulimit -e mutter -l "$mutter_cpu_limit" -b >/dev/null 2>&1 || true
-  echo "Capping mutter CPU at ${mutter_cpu_limit}% of one core (cpulimit -e)" | tee -a /usr/local/scripts/sim.log
+if (( mutter_cpu_limit > 0 )); then
+  if ! command -v cpulimit >/dev/null 2>&1; then
+    echo "WARNING: cpulimit not installed — cannot cap compositor CPU (apt_update.sh installs it)" | tee -a /usr/local/scripts/sim.log
+  else
+    pkill -f 'cpulimit -e mutter' 2>/dev/null || true
+    pkill -f 'cpulimit -e gnome-shell' 2>/dev/null || true
+    capped=""
+    if pgrep -x gnome-shell >/dev/null 2>&1; then
+      cpulimit -e gnome-shell -l "$mutter_cpu_limit" -b >/dev/null 2>&1 || true
+      capped="gnome-shell"
+    elif pgrep -x mutter >/dev/null 2>&1; then
+      cpulimit -e mutter -l "$mutter_cpu_limit" -b >/dev/null 2>&1 || true
+      capped="mutter"
+    else
+      echo "WARNING: no GNOME compositor (gnome-shell/mutter) running yet — compositor CPU not capped" | tee -a /usr/local/scripts/sim.log
+    fi
+    [ -n "$capped" ] && echo "Capping ${capped} compositor CPU at ${mutter_cpu_limit}% of one core (cpulimit -e)" | tee -a /usr/local/scripts/sim.log
+  fi
 fi
 tempvar=$(get_value $username 'repo_location')
 #------------------------------------------------------------
