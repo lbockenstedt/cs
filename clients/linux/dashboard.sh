@@ -408,7 +408,9 @@ while true; do
   echo ""
   printf "  %sSite:%s    %-22s  %sSim-ID:%s %s\n" "$BOLD" "$RST" "$wsite" "$BOLD" "$RST" "$simulation_id"
   printf "  %sPHY:%s     %-22s  %sLoad:%s   %s%%\n" "$BOLD" "$RST" "$sim_phy" "$BOLD" "$RST" "$sim_load"
-  printf "  %sVersion:%s %s\n" "$BOLD" "$RST" "$simsh_ver"
+  # sim-code version on the RIGHT side (under Load, the right column) — the
+  # per-box deploy indicator. 35 leading chars line "Version:" up under "Load:".
+  printf "  %-33s%sVersion:%s %s\n" "" "$BOLD" "$RST" "$simsh_ver"
   [[ -n "$wladapter" ]] && printf "  %sAdapter:%s %s\n" "$BOLD" "$RST" "$wladapter"
   echo ""
   printf "  %sWiFi:%s    %s\n" "$BOLD" "$RST" "$(get_wifi_status)"

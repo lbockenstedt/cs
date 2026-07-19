@@ -1,5 +1,5 @@
 #!/bin/bash
-version=.96
+version=.97
 LOG_FILE=/usr/local/scripts/sim.log
 
 echo $(date) | tee -a ${LOG_FILE}
@@ -143,6 +143,19 @@ if ! grep -qs 'wifi.scan-rand-mac-address=no' "$_no_rand_conf" 2>/dev/null; then
     echo "MAC-randomization self-heal skipped (no sudo — install.sh backstop)" | tee -a ${LOG_FILE}
   fi
 fi
+
+# Randomized sleep — desynchronizes the fleet so 1000 clients don't all step
+# in lockstep. Sleeps a uniformly random duration in [N, 2N]: _rsleep 30 sleeps
+# 30-60s, _rsleep 5 sleeps 5-10s. Used for the pacing/stagger timers only (the
+# poll loops below use a fixed 1s cadence on purpose; the offline window and
+# kill-switch sleep are handled separately). Defined BEFORE the loop: it is
+# first called mid-loop (the settle after the config dump) well before the
+# in-loop function block, so a loop-body definition left the first iteration
+# with "_rsleep: command not found".
+_rsleep() {
+  local base="${1:-1}"
+  sleep $(( base + RANDOM % (base + 1) ))
+}
 
 while true; do
   #------------------------------------------------------------
@@ -582,15 +595,6 @@ _wait_gateway() {
 _is_wifi_connected() {
   [[ -n "${wladapter:-}" ]] || return 1
   nmcli -t -f DEVICE,STATE device status 2>/dev/null | grep -q "^${wladapter}:connected"
-}
-# Randomized sleep — desynchronizes the fleet so 1000 clients don't all step
-# in lockstep. Sleeps a uniformly random duration in [N, 2N]: _rsleep 30 sleeps
-# 30-60s, _rsleep 5 sleeps 5-10s. Used for the pacing/stagger timers only (the
-# poll loops above use a fixed 1s cadence on purpose; the offline window and
-# kill-switch sleep are handled separately).
-_rsleep() {
-  local base="${1:-1}"
-  sleep $(( base + RANDOM % (base + 1) ))
 }
 # Interruptible sleep — broken early by USR1 (the trap kills this sleep child).
 # Used for the offline window so a config update / repurpose lands immediately
