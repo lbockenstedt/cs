@@ -55,7 +55,7 @@ SIM_FLAG_KEYS = (
     "dns_latency_1", "dns_latency_2", "dns_latency_3",
     "dns_bad_ip_1", "dns_bad_ip_2", "dns_bad_ip_3",
     "dns_bad_record_1", "dns_bad_record_2", "dns_bad_record_3",
-    "central_check",
+    "central_check", "mutter_cpu_limit",
 )
 
 _SLOT_RE = re.compile(r"^s[0-9]$")
