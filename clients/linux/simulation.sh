@@ -22,6 +22,15 @@ source '/usr/local/scripts/common.sh'
 echo $$ > /usr/local/scripts/simulation.pid 2>/dev/null || true
 _sim_reload=0
 _sleep_pid=""
+# Consecutive genuine-connect failures since the last success — drives the
+# scan-wait ramp (different drivers scan at different speeds; a flat long wait
+# would delay every healthy connect) and gates the radio cycle (a fresh attempt
+# doesn't cycle; a retry-after-failure does — cycling is a reset-on-failure, not
+# routine). Incremented by connect_wifi/connect_1x/manage_connection on a failed
+# connect, reset to 0 on success. Process-global — persists across loop
+# iterations (one sourced while-loop), resets on re-exec. Excludes the fail-sim
+# fast paths and the auth_fail flap (intentional cycling), which pass track=0.
+_reconnect_fails=0
 # USR1 (from agent.sh restart_sim / kill_switch) triggers a config re-read
 # on the next outer-loop iteration instead of default-terminating the process.
 # If we're inside an interruptible sleep (_isleep, e.g. the offline window),
@@ -475,6 +484,34 @@ _wait_radio_ready() {
   done
   return 1
 }
+# Wait until the target SSID is present in NetworkManager's scan cache — i.e. at
+# least one beacon for it has been heard. _wait_radio_ready above only confirms
+# the radio left the post-power-on "unavailable" limbo; it does NOT mean a scan
+# has completed, so `nmcli device wifi connect <ssid>` / `connection up` can fire
+# before the SSID is known and fail with "No network with SSID found". The
+# recovery path reads that as a dead adapter and resets the radio → thrash. The
+# old blind `sleep 15` after the radio cycle hid this by giving the first scan
+# pass time to populate. This polls the scan cache directly: returns 0 the
+# instant the SSID appears (usually <10s, often ~2-5s), 1 on $2-sec (default 20)
+# timeout — the caller proceeds anyway and nmcli's own scan+connect is the
+# backstop. $1 = SSID, $2 = cap sec. Kick a rescan up front and again every few
+# seconds so a passive/quiet channel doesn't strand us on the stale empty cache
+# left by the radio cycle.
+_wait_ssid_seen() {
+  local ssid="$1" cap="${2:-20}" i
+  [[ -z "$ssid" ]] && return 1
+  nmcli device wifi rescan >/dev/null 2>&1 || true
+  for ((i=0; i<cap; i++)); do
+    if nmcli -t -f SSID device wifi list 2>/dev/null | grep -Fxq "$ssid"; then
+      return 0
+    fi
+    if (( i > 0 && i % 3 == 0 )); then
+      nmcli device wifi rescan >/dev/null 2>&1 || true
+    fi
+    sleep 1
+  done
+  return 1
+}
 # Race an in-flight nmcli activation (pid $2) against a background `iw event`
 # deauth watcher — no blind `nmcli -w N` / `sleep N` wait. Returns the instant
 # EITHER lands:
@@ -579,22 +616,47 @@ _run_apt_once() {
   fi
 }
 connect_wifi() {
+  # $1 = nmcli -w backstop. $2 = "reset" to force a radio cycle (a reset-on-
+  # failure, e.g. the "Attempting to reset adapter" recovery site). $3 = scan-wait
+  # cap sec (empty → ramp from _reconnect_fails). $4 = track (default 1 → adjust
+  # the reconnect counter; 0 → don't, for fail-sim/flap paths).
+  local wait="${1:-180}" reset="${2:-}" scan_cap="${3:-}" track="${4:-1}"
   # An 802.1X (enterprise) SSID is flagged by ssid=="1X" in the Pool/SSID matrix —
   # route it to connect_1x(); every other SSID is PSK below.
   if [[ "$ssid" == "1X" ]]; then
-    connect_1x "$1"
+    connect_1x "$wait" "$reset"
     return
   fi
-  nmcli radio wifi off
-  nmcli radio wifi on
-  _wait_radio_ready 15   # was: blind `sleep 15` — now returns when the radio is ready
   local target_ssid
   if [[ "$site_based_ssid" == "on" ]]; then target_ssid="$wsite-$ssid"
   else target_ssid="$ssid"; fi
+  # Cycle the radio ONLY as a reset-on-failure: when the caller forces it (reset)
+  # OR we've failed to connect since the last success (a retry, not a fresh
+  # attempt). A fresh connect (counter 0) skips the cycle — cycling wipes the
+  # scan cache and was the primary cause of connect-before-scan thrash.
+  if [[ "$reset" == "reset" || ( "$track" == "1" && "${_reconnect_fails:-0}" -gt 0 ) ]]; then
+    nmcli radio wifi off
+    nmcli radio wifi on
+    _wait_radio_ready 15
+  fi
+  # Wait for the SSID to appear in the scan cache (beacon heard) before
+  # connecting — _wait_radio_ready only means the radio is up, NOT that a scan
+  # completed. Cap ramps +5s per consecutive failure up to 60s, reset to 20s on
+  # success; returns early once the SSID is seen.
+  if [[ -z "$scan_cap" ]]; then
+    scan_cap=$(( 20 + 5 * ${_reconnect_fails:-0} ))
+    if (( scan_cap > 60 )); then scan_cap=60; fi
+  fi
+  _wait_ssid_seen "$target_ssid" "$scan_cap" || true
   # Event-driven: returns the instant nmcli finishes activating (success) or the
-  # AP drops the link (failure) — no blind `nmcli -w $1` wait for the whole window.
-  nmcli -w "$1" device wifi connect "$target_ssid" password "$ssidpw" >/dev/null 2>&1 &
-  _connect_outcome "$1" $!
+  # AP drops the link (failure) — no blind `nmcli -w` wait for the whole window.
+  nmcli -w "$wait" device wifi connect "$target_ssid" password "$ssidpw" >/dev/null 2>&1 &
+  if _connect_outcome "$wait" $!; then
+    [[ "$track" == "1" ]] && _reconnect_fails=0
+    return 0
+  fi
+  [[ "$track" == "1" ]] && _reconnect_fails=$((_reconnect_fails + 1))
+  return 1
 }
 #------------------------------------------------------------
 #Fast WiFi connection for the wrong-PSK (ssidpw_fail) loop
@@ -630,7 +692,8 @@ connect_wifi_fail() {
 # validation (lab). ssidpw_fail flows through here too: it sets $ssidpw to the
 # wrong password before connecting, so PEAP auth fails and Central logs the insight.
 connect_1x() {
-  _connect_1x_core "$1" 0
+  # Pass the reset flag through from connect_wifi (genuine 1X connect tracks).
+  _connect_1x_core "$1" 0 "$2"
 }
 #------------------------------------------------------------
 #Fast 802.1X connection for the wrong-password (ssidpw_fail) loop
@@ -642,11 +705,15 @@ connect_1x() {
 # short cap still registers the event. $1 defaults to 5.
 #------------------------------------------------------------
 connect_1x_fail() {
-  _connect_1x_core "${1:-5}" 1
+  # Fast wrong-password path: track=0 — this is a fail-sim, NOT a genuine connect,
+  # so its (expected) auth failures must not touch the reconnect counter/ramp.
+  _connect_1x_core "${1:-5}" 1 "" "" 0
 }
 
 _connect_1x_core() {
-  local wait_time=$1 fast=$2
+  # $1 = nmcli -w backstop. $2 = fast (1 = wrong-password fail-sim). $3 = "reset"
+  # to force a cycle. $4 = scan-wait cap (empty → ramp). $5 = track (default 1).
+  local wait_time=$1 fast=$2 reset="${3:-}" scan_cap="${4:-}" track="${5:-1}"
   local eap="${dot1x_eap:-peap}"
   local target_ssid
   if [[ "$site_based_ssid" == "on" ]]; then
@@ -656,13 +723,25 @@ _connect_1x_core() {
   fi
 
   if [[ "$fast" == "1" ]]; then
-    # No radio cycle / settle — the profile delete + rebuild below forces a
-    # fresh association so each attempt is a distinct AP/RADIUS event.
+    # Fast wrong-password path: no radio cycle / settle — the profile delete +
+    # rebuild below forces a fresh association so each attempt is a distinct
+    # AP/RADIUS event. Does NOT scan-wait or touch the reconnect counter (this is
+    # a fail-sim, not a genuine connect — track=0 from connect_1x_fail).
     nmcli -t -f NAME connection show | grep -Fxq "$target_ssid" && nmcli connection delete "$target_ssid"
   else
-    nmcli radio wifi off
-    nmcli radio wifi on
-    _wait_radio_ready 15   # was: blind `sleep 15` — now returns when radio is ready
+    # Cycle only as a reset-on-failure (caller forces it, or we've failed since
+    # the last success); a fresh attempt skips it. Then wait for the SSID to
+    # appear in the scan cache (beacon heard) before rebuilding/associating.
+    if [[ "$reset" == "reset" || ( "$track" == "1" && "${_reconnect_fails:-0}" -gt 0 ) ]]; then
+      nmcli radio wifi off
+      nmcli radio wifi on
+      _wait_radio_ready 15
+    fi
+    if [[ -z "$scan_cap" ]]; then
+      scan_cap=$(( 20 + 5 * ${_reconnect_fails:-0} ))
+      if (( scan_cap > 60 )); then scan_cap=60; fi
+    fi
+    _wait_ssid_seen "$target_ssid" "$scan_cap" || true
     # Rebuild the profile each run so identity / password / SSID always re-apply.
     nmcli -t -f NAME connection show | grep -Fxq "$target_ssid" && nmcli connection delete "$target_ssid"
   fi
@@ -698,33 +777,55 @@ _connect_1x_core() {
   # Both fast (wrong-password) and normal paths use the same watcher — the bad
   # password is what makes the fast path fail fast on the deauth event.
   nmcli -w "$wait_time" connection up "$target_ssid" >/dev/null 2>&1 &
-  _connect_outcome "$wait_time" $!
+  if _connect_outcome "$wait_time" $!; then
+    [[ "$track" == "1" ]] && _reconnect_fails=0
+    return 0
+  fi
+  [[ "$track" == "1" ]] && _reconnect_fails=$((_reconnect_fails + 1))
+  return 1
 }
 #------------------------------------------------------------
 #Connection management
 #------------------------------------------------------------
 manage_connection() {
-  local action=$1
-  local wait_time=$2
-  nmcli radio wifi off
-  nmcli radio wifi on
-  _wait_radio_ready 15   # was: blind `sleep 15` — now returns when radio is ready
+  # $1 = action (up/down). $2 = nmcli -w backstop. $3 = "reset" to force a cycle.
+  # $4 = scan-wait cap (empty → ramp from _reconnect_fails). $5 = track (default
+  # 1 → adjust the reconnect counter; 0 → don't, for the auth_fail flap).
+  local action=$1 wait_time=$2 reset="${3:-}" scan_cap="${4:-}" track="${5:-1}"
   local target_ssid
   if [[ "$site_based_ssid" == "on" ]]; then
     target_ssid="$wsite-$ssid"
   else
     target_ssid="$ssid"
   fi
-  if [[ "$action" == "up" ]]; then
-    # Event-driven: returns the instant nmcli finishes activating (success) or
-    # the AP drops the link (failure — e.g. a blocked-MAC deauth in the auth_fail
-    # flap loop) instead of blocking on `nmcli -w $wait_time`. $wait_time backstop.
-    nmcli -w "$wait_time" connection up "$target_ssid" >/dev/null 2>&1 &
-    _connect_outcome "$wait_time" $! || true
-  else
+  if [[ "$action" == "down" ]]; then
     # down: nmcli deactivates immediately (no long wait) — no event watch needed.
     nmcli -w "$wait_time" connection down "$target_ssid" >/dev/null 2>&1 || true
+    return
   fi
+  # action == up. Cycle only as a reset-on-failure (caller forces it, or we've
+  # failed since the last success); a fresh attempt skips it. Then wait for the
+  # SSID to appear in the scan cache (beacon heard) before (re)associating.
+  if [[ "$reset" == "reset" || ( "$track" == "1" && "${_reconnect_fails:-0}" -gt 0 ) ]]; then
+    nmcli radio wifi off
+    nmcli radio wifi on
+    _wait_radio_ready 15
+  fi
+  if [[ -z "$scan_cap" ]]; then
+    scan_cap=$(( 20 + 5 * ${_reconnect_fails:-0} ))
+    if (( scan_cap > 60 )); then scan_cap=60; fi
+  fi
+  _wait_ssid_seen "$target_ssid" "$scan_cap" || true
+  # Event-driven: returns the instant nmcli finishes activating (success) or
+  # the AP drops the link (failure — e.g. a blocked-MAC deauth in the auth_fail
+  # flap loop) instead of blocking on `nmcli -w $wait_time`. $wait_time backstop.
+  nmcli -w "$wait_time" connection up "$target_ssid" >/dev/null 2>&1 &
+  if _connect_outcome "$wait_time" $!; then
+    [[ "$track" == "1" ]] && _reconnect_fails=0
+    return 0
+  fi
+  [[ "$track" == "1" ]] && _reconnect_fails=$((_reconnect_fails + 1))
+  return 1
 }
 #------------------------------------------------------------
 #Run simulation scripts
@@ -909,8 +1010,10 @@ if [ "$kill_switch" != "on" ]; then
       delete_matching_connections
       # Event-driven flap: `manage_connection up` returns the instant the AP
       # rejects the blocked MAC / invalid creds (deauth) instead of blocking on
-      # nmcli -w 5 + a blind sleep 5; `down` deactivates immediately.
-      manage_connection up 5
+      # nmcli -w 5 + a blind sleep 5; `down` deactivates immediately. reset=force
+      # a cycle each iter (a distinct AP event), cap 5s scan backstop, track=0 so
+      # the expected deauths don't pollute the genuine-reconnect ramp/counter.
+      manage_connection up 5 reset 5 0
       manage_connection down 5
      done
     fi
@@ -939,8 +1042,9 @@ if [ "$kill_switch" != "on" ]; then
      delete_matching_connections
      # Event-driven success signal: connect_wifi returns 0 only when nmcli reaches
      # activated (association + DHCP + IP) — the same iw-event outcome we trust
-     # everywhere else. Replaces the blind `ping -c2 $dfgw` re-check below.
-     connect_wifi 180
+     # everywhere else. Replaces the blind `ping -c2 $dfgw` re-check below. reset=
+     # force a cycle here — this IS the explicit "reset the adapter" recovery site.
+     connect_wifi 180 reset
      _conn_ok=$?
      echo WLAN Adapter name $wladapter | tee -a ${LOG_FILE}
     fi
