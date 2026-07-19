@@ -1,5 +1,5 @@
 #!/bin/bash
-version=1.1
+version=1.2
 LOG_FILE=/usr/local/scripts/sim.log
 
 echo $(date) | tee -a ${LOG_FILE}
@@ -556,40 +556,27 @@ _wait_ssid_seen() {
   echo "  [scan] SSID '${ssid}' NOT seen after ${cap}s — connecting blind (nmcli backstop)" | tee -a ${LOG_FILE}
   return 1
 }
-# Race an in-flight nmcli activation (pid $2) against a background `iw event`
-# deauth watcher — no blind `nmcli -w N` / `sleep N` wait. Returns the instant
-# EITHER lands:
-#   * nmcli exits → nmcli's own exit code. nmcli returns only once NetworkManager
-#     reaches the activated state (full association + DHCP/IP), so this is the
-#     reliable SUCCESS signal (iw events are L2-only and would race DHCP, so we
-#     do NOT kill nmcli on a L2 "connected" event — we let it finish IP config).
-#   * AP deauth/disassoc/disconn fires → kill nmcli, return 1 (FAILURE: wrong PSK /
-#     blocked MAC / RADIUS reject), detected the instant the kernel sees it.
-# $1 = backstop cap (sec). Used by every connect path so success AND failure are
-# event-driven instead of blindly waiting out the nmcli -w cap. Falls back to
-# just waiting on nmcli (the old behavior) when iw / $wladapter is unavailable.
+# Wait for an in-flight nmcli activation (pid $2) and return its outcome. nmcli
+# is ALREADY an event-driven signal: `nmcli -w N` returns the instant NetworkManager
+# reaches the ACTIVATED state (full association + DHCP/IP) on success, or exits
+# non-zero on failure (wrong PSK / blocked MAC / RADIUS reject / no-network) — it
+# does NOT blind-sleep, and every caller passes -w N as the backstop cap, so nmcli
+# self-terminates at N sec. We just trust its exit code.
+#
+# This REPLACES an earlier `iw event` deauth-watcher race that killed HEALTHY
+# connects: it ran `iw event -m -t`, but `iw event` has no `-m` flag, so the
+# watcher process errored out and exited within milliseconds. The loop then read
+# that as "adapter deauthed", killed nmcli ~1s in, and returned FAILURE on EVERY
+# connect the instant the SSID was found — the exact "SSID seen → connection
+# failed multiple times → reset adapter" thrash. (Its grep pattern "wlan0: deauth"
+# was broken too — real iw output is "wlan0 (phy #0): deauth…".) The fail-sim
+# loops keep their fast cadence via their own short `nmcli -w 5` cap, so dropping
+# the iw watcher doesn't slow them below the ~10 attempts/min insight threshold.
+# $1 (cap) is retained for signature compatibility with every existing caller.
 _connect_outcome() {
-  local cap="${1:-30}" nm_pid="$2"
-  if [[ -z "${wladapter:-}" ]] || ! command -v iw >/dev/null 2>&1; then
-    wait "$nm_pid" 2>/dev/null; return $?
-  fi
-  timeout "$cap" bash -c 'iw event -m -t 2>/dev/null | grep -m1 -E "$1: (deauth|disassoc|disconn)"' \
-    _ "$wladapter" >/dev/null 2>&1 &
-  local ev_pid=$! i
-  for ((i=0; i<cap; i++)); do
-    if ! kill -0 "$nm_pid" 2>/dev/null; then
-      wait "$nm_pid" 2>/dev/null; local rc=$?
-      kill "$ev_pid" 2>/dev/null; wait "$ev_pid" 2>/dev/null || true
-      return "$rc"
-    fi
-    if ! kill -0 "$ev_pid" 2>/dev/null; then
-      kill "$nm_pid" 2>/dev/null; wait "$nm_pid" 2>/dev/null || true
-      return 1
-    fi
-    sleep 1
-  done
-  kill "$nm_pid" "$ev_pid" 2>/dev/null; wait 2>/dev/null || true
-  return 1
+  local nm_pid="$2"
+  wait "$nm_pid" 2>/dev/null
+  return $?
 }
 # Wait for a wlan adapter to appear — replaces the blind `sleep 15` that used to
 # precede `wladapter=$(...)` re-detection in the recovery paths. Polls up to $1
