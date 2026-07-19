@@ -1,5 +1,5 @@
 #!/bin/bash
-version=1.0
+version=1.1
 LOG_FILE=/usr/local/scripts/sim.log
 
 echo $(date) | tee -a ${LOG_FILE}
@@ -163,6 +163,21 @@ fi
 _rsleep() {
   local base="${1:-1}"
   sleep $(( base + RANDOM % (base + 1) ))
+}
+
+# Is the wlan adapter actively connecting (associating / need-auth / getting IP)
+# or already associated? Used to VETO a radio cycle: if NetworkManager is already
+# mid-association to an SSID it found in the scan, bouncing the radio would tear
+# that down and wipe the scan cache — forcing a slow driver to rediscover from
+# scratch, the exact thrash we're trying to avoid. Only cycle when the adapter is
+# genuinely idle (disconnected / unavailable / failed). Reads $wladapter at call
+# time; returns 0 (BUSY → do NOT cycle) when the device state is connecting* or
+# connected*, 1 (idle → cycle allowed) otherwise or when no adapter is present.
+_wifi_busy() {
+  [[ -n "${wladapter:-}" ]] || return 1
+  local st
+  st=$(nmcli -t -f DEVICE,STATE device status 2>/dev/null | grep "^${wladapter}:" | head -1 | cut -d: -f2)
+  [[ "$st" == connecting* || "$st" == connected* ]]
 }
 
 while true; do
@@ -656,9 +671,14 @@ connect_wifi() {
   # kept WARM — a radio bounce wipes that cache, which stranded slow drivers
   # (SSID takes ~1 min to surface). Only a persistent failure escalates to reset.
   if [[ "$reset" == "reset" || ( "$track" == "1" && "${_reconnect_fails:-0}" -ge "${_RADIO_CYCLE_AFTER:-5}" ) ]]; then
-    nmcli radio wifi off
-    nmcli radio wifi on
-    _wait_radio_ready 15
+    if _wifi_busy; then
+      echo "  [radio] cycle deferred — adapter mid-connect/associated, letting it finish" | tee -a ${LOG_FILE}
+    else
+      echo "  [radio] cycling radio (reset=${reset:-no}, reconnect-fails=${_reconnect_fails:-0})" | tee -a ${LOG_FILE}
+      nmcli radio wifi off
+      nmcli radio wifi on
+      _wait_radio_ready 15
+    fi
   fi
   # Wait for the SSID to appear in the scan cache (beacon heard) before
   # connecting — _wait_radio_ready only means the radio is up, NOT that a scan
@@ -762,9 +782,14 @@ _connect_1x_core() {
     # (a bounce wipes the scan cache and strands slow drivers). Then wait for the
     # SSID to appear in the scan cache (beacon heard) before rebuilding/associating.
     if [[ "$reset" == "reset" || ( "$track" == "1" && "${_reconnect_fails:-0}" -ge "${_RADIO_CYCLE_AFTER:-5}" ) ]]; then
-      nmcli radio wifi off
-      nmcli radio wifi on
-      _wait_radio_ready 15
+      if _wifi_busy; then
+        echo "  [radio] cycle deferred — adapter mid-connect/associated, letting it finish" | tee -a ${LOG_FILE}
+      else
+        echo "  [radio] cycling radio (reset=${reset:-no}, reconnect-fails=${_reconnect_fails:-0})" | tee -a ${LOG_FILE}
+        nmcli radio wifi off
+        nmcli radio wifi on
+        _wait_radio_ready 15
+      fi
     fi
     if [[ -z "$scan_cap" ]]; then
       scan_cap=$(( 20 + 5 * ${_reconnect_fails:-0} ))
@@ -844,9 +869,14 @@ manage_connection() {
   # radio (a bounce wipes the scan cache and strands slow drivers). Then wait for
   # the SSID to appear in the scan cache (beacon heard) before (re)associating.
   if [[ "$reset" == "reset" || ( "$track" == "1" && "${_reconnect_fails:-0}" -ge "${_RADIO_CYCLE_AFTER:-5}" ) ]]; then
-    nmcli radio wifi off
-    nmcli radio wifi on
-    _wait_radio_ready 15
+    if _wifi_busy; then
+      echo "  [radio] cycle deferred — adapter mid-connect/associated, letting it finish" | tee -a ${LOG_FILE}
+    else
+      echo "  [radio] cycling radio (reset=${reset:-no}, reconnect-fails=${_reconnect_fails:-0})" | tee -a ${LOG_FILE}
+      nmcli radio wifi off
+      nmcli radio wifi on
+      _wait_radio_ready 15
+    fi
   fi
   if [[ -z "$scan_cap" ]]; then
     scan_cap=$(( 20 + 5 * ${_reconnect_fails:-0} ))
