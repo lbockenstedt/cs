@@ -446,6 +446,12 @@ class ConfigCommandsMixin:
         #    stale hub override is removed so load_configs doesn't double-apply it.
         #  - otherwise: write configs/hub-*-overrides.conf (hub-managed override).
         #    None = clear the override so the base file applies.
+        # STANDALONE-ONLY: the commit+push branch below fires only for a genuinely
+        # standalone spoke (no hub → _source stays 'github' + its own token). When
+        # a hub manages this spoke it sends config_source='hub' AND a token-less
+        # github_config (replacing _github_config above → _gh_token=False), so BOTH
+        # conditions fail and the edit lands as a hub-override — the hub is the
+        # sole GitHub client and does the commit. Do NOT let an attached spoke push.
         _push_map = {}  # repo-relative path -> content, for the fetch+reset+push
         _client_config_changed = False  # sim/user override changed → push update_now
         for override_key, hub_filename, repo_filename in (

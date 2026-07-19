@@ -112,8 +112,16 @@ class RepoSync:
         except Exception:  # noqa: BLE001
             _source = "github"
 
+        # STANDALONE-ONLY CONTRACT: repo_sync (spoke-side GitHub pull) is the
+        # no-hub fallback ONLY. Whenever a hub manages this spoke it drives
+        # config_source='hub' (the hub is the sole GitHub client — it pulls,
+        # commits, and fans config down; see the hub's github_config_client), so
+        # this returns here and the spoke never touches GitHub. Only a genuinely
+        # standalone spoke (never overridden by a hub → flag stays 'github')
+        # reaches the pull below. Do NOT re-enable spoke pulls under a hub.
         if _source != "github":
-            logger.debug("repo sync[%s]: skipped (source=%s)", sid, _source)
+            logger.debug("repo sync[%s]: skipped (source=%s → hub-managed, standalone-only path)",
+                         sid, _source)
             return
         if not token:
             logger.debug("repo sync[%s]: skipped (no github_token in memory)", sid)
