@@ -35,6 +35,15 @@ class IngestCommandsMixin:
             entry = self.deploy.ingest_telemetry(hostname, d)
             if not entry:
                 return {"status": "ERROR", "message": "missing hostname"}
+            # Wake the conditional relay loop so any state change in this fresh
+            # frame (VM deleting/recloning, client stop/start) relays to the hub
+            # immediately instead of waiting out the idle interval.
+            try:
+                cp = getattr(self, "control_plane", None)
+                if cp is not None and getattr(cp, "_relay_wake", None) is not None:
+                    cp._relay_wake.set()
+            except Exception:  # noqa: BLE001 — relay wake is best-effort
+                pass
             # Phase F: a fresh VM list is the trigger for sim-tag sync (legacy
             # drives it off client-status ingest; here the per-host VM list is
             # the source of truth). Best-effort background sweep — no-op until

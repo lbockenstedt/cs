@@ -127,6 +127,11 @@ class CSControlPlane(AgentHostingControlPlane):
         self._api_app = None
         self._api_server = None
         self._api_task = None
+        # Set by an agent-frame ingest to WAKE the conditional relay loop
+        # immediately, so a state change (VM deleting/recloning, a client going
+        # stopped/started) relays in ~0.1s instead of waiting out the idle SLOW
+        # interval. Created lazily on first use to avoid binding to a loop here.
+        self._relay_wake: Optional[asyncio.Event] = None
 
     # ── local webui TLS (le cert distribution → this spoke's own dashboard) ───
     # The 8080 uvicorn server serves the local dashboard + client API. INSTALL_CERT
@@ -503,6 +508,10 @@ class CSControlPlane(AgentHostingControlPlane):
         _last_sig: Optional[str] = None
         _last_send_ts = 0.0
         _force_send = True            # first tick after (re)connect always sends
+        # Wake event: an agent-frame ingest sets it so a state change relays
+        # immediately instead of waiting out the idle SLOW interval (created here
+        # so it binds to THIS running loop).
+        self._relay_wake = asyncio.Event()
         # Stagger the first send so a freshly-ingested frame is more likely.
         await asyncio.sleep(2)
         while True:
@@ -630,7 +639,16 @@ class CSControlPlane(AgentHostingControlPlane):
             # cadence locally so the hub distributes the merge work down to the
             # spoke rather than shedding our frames (see the loop docstring and
             # lm/docs/backpressure-throttling.md §6).
-            await asyncio.sleep(self._bp_send_interval(interval))
+            # Interruptible sleep: wake early when an agent frame is ingested
+            # (a state change to relay) — else time out after the interval (the
+            # heartbeat/idle cadence). This is what makes a delete/reclone/stop
+            # reflect in ~0.1s instead of up to the SLOW interval.
+            try:
+                await asyncio.wait_for(self._relay_wake.wait(),
+                                       timeout=self._bp_send_interval(interval))
+            except asyncio.TimeoutError:
+                pass
+            self._relay_wake.clear()
 
     def run_standalone_mode(self):
         """Standalone FastAPI server: the full client API surface on
