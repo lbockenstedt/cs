@@ -291,6 +291,28 @@ class CSSettings:
             "protected_vmids": sorted(_protected),
         }
 
+        # N-image clone sources. Emit image_count + image{i}_template_id/_pct for
+        # the pxmx agent's _resolve_images ONLY when the operator set vm_image_count
+        # via the new VM Images UI. Absent → leave image1/image2/image1_pct (above)
+        # as the source of truth so existing 2-image configs keep working unchanged.
+        _raw_count = self.get("vm_image_count")
+        if _raw_count is not None and str(_raw_count).strip() != "":
+            try:
+                _img_count = max(1, min(20, int(_raw_count or 1)))
+            except (TypeError, ValueError):
+                _img_count = 1
+            payload["image_count"] = _img_count
+            for _i in range(1, _img_count + 1):
+                _raw = self.get(f"image{_i}_template_id")
+                if (_raw is None or str(_raw).strip() == "") and _i <= 2:
+                    _raw = {1: img1_id, 2: img2_id}.get(_i)
+                if _raw is not None and str(_raw).strip() != "":
+                    payload[f"image{_i}_template_id"] = _template_id_or_name(_raw, _raw)
+                try:
+                    payload[f"image{_i}_pct"] = max(0, min(100, int(self.get(f"vm_image_{_i}_pct", 0) or 0)))
+                except (TypeError, ValueError):
+                    payload[f"image{_i}_pct"] = 0
+
         # Per-host override: a non-default vmid_start/vmid_end (or vm_set_override)
         # pinned for this hostname overrides the global values, so the pxmx agent
         # honors it over its own hostname-suffix derivation. (vm_set_override is

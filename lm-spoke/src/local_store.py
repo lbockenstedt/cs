@@ -155,7 +155,10 @@ _DEFAULT_HUB_CONFIG: Dict[str, Any] = {
     # preserve-on-reset: reset restores these canonical tier IDs.
     "t1_pci_vidpids": ["1912:0015"],
     "t3_pci_vidpids": ["168c:0034"],
-    # VM Templates (clone-source VMIDs + image1 mix)
+    # VM Templates (clone-source VMIDs + per-image mix). vm_image_count = how many
+    # images the operator configured (1..N); each has vm_image_{i}_template_id +
+    # vm_image_{i}_pct. Defaults keep the legacy 2-image 50/50 behavior.
+    "vm_image_count": 1,
     "vm_image_1_template_id": 100,
     "vm_image_2_template_id": 200,
     "vm_image_1_pct": 50,
@@ -277,6 +280,32 @@ class LocalStore:
     def set_central_sites_config(self, cfg: Dict[str, Any]) -> None:
         with self._lock:
             self._data["central_sites_config"] = cfg or {}
+            self._save()
+
+    # ── Mist API config (token + org id + region host) ──────────────────────
+    # Mirrors central_config: the creds the MistPoller's MistClient is built
+    # from. In distributed mode the spoke holds these; in centralized mode the
+    # hub holds them and the spoke is a relay (see store.mist_api_is_centralized).
+
+    def get_mist_config(self) -> Dict[str, Any]:
+        return dict(self._data.get("mist_config") or {})
+
+    def set_mist_config(self, cfg: Dict[str, Any]) -> None:
+        with self._lock:
+            self._data["mist_config"] = cfg or {}
+            self._save()
+
+    # ── Mist sites config (which sites to poll + monitored checks) ──────────
+    # Mirrors central_sites_config: site_mappings + monitored_checks +
+    # hardware_checks (+ sim_quotas rides here too in the hub twin). The
+    # MistPoller reads this to scope its per-site poll.
+
+    def get_mist_sites_config(self) -> Dict[str, Any]:
+        return dict(self._data.get("mist_sites_config") or {})
+
+    def set_mist_sites_config(self, cfg: Dict[str, Any]) -> None:
+        with self._lock:
+            self._data["mist_sites_config"] = cfg or {}
             self._save()
 
     # ── pxmx server → site map (engine site resolver) ──────────────────────────

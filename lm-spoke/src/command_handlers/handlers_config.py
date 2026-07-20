@@ -142,6 +142,57 @@ class ConfigCommandsMixin:
         if cmd in ("CS_CENTRAL_BROWSE",):
             return await self.central_poller.browse()
 
+        # ── Juniper Mist API (twin of the Central handlers above) ──────────
+        if cmd in ("CS_GET_MIST_CONFIG",):
+            return {"status": "SUCCESS", "mist_config": self.local_store.get_mist_config()}
+
+        if cmd in ("CS_SET_MIST_CONFIG",):
+            self._merge_mist_config(d.get("mist_config") or {})
+            return {"status": "SUCCESS"}
+
+        if cmd in ("CS_GET_MIST_SITES_CONFIG",):
+            return {"status": "SUCCESS", **self.local_store.get_mist_sites_config()}
+
+        if cmd in ("CS_SET_MIST_SITES_CONFIG",):
+            cfg = d if isinstance(d, dict) else {}
+            # Validate sim_quotas against this tenant's simulation.conf sims
+            # (same drop-unknown + surface-errors pass as the Central twin).
+            try:
+                import sim_quota
+                sims = [s["sim_id"] for s in sim_quota.available_sims(self.settings.config_dir)]
+                clean, errs = sim_quota.validate_sim_quotas(cfg.get("sim_quotas"), sims)
+                if errs:
+                    logger.warning("CS_SET_MIST_SITES_CONFIG: sim_quotas errors: %s", errs)
+                cfg = {**cfg, "sim_quotas": clean}
+            except Exception as exc:  # noqa: BLE001 — never block the save
+                logger.warning("sim_quotas validate failed (mist): %s", exc)
+            self.local_store.set_mist_sites_config(cfg)
+            self.mist_poller.reload()
+            return {"status": "SUCCESS"}
+
+        if cmd in ("CS_GET_MIST_AVAILABLE",):
+            return await self.mist_poller.available_checks()
+
+        if cmd in ("CS_TEST_MIST",):
+            return await self.mist_poller.test_connection()
+
+        if cmd in ("CS_MIST_BROWSE",):
+            return await self.mist_poller.browse()
+
+        if cmd == "CS_GET_MIST_HEALTH":
+            # 30-day per-check health for a DISTRIBUTED Mist tenant (twin of
+            # CS_GET_HEALTH). Daily summaries ride in mist_status already; this
+            # serves the on-hover HOURLY breakdown for one check.
+            h = getattr(self.mist_poller, "_health", None)
+            if h is None:
+                return {"hourly": []}
+            site = d.get("site")
+            check = d.get("check")
+            from central_poller import _CC_SCOPE
+            if site and check:
+                return {"hourly": h.hourly(_CC_SCOPE, site, check)}
+            return {"daily": h.summary(_CC_SCOPE)}
+
         if cmd == "CS_GET_HEALTH":
             # 30-day per-check health for a DISTRIBUTED tenant. Daily summaries ride
             # in central_status already; this serves the on-hover HOURLY breakdown
@@ -299,6 +350,28 @@ class ConfigCommandsMixin:
         self.central_poller.reload()
         return merged
 
+    def _merge_mist_config(self, cfg: Dict[str, Any]) -> Dict[str, Any]:
+        """Sentinel-merge a Mist API config patch into local_store and rebuild
+        the poller's MistClient. Twin of ``_merge_central_config``: shared by
+        CS_SET_MIST_CONFIG (standalone local UI) and the hub-pushed
+        CS_CONFIG_UPDATE path (_apply_hub_config) so BOTH entry points persist
+        creds AND reload the client.
+
+        Sentinel rule: an empty/None value KEEPS the stored value (so a partial
+        save — e.g. changing only the region host, or a hub push that omits
+        unchanged secrets — never wipes the token). A new key with an empty
+        value is still written (first-time provisioning of a placeholder field)."""
+        current = self.local_store.get_mist_config()
+        merged = dict(current)
+        for k, v in (cfg or {}).items():
+            if v not in (None, ""):
+                merged[k] = v
+            elif k not in current:
+                merged[k] = v
+        self.local_store.set_mist_config(merged)
+        self.mist_poller.reload()
+        return merged
+
     def _apply_hub_config(self, patch: Dict[str, Any]) -> list:
         """Apply a hub-pushed CS_CONFIG_UPDATE patch to the cs settings store.
 
@@ -332,6 +405,23 @@ class ConfigCommandsMixin:
                 self.local_store.set_central_sites_config(csc)
                 self.central_poller.reload()
                 applied.append("central_sites_config")
+        # Juniper Mist creds pushed from the hub (Setup -> Mist API -> Save).
+        # Twin of the central_config branch above: WITHOUT it the push is
+        # silently dropped and the Mist poller keeps _client=None, so the Mist
+        # site dropdown / Sites-Alerts-Clients tabs stay empty.
+        if "mist_config" in patch:
+            mc = patch.get("mist_config")
+            self._merge_mist_config(mc if isinstance(mc, dict) else {})
+            applied.append("mist_config")
+        # Hub-pushed mist_sites_config (monitored_checks/hardware_checks/
+        # site_mappings + sim_quotas): apply to local_store + reload the poller
+        # so a hub-side Config -> Sim Quotas / Mist save reaches this spoke.
+        if "mist_sites_config" in patch:
+            msc = patch.get("mist_sites_config")
+            if isinstance(msc, dict):
+                self.local_store.set_mist_sites_config(msc)
+                self.mist_poller.reload()
+                applied.append("mist_sites_config")
         # Hub-pushed effective sim quotas (global defaults merged with this
         # tenant's overrides, enabled-only) — the SimQuotaEngine's input. Persist
         # + trigger a reconcile so the engine picks up the new target set.
@@ -423,6 +513,27 @@ class ConfigCommandsMixin:
             if hub_key in patch:
                 update[settings_key] = patch[hub_key]
                 applied.append(f"{hub_key}->{settings_key}")
+        # N-image generic keys from the new VM Images UI (any i). vm_image_count +
+        # vm_image_{i}_pct are direct settings keys; vm_image_{i}_template_id /
+        # _template_spec remap to image{i}_*. (i=1/2 may ALSO be covered by the
+        # static lists above — re-applying the same value is harmless/idempotent.)
+        if "vm_image_count" in patch:
+            update["vm_image_count"] = patch["vm_image_count"]
+            applied.append("vm_image_count")
+        for _k, _v in patch.items():
+            if not _k.startswith("vm_image_"):
+                continue
+            _parts = _k[len("vm_image_"):].split("_", 1)
+            if len(_parts) != 2 or not _parts[0].isdigit():
+                continue
+            _i, _field = _parts[0], _parts[1]
+            if _field == "pct":
+                update[_k] = _v
+                applied.append(_k)
+            elif _field in ("template_id", "template_spec"):
+                _sk = f"image{_i}_{_field}"
+                update[_sk] = _v
+                applied.append(f"{_k}->{_sk}")
         # Spoke-side relay timeouts (send_to_agent long-op / fast windows) —
         # hub-configurable via Setup → General. Not a CSSettings/agent key: stored
         # on the spoke and read by the SPOKE_RELAY forward (send_to_agent).
@@ -585,6 +696,7 @@ class ConfigCommandsMixin:
         # push; the reconcile lock serializes it with the periodic 60s sweep.
         _reconcile_keys = (
             "effective_sim_quotas", "central_sites_config",
+            "mist_sites_config",
             "sim_conf_override", "user_conf_override", "qt_exclude_sims",
         )
         if any(k in a for a in applied for k in _reconcile_keys):
