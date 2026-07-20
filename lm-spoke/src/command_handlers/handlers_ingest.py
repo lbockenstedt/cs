@@ -106,10 +106,9 @@ class IngestCommandsMixin:
                 return {"status": "ERROR",
                         "message": "missing 'hostname' or 'token'"}
             self.tokens.save(hostname, token)
-            # A fresh token may fix the very auth failure that put us in back-off
-            # — clear it (and the debounce) so the sync retries now with the new
-            # token instead of waiting out the 10-min penalty.
-            self._sim_tag_backoff_until = 0.0
+            # Clear the debounce so a fresh token (which may re-enable API calls
+            # used elsewhere) also triggers a sim-tag re-dispatch now. Tagging
+            # itself no longer needs the token — it runs agent-side via qm/pct.
             self._sim_tag_last_ts = 0.0
             asyncio.create_task(self._maybe_sync_sim_tags())
             return {"status": "SUCCESS", "stored": True, "hostname": hostname,

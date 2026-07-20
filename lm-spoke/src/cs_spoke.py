@@ -37,7 +37,7 @@ from simulation_engine import SimulationEngine
 import sim_config
 from proxmox_deploy import ProxmoxDeploy
 from command_queue import CommandQueue, CSSettings
-from token_store import TokenStore, sync_all_sim_tags
+from token_store import TokenStore, compute_sim_tag_map
 from client_registry import ClientRegistry
 from demo_scenarios import DemoManager
 from local_store import LocalStore
@@ -107,15 +107,16 @@ class CSSpoke(AgentCommandsMixin, SimCommandsMixin, ConfigCommandsMixin,
         # config delivery time (client_api /api/config); demos never touch the
         # persisted store. Expiry sweep is started by control_plane.run().
         self.demo = DemoManager(on_change=self._on_client_override_changed)
-        self._sim_tag_cache: Dict[tuple, set] = {}
+        # Per-host signature of the last sim-tag map dispatched to each agent, so
+        # an unchanged map is not re-sent every debounce ({hostname: sig-tuple}).
+        self._sim_tag_cache: Dict[str, tuple] = {}
         self._sim_tag_sync_lock = asyncio.Lock()
-        # Sim-tag sweep is DEBOUNCED off the per-frame telemetry hot path: at most
-        # once per _SIM_TAG_MIN_INTERVAL, and it backs off hard when a sweep has
-        # PUT failures (Proxmox unreachable / wrong host:port / bad token) so a
-        # misconfigured target can't re-storm every 10s telemetry frame — the
-        # regression behind the recurring CS_INGEST_TELEMETRY Request Timeouts.
+        # Sim-tag sync is DEBOUNCED off the per-frame telemetry hot path: at most
+        # once per _SIM_TAG_MIN_INTERVAL. It no longer PUTs to the Proxmox API from
+        # this off-host spoke (that storm was the regression behind the recurring
+        # CS_INGEST_TELEMETRY Request Timeouts) — it computes the desired tags and
+        # dispatches them to each host's pxmx AGENT for a LOCAL qm/pct apply.
         self._sim_tag_last_ts = 0.0
-        self._sim_tag_backoff_until = 0.0
         # Control-plane back-reference, set by CSControlPlane.run() so the
         # GET_AGENTS / SPOKE_RELAY / SET_AGENT_CONFIG handlers can reach
         # connected_agents / approve_pending_agent / send_to_agent (mirrors
@@ -330,41 +331,66 @@ class CSSpoke(AgentCommandsMixin, SimCommandsMixin, ConfigCommandsMixin,
         return {"status": overall, "message": msg, "nodes": nodes}
 
     # ── Phase F: sim-tag sync (driven off CS_INGEST_TELEMETRY / token store) ──
-    _SIM_TAG_MIN_INTERVAL = 60.0    # at most one sweep per minute
-    _SIM_TAG_FAIL_BACKOFF = 600.0   # 10 min after a sweep with PUT failures
+    # Tagging moved to the pxmx AGENT: this (off-host) cs spoke computes the
+    # desired `sim-` tags per VM (from the client registry) and dispatches each
+    # host's map to that host's agent (PXMX_APPLY_SIM_TAGS), which applies them
+    # with LOCAL `qm`/`pct set --tags`. The spoke no longer PUTs to the Proxmox
+    # API — that per-VM PUT (rebuilding an SSL context each call) storm was what
+    # caused the recurring CS_INGEST_TELEMETRY Request Timeouts → stale VM Server
+    # / Overview / quota engine across the whole fleet.
+    _SIM_TAG_SYNC_ENABLED = True
+    _SIM_TAG_MIN_INTERVAL = 60.0    # at most one dispatch sweep per minute
+    _SIM_TAG_DISPATCH_TIMEOUT = 60.0  # per-agent PXMX_APPLY_SIM_TAGS relay timeout
 
     async def _maybe_sync_sim_tags(self) -> None:
-        """Best-effort sim-tag sweep — DEBOUNCED off the telemetry hot path.
+        """Debounced sim-tag sync — computes desired tags off the telemetry hot
+        path and dispatches them to each pxmx AGENT for a LOCAL (qm/pct) apply.
 
-        Runs at most once per ``_SIM_TAG_MIN_INTERVAL``; a sweep with PUT
-        failures (Proxmox unreachable / wrong host:port / bad token) backs off
-        for ``_SIM_TAG_FAIL_BACKOFF`` so a misconfigured target can't re-storm
-        every telemetry frame (each old call also rebuilt an SSL context per VM,
-        burning loop CPU — the cause of the CS_INGEST Request Timeouts). No-op
-        until the client registry is wired. Never raises."""
+        Runs at most once per ``_SIM_TAG_MIN_INTERVAL``. No Proxmox API PUT from
+        this off-host spoke (that storm caused the CS_INGEST_TELEMETRY Request
+        Timeouts). Per-host maps unchanged since the last dispatch are skipped,
+        and only hosts whose agent is currently connected are sent. No-op until
+        the client registry is wired. Never raises."""
+        if not self._SIM_TAG_SYNC_ENABLED:
+            return
         if self.registry is None:
             return  # nothing to sync until the client registry lands
         now = time.time()
-        if now < self._sim_tag_backoff_until:
-            return  # in failure back-off — a target is unreachable/misconfigured
         if now - self._sim_tag_last_ts < self._SIM_TAG_MIN_INTERVAL:
-            return  # debounced — already swept within the interval
+            return  # debounced — already dispatched within the interval
         if self._sim_tag_sync_lock.locked():
-            return  # a sweep is already running — don't pile another on
+            return  # a dispatch is already running — don't pile another on
         try:
             async with self._sim_tag_sync_lock:
                 self._sim_tag_last_ts = time.time()
-                _updated, failures = await sync_all_sim_tags(
-                    self.deploy, self.tokens, self.registry,
-                    applied_cache=self._sim_tag_cache)
-                if failures:
-                    self._sim_tag_backoff_until = time.time() + self._SIM_TAG_FAIL_BACKOFF
-                    logger.warning(
-                        "sim-tag sync: %d VM(s) failed to tag (Proxmox unreachable / "
-                        "wrong host:port / bad token?) — backing off %.0fm",
-                        failures, self._SIM_TAG_FAIL_BACKOFF / 60)
+                tag_map = compute_sim_tag_map(self.deploy, self.registry)
+                if not tag_map:
+                    return
+                # hostname -> currently-connected agent id
+                hn_to_aid: Dict[str, str] = {}
+                for aid, info in (self.control_plane.connected_agents or {}).items():
+                    hn = str((info or {}).get("hostname") or "").strip()
+                    if hn:
+                        hn_to_aid[hn] = aid
+                for hostname, vmid_map in tag_map.items():
+                    aid = hn_to_aid.get(hostname)
+                    if not aid:
+                        continue  # that host's agent isn't connected right now
+                    # skip re-send when this host's desired map is unchanged
+                    sig = tuple(sorted(
+                        (str(v), tuple(sorted(t))) for v, t in vmid_map.items()))
+                    if self._sim_tag_cache.get(hostname) == sig:
+                        continue
+                    try:
+                        await self.control_plane.send_to_agent(
+                            "PXMX_APPLY_SIM_TAGS", {"tags": vmid_map},
+                            agent_id=aid, timeout=self._SIM_TAG_DISPATCH_TIMEOUT)
+                        self._sim_tag_cache[hostname] = sig
+                        logger.debug("sim-tags: dispatched %d VM(s) to agent %s (%s)",
+                                     len(vmid_map), aid, hostname)
+                    except Exception as exc:  # noqa: BLE001 - one host must not abort the rest
+                        logger.debug("sim-tag dispatch to %s failed: %s", hostname, exc)
         except Exception as e:  # noqa: BLE001
-            self._sim_tag_backoff_until = time.time() + self._SIM_TAG_FAIL_BACKOFF
             logger.debug("sim-tag sync skipped: %s", e)
 
     # ── command dispatch ───────────────────────────────────────────────────
