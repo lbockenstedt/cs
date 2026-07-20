@@ -398,6 +398,18 @@ class ConfigCommandsMixin:
             if isinstance(sw, list):
                 self.local_store.set_ssid_weights(sw)
                 applied.append("ssid_weights")
+        # Dongle-quarantine exclusion sims (hub-pushed resolved set: per-tenant
+        # csc override else the platform-wide default). Merged INTO the local
+        # central_sites_config (read-modify-write) so the SimQuotaEngine reads it
+        # via local_store.get_central_sites_config(); the rest of csc is preserved.
+        # The engine defaults to the locked set when this key is absent.
+        if "qt_exclude_sims" in patch:
+            qt = patch.get("qt_exclude_sims")
+            if isinstance(qt, list):
+                csc = self.local_store.get_central_sites_config() or {}
+                csc["qt_exclude_sims"] = [str(s) for s in qt if str(s).strip()]
+                self.local_store.set_central_sites_config(csc)
+                applied.append("qt_exclude_sims")
         if "ignored_hostnames" in patch:
             ih = patch.get("ignored_hostnames")
             if isinstance(ih, list):
@@ -573,7 +585,7 @@ class ConfigCommandsMixin:
         # push; the reconcile lock serializes it with the periodic 60s sweep.
         _reconcile_keys = (
             "effective_sim_quotas", "central_sites_config",
-            "sim_conf_override", "user_conf_override",
+            "sim_conf_override", "user_conf_override", "qt_exclude_sims",
         )
         if any(k in a for a in applied for k in _reconcile_keys):
             self._trigger_sim_quota_reconcile()
