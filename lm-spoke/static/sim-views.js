@@ -4937,18 +4937,25 @@ function csQtCount(h) {
 // auto-recovery that clears it (a still-plugged dongle gets retried; if the
 // kernel errors persist it re-quarantines next pass). A failed clone NEVER
 // quarantines the dongle, so this is the sole "sidelined dongle" signal.
-function csQtBadge(q) {
+// The optional spoke/target enable a per-bus "Remove from QT" button (admin
+// un-quarantines a dongle once the issue is fixed) that dispatches the agent's
+// clear_usb_quarantine CS_COMMAND; omitted on the fleet summary pill.
+function csQtBadge(q, spoke, target) {
     if (!q || !q.bus_path) return '';
     const at = Number(q.recovers_at);
     const secs = isFinite(at) ? at - Date.now() / 1000 : NaN;
     const reason = String(q.reason || 'quarantined');
     const present = q.present === false ? ' (absent)' : '';
-    const title = `Quarantined — ${reason}${present}. Auto-recovers after 1h; re-quarantines if kernel USB errors persist.`;
+    const perm = q.permanent ? ' · PERMANENT' : (q.strikes ? ` · strike ${q.strikes}/5` : '');
+    const title = `Quarantined — ${reason}${present}.${perm} Auto-recovers after 1h; re-quarantines if kernel USB errors persist. Remove only once the issue is fixed.`;
     const cnt = (isFinite(secs) && secs > 0)
         ? `<span class="cs-qt-countdown" data-qt-at="${at}">${csFmtDuration(secs)}</span>`
-        : 'now';
+        : (q.permanent ? 'never' : 'now');
+    const rm = (spoke && target)
+        ? `<button onclick="event.stopPropagation(); csClearQt('${csEscape(spoke)}','${csEscape(target)}','${csEscape(q.bus_path)}')" title="Remove this dongle from quarantine (clears its strike history)" class="ml-1 px-1 py-0.5 rounded bg-red-600 hover:bg-red-700 text-white text-[9px] font-bold normal-case">✕ Remove</button>`
+        : '';
     return `<span class="inline-flex items-center gap-1 px-2 py-0.5 rounded text-[10px] font-bold uppercase tracking-wider bg-red-100 text-red-700" title="${csEscape(title)}">`
-        + `<span class="w-1.5 h-1.5 rounded-full bg-red-500 animate-pulse"></span>🚫 QT ${csEscape(q.bus_path)} · ${csEscape(reason)} · clears in ${cnt}</span>`;
+        + `<span class="w-1.5 h-1.5 rounded-full bg-red-500 animate-pulse"></span>🚫 QT ${csEscape(q.bus_path)} · ${csEscape(reason)}${perm} · clears in ${cnt}${rm}</span>`;
 }
 
 function csVmStatusBadge(v) {
@@ -5148,6 +5155,22 @@ const CS_VM_ACTION_LABEL = {
     reboot_vm: 'Rebooting', reclone_vm: 'Recloning', snapshot_vm: 'Snapshotting',
 };
 function csVmActionLabel(a) { return CS_VM_ACTION_LABEL[a] || a; }
+
+// Remove a single dongle from quarantine (admin un-QT once the issue is fixed).
+// Dispatches the agent's clear_usb_quarantine CS_COMMAND with the bus_path;
+// the agent pops the bus's quarantine entry (strike history reset). Refreshes
+// the USB card so the badge clears.
+window.csClearQt = async function (spoke, target, busPath) {
+    if (!spoke || !target || !busPath) return;
+    if (!confirm(`Remove dongle ${busPath} from quarantine on ${target}?\n\nThis clears its strike history — only do this once the underlying issue is fixed, or it will re-quarantine on the next kernel USB error.`)) return;
+    const sid = encodeURIComponent(spoke);
+    try {
+        await csFetch(`/${csTenant()}/spokes/${sid}/proxmox-command?tenant_id=${csTenant()}`,
+            { method: 'POST', body: JSON.stringify({ action: 'clear_usb_quarantine', args: { bus_path: busPath }, target }) });
+        if (typeof showToast === 'function') showToast(`Removing ${busPath} from QT…`, 'info');
+        setTimeout(() => loadCSData('VM Server', currentSubChild, true), 800);
+    } catch (e) { console.error('csClearQt failed', e); if (typeof showToast === 'function') showToast('Remove from QT failed: ' + (e.message || e), 'error'); }
+};
 
 window.csVmAction = async function (key, action) {
     // key is the composite spoke|host|vmid (routes to the VM's OWN host); tolerate
@@ -5419,10 +5442,12 @@ async function csRenderVmServerUsb() {
     // auto-recovery. Surfaced here (the dongle-management surface) so an admin
     // sees WHY a dongle is sidelined and that it self-clears.
     const qt = (px.quarantine || []).filter(q => q && q.bus_path);
+    const _qtSpoke = (h && h.spoke_id) || '';
+    const _qtTarget = (h && (h.hostname || h.spoke_hostname || h.spoke_id)) || '';
     const qtBox = qt.length ? `<div class="mb-4 border border-red-200 bg-red-50 rounded-lg p-3">
       <p class="text-[11px] font-bold text-red-700 uppercase tracking-wider mb-2">Quarantined dongles (${qt.length}) — sidelined by kernel USB errors</p>
-      <div class="flex flex-wrap gap-2">${qt.map(csQtBadge).join('')}</div>
-      <p class="text-[10px] text-red-600/80 mt-2">Each auto-recovers after 1h and gets retried; re-quarantines if the kernel errors persist. A failed clone never quarantines a dongle.</p>
+      <div class="flex flex-wrap gap-2">${qt.map(q => csQtBadge(q, _qtSpoke, _qtTarget)).join('')}</div>
+      <p class="text-[10px] text-red-600/80 mt-2">Each auto-recovers after 1h and gets retried; re-quarantines if the kernel errors persist. A failed clone never quarantines a dongle. Use <b>✕ Remove</b> only once the issue is fixed (clears the bus's strike history).</p>
     </div>` : '';
     // Type options for the per-row dropdown. A certified dongle that hasn't
     // been classified yet shows a "—" placeholder (selected) so the operator
