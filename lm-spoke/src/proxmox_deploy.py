@@ -451,8 +451,12 @@ class ProxmoxDeploy:
             summary["connected"] = connected
             vms = st.get("vms", []) or []
             usb = st.get("usb_state", []) or []
-            all_vms.extend(vms)
-            all_usb.extend(usb)
+            # NOTE: the flat top-level proxmox_vms/usb_devices below are LEGACY
+            # (single-host readers). Every VM/USB already rides proxmox_hosts[]
+            # below, and the hub uses the per-host shape whenever proxmox_hosts is
+            # present (always, since we build one entry per host). So we no longer
+            # duplicate every VM into a flat list — that doubled the VM payload on
+            # the wire for nothing. The flat keys stay (empty) for any old reader.
             hosts.append({
                 "hostname":      hn,
                 "proxmox":       summary,

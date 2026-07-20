@@ -409,6 +409,64 @@ class CSControlPlane(AgentHostingControlPlane):
         """
         return [asyncio.create_task(self._cs_telemetry_relay_loop(websocket))]
 
+    @staticmethod
+    def _relay_content_sig(payload: Dict[str, Any]) -> Optional[str]:
+        """Stable hash of the STATE that matters in a relay frame — so an idle
+        fleet stops re-sending byte-identical frames every 10s (conditional
+        relay). Deliberately EXCLUDES per-cycle noise (timestamps, rolling
+        CPU/mem averages) but INCLUDES every client/VM state signal
+        (running/cloning/shedding/stopped/started, prov/delete-gate, USB,
+        quarantine, central/mist status, command queue) — those transitions are
+        exactly what the Quota Engine + UI act on, so a change to any of them
+        changes the sig and forces an immediate send. Returns None on any error
+        → caller treats that as "changed" and sends (fail-safe: never skip)."""
+        try:
+            import hashlib
+            import json
+            parts: list = []
+            for h in payload.get("proxmox_hosts") or []:
+                h = h or {}
+                hpx = h.get("proxmox") or {}
+                for v in h.get("proxmox_vms") or []:
+                    v = v or {}
+                    parts.append(("vm", v.get("vmid"), v.get("status"), v.get("prov_status"),
+                                  tuple(sorted(str(t) for t in (v.get("tags") or [])))))
+                for u in h.get("usb_devices") or []:
+                    u = u or {}
+                    parts.append(("usb", u.get("bus_path") or u.get("bus"),
+                                  u.get("vidpid"), u.get("state")))
+                pr = hpx.get("prov_run") or {}
+                parts.append(("prov", bool(pr.get("running")),
+                              tuple(sorted((str((it or {}).get("vmid")), str((it or {}).get("status")))
+                                           for it in (pr.get("items") or [])))))
+                dg = hpx.get("delete_gate") or {}
+                parts.append(("gate", dg.get("reason"), dg.get("threshold_exceeded")))
+                parts.append(("qt", tuple(sorted(str((q or {}).get("bus_path"))
+                                                 for q in (hpx.get("quarantine") or [])))))
+                pv = hpx.get("provision") or {}
+                parts.append(("provn", pv.get("reason"), pv.get("halt"),
+                              pv.get("loop_running"), pv.get("auto_provision_on")))
+                parts.append(("range", str(hpx.get("vmid_range")), hpx.get("connected"),
+                              hpx.get("agent_version")))
+            for c in payload.get("clients") or []:
+                c = c or {}
+                parts.append(("cli", c.get("hostname"), c.get("online"), c.get("status"),
+                              tuple(sorted(str(s) for s in (c.get("active_simulations") or []))),
+                              c.get("tier"), c.get("simulation_id")))
+            cen = payload.get("central") or {}
+            parts.append(("cen", cen.get("status") or cen.get("token_state"),
+                          cen.get("wireless_clients"), cen.get("hardware_alerts")))
+            mist = payload.get("mist") or {}
+            parts.append(("mist", mist.get("status") or mist.get("token_state"),
+                          mist.get("wireless_clients")))
+            for q in payload.get("command_queue") or []:
+                q = q or {}
+                parts.append(("q", q.get("id") or q.get("cs_cmd_id"), q.get("status")))
+            parts.append(("drain", bool(payload.get("draining"))))
+            return hashlib.sha1(json.dumps(parts, sort_keys=True, default=str).encode()).hexdigest()
+        except Exception:
+            return None
+
     async def _cs_telemetry_relay_loop(self, websocket) -> None:
         """Re-emit a signed ``CS_TELEMETRY`` frame to the hub every
         ``CS_TELEMETRY_INTERVAL_S`` (default 10s). The payload is
@@ -431,6 +489,20 @@ class CSControlPlane(AgentHostingControlPlane):
             interval = max(2, int(os.environ.get("CS_TELEMETRY_INTERVAL_S", "10")))
         except Exception:
             pass
+        # Conditional relay (default ON; CS_TELEMETRY_CONDITIONAL=0 to disable and
+        # fall back to the old "send every tick" behavior). When nothing in the
+        # state signature changed we SKIP the send — an idle fleet stops re-sending
+        # identical frames + stops churning the hub's cache/memo. Safeguards so it
+        # can never strand the hub: force a full send on the FIRST tick after
+        # (re)connect, and a heartbeat send at least every _HEARTBEAT_S regardless
+        # (also refreshes the rolling CPU/mem the sig deliberately ignores).
+        _CONDITIONAL = (os.environ.get("CS_TELEMETRY_CONDITIONAL", "1") != "0")
+        _HEARTBEAT_S = 60
+        _FAST = min(interval, 3)      # a state change just happened → stay snappy
+        _SLOW = max(interval, 30)     # idle → back off (heartbeat still bounds it)
+        _last_sig: Optional[str] = None
+        _last_send_ts = 0.0
+        _force_send = True            # first tick after (re)connect always sends
         # Stagger the first send so a freshly-ingested frame is more likely.
         await asyncio.sleep(2)
         while True:
@@ -512,16 +584,42 @@ class CSControlPlane(AgentHostingControlPlane):
                 # out when we exit mid-reply. A fresh process starts False, so
                 # the first post-restart frame tells the hub to clear drain.
                 payload["draining"] = bool(getattr(self, "_draining", False))
-                msg = {
-                    "header": {
-                        "message_id": str(uuid.uuid4()),
-                        "timestamp": time.time(),
-                        "sender_id": self.spoke_id,
-                        "destination_id": "hub",
-                    },
-                    "payload": {"type": "CS_TELEMETRY", "data": payload},
-                }
-                await websocket.send(self._encode_frame(msg))
+                # ── Conditional relay: send only on a state change, a forced
+                # reseed, or the heartbeat ceiling. A skipped tick sends NOTHING
+                # (the hub keeps the last frame, which is identical) — that's the
+                # transfer + hub-load saving. Any client/VM state transition
+                # changes _sig → sends immediately, so the Quota Engine/UI are
+                # never delayed. Next interval is FAST right after a change, SLOW
+                # when idle. ``draining`` must always get through, so treat it as
+                # a force.
+                _now = time.time()
+                _sig = self._relay_content_sig(payload)
+                _changed = (_sig is None) or (_sig != _last_sig)
+                _due_heartbeat = (_now - _last_send_ts) >= _HEARTBEAT_S
+                _draining_now = bool(payload.get("draining"))
+                _do_send = ((not _CONDITIONAL) or _force_send or _changed
+                            or _due_heartbeat or _draining_now)
+                if _do_send:
+                    # Carry the content sig so the HUB can skip its memo
+                    # invalidation + browser broadcast on a heartbeat frame whose
+                    # content didn't actually change (see main._handle_cs_telemetry).
+                    payload["_content_sig"] = _sig
+                    msg = {
+                        "header": {
+                            "message_id": str(uuid.uuid4()),
+                            "timestamp": time.time(),
+                            "sender_id": self.spoke_id,
+                            "destination_id": "hub",
+                        },
+                        "payload": {"type": "CS_TELEMETRY", "data": payload},
+                    }
+                    await websocket.send(self._encode_frame(msg))
+                    _last_sig = _sig
+                    _last_send_ts = _now
+                    _force_send = False
+                    interval = _FAST if _changed else _SLOW
+                else:
+                    interval = _SLOW
             except asyncio.CancelledError:
                 raise
             except Exception as e:
