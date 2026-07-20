@@ -41,6 +41,7 @@ import asyncio
 import json
 import logging
 import time
+import uuid
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -56,6 +57,22 @@ OFFLINE_TTL_S = 3600.0           # keep an offline runner this long before
                                  # the VM through a WS blip; release only a
                                  # truly-gone client so it can rejoin the pool).
 RECONCILE_INTERVAL_S = 60.0      # periodic self-heal sweep
+
+# ── Dongle-quarantine (Chunk 3) ─────────────────────────────────────────────
+# A T2 (USB-dongle) client that NEVER connected (no SSID / no IP) within the
+# grace window, and isn't running an exclusion sim, is shed: its bus is
+# quarantined (strike-aware) and the VM destroyed so the provision loop re-clones
+# onto a free eligible non-permanent bus. Storm guard: >20% per host failed
+# raises a bulk alarm (infrastructure, not dongles) and suppresses the shed.
+QT_GRACE_S_DEFAULT = 3600.0          # 1h after first heartbeat before "never connected"
+QT_EXCLUDE_SIMS_DEFAULT = ("dhcp_fail", "assoc_fail", "ssidpw_fail",
+                           "auth_fail", "port_flap")  # sims where no-IP is the point
+QT_BULK_THRESHOLD = 0.20             # >20% per host failed → bulk alarm, no mass shed
+QT_BULK_MIN_HOST = 3                 # a host needs ≥3 T2 clients before the ratio
+                                     # is meaningful — a 1-client host at "100%
+                                     # failed" is a single bad dongle, not a bulk
+                                     # event, and must still be shed.
+QT_ONLINE_S = 300.0                  # client seen within 5min counts as online
 
 
 def _quota_key(q: Dict[str, Any]) -> str:
@@ -103,6 +120,11 @@ class SimQuotaEngine:
         # its hosting pxmx server without rebuilding the index per client.
         self._name_to_host: Dict[str, str] = {}
         self._pxmx_site_map: Dict[str, str] = {}
+        # Dongle-quarantine: per-sweep per-host failed/total + per-bus failure
+        # relayed to the hub for the bulk/single-bus alarm engine, and a recent-
+        # shed map so a slow-destroy doesn't get re-dispatched each sweep.
+        self._qt_telemetry: Dict[str, Any] = {}
+        self._qt_shed_recent: Dict[str, Dict[str, float]] = {}
         try:
             data_dir = Path(getattr(spoke, "data_dir", None) or ".")
             data_dir.mkdir(parents=True, exist_ok=True)
@@ -200,6 +222,142 @@ class SimQuotaEngine:
             logger.debug("SimQuotaEngine: user_conf load failed: %s", exc)
             self._user_conf = None
             self._sim_conf = None
+
+    # ── dongle-quarantine detection ───────────────────────────────────────────
+    def _host_vm_bus_index(self, deploy) -> Dict[str, Dict[str, str]]:
+        """``{host: {vmid_str: bus_path}}`` from the deploy's per-host
+        ``usb_state`` snapshot. The host key matches ``_name_to_host``'s value
+        (= the agent_id for ``send_to_agent``)."""
+        out: Dict[str, Dict[str, str]] = {}
+        for host, st in getattr(deploy, "proxmox_states", {}).items():
+            m: Dict[str, str] = {}
+            for u in (st.get("usb_state") or []):
+                v = u.get("vmid")
+                if v not in (None, ""):
+                    m[str(v)] = u.get("bus_path")
+            out[host] = m
+        return out
+
+    def _qt_exclude_sims(self) -> set:
+        try:
+            csc = self.spoke.local_store.get_central_sites_config() or {}
+        except Exception:  # noqa: BLE001
+            return set(QT_EXCLUDE_SIMS_DEFAULT)
+        vals = csc.get("qt_exclude_sims")
+        if not vals:
+            return set(QT_EXCLUDE_SIMS_DEFAULT)
+        return {str(s) for s in vals}
+
+    def _quarantine_sweep(self, now: float) -> None:
+        """Detect T2 clients that never connected (no SSID / no IP) past the
+        grace window and aren't running an exclusion sim; shed them (QT bus +
+        destroy VM) unless the per-host storm guard trips (>20% failed → bulk
+        alarm, no mass shed). Synchronous analysis; dispatches are fired as
+        background tasks (``_qt_shed``) so a slow agent doesn't stall the sweep.
+        Never raises — populates ``self._qt_telemetry`` for the hub alarm engine.
+        """
+        try:
+            deploy = getattr(self.spoke, "deploy", None)
+            if deploy is None:
+                self._qt_telemetry = {}
+                return
+            exclude = self._qt_exclude_sims()
+            try:
+                grace = float((self.spoke.local_store.get_central_sites_config()
+                               or {}).get("qt_grace_s") or QT_GRACE_S_DEFAULT)
+            except Exception:  # noqa: BLE001
+                grace = QT_GRACE_S_DEFAULT
+            _, name_to_vmid = deploy.usb_vmid_index()
+            host_vm_bus = self._host_vm_bus_index(deploy)
+            per_host_total: Dict[str, int] = {}
+            per_host_failed: Dict[str, int] = {}
+            per_bus_fail: Dict[str, int] = {}
+            candidates: List[Tuple[str, Any, str, Optional[str]]] = []
+            for hostname, c in self._all_clients().items():
+                if str(c.get("tier") or "").lower() != "t2":
+                    continue
+                hkey = str(hostname).strip().lower()
+                host = self._name_to_host.get(hkey)
+                if host:
+                    per_host_total[host] = per_host_total.get(host, 0) + 1
+                # Only a client that NEVER connected is a candidate (a mid-run
+                # drop is out of scope): ever_connected latched False, and the
+                # latest heartbeat still shows no IP + no SSID.
+                if c.get("ever_connected"):
+                    continue
+                if c.get("ip") or c.get("connected_ssid"):
+                    continue
+                ls = c.get("last_seen")
+                if not ls or (now - float(ls)) > QT_ONLINE_S:
+                    continue  # offline (no heartbeat over the backend net)
+                fs = c.get("first_seen") or ls
+                if (now - float(fs)) < grace:
+                    continue  # within the grace window — give it time to connect
+                active = set(c.get("active_simulations") or [])
+                # A client running ONLY exclusion sims (no-IP is the point) is
+                # NOT a candidate; one running any non-exclusion sim (or none)
+                # should have connected → candidate.
+                if active and active.issubset(exclude):
+                    continue
+                vmid = name_to_vmid.get(hkey)
+                if not vmid:
+                    continue
+                bus = (host_vm_bus.get(host) or {}).get(str(vmid))
+                if host:
+                    per_host_failed[host] = per_host_failed.get(host, 0) + 1
+                if bus:
+                    per_bus_fail[bus] = per_bus_fail.get(bus, 0) + 1
+                candidates.append((hostname, vmid, host, bus))
+            # Storm guard: >20% per host failed → bulk alarm; suppress shed there.
+            bulk_hosts: List[str] = []
+            for host, failed in per_host_failed.items():
+                total = per_host_total.get(host, 0)
+                if total >= QT_BULK_MIN_HOST and (failed / total) > QT_BULK_THRESHOLD:
+                    bulk_hosts.append(host)
+            bulk_set = set(bulk_hosts)
+            self._qt_telemetry = {
+                "ts": now,
+                "per_host": {h: {"failed": per_host_failed.get(h, 0),
+                                 "total": per_host_total.get(h, 0)}
+                             for h in per_host_total},
+                "per_bus_fails": dict(per_bus_fail),
+                "bulk_hosts": bulk_hosts,
+            }
+            for hostname, vmid, host, bus in candidates:
+                if host in bulk_set:
+                    logger.warning("dongle-quarantine: bulk failure on host %s "
+                                    "(>20%% failed) — NOT shedding %s (infra, not "
+                                    "dongles)", host, hostname)
+                    continue
+                if host and (now - self._qt_shed_recent.get(host, {})
+                             .get(hostname, 0)) < grace:
+                    continue  # already shed this client recently; don't re-dispatch
+                asyncio.create_task(self._qt_shed(hostname, vmid, host, bus, now))
+        except Exception as exc:  # noqa: BLE001 — a sweep must not kill the loop
+            logger.warning("dongle-quarantine sweep failed: %s", exc)
+
+    async def _qt_shed(self, hostname: str, vmid: Any, host: Optional[str],
+                       bus: Optional[str], now: float) -> None:
+        """Dispatch quarantine_dongle_and_destroy to the client's pxmx agent."""
+        cp = getattr(self.spoke, "control_plane", None)
+        if cp is None or not host:
+            return
+        try:
+            vid = int(vmid) if str(vmid).isdigit() else vmid
+            await cp.send_to_agent(
+                "CS_COMMAND",
+                {"action": "quarantine_dongle_and_destroy",
+                 "vmid": vid, "bus_path": bus,
+                 "reason": "never connected (no IP / no SSID)",
+                 "cs_cmd_id": uuid.uuid4().hex},
+                agent_id=host,
+                timeout=getattr(self.spoke, "_relay_timeout_long", 60.0))
+            self._qt_shed_recent.setdefault(host, {})[hostname] = now
+            logger.warning("dongle-quarantine: shed %s (vmid %s, bus %s, host %s)",
+                           hostname, vmid, bus, host)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("dongle-quarantine: shed dispatch failed for %s: %s",
+                           hostname, exc)
 
     def _human_pinned_sim(self, hostname: str, sim_id: str) -> bool:
         """True when a human explicitly set this sim flag in the client's
@@ -947,6 +1105,10 @@ class SimQuotaEngine:
             self._save_ledger()
             if any(actions.values()):
                 logger.info("SimQuotaEngine reconcile: %s", actions)
+            # Dongle-quarantine detection runs at the tail of each sweep (after
+            # the ledger/overrides are settled). Synchronous analysis; sheds are
+            # fired as background tasks. Populates _qt_telemetry for the relay.
+            self._quarantine_sweep(now)
             return actions
 
     async def reset(self) -> Dict[str, Any]:

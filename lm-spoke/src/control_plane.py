@@ -488,6 +488,15 @@ class CSControlPlane(AgentHostingControlPlane):
                             await registry.record_tiers_batch(tier_updates)
                         except Exception as e:  # noqa: BLE001
                             logger.debug("record_tiers_batch failed: %s", e)
+                # Dongle-quarantine per-host failed/total + per-bus failure for
+                # the hub's bulk/single-bus alarm engine (the spoke's detection
+                # sweep populates engine._qt_telemetry each reconcile).
+                _eng = getattr(cs_mod, "engine", None)
+                if _eng is not None:
+                    try:
+                        payload["qt_state"] = getattr(_eng, "_qt_telemetry", {}) or {}
+                    except Exception as e:  # noqa: BLE001
+                        logger.debug("qt_state telemetry overlay failed: %s", e)
                 # Draining flag: True while a self-update is running (git pull +
                 # about to os._exit+relaunch). The hub reads this and, while set,
                 # queues CS_CONFIG_UPDATE (and other request/reply) pushes to the

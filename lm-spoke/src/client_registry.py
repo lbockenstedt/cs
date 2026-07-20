@@ -196,6 +196,21 @@ class ClientRegistry:
                 if key in payload:
                     entry[key] = payload[key]
 
+            # Dongle-quarantine detection state. ``first_seen`` is the grace-
+            # window T0 (set once, on the first heartbeat). ``ever_connected``
+            # latches True the first time the client reported a sim IP OR an
+            # associated SSID — a client that NEVER connected (the QT trigger)
+            # stays False; a client that connected then dropped (a mid-run
+            # failure, out of scope) stays True and is left alone. Old entries
+            # upgraded in place pick up first_seen=now (conservative: restarts
+            # the 1h grace once).
+            if not entry.get("first_seen"):
+                entry["first_seen"] = entry["last_seen"]
+            if payload.get("ip") or payload.get("connected_ssid"):
+                entry["ever_connected"] = True
+            elif "ever_connected" not in entry:
+                entry["ever_connected"] = False
+
             # Merge errors into a rolling recent_errors window.
             errs: List[str] = list(payload.get("errors") or [])
             if errs:
