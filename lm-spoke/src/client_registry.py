@@ -178,9 +178,9 @@ class ClientRegistry:
         """Upsert *hostname* with *payload* (a status beacon) and return the entry.
 
         Merges the mutable fields a client reports (last_seen, connected_ssid,
-        gateway_reachable, active_simulations, errors, iteration, platform,
-        simulation_id, config, status) without clobbering server-side fields
-        like ``overrides``.
+        ip, gateway_reachable, active_simulations, errors, iteration,
+        platform, simulation_id, config, status) without clobbering
+        server-side fields like ``overrides``.
         """
         hostname = str(hostname or "").strip()
         if not hostname:
@@ -191,7 +191,7 @@ class ClientRegistry:
             entry["last_seen"] = time.time()
 
             for key in ("simulation_id", "platform", "iteration",
-                        "connected_ssid", "gateway_reachable",
+                        "connected_ssid", "ip", "gateway_reachable",
                         "active_simulations", "config", "status", "has_usb"):
                 if key in payload:
                     entry[key] = payload[key]

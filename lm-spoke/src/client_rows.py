@@ -95,6 +95,11 @@ def build_client_rows(spoke, now: float | None = None
             "hw_type": c.get("platform") or "",
             "online": bool(last_seen and (now - last_seen) < 300),
             "connected_ssid": c.get("connected_ssid") or "—",
+            # Sim-network connectivity (relayed to the hub so a T2 client that
+            # never got an IP / never associated can be detected: the heartbeat
+            # rides a separate backend network, so online≠has-sim-IP).
+            "ip": c.get("ip") or "",
+            "gateway_reachable": bool(c.get("gateway_reachable")),
             "simulation_id": eff_sim_id,
             "active_simulations": c.get("active_simulations") or [],
             "last_seen": last_seen if last_seen is not None else "—",

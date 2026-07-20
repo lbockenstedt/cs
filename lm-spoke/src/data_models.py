@@ -22,6 +22,7 @@ class Client(BaseModel):
     last_seen: Optional[float] = None  # epoch seconds
     iteration: int = 0
     connected_ssid: str = ""
+    ip: str = ""  # IPv4 on the sim interface (default-route src); "" = no IP yet
     gateway_reachable: Optional[bool] = None
     vh_connected: bool = False
     active_simulations: List[str] = Field(default_factory=list)

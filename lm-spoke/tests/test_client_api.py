@@ -63,6 +63,7 @@ def test_status_upserts_registry(client):
     r = client.post("/api/status", json={
         "hostname": "sim-1", "platform": "linux", "iteration": 3,
         "connected_ssid": "corp", "gateway_reachable": True,
+        "ip": "10.0.0.42",
         "active_simulations": ["www_traffic"], "errors": ["boom"],
     })
     assert r.status_code == 200
@@ -71,6 +72,8 @@ def test_status_upserts_registry(client):
     clients = client.get("/api/clients").json()
     assert "sim-1" in clients
     assert clients["sim-1"]["connected_ssid"] == "corp"
+    assert clients["sim-1"]["ip"] == "10.0.0.42"
+    assert clients["sim-1"]["gateway_reachable"] is True
     assert clients["sim-1"]["recent_errors"] == ["boom"]
     assert clients["sim-1"]["active_simulations"] == ["www_traffic"]
 
@@ -122,6 +125,53 @@ def test_apersist_round_trips_to_disk(tmp_path):
         else:
             asyncio.set_event_loop(asyncio.new_event_loop())
         loop.close()
+
+
+# ── relay row (the spoke→hub CS_TELEMETRY choke point) ────────────────────────
+def test_build_client_rows_relays_ip_and_gateway(spoke):
+    """``build_client_rows`` is the choke point for what the hub sees: it must
+    carry ``ip`` + ``gateway_reachable`` (previously ``gateway_reachable`` was
+    persisted in the registry but dropped here, so the hub never saw it). The
+    dongle-quarantine trigger relies on these reaching the hub."""
+    import asyncio
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    try:
+        loop.run_until_complete(spoke.registry.apply_status("sim-1", {
+            "hostname": "sim-1", "platform": "linux", "iteration": 1,
+            "connected_ssid": "corp", "gateway_reachable": True, "ip": "10.0.0.42",
+        }))
+        from client_rows import build_client_rows
+        rows, _ = build_client_rows(spoke)
+        row = next(r for r in rows if r["hostname"] == "sim-1")
+        assert row["ip"] == "10.0.0.42"
+        assert row["gateway_reachable"] is True
+        assert row["connected_ssid"] == "corp"
+    finally:
+        loop.close()
+        asyncio.set_event_loop(asyncio.new_event_loop())
+
+
+def test_build_client_rows_no_ip_is_empty_not_missing(spoke):
+    """A client that never got an IP reports none — the row must surface ``""``
+    (falsy) so the trigger can detect 'never got an IP', not a missing key."""
+    import asyncio
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    try:
+        loop.run_until_complete(spoke.registry.apply_status("noip-1", {
+            "hostname": "noip-1", "platform": "linux", "iteration": 1,
+            "connected_ssid": "", "gateway_reachable": False,
+        }))
+        from client_rows import build_client_rows
+        rows, _ = build_client_rows(spoke)
+        row = next(r for r in rows if r["hostname"] == "noip-1")
+        assert row["ip"] == ""
+        assert row["gateway_reachable"] is False
+        assert row["connected_ssid"] == "—"
+    finally:
+        loop.close()
+        asyncio.set_event_loop(asyncio.new_event_loop())
 
 
 # ── config delivery ──────────────────────────────────────────────────────────
