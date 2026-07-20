@@ -6,6 +6,11 @@
 # each top-level package, and runs `pip install -r` in this venv if any are
 # missing. LM_DEP_GUARD_DISABLE=1 opts out. PYTHONPATH ($LM_DIR + $LM_DIR/core/src)
 # resolves both `core.src.dep_guard` and the bare `dep_guard` fallback.
+# PEP 563: make ALL annotations lazy strings (never evaluated at import) so a
+# missing typing import in a signature can't crash the module on startup — the
+# defect that crash-looped the cs fleet (see cs-telemetry-conditional-relay).
+# Must be the first statement (comments above are fine).
+from __future__ import annotations
 import os as _os
 import sys as _sys
 try:
