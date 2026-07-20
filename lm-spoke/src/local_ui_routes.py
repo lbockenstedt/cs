@@ -71,6 +71,71 @@ def build_local_ui_router(spoke) -> APIRouter:
                 logger.debug("record_tiers_batch failed: %s", e)
         return {"tenant_id": "default", "clients": rows}
 
+    # ── VM Server tab (per-host Proxmox telemetry) ─────────────────────────────
+    # Standalone equivalent of the hub's /sim/api/aggregate/proxmox
+    # (core/simulations/service.get_proxmox_data). Built from THIS spoke's own
+    # proxmox_states via deploy.relay_payload, with the freshness fields
+    # (host_online / host_stale / freshness{...}) recomputed PER REQUEST so a
+    # shut-down agent ages out — same contract sim-views.js's Details page +
+    # Telemetry Freshness panel consume on the hub. No hub hop in standalone, so
+    # hub_cache_age_s is null and the frame is always "current" (cache_fresh).
+    _HOST_STALE_S = 180
+
+    @router.get("/aggregate/proxmox")
+    async def aggregate_proxmox():
+        now = time.time()
+        try:
+            payload = spoke.deploy.relay_payload(spoke.spoke_id, spoke.spoke_id)
+        except Exception as e:  # noqa: BLE001
+            logger.debug("aggregate_proxmox: relay_payload failed: %s", e)
+            return {"tenant_id": "default", "hosts": []}
+        hosts = []
+        for h in (payload.get("proxmox_hosts") or []):
+            h = h or {}
+            hpx = h.get("proxmox") or {}
+            hls = hpx.get("last_seen")
+            age = max(0, int(now - hls)) if isinstance(hls, (int, float)) and hls else None
+            stale = (age is None) or age > _HOST_STALE_S
+            at = hpx.get("agent_telemetry") or {}
+            gen = at.get("gen_ts")
+            hosts.append({
+                "spoke_id": spoke.spoke_id,
+                "spoke_name": h.get("hostname") or spoke.spoke_id,
+                "spoke_hostname": h.get("hostname") or "",
+                "hostname": h.get("hostname") or "",
+                "spoke_online": True,           # standalone: this box IS the spoke
+                "host_online": (not stale),
+                "host_stale": stale,
+                "host_age_s": age,
+                "vm_count": hpx.get("vm_count") or len(h.get("proxmox_vms") or []),
+                "usb_count": hpx.get("usb_count") or len(h.get("usb_devices") or []),
+                "proxmox": hpx,
+                "proxmox_vms": h.get("proxmox_vms") or [],
+                "usb_devices": h.get("usb_devices") or [],
+                "reclone_state": h.get("reclone_state") or {},
+                "host_last_seen": hls,
+                "ingested_at": hpx.get("ingested_at"),
+                "hub_fetched_at": None,         # no hub hop in standalone
+                "cache_age_s": None, "cache_fresh": True, "cache_stale": False,
+                "freshness": {
+                    "agent_gen_age_s":  round(now - gen, 1) if isinstance(gen, (int, float)) else None,
+                    "agent_to_spoke_s": at.get("agent_to_spoke_lag_s"),
+                    "spoke_ingest_age_s": round(now - hls, 1) if isinstance(hls, (int, float)) and hls else None,
+                    "hub_cache_age_s":  None,
+                    "relay_age_s":      h.get("relay_age_s"),
+                    "interval_s":       at.get("interval_s"),
+                    "phase_ms":         at.get("phase_ms") or {},
+                    "iter":             at.get("iter"),
+                    "vm_count":         at.get("vm_count"),
+                    "node_count":       at.get("node_count"),
+                    "agent_version":    at.get("agent_version"),
+                    "reconnect_count":        at.get("reconnect_count"),
+                    "last_disconnect_reason": at.get("last_disconnect_reason"),
+                    "last_disconnect_age_s":  at.get("last_disconnect_age_s"),
+                },
+            })
+        return {"tenant_id": "default", "hosts": hosts}
+
     # ── Simulations tab (Checks/Hardware/Client Count sub-tabs) ─────────────
     # Real data from CentralPoller now (see module docstring) — empty
     # central_status (no Central configured yet) still renders sim-views.js's
