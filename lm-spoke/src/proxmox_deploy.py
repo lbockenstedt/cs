@@ -100,6 +100,10 @@ class ProxmoxDeploy:
         # back to "—" when None. Projected via _SUMMARY_KEYS so they relay to
         # the hub cache alongside the rest of the per-host ``proxmox`` block.
         "cpu_1h_avg", "mem_1h_avg",
+        # Telemetry-freshness diagnostic (VM Server detail page): the agent's
+        # self-timing block (gen_ts / per-phase collect ms / cadence / iter) plus
+        # when this spoke ingested the frame. The hub stamps cached_at on top.
+        "agent_telemetry", "ingested_at",
     )
 
     def __init__(self) -> None:
@@ -193,9 +197,25 @@ class ProxmoxDeploy:
             except (TypeError, ValueError):
                 vmid_range = None
 
+        # Telemetry-freshness diagnostic: keep the agent's self-timing block
+        # (gen_ts / per-phase durations / cadence / iter) and stamp when THIS
+        # spoke ingested the frame. The hub adds cached_at on top, giving the
+        # detail page a per-hop age chain (agent → spoke → hub → WebUI) so the
+        # delay's location is visible.
+        agent_telemetry = dict(body.get("telemetry") or {})
+        agent_telemetry["ingested_at"] = now
+        try:
+            _gen = agent_telemetry.get("gen_ts")
+            if isinstance(_gen, (int, float)):
+                agent_telemetry["agent_to_spoke_lag_s"] = round(max(0.0, now - _gen), 1)
+        except Exception:  # noqa: BLE001
+            pass
+
         entry: Dict[str, Any] = {
             "connected":        True,
             "last_seen":        now,
+            "ingested_at":      now,
+            "agent_telemetry":  agent_telemetry,
             "agent_version":    _s(body.get("agent_version")),
             "pve_version":      _s(body.get("pve_version")),
             "vm_count":         len(non_template),
@@ -426,6 +446,11 @@ class ProxmoxDeploy:
                 "proxmox_vms":   vms,
                 "usb_devices":   usb,
                 "reclone_state": st.get("reclone_state") or {},
+                # When THIS relay frame left the spoke, + how stale the host's
+                # ingested data already was at relay time — the spoke→hub hop and
+                # the spoke-side queue delay, for the detail-page freshness chain.
+                "relayed_at":    now,
+                "relay_age_s":   round(age, 1),
             })
             if freshest is None or float(st.get("last_seen", 0) or 0) > \
                     float((freshest or {}).get("last_seen", 0) or 0):

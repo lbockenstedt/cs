@@ -5847,6 +5847,52 @@ window.csCmdDelete = async function (btn) {
 };
 
 // ── Details (node header + headline stats + telemetry tile grid + raw dump) ─
+// Telemetry-freshness diagnostic panel (mirrors the hub sim-views.js). Renders
+// the per-HOP age chain (agent built the frame → cs spoke ingested → hub cached
+// → now) + the agent's per-phase collect timings + effective cadence, from the
+// per-request ``h.freshness`` block. Degrades to em-dashes when the backend
+// hasn't supplied freshness (older cache / standalone-spoke path not yet wired).
+function csFreshnessPanel(h) {
+    const f = (h && h.freshness) || {};
+    const ph = f.phase_ms || {};
+    const ms = v => (v == null ? '—' : v + 'ms');
+    const secs = v => {
+        if (v == null) return '—';
+        if (v < 60) return v + 's';
+        if (v < 3600) return Math.floor(v / 60) + 'm ' + Math.round(v % 60) + 's';
+        return Math.floor(v / 3600) + 'h ' + Math.floor((v % 3600) / 60) + 'm';
+    };
+    const state = h.host_online
+        ? '<span class="text-green-600 font-bold">● LIVE</span>'
+        : (h.host_stale ? `<span class="text-amber-600 font-bold">● STALE (${csEscape(secs(h.host_age_s))})</span>`
+                        : '<span class="text-slate-500 font-bold">● —</span>');
+    const tile = (label, val, hint) => `<div class="rounded-md border border-slate-200 bg-white px-3 py-2">
+        <div class="text-[10px] uppercase tracking-wider text-slate-400">${csEscape(label)}</div>
+        <div class="text-sm font-mono font-bold text-slate-700">${csEscape(val)}</div>
+        ${hint ? `<div class="text-[10px] text-slate-400">${csEscape(hint)}</div>` : ''}</div>`;
+    return `<div class="hpe-card rounded-lg p-4 shadow-sm mb-4">
+      <div class="flex items-center justify-between mb-2 flex-wrap gap-2">
+        <p class="text-[11px] font-bold text-slate-400 uppercase tracking-wider">Telemetry Freshness</p>
+        <span class="text-xs text-slate-500">${state} · agent v${csEscape(String(f.agent_version || '—'))} · tick #${csEscape(String(f.iter != null ? f.iter : '—'))}</span>
+      </div>
+      <div class="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-5 gap-2 mb-3">
+        ${tile('Agent generated', secs(f.agent_gen_age_s) + ' ago', 'frame built on agent')}
+        ${tile('Agent → Spoke', f.agent_to_spoke_s != null ? f.agent_to_spoke_s + 's' : '—', 'relay to cs spoke')}
+        ${tile('Spoke ingested', secs(f.spoke_ingest_age_s) + ' ago', 'cs spoke stored')}
+        ${tile('Hub cached', secs(f.hub_cache_age_s) + ' ago', 'hub received frame')}
+        ${tile('Tick cadence', f.interval_s != null ? f.interval_s + 's' : '—', 'agent loop interval')}
+      </div>
+      <p class="text-[11px] font-bold text-slate-400 uppercase tracking-wider mb-2">Agent collect phase — last tick</p>
+      <div class="grid grid-cols-2 sm:grid-cols-4 gap-2">
+        ${tile('metrics', ms(ph.metrics_ms))}
+        ${tile('get_vm_list', ms(ph.vm_list_ms))}
+        ${tile('get_node_stats', ms(ph.node_stats_ms))}
+        ${tile('compute_tiers', ms(ph.tiers_ms))}
+      </div>
+      <div class="text-[10px] text-slate-400 mt-2">VMs ${csEscape(String(f.vm_count != null ? f.vm_count : '—'))} · nodes ${csEscape(String(f.node_count != null ? f.node_count : '—'))}. Big <b>agent-generated age</b> with small phase times ⇒ spoke/hub relay lag; big <b>get_vm_list</b>/<b>get_node_stats</b> ⇒ agent pvesh stall on a busy host.</div>
+    </div>`;
+}
+
 async function csRenderVmServerDetails() {
     csSetToolbar('');
     try { await csVmLoad(); } catch (e) { console.error('csRenderVmServerDetails: vm load failed', e); csSet(csErrorBox('Could not load details', e)); return; }
@@ -5878,6 +5924,7 @@ async function csRenderVmServerDetails() {
         ${csStat('CPU 1h', px.cpu_1h_avg || '—')}${csStat('Mem 1h', px.mem_1h_avg || '—')}
         ${csStat('Agent', px.agent_version || '—')}
       </div>
+      ${csFreshnessPanel(h)}
       <div class="flex items-center justify-between mb-2">
         <p class="text-[11px] font-bold text-slate-400 uppercase tracking-wider">Telemetry</p>
         <span class="text-[10px] text-slate-400">${entries.length} field${entries.length === 1 ? '' : 's'}</span>
