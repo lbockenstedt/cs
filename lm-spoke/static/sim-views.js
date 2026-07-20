@@ -2863,6 +2863,12 @@ async function csRenderSimQuotaState() {
             csSet(`<div class="hpe-card p-5 shadow-sm"><p class="text-xs text-slate-500">${csEscape(st.warning)}</p></div>`);
             return;
         }
+        // Known-good operating points, keyed by alert_key = "{alert_type}:{alert_id}".
+        // Best-effort — empty object if the backend lacks the route (spoke-local
+        // copy) or the fetch fails, so the view degrades gracefully.
+        const _kg = await csFetch(`/${csTenant()}/sim-quota/known-good`).catch(() => null);
+        const knownGood = (_kg && _kg.known_good && typeof _kg.known_good === 'object') ? _kg.known_good : {};
+        const kgCount = Object.keys(knownGood).length;
         const eff = Array.isArray(st.effective) ? st.effective : [];
         const ledger = (st.ledger && typeof st.ledger === 'object') ? st.ledger : {};
         // Mirrors the engine's _quota_key / sim_quota.quota_dedup_key: a
@@ -2888,6 +2894,28 @@ async function csRenderSimQuotaState() {
         };
         const chips = (hosts) => (hosts || []).map(h =>
             `<span class="inline-block bg-slate-100 text-slate-700 rounded px-1.5 py-0.5 mr-1 mb-1 font-mono text-[11px]">${csEscape(h)}</span>`).join('');
+        // Compact "Known-good" line for a quota row that has a recorded stable
+        // operating point (matched by alert_key = "{alert_type}:{alert_id}"), plus
+        // a per-row "Reset to known-good" button. Empty string when the row has no
+        // alert (presence/untethered) or no recorded point.
+        const kgLine = (q) => {
+            if (!q.alert_id) return '';
+            const ak = `${q.alert_type || 'alert'}:${q.alert_id}`;
+            const g = knownGood[ak];
+            if (!g) return '';
+            const knobs = (g.knobs && typeof g.knobs === 'object') ? g.knobs : {};
+            const knobStr = Object.keys(knobs).length
+                ? Object.entries(knobs).map(([kk, vv]) => `${csEscape(kk)} ${csEscape(String(vv))}`).join(', ')
+                : 'no knob changes';
+            const n = (g.count != null) ? g.count : '—';
+            const stable = csDurShort(g.time_to_stable_s);
+            const at = g.achieved_at != null ? csLastSeen(g.achieved_at) : '';
+            return `<div class="mt-1.5 flex flex-wrap items-center gap-2 text-[11px] text-emerald-700"${at ? ` title="Achieved ${csEscape(at)}"` : ''}>
+                <span class="font-semibold">✅ known-good:</span>
+                <span>${csEscape(String(n))} clients · stable in ${csEscape(stable)} · knobs: ${knobStr}</span>
+                <button onclick="csResetToKnownGood(${csEscape(JSON.stringify(ak))})" class="bg-[#01A982]/10 hover:bg-[#01A982]/20 text-[#01A982] border border-[#01A982] px-2 py-0.5 rounded text-[10px] font-bold">Reset to known-good</button>
+            </div>`;
+        };
         const rows = eff.map(q => {
             const k = keyOf(q);
             const e = ledger[k] || {};
@@ -2919,7 +2947,7 @@ async function csRenderSimQuotaState() {
               <td class="px-2 py-1.5 text-xs text-center">${fill}</td>
               <td class="px-2 py-1.5 text-xs text-center">${q.multi_capable ? '✓' : '—'}</td>
               <td class="px-2 py-1.5 text-xs text-center">${q.rehome ? '✓' : '—'}</td>
-              <td class="px-2 py-1.5 text-xs">${chips(clients) || '<span class="text-slate-400 italic">none</span>'}</td>
+              <td class="px-2 py-1.5 text-xs">${chips(clients) || '<span class="text-slate-400 italic">none</span>'}${kgLine(q)}</td>
             </tr>`;
         }).join('');
         // Ledger entries no longer in the effective set (quota removed but
@@ -2940,7 +2968,10 @@ async function csRenderSimQuotaState() {
           <div class="hpe-card rounded-lg p-5 shadow-sm">
             <div class="flex flex-wrap items-center justify-between gap-2 mb-2">
               <h3 class="text-sm font-bold text-slate-500 uppercase tracking-wider">Quota State ${helpIcon('cs', null, 'Simulations help')}</h3>
-              <button onclick="csRenderSimQuotaState()" class="bg-[#01A982]/10 hover:bg-[#01A982]/20 text-[#01A982] border border-[#01A982] px-3 py-1.5 rounded-md text-sm font-bold shadow-sm">↻ Refresh</button>
+              <div class="flex gap-2">
+                ${kgCount ? `<button onclick="csResetToKnownGood('')" class="bg-[#01A982]/10 hover:bg-[#01A982]/20 text-[#01A982] border border-[#01A982] px-3 py-1.5 rounded-md text-sm font-bold shadow-sm" title="Restore every alert with a recorded known-good operating point, then hold ~1h before resuming learning">✅ Reset ALL to known-good</button>` : ''}
+                <button onclick="csRenderSimQuotaState()" class="bg-[#01A982]/10 hover:bg-[#01A982]/20 text-[#01A982] border border-[#01A982] px-3 py-1.5 rounded-md text-sm font-bold shadow-sm">↻ Refresh</button>
+              </div>
             </div>
             <p class="text-xs text-slate-500 mb-3">Live SimQuotaEngine ledger — which clients are currently assigned to each effective quota. The engine tops up to the target count from the online pool each 60s sweep; amber = under-filled.</p>
             ${eff.length ? `<table class="w-full text-left">
@@ -2960,6 +2991,51 @@ async function csRenderSimQuotaState() {
         csSet(csErrorBox('Could not load Quota State', e));
     }
 }
+
+// seconds → compact "Xs" / "Ym" / "Zh Ym" (known-good time_to_stable_s human
+// formatter). csFmtDuration renders mm:ss under an hour, which reads oddly for a
+// "stable in" phrase, so we use this word form here.
+function csDurShort(s) {
+    s = Math.max(0, Math.round(Number(s) || 0));
+    if (s < 60) return `${s}s`;
+    const h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60);
+    if (h > 0) return m > 0 ? `${h}h ${m}m` : `${h}h`;
+    return `${m}m`;
+}
+
+// Reset to known-good: restore the engine to the last recorded stable operating
+// point (client count + config knobs that reliably fired the alert). The backend
+// holds that point for hold_seconds, then resumes adaptive learning. alertKey
+// omitted / empty → reset ALL alerts with a known-good point. Best-effort:
+// surfaces no_known_good / no_match statuses as informative toasts. Degrades
+// gracefully if the spoke-local backend lacks the route.
+window.csResetToKnownGood = async function (alertKey) {
+    const ak = alertKey || '';
+    const scope = ak ? 'this alert' : 'ALL alerts';
+    if (typeof confirm === 'function' &&
+        !confirm(`Reset ${scope} to the known-good operating point? The engine holds it for ~1h, then resumes learning.`)) return;
+    try {
+        const body = JSON.stringify(ak ? { alert_key: ak } : {});
+        const r = await csFetch(`/${csTenant()}/sim-quota/reset-to-known-good`, { method: 'POST', body }) || {};
+        const status = r.status || '';
+        if (status === 'no_known_good') {
+            if (typeof showToast === 'function') showToast('No known-good operating point recorded yet.', 'info');
+            return;
+        }
+        if (status === 'no_match') {
+            if (typeof showToast === 'function') showToast('No known-good point matches that alert.', 'info');
+            return;
+        }
+        const n = Array.isArray(r.restored_alerts) ? r.restored_alerts.length : 0;
+        const hold = r.hold_seconds ? csDurShort(r.hold_seconds) : '1h';
+        const label = n ? `Reset ${n} alert${n === 1 ? '' : 's'} to known-good` : 'Reset to known-good';
+        if (typeof showToast === 'function') showToast(`${label} — holding ${hold} then resuming learning`, 'success');
+        setTimeout(csRenderSimQuotaState, 1500);
+    } catch (e) {
+        console.error('csResetToKnownGood: reset failed', e);
+        if (typeof showToast === 'function') showToast('Reset to known-good failed: ' + (e.message || e), 'error');
+    }
+};
 
 // ── PXMX Sites: assign each connected pxmx server (agent host) to a site ──────
 // The SimQuotaEngine resolves a client's site via its hosting server's entry
