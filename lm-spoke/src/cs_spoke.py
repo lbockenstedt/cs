@@ -42,6 +42,7 @@ from client_registry import ClientRegistry
 from demo_scenarios import DemoManager
 from local_store import LocalStore
 from central_poller import CentralPoller
+from mist_poller import MistPoller
 import client_api  # for client_api.push_pending (live command delivery to WS agents)
 
 try:
@@ -131,6 +132,12 @@ class CSSpoke(AgentCommandsMixin, SimCommandsMixin, ConfigCommandsMixin,
         # CSControlPlane.run()/run_standalone_mode() (needs a running loop).
         self.central_status: Dict[str, Any] = {}
         self.central_poller = CentralPoller(self)
+        # Juniper Mist twin of central_status/central_poller — populated by
+        # MistPoller in the same Simulations Checks/Hardware/Client-Count shape
+        # so sim-views.js's tabs render Mist data identically. Started by
+        # CSControlPlane.run()/run_standalone_mode() alongside the Central loop.
+        self.mist_status: Dict[str, Any] = {}
+        self.mist_poller = MistPoller(self)
         # SimQuotaEngine — keeps each declared sim quota filled from the online
         # pool (alert/insight → sim + N clients + site). Reconciles against the
         # hub-pushed effective_sim_quotas; started by CSControlPlane.run().

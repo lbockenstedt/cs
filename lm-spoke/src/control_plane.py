@@ -350,6 +350,10 @@ class CSControlPlane(AgentHostingControlPlane):
         # dashboard's Simulations tab AND (via _cs_telemetry_relay_loop below)
         # the hub's Simulations tab when this spoke is hub-connected.
         cs_spoke.central_poller.start()
+        # Start the Juniper Mist poll loop (twin of the Central loop above).
+        # Same 5-min cadence; writes cs_spoke.mist_status in the central_status
+        # shape so the hub/local Simulations tabs render Mist data identically.
+        cs_spoke.mist_poller.start()
         # Start the SimQuotaEngine self-heal loop (reconciles client assignments
         # against the hub-pushed effective_sim_quotas every 60s; an immediate
         # reconcile also fires on each effective_sim_quotas push).
@@ -455,6 +459,10 @@ class CSControlPlane(AgentHostingControlPlane):
                 # overlay this spoke's real CentralPoller output so a
                 # hub-connected deployment's Simulations tab gets live data too.
                 payload["central"] = getattr(cs_mod, "central_status", {}) or {}
+                # Mist twin: overlay this spoke's real MistPoller output so a
+                # hub-connected deployment's Simulations tab gets live Mist
+                # data too (same shape as the Central block above).
+                payload["mist"] = getattr(cs_mod, "mist_status", {}) or {}
                 # Command queue → telemetry so the hub's VM Server → Command
                 # Queue view serves from its CS_TELEMETRY cache (instant) instead
                 # of a live 15s request_response that stalls when this spoke is
@@ -544,6 +552,7 @@ class CSControlPlane(AgentHostingControlPlane):
         # hook rather than a direct call here (mirrors cs_spoke.demo.start()'s
         # own "needs a running loop" guard, just triggered later).
         app.add_event_handler("startup", spoke.central_poller.start)
+        app.add_event_handler("startup", spoke.mist_poller.start)
         if getattr(spoke, "sim_quota_engine", None) is not None:
             app.add_event_handler("startup", spoke.sim_quota_engine.start)
         uvicorn.run(app, host=self.api_host, port=self.api_port)
