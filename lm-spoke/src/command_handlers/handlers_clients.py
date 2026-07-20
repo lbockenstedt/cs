@@ -116,6 +116,16 @@ class ClientCommandsMixin:
             res = await self.registry.purge()
             return {"status": "SUCCESS", **res}
 
+        if cmd == "CS_PURGE_HOST":
+            # Operator deleted a VM Server row for an intentionally shut-down
+            # host (hub DELETE /sim/api/proxmox/host/{hostname} forwards here).
+            # Drop it from proxmox_states so it stops being relayed.
+            hostname = (d.get("hostname") or "").strip()
+            if not hostname:
+                return {"status": "ERROR", "message": "missing hostname"}
+            removed = self.deploy.remove_host(hostname)
+            return {"status": "SUCCESS", "hostname": hostname, "removed": removed}
+
         # ── Per-host USB VMID overrides ──────────────────────────────────────
         # Optional per-host vmid_start/vmid_end/vm_set_override that override the
         # global range for one proxmox host (the pxmx agent honors a non-default

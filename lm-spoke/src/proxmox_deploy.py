@@ -119,6 +119,19 @@ class ProxmoxDeploy:
         self.cpu_samples: Dict[str, List[Tuple[float, float]]] = {}
         self.mem_samples: Dict[str, List[Tuple[float, float]]] = {}
 
+    def remove_host(self, hostname: str) -> bool:
+        """Drop a host from proxmox_states (+ its resource-sample rings + event
+        buffer) so a shut-down host stops being relayed to the hub. Returns True if
+        the host was present. Used by the CS_PURGE_HOST command (operator deletes a
+        VM Server row for an intentionally-off host)."""
+        hn = (hostname or "").strip()
+        present = hn in self.proxmox_states
+        self.proxmox_states.pop(hn, None)
+        self.cpu_samples.pop(hn, None)
+        self.mem_samples.pop(hn, None)
+        self.events.pop(hn, None)
+        return present
+
     # ── ingest ───────────────────────────────────────────────────────────────
 
     def ingest_telemetry(self, hostname: str, body: Dict[str, Any]) -> Dict[str, Any]:
