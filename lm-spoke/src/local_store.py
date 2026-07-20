@@ -155,10 +155,12 @@ _DEFAULT_HUB_CONFIG: Dict[str, Any] = {
     # preserve-on-reset: reset restores these canonical tier IDs.
     "t1_pci_vidpids": ["1912:0015"],
     "t3_pci_vidpids": ["168c:0034"],
-    # VM Templates (clone-source VMIDs + per-image mix). vm_image_count = how many
-    # images the operator configured (1..N); each has vm_image_{i}_template_id +
-    # vm_image_{i}_pct. Defaults keep the legacy 2-image 50/50 behavior.
-    "vm_image_count": 1,
+    # VM Templates (clone-source VMIDs + per-image mix). The new VM Images UI adds
+    # vm_image_count (how many images, 1..N) + vm_image_{i}_template_id/_pct.
+    # vm_image_count is intentionally NOT defaulted here: when it is UNSET
+    # (existing/legacy configs), the cs speak keeps the 2-image
+    # image1/image2/image1_pct behavior below untouched; a default of 1 would
+    # instead silently drop image 2 for every legacy deployment.
     "vm_image_1_template_id": 100,
     "vm_image_2_template_id": 200,
     "vm_image_1_pct": 50,
