@@ -595,7 +595,9 @@ if __name__ == "__main__":
     parser.add_argument("--tenant-id-hint",  default=os.getenv("LM_TENANT_ID_HINT", ""))
     args = parser.parse_args()
     if not args.id:
-        args.id = f"{socket.gethostname()}-spoke"
+        # Derived id = the bare hostname (no "-spoke" suffix). A pinned --id /
+        # SPOKE_ID still wins; only the unpinned/derived case is affected.
+        args.id = socket.gethostname()
     cp = CSControlPlane(args.id, args.secret, args.hub_secret, args.hub,
                         onboarding_psk=args.onboarding_psk,
                         tenant_id_hint=args.tenant_id_hint,

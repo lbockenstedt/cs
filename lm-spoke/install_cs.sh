@@ -877,7 +877,7 @@ if [ "$HUB_URL_PINNED" != "1" ]; then
 fi
 
 # Bake SPOKE_ID into .env + the unit ONLY when it was explicitly pinned. In the
-# derived case Python computes `<hostname>-spoke` at startup, so a clone that was
+# derived case Python uses the bare `<hostname>` at startup, so a clone that was
 # renamed reconnects under a new id (correlated to the old one via the install
 # UUID). INSTALL_UUID is deliberately NOT written here — the spoke mints it at
 # first start (BaseControlPlane._ensure_install_uuid), and prep-for-imaging
@@ -1203,7 +1203,7 @@ fi
 if [ "$SPOKE_ID_PINNED" = "1" ]; then
     echo "  Spoke ID:     $SPOKE_ID  (pinned)"
 else
-    echo "  Spoke ID:     $(hostname -s)-spoke  (derived from hostname at startup)"
+    echo "  Spoke ID:     $(hostname)  (derived from hostname at startup)"
 fi
 echo "  Version:      $(cat $LM_DIR/cs/VERSION 2>/dev/null || echo unknown)"
 echo "  Status:       sudo systemctl status lm-cs"
