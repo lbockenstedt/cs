@@ -28,7 +28,7 @@ import argparse
 import sys
 import os
 from pathlib import Path
-from typing import Dict, Any
+from typing import Any, Dict, Optional
 import uvicorn
 
 # Sibling modules (simulation_engine, cs_spoke, sim_config, sim_primitives,
