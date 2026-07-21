@@ -233,6 +233,7 @@ class ConfigCommandsMixin:
             eng = getattr(self, "sim_quota_engine", None)
             snap = eng.snapshot() if eng is not None else {}
             placement_warnings = eng.placement_warnings() if eng is not None else []
+            quota_diag = eng.quota_diagnostics() if eng is not None else []
             csc = self.local_store.get_central_sites_config()
             monitored = csc.get("monitored_checks") or []
             # Live per-check firing status from the Central poller's last cycle —
@@ -249,6 +250,7 @@ class ConfigCommandsMixin:
                     "ledger": snap,
                     "monitored_checks": monitored,
                     "placement_warnings": placement_warnings,
+                    "diagnostics": quota_diag,
                     "pool": eng.pool_counts() if eng is not None else {},
                     "check_status": cs.get("status") or {}}
 

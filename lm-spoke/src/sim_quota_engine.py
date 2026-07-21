@@ -631,6 +631,39 @@ class SimQuotaEngine:
         excl_bucket = {s for s in self._client_active_sims(c) if not self._sim_multi(s)}
         return not (excl_bucket - {sim_id})
 
+    def _diag_reason(self, hostname: str, c: Dict[str, Any], sim_id: str,
+                     multi: bool, scope_site: str, claim_key: str,
+                     assigned: Dict[str, str]) -> Optional[str]:
+        """WHY ``hostname`` is not a usable top-up candidate for this quota, or
+        None if it IS usable (in-site or re-homable). Read-only mirror of
+        _pool_eligible + the in_site/cross site tests, for the Engine State
+        diagnostic. Caller pre-filters to harvestable + not already assigned."""
+        if self._has_manual_sim_pin(hostname, c):
+            return "human_pin"
+        if sim_id and self._human_pinned_sim(hostname, sim_id):
+            return "human_pin"
+        if multi:
+            if self._exclusive_running(hostname, c):
+                return "exclusive_monopolized"   # a non-shareable sim owns it
+        else:
+            if self._engine_sims_for(hostname):
+                return "packed_other_quota"       # already serving another quota
+            if {s for s in self._client_active_sims(c)
+                    if not self._sim_multi(s)} - {sim_id}:
+                return "exclusive_bucket_default"
+        # eligible on the sim rules — now check site/SSID reachability.
+        if not self._cell_ok_for(hostname, claim_key):
+            return "ssid_claimed_other_cell"
+        if (not scope_site or self._effective_site(hostname, c) == scope_site
+                or (self._is_tenant_pool_client(hostname)
+                    and self._site_ok_for(hostname, scope_site))):
+            return None                            # usable in-site
+        if not self._is_tenant_pool_client(hostname):
+            return "off_site_pinned"               # wrong site, can't re-home
+        if not self._site_ok_for(hostname, scope_site):
+            return "site_claimed_this_sweep"
+        return None                                # usable via re-home
+
     # ── assign / release ─────────────────────────────────────────────────────
     async def _assign(self, hostname: str, sim_id: str, site: str,
                       cell: Optional[Dict[str, Any]] = None) -> None:
@@ -921,6 +954,11 @@ class SimQuotaEngine:
             # sims (dns_fail) stack onto the rest, then the shareable sims.
             quotas = sorted(quotas, key=lambda q: 0 if not (q.get("sim_id") or "")
                             else (1 if not bool(q.get("multi_capable")) else 2))
+            # Per-quota candidate diagnostics for the Config → Engine State view —
+            # rebuilt every sweep so an operator can see WHY a quota is underfilled
+            # (how many clients are eligible vs blocked, and by what). See
+            # _diag_reason + quota_diagnostics().
+            self._quota_diag: Dict[str, Any] = {}
             for q in quotas:
                 key = _quota_key(q)
                 sim_id = q.get("sim_id") or ""
@@ -1084,6 +1122,31 @@ class SimQuotaEngine:
                         await self._release(h, sim_id, from_site, key)
                         actions["released"] += 1
 
+                # Capture WHY this quota is (or isn't) filled — a read-only pass
+                # over the harvestable pool attributing each not-assigned client's
+                # blocking reason (see _diag_reason). Surfaced on Config → Engine
+                # State so "underfilled 0/N" is self-explaining instead of opaque.
+                blocked: Dict[str, int] = {}
+                eligible_free = not_harvestable = 0
+                for h, c in clients.items():
+                    if h in assigned:
+                        continue
+                    if not self._is_harvestable(c, now):
+                        not_harvestable += 1
+                        continue
+                    r = self._diag_reason(h, c, sim_id, multi, scope_site,
+                                          claim_key, assigned)
+                    if r is None:
+                        eligible_free += 1
+                    else:
+                        blocked[r] = blocked.get(r, 0) + 1
+                self._quota_diag[key] = {
+                    "sim_id": sim_id, "site": scope_site, "claim": claim_key,
+                    "multi": multi, "target": target, "producing": len(producing),
+                    "assigned": len(assigned), "eligible_free": eligible_free,
+                    "not_harvestable": not_harvestable, "blocked": blocked,
+                }
+
             # Release clients whose quota left the effective set. Legacy
             # placement:* ledger entries are DEPRECATED (placement is now the
             # stateless weighted spread) — drop them without a release; the
@@ -1236,6 +1299,15 @@ class SimQuotaEngine:
                               if str(h).strip().lower() not in ignored]}
             for key, e in self._ledger.items()
         }
+
+    def quota_diagnostics(self) -> List[Dict[str, Any]]:
+        """Per-quota candidate breakdown from the last sweep (see _quota_diag):
+        target/producing + eligible-free + not-harvestable + blocked-reason
+        counts. Powers the Config → Engine State 'why underfilled' view so an
+        opaque '0/N underfilled' names WHICH clients are blocked and by what.
+        Empty until the first sweep runs."""
+        diag = getattr(self, "_quota_diag", None) or {}
+        return [{"key": k, **v} for k, v in diag.items()]
 
     def placement_warnings(self) -> List[Dict[str, Any]]:
         """SSID cells that couldn't reach their hold-N floor last sweep (pool too
