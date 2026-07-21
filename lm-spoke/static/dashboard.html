@@ -83,6 +83,8 @@
         <button class="cs-tab-btn px-4 py-2 text-sm font-semibold rounded-t-lg border border-b-0 border-transparent text-slate-500"
                 data-view="Quota State" role="tab" aria-selected="false">Quota State</button>
         <button class="cs-tab-btn px-4 py-2 text-sm font-semibold rounded-t-lg border border-b-0 border-transparent text-slate-500"
+                data-view="Engine Diagnostic" role="tab" aria-selected="false">Engine Diagnostic</button>
+        <button class="cs-tab-btn px-4 py-2 text-sm font-semibold rounded-t-lg border border-b-0 border-transparent text-slate-500"
                 data-view="Auto-Provisioning" role="tab" aria-selected="false">Auto-Provisioning</button>
         <button class="cs-tab-btn px-4 py-2 text-sm font-semibold rounded-t-lg border border-b-0 border-transparent text-slate-500"
                 data-view="Central API Setup" role="tab" aria-selected="false">Central API Setup</button>
@@ -161,6 +163,7 @@
             'Sim Quotas': () => csRenderConfigSimQuotas(),
             'PXMX Sites': () => csRenderPxmxSiteMap(),
             'Quota State': () => csRenderSimQuotaState(),
+            'Engine Diagnostic': () => csRenderEngineDiag(),
             'Auto-Provisioning': () => renderAutoProvisioning(),
             'Central API Setup': () => csRenderSetupCentralApi(),
         };
