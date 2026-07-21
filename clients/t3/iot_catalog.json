@@ -1,0 +1,908 @@
+{
+  "schema_version": 1,
+  "description": "IoT device catalog for the T3 / cs simulation fleet. The single source of truth for the per-device DHCP fingerprint (option 60 vendor-class-id + option 55 parameter-request-list), the vendor OUI MAC prefix, the simulated hostname, and the per-vendor traffic endpoints each emulated device generates. Two existing T3 files are DERIVED from this catalog (see catalog.py --emit-mac-config / --emit-fingerprints): mac_config.json (the OUI pool consumed by gen_macs.sh) and the fingerprint+traffic block in wireless.sh. Keep this catalog canonical; regenerate the derived files after edits rather than hand-editing them.",
+  "notes": [
+    "Devices with a non-null 'oui' form the MAC pool (mac_config.json); the emitted total count must be <= 25 (gen_macs.sh hard limit).",
+    "Devices with a null 'oui' still carry a DHCP fingerprint + traffic profile but get no vendor MAC (they reuse the host OUI).",
+    "'verified: true' means the fingerprint + OUI came from the existing T3 wireless.sh / mac_config.json (the user's real captured data). 'verified: false' means the profile is reconstructed from known DHCP-fingerprint patterns and the OUI must be confirmed against the IEEE OUI registry before fleet use.",
+    "param_request_list is the DHCP option 55 value as an int list (e.g. [1,3,6] = subnet-mask, router, DNS). vendor_class_id is the DHCP option 60 string verbatim.",
+    "traffic endpoints are grouped by generator: dns (dig/nslookup), curl (raw HTTP(S) fetch), http (headless browser visit), wget (recursive site fetch). Empty arrays = the device emits no application traffic (DHCP/DNS fingerprint only)."
+  ],
+  "categories": {
+    "industrial-controller": "PLC / building controller (Mercury, Crestron, Lutron)",
+    "garage-door": "Smart garage / myQ-style opener (LiftMaster)",
+    "digital-signage": "Networked media player / signage (BrightSign, PlaySignage, Barco, WePresent)",
+    "printer": "Network printer / label printer (HP, Zebra)",
+    "ip-phone": "VoIP desk phone (Polycom, Yealink)",
+    "ip-camera": "Surveillance camera (Axis, Hikvision, Ring, Wyze)",
+    "serial-server": "Industrial serial/device server (Moxa)",
+    "doorbell": "Video doorbell / security (Ring)",
+    "thermostat": "Smart thermostat / HVAC (Resideo, Nest, Ecobee)",
+    "occupancy-sensor": "People-count / occupancy sensor (Density)",
+    "vr-headset": "Standalone VR / AR (Oculus / Meta Quest)",
+    "ev": "Electric vehicle / charger telemetry (Tesla)",
+    "smart-speaker": "Voice assistant / smart speaker (Sonos, Echo, Google Home)",
+    "smart-display": "Smart display / hub (Alexa Show, Google Nest Hub)",
+    "smart-lock": "Networked door lock (August, Yale)",
+    "smart-lighting": "Lighting bridge / smart bulb (Hue, Shelly, TP-Link, Tuya)",
+    "smart-plug": "Wi-Fi smart plug / relay (TP-Link, Tuya, Shelly)",
+    "robot-vacuum": "Robotic vacuum / mower (iRobot, Ecovacs)",
+    "sensor-tag": "Low-power Wi-Fi sensor / ESP8266/ESP32 endpoint",
+    "iot-gateway": "Multi-protocol IoT hub / bridge (SmartThings, Hubitat, Aqara)",
+    "mobile": "Consumer mobile / tablet (Apple, Samsung, Microsoft Surface)",
+    "network-infra": "Network infrastructure device (Cisco)"
+  },
+  "devices": [
+    {
+      "id": "mercury-sd",
+      "vendor": "Mercury",
+      "model": "MercurySD",
+      "category": "industrial-controller",
+      "hostname": "MercurySD",
+      "oui": "00:0f:e5",
+      "count": 1,
+      "verified": true,
+      "source": "t3-wireless.sh",
+      "dhcp": {
+        "vendor_class_id": "dhcpcd-5.5.6:Mercury-6.99.5:i386:i386",
+        "param_request_list": [1, 3, 6]
+      },
+      "traffic": {
+        "dns": [],
+        "curl": [],
+        "http": ["https://www.mercurysd.ie/products"],
+        "wget": []
+      }
+    },
+    {
+      "id": "liftmaster-myq",
+      "vendor": "LiftMaster",
+      "model": "myQ Garage Hub",
+      "category": "garage-door",
+      "hostname": "LiftMaster",
+      "oui": "cc:6a:10",
+      "count": 1,
+      "verified": true,
+      "source": "t3-wireless.sh",
+      "dhcp": {
+        "vendor_class_id": "dhcpcd-5.5.6:busybox-6.99.5:i386:i386",
+        "param_request_list": [1, 3, 6]
+      },
+      "traffic": {
+        "dns": ["connect-ca.myqdevice.com"],
+        "curl": [
+          "https://40.117.182.120:8883",
+          "https://connect-ca.myqdevice.com:8883"
+        ],
+        "http": ["https://setup.myqdevice.com"],
+        "wget": ["https://www.liftmaster.com/"]
+      }
+    },
+    {
+      "id": "brightsign-xt1144",
+      "vendor": "BrightSign",
+      "model": "XT1144",
+      "category": "digital-signage",
+      "hostname": "BrightSign",
+      "oui": "90:ac:3f",
+      "count": 1,
+      "verified": true,
+      "source": "t3-wireless.sh",
+      "dhcp": {
+        "vendor_class_id": "BrightSign-XT1144",
+        "param_request_list": [1, 3, 6, 12, 15, 26, 28, 33, 42, 43, 51, 58, 59, 119, 121]
+      },
+      "traffic": {
+        "dns": [],
+        "curl": [],
+        "http": ["https://www.brightsign.biz/contact-us/"],
+        "wget": []
+      }
+    },
+    {
+      "id": "zebra-zt230",
+      "vendor": "Zebra",
+      "model": "ZT230 (203dpi ZPL)",
+      "category": "printer",
+      "hostname": "ZebraPrinter",
+      "oui": "cc:69:fa",
+      "count": 1,
+      "verified": true,
+      "source": "t3-wireless.sh",
+      "dhcp": {
+        "vendor_class_id": "Zebra-Technologies-ZTC-ZT230-203dpi-ZPL",
+        "param_request_list": [1, 3, 44, 6, 15, 12, 11]
+      },
+      "traffic": {
+        "dns": [],
+        "curl": [],
+        "http": ["https://www.zebra.com/us/en.html"],
+        "wget": []
+      }
+    },
+    {
+      "id": "playsignage-player",
+      "vendor": "PlaySignage",
+      "model": "PlaySignage Player",
+      "category": "digital-signage",
+      "hostname": "PlaySignage",
+      "oui": null,
+      "count": 0,
+      "verified": true,
+      "source": "t3-wireless.sh",
+      "dhcp": {
+        "vendor_class_id": "dhcpcd-5.5.6:linux-6.99.5:i386:i386",
+        "param_request_list": [1, 3, 6]
+      },
+      "traffic": {
+        "dns": [],
+        "curl": [],
+        "http": [
+          "https://my.playsignage.com",
+          "https://us-storage.playsignage.com",
+          "https://stream.playsignage.com",
+          "https://release.playsignage.com",
+          "https://playsignage.com"
+        ],
+        "wget": [
+          "https://connect.raspberrypi.com/",
+          "https://playsignage.com/",
+          "https://my.playsignage.com/",
+          "https://us-storage.playsignage.com/",
+          "https://stream.playsignage.com/",
+          "https://release.playsignage.com/"
+        ]
+      }
+    },
+    {
+      "id": "sonos-speaker",
+      "vendor": "Sonos",
+      "model": "Sonos Speaker",
+      "category": "smart-speaker",
+      "hostname": "SONOS",
+      "oui": "f0:f6:c1",
+      "count": 1,
+      "verified": true,
+      "source": "t3-wireless.sh",
+      "dhcp": {
+        "vendor_class_id": "dhcpcd-5.5.6:SONOS-6.99.5:i386:i386",
+        "param_request_list": [1, 3, 6]
+      },
+      "traffic": {
+        "dns": [
+          "onn-i-09007be6d9db10869-us-east-1.lechmere.prod.ws.sonos.com",
+          "feature-config.sslauth.sonos.com"
+        ],
+        "curl": [
+          "https://conn-i-09007be6d9db10869-us-east-1.lechmere.prod.ws.sonos.com",
+          "https://feature-config.sslauth.sonos.com"
+        ],
+        "http": [
+          "https://conn-i-09007be6d9db10869-us-east-1.lechmere.prod.ws.sonos.com",
+          "https://www.sonos.com/en-us/home"
+        ],
+        "wget": ["https://www.sonos.com/"]
+      }
+    },
+    {
+      "id": "hp-jetdirect",
+      "vendor": "HP",
+      "model": "JetDirect Printer",
+      "category": "printer",
+      "hostname": "HPPrinter",
+      "oui": "5c:60:ba",
+      "count": 1,
+      "verified": true,
+      "source": "t3-wireless.sh",
+      "dhcp": {
+        "vendor_class_id": "Hewlett-Packard_JetDirect",
+        "param_request_list": [1, 3, 6]
+      },
+      "traffic": {
+        "dns": [],
+        "curl": [],
+        "http": ["https://support.hp.com/us-en/printer"],
+        "wget": []
+      }
+    },
+    {
+      "id": "polycom-ip-phone",
+      "vendor": "Polycom",
+      "model": "IP Phone",
+      "category": "ip-phone",
+      "hostname": "PolyCom",
+      "oui": "64:16:7f",
+      "count": 1,
+      "verified": true,
+      "source": "t3-wireless.sh",
+      "dhcp": {
+        "vendor_class_id": "dhcpcd-5.2.10:Linux-2.6.37+:armv7l:ti8168evm",
+        "param_request_list": [1, 3, 6]
+      },
+      "traffic": { "dns": [], "curl": [], "http": [], "wget": [] }
+    },
+    {
+      "id": "axis-p3265",
+      "vendor": "Axis",
+      "model": "P3265-LV Dome Camera",
+      "category": "ip-camera",
+      "hostname": "AxisCam",
+      "oui": "ac:cc:8e",
+      "count": 1,
+      "verified": true,
+      "source": "t3-wireless.sh",
+      "dhcp": {
+        "vendor_class_id": "Axis,DomeCamera,P3265-LV,10.12.165",
+        "param_request_list": [1, 3, 6]
+      },
+      "traffic": { "dns": [], "curl": [], "http": [], "wget": [] }
+    },
+    {
+      "id": "moxa-device-server",
+      "vendor": "Moxa",
+      "model": "NPort Device Server",
+      "category": "serial-server",
+      "hostname": "MoxaDevice",
+      "oui": "2e:0b:57",
+      "count": 1,
+      "verified": true,
+      "source": "t3-wireless.sh",
+      "dhcp": {
+        "vendor_class_id": "udhcp-1.19.2",
+        "param_request_list": [1, 3, 4, 12, 15, 28, 42]
+      },
+      "traffic": { "dns": [], "curl": [], "http": [], "wget": [] }
+    },
+    {
+      "id": "ring-doorbell",
+      "vendor": "Ring",
+      "model": "Stick Up Cam / Doorbell",
+      "category": "doorbell",
+      "hostname": "Ring",
+      "oui": "9c:76:13",
+      "count": 1,
+      "verified": true,
+      "source": "t3-wireless.sh",
+      "dhcp": {
+        "vendor_class_id": "busybox",
+        "param_request_list": [1, 3, 6]
+      },
+      "traffic": {
+        "dns": [
+          "ec2-3-235-249-68.prd.rings.solutions",
+          "api.prod.signalling.ring.devices.a2z.com",
+          "alexa.na.gateway.devices.a2z.com",
+          "spectrum.s3.amazonaws.com",
+          "api.amazon.com",
+          "amzn-sidewalk-events-us-east-1-prod.s3.amazonaws.com",
+          "stickupcammini.devices.prod.rss.ring.amazon.dev",
+          "fw-eventstream.ring.com"
+        ],
+        "curl": [
+          "https://api.prod.signalling.ring.devices.a2z.com",
+          "https://alexa.na.gateway.devices.a2z.com",
+          "http://spectrum.s3.amazonaws.com",
+          "https://api.amazon.com",
+          "https://amzn-sidewalk-events-us-east-1-prod.s3.amazonaws.com",
+          "https://fw-eventstream.ring.com"
+        ],
+        "http": [
+          "https://api.prod.signalling.ring.devices.a2z.com",
+          "https://ring.com"
+        ],
+        "wget": ["https://ring.com/"]
+      }
+    },
+    {
+      "id": "resideo-thermostat",
+      "vendor": "Resideo",
+      "model": "LCC Thermostat",
+      "category": "thermostat",
+      "hostname": "Resideo",
+      "oui": "48:a2:e6",
+      "count": 1,
+      "verified": true,
+      "source": "t3-wireless.sh",
+      "dhcp": {
+        "vendor_class_id": "bsd-kernel:6.9.9",
+        "param_request_list": [1, 3, 6]
+      },
+      "traffic": {
+        "dns": [
+          "lcc-prodsf-lcc03sf-iothub.azure-devices.net",
+          "weather02.clouddevice.io"
+        ],
+        "curl": [
+          "http://lcc-prodsf-lcc03sf-iothub.azure-devices.net:5671",
+          "https://weather02.clouddevice.io"
+        ],
+        "http": ["https://www.resideo.com/us/en/"],
+        "wget": ["https://www.resideo.com/"]
+      }
+    },
+    {
+      "id": "barco-clickshare",
+      "vendor": "Barco",
+      "model": "ClickShare Share",
+      "category": "digital-signage",
+      "hostname": "BarcoShare",
+      "oui": null,
+      "count": 0,
+      "verified": true,
+      "source": "t3-wireless.sh",
+      "dhcp": {
+        "vendor_class_id": "Barco-linux-bsd:6.9.9",
+        "param_request_list": [1, 3, 6]
+      },
+      "traffic": {
+        "dns": [],
+        "curl": [],
+        "http": ["https://www.barco.com/en/"],
+        "wget": []
+      }
+    },
+    {
+      "id": "wepresent-gateway",
+      "vendor": "WePresent",
+      "model": "Wireless Presentation Gateway",
+      "category": "digital-signage",
+      "hostname": "WePresentGW",
+      "oui": null,
+      "count": 0,
+      "verified": true,
+      "source": "t3-wireless.sh",
+      "dhcp": {
+        "vendor_class_id": "udhcp-0.9.9-pre",
+        "param_request_list": [1, 3, 6]
+      },
+      "traffic": { "dns": [], "curl": [], "http": [], "wget": [] }
+    },
+    {
+      "id": "density-sensor",
+      "vendor": "Density",
+      "model": "Occupancy Sensor",
+      "category": "occupancy-sensor",
+      "hostname": "Desnity",
+      "oui": "b8:80:4f",
+      "count": 1,
+      "verified": true,
+      "source": "t3-wireless.sh",
+      "dhcp": {
+        "vendor_class_id": "Density-Device",
+        "param_request_list": [1, 3, 6]
+      },
+      "traffic": {
+        "dns": [],
+        "curl": [],
+        "http": ["https://www.density.io"],
+        "wget": []
+      }
+    },
+    {
+      "id": "oculus-quest",
+      "vendor": "Meta",
+      "model": "Oculus Quest",
+      "category": "vr-headset",
+      "hostname": "Oculus",
+      "oui": "2c:26:17",
+      "count": 1,
+      "verified": true,
+      "source": "t3-wireless.sh",
+      "dhcp": {
+        "vendor_class_id": "android-dhcp-12",
+        "param_request_list": [1, 3, 6]
+      },
+      "traffic": {
+        "dns": [],
+        "curl": [],
+        "http": ["https://www.meta.com/quest/"],
+        "wget": ["https://www.meta.com/"]
+      }
+    },
+    {
+      "id": "tesla-vehicle",
+      "vendor": "Tesla",
+      "model": "Vehicle Telemetry",
+      "category": "ev",
+      "hostname": "Tesla",
+      "oui": "4c:fc:aa",
+      "count": 1,
+      "verified": true,
+      "source": "t3-wireless.sh",
+      "dhcp": {
+        "vendor_class_id": "tesla-busybox-1.9.9",
+        "param_request_list": [1, 3, 6]
+      },
+      "traffic": {
+        "dns": [],
+        "curl": [
+          "https://x3-prod.obs.tesla.com",
+          "https://hermes-prd.ap.tesla.services",
+          "https://maps-prd.go.tesla.services",
+          "https://telemetry-prd.vn.tesla.services"
+        ],
+        "http": [],
+        "wget": []
+      }
+    },
+    {
+      "id": "crestron-controller",
+      "vendor": "Crestron",
+      "model": "Control Processor",
+      "category": "industrial-controller",
+      "hostname": "Crestron",
+      "oui": "00:10:7f",
+      "count": 1,
+      "verified": true,
+      "source": "t3-wireless.sh",
+      "dhcp": {
+        "vendor_class_id": "freebsd-kernel:3.9.1",
+        "param_request_list": [1, 3, 6]
+      },
+      "traffic": {
+        "dns": ["api.my.crestron.com", "fc.crestron.io"],
+        "curl": [],
+        "http": ["https://www.crestron.com"],
+        "wget": ["https://www.crestron.com/"]
+      }
+    },
+
+    {
+      "_comment": "── MAC-pool-only vendors (from mac_config.json; fingerprint not yet captured in wireless.sh) ──",
+      "id": "samsung-mobile-a",
+      "vendor": "Samsung",
+      "model": "Galaxy Device (OUI 28:cd:c1)",
+      "category": "mobile",
+      "hostname": "SamsungA",
+      "oui": "28:cd:c1",
+      "count": 1,
+      "verified": true,
+      "source": "t3-mac_config.json",
+      "dhcp": {
+        "vendor_class_id": "android-dhcp-10",
+        "param_request_list": [1, 3, 6, 15, 28, 121, 249]
+      },
+      "traffic": { "dns": [], "curl": [], "http": [], "wget": [] }
+    },
+    {
+      "id": "samsung-mobile-b",
+      "vendor": "Samsung",
+      "model": "Galaxy Device (OUI 40:b8:37)",
+      "category": "mobile",
+      "hostname": "SamsungB",
+      "oui": "40:b8:37",
+      "count": 1,
+      "verified": true,
+      "source": "t3-mac_config.json",
+      "dhcp": {
+        "vendor_class_id": "android-dhcp-10",
+        "param_request_list": [1, 3, 6, 15, 28, 121, 249]
+      },
+      "traffic": { "dns": [], "curl": [], "http": [], "wget": [] }
+    },
+    {
+      "id": "cisco-ap",
+      "vendor": "Cisco",
+      "model": "AP / Network Device",
+      "category": "network-infra",
+      "hostname": "CiscoAP",
+      "oui": "00:1b:54",
+      "count": 1,
+      "verified": true,
+      "source": "t3-mac_config.json",
+      "dhcp": {
+        "vendor_class_id": "udhcp-1.12.1",
+        "param_request_list": [1, 3, 6, 12, 15, 28, 42]
+      },
+      "traffic": { "dns": [], "curl": [], "http": [], "wget": [] }
+    },
+    {
+      "id": "lutron-bridge-a",
+      "vendor": "Lutron",
+      "model": "Smart Bridge (OUI 00:04:a5)",
+      "category": "smart-lighting",
+      "hostname": "LutronA",
+      "oui": "00:04:a5",
+      "count": 1,
+      "verified": true,
+      "source": "t3-mac_config.json",
+      "dhcp": {
+        "vendor_class_id": "Lutron-Electronics",
+        "param_request_list": [1, 3, 6, 12, 15, 28]
+      },
+      "traffic": { "dns": [], "curl": [], "http": [], "wget": [] }
+    },
+    {
+      "id": "lutron-bridge-b",
+      "vendor": "Lutron",
+      "model": "Smart Bridge (OUI 00:12:5f)",
+      "category": "smart-lighting",
+      "hostname": "LutronB",
+      "oui": "00:12:5f",
+      "count": 1,
+      "verified": true,
+      "source": "t3-mac_config.json",
+      "dhcp": {
+        "vendor_class_id": "Lutron-Electronics",
+        "param_request_list": [1, 3, 6, 12, 15, 28]
+      },
+      "traffic": { "dns": [], "curl": [], "http": [], "wget": [] }
+    },
+    {
+      "id": "hikvision-camera",
+      "vendor": "Hikvision",
+      "model": "IP Camera",
+      "category": "ip-camera",
+      "hostname": "HikvisionCam",
+      "oui": "c0:56:e3",
+      "count": 1,
+      "verified": true,
+      "source": "t3-mac_config.json",
+      "dhcp": {
+        "vendor_class_id": "udhcp-1.19.2",
+        "param_request_list": [1, 3, 6, 12, 15, 28, 42]
+      },
+      "traffic": { "dns": [], "curl": [], "http": [], "wget": [] }
+    },
+    {
+      "id": "apple-mobile",
+      "vendor": "Apple",
+      "model": "iPhone / iPad",
+      "category": "mobile",
+      "hostname": "AppleDev",
+      "oui": "3c:15:c2",
+      "count": 1,
+      "verified": true,
+      "source": "t3-mac_config.json",
+      "dhcp": {
+        "vendor_class_id": "dhcpcd-5.5.6:Apple-6.99.5:i386:i386",
+        "param_request_list": [1, 3, 6, 15, 28, 119, 121, 249, 252]
+      },
+      "traffic": { "dns": [], "curl": [], "http": [], "wget": [] }
+    },
+    {
+      "id": "amazon-echo",
+      "vendor": "Amazon",
+      "model": "Echo / Fire Device",
+      "category": "smart-speaker",
+      "hostname": "AmazonEcho",
+      "oui": "fc:65:de",
+      "count": 1,
+      "verified": true,
+      "source": "t3-mac_config.json",
+      "dhcp": {
+        "vendor_class_id": "android-dhcp-9",
+        "param_request_list": [1, 3, 6, 15, 28, 121, 249]
+      },
+      "traffic": { "dns": [], "curl": [], "http": [], "wget": [] }
+    },
+    {
+      "id": "honeywell-thermostat",
+      "vendor": "Honeywell",
+      "model": "Lyric / Home Thermostat",
+      "category": "thermostat",
+      "hostname": "Honeywell",
+      "oui": "44:61:32",
+      "count": 1,
+      "verified": true,
+      "source": "t3-mac_config.json",
+      "dhcp": {
+        "vendor_class_id": "dhcpcd-6.0.5:Honeywell",
+        "param_request_list": [1, 3, 6, 15, 28]
+      },
+      "traffic": { "dns": [], "curl": [], "http": [], "wget": [] }
+    },
+    {
+      "id": "yealink-phone",
+      "vendor": "Yealink",
+      "model": "IP Phone",
+      "category": "ip-phone",
+      "hostname": "Yealink",
+      "oui": "80:5e:c0",
+      "count": 1,
+      "verified": true,
+      "source": "t3-mac_config.json",
+      "dhcp": {
+        "vendor_class_id": "Yealink-T54H",
+        "param_request_list": [1, 3, 6, 12, 15, 28, 42, 66]
+      },
+      "traffic": { "dns": [], "curl": [], "http": [], "wget": [] }
+    },
+
+    {
+      "_comment": "── Expansion profiles — reconstructed from known DHCP-fingerprint patterns; OUI must be verified against the IEEE registry before fleet use (verified: false) ──",
+      "id": "nest-thermostat",
+      "vendor": "Google Nest",
+      "model": "Learning Thermostat",
+      "category": "thermostat",
+      "hostname": "Nest",
+      "oui": null,
+      "count": 0,
+      "verified": false,
+      "source": "expansion",
+      "dhcp": {
+        "vendor_class_id": "dhcpcd-6.0.5:Nest",
+        "param_request_list": [1, 3, 6, 15, 28, 121]
+      },
+      "traffic": {
+        "dns": ["nest-thermostat.firebaseio.com", "home.nest.com"],
+        "curl": ["https://home.nest.com"],
+        "http": [],
+        "wget": []
+      }
+    },
+    {
+      "id": "ecobee-thermostat",
+      "vendor": "ecobee",
+      "model": "SmartThermostat",
+      "category": "thermostat",
+      "hostname": "ecobee",
+      "oui": null,
+      "count": 0,
+      "verified": false,
+      "source": "expansion",
+      "dhcp": {
+        "vendor_class_id": "udhcp-1.14.3.1",
+        "param_request_list": [1, 3, 6, 12, 15, 28, 42]
+      },
+      "traffic": {
+        "dns": ["ecobee.com", "home.ecobee.com"],
+        "curl": ["https://home.ecobee.com"],
+        "http": [],
+        "wget": []
+      }
+    },
+    {
+      "id": "wyze-cam",
+      "vendor": "Wyze",
+      "model": "Cam v3",
+      "category": "ip-camera",
+      "hostname": "WyzeCam",
+      "oui": null,
+      "count": 0,
+      "verified": false,
+      "source": "expansion",
+      "dhcp": {
+        "vendor_class_id": "android-dhcp-9",
+        "param_request_list": [1, 3, 6, 15, 28, 121, 249]
+      },
+      "traffic": {
+        "dns": ["api.wyzecam.com", "res.wyzecam.com"],
+        "curl": ["https://api.wyzecam.com"],
+        "http": [],
+        "wget": []
+      }
+    },
+    {
+      "id": "hue-bridge",
+      "vendor": "Signify",
+      "model": "Philips Hue Bridge",
+      "category": "smart-lighting",
+      "hostname": "HueBridge",
+      "oui": null,
+      "count": 0,
+      "verified": false,
+      "source": "expansion",
+      "dhcp": {
+        "vendor_class_id": "dhcpcd-5.5.6:PhilipsHue",
+        "param_request_list": [1, 3, 6, 12, 15, 28]
+      },
+      "traffic": {
+        "dns": ["discovery.meethue.com", "api.meethue.com"],
+        "curl": ["https://discovery.meethue.com"],
+        "http": [],
+        "wget": []
+      }
+    },
+    {
+      "id": "tp-link-smart-plug",
+      "vendor": "TP-Link",
+      "model": "Kasa Smart Plug (HS103)",
+      "category": "smart-plug",
+      "hostname": "TPLinkPlug",
+      "oui": null,
+      "count": 0,
+      "verified": false,
+      "source": "expansion",
+      "dhcp": {
+        "vendor_class_id": "udhcp-1.12.1",
+        "param_request_list": [1, 3, 6, 12, 15, 28]
+      },
+      "traffic": {
+        "dns": ["n-devs.tplinkcloud.com", "use-common.tplinkcloud.com"],
+        "curl": ["https://n-devs.tplinkcloud.com"],
+        "http": [],
+        "wget": []
+      }
+    },
+    {
+      "id": "shelly-relay",
+      "vendor": "Shelly",
+      "model": "Shelly 1PM Relay",
+      "category": "smart-plug",
+      "hostname": "Shelly",
+      "oui": null,
+      "count": 0,
+      "verified": false,
+      "source": "expansion",
+      "dhcp": {
+        "vendor_class_id": "esp8266:shelly",
+        "param_request_list": [1, 3, 6, 12, 15, 28]
+      },
+      "traffic": {
+        "dns": ["shelly-api.cloud.shelly.com", "homeassistant.local"],
+        "curl": [],
+        "http": [],
+        "wget": []
+      }
+    },
+    {
+      "id": "tuya-device",
+      "vendor": "Tuya",
+      "model": "Generic Tuya Smart Device",
+      "category": "smart-plug",
+      "hostname": "Tuya",
+      "oui": null,
+      "count": 0,
+      "verified": false,
+      "source": "expansion",
+      "dhcp": {
+        "vendor_class_id": "tuya_discovery",
+        "param_request_list": [1, 3, 6, 12, 15, 28]
+      },
+      "traffic": {
+        "dns": ["m1.tuyaus.com", "log.tuyaus.com"],
+        "curl": [],
+        "http": [],
+        "wget": []
+      }
+    },
+    {
+      "id": "irobot-roomba",
+      "vendor": "iRobot",
+      "model": "Roomba",
+      "category": "robot-vacuum",
+      "hostname": "Roomba",
+      "oui": null,
+      "count": 0,
+      "verified": false,
+      "source": "expansion",
+      "dhcp": {
+        "vendor_class_id": "udhcp-1.14.3.1",
+        "param_request_list": [1, 3, 6, 12, 15, 28, 42]
+      },
+      "traffic": {
+        "dns": ["irobot-prod.iot.irobot.com", "agg-west.iot.irobot.com"],
+        "curl": [],
+        "http": [],
+        "wget": []
+      }
+    },
+    {
+      "id": "smartthings-hub",
+      "vendor": "Samsung",
+      "model": "SmartThings Hub",
+      "category": "iot-gateway",
+      "hostname": "SmartThings",
+      "oui": null,
+      "count": 0,
+      "verified": false,
+      "source": "expansion",
+      "dhcp": {
+        "vendor_class_id": "udhcp-1.12.1",
+        "param_request_list": [1, 3, 6, 12, 15, 28, 42]
+      },
+      "traffic": {
+        "dns": ["api.smartthings.com", "discovery.smartthings.com"],
+        "curl": ["https://api.smartthings.com"],
+        "http": [],
+        "wget": []
+      }
+    },
+    {
+      "id": "google-home",
+      "vendor": "Google",
+      "model": "Nest Audio / Home",
+      "category": "smart-speaker",
+      "hostname": "GoogleHome",
+      "oui": null,
+      "count": 0,
+      "verified": false,
+      "source": "expansion",
+      "dhcp": {
+        "vendor_class_id": "android-dhcp-10",
+        "param_request_list": [1, 3, 6, 15, 28, 121, 249]
+      },
+      "traffic": {
+        "dns": ["android.clients.google.com", "play.googleapis.com"],
+        "curl": [],
+        "http": [],
+        "wget": []
+      }
+    },
+    {
+      "id": "august-smart-lock",
+      "vendor": "August",
+      "model": "Wi-Fi Smart Lock",
+      "category": "smart-lock",
+      "hostname": "AugustLock",
+      "oui": null,
+      "count": 0,
+      "verified": false,
+      "source": "expansion",
+      "dhcp": {
+        "vendor_class_id": "android-dhcp-9",
+        "param_request_list": [1, 3, 6, 15, 28, 121, 249]
+      },
+      "traffic": {
+        "dns": ["api-production.august.com", "lock.august.com"],
+        "curl": ["https://api-production.august.com"],
+        "http": [],
+        "wget": []
+      }
+    },
+    {
+      "id": "esp8266-sensor-tag",
+      "vendor": "Espressif",
+      "model": "ESP8266 Sensor Tag",
+      "category": "sensor-tag",
+      "hostname": "ESPSensor",
+      "oui": null,
+      "count": 0,
+      "verified": false,
+      "source": "expansion",
+      "dhcp": {
+        "vendor_class_id": "esp8266:arduino",
+        "param_request_list": [1, 3, 6, 15]
+      },
+      "traffic": {
+        "dns": ["pool.ntp.org"],
+        "curl": [],
+        "http": [],
+        "wget": []
+      }
+    },
+    {
+      "id": "echo-show",
+      "vendor": "Amazon",
+      "model": "Echo Show (Smart Display)",
+      "category": "smart-display",
+      "hostname": "EchoShow",
+      "oui": null,
+      "count": 0,
+      "verified": false,
+      "source": "expansion",
+      "dhcp": {
+        "vendor_class_id": "android-dhcp-10",
+        "param_request_list": [1, 3, 6, 15, 28, 121, 249]
+      },
+      "traffic": {
+        "dns": ["alexa.na.gateway.devices.a2z.com", "api.amazon.com"],
+        "curl": [],
+        "http": [],
+        "wget": []
+      }
+    },
+    {
+      "id": "windows-iot",
+      "vendor": "Microsoft",
+      "model": "Windows IoT / Surface",
+      "category": "mobile",
+      "hostname": "WinIoT",
+      "oui": null,
+      "count": 0,
+      "verified": false,
+      "source": "expansion",
+      "dhcp": {
+        "vendor_class_id": "MSFT 5.0",
+        "param_request_list": [1, 3, 6, 15, 31, 33, 43, 44, 46, 47, 119, 121, 249, 252]
+      },
+      "traffic": {
+        "dns": ["www.msftconnecttest.com", "dns.msftncsi.com"],
+        "curl": ["http://www.msftconnecttest.com/connecttest.txt"],
+        "http": [],
+        "wget": []
+      }
+    }
+  ]
+}

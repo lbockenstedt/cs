@@ -148,7 +148,6 @@ class ClientRegistry:
         async with self._lock:
             if not self._dirty:
                 return
-            self._dirty = False
             try:
                 clients = self.clients  # stable: we hold self._lock
 
@@ -157,6 +156,10 @@ class ClientRegistry:
                         json.dumps(clients, sort_keys=True), encoding="utf-8")
 
                 await asyncio.to_thread(_write)
+                # Clear dirty only AFTER a successful write — a failed write must
+                # keep us dirty so the next _delayed_flush retries instead of
+                # silently losing the durable snapshot.
+                self._dirty = False
             except Exception as exc:  # noqa: BLE001
                 logger.warning("could not persist %s: %s", self._path, exc)
 

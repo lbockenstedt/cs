@@ -81,13 +81,20 @@ def build_client_rows(spoke, now: float | None = None
         tier = tier_index.get(str(vmid)) if vmid else None
         if vmid and tier:
             tier_updates[hostname] = {"tier": tier, "has_usb": has_usb}
+        tier_stale = False
+        tier_as_of: Any = None
         if vmid is None:
             # Host/agent offline or VM aged out of proxmox_states: the live
             # join can't classify it. Fall back to the last-known authoritative
             # tier/has_usb persisted while it WAS reporting, so
             # csClassifyClient (which prefers c.tier) keeps it T2 instead of
-            # dropping to T1.
-            tier = tier or c.get("tier")
+            # dropping to T1. Stamp tier_stale so the UI/QuotaEngine can tell an
+            # ASSUMED (persisted-fallback) tier from a live-resolved one.
+            _fb_tier = c.get("tier")
+            if tier is None and _fb_tier:
+                tier_stale = True
+                tier_as_of = c.get("tier_as_of") or c.get("last_seen")
+            tier = tier or _fb_tier
             has_usb = has_usb or bool(c.get("last_known_has_usb"))
         rows.append({
             "hostname": hostname, "id": hostname,
@@ -110,6 +117,10 @@ def build_client_rows(spoke, now: float | None = None
             # Authoritative tier (t1/t2/t3) from the agent's per-VM passthrough
             # classification; csClassifyClient prefers this over has_usb.
             "tier": tier,
+            # True when `tier` came from the persisted last-known fallback (host
+            # unresolvable) rather than a live join — an ASSUMED tier, not live.
+            "tier_stale": tier_stale,
+            "tier_as_of": tier_as_of,
             # Carry the persisted per-client sim overrides + config up so the
             # WebUI's per-sim override buttons reflect what's SET (not just
             # what's running) and STAY across refreshes.

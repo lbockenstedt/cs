@@ -235,12 +235,22 @@ class ConfigCommandsMixin:
             placement_warnings = eng.placement_warnings() if eng is not None else []
             csc = self.local_store.get_central_sites_config()
             monitored = csc.get("monitored_checks") or []
+            # Live per-check firing status from the Central poller's last cycle —
+            # the same ``{site: {check_id: {status, message}}}`` the dashboard
+            # Checks table renders via ``csStatusBadge``. Surfaced here so the
+            # Engine State view can show whether each alert/insight is currently
+            # firing WITHOUT a second API query: it reuses the spoke's in-memory
+            # ``central_status`` (refreshed every poll loop). Empty when Central
+            # isn't configured or no poll has run yet. INVERTED semantics live in
+            # the poller: status "ok" == the expected error IS present == firing.
+            cs = getattr(self, "central_status", None) or {}
             return {"status": "SUCCESS",
                     "effective": self.local_store.get_effective_sim_quotas(),
                     "ledger": snap,
                     "monitored_checks": monitored,
                     "placement_warnings": placement_warnings,
-                    "pool": eng.pool_counts() if eng is not None else {}}
+                    "pool": eng.pool_counts() if eng is not None else {},
+                    "check_status": cs.get("status") or {}}
 
         if cmd == "CS_RESET_SIM_QUOTA":
             # Clear the engine ledger + engine-set overrides and reconcile fresh —

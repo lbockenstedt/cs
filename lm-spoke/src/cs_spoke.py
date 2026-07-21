@@ -346,18 +346,17 @@ class CSSpoke(AgentCommandsMixin, SimCommandsMixin, ConfigCommandsMixin,
         """Debounced sim-tag sync — computes desired tags off the telemetry hot
         path and dispatches them to each pxmx AGENT for a LOCAL (qm/pct) apply.
 
-        Runs at most once per ``_SIM_TAG_MIN_INTERVAL``. No Proxmox API PUT from
-        this off-host spoke (that storm caused the CS_INGEST_TELEMETRY Request
-        Timeouts). Per-host maps unchanged since the last dispatch are skipped,
-        and only hosts whose agent is currently connected are sent. No-op until
-        the client registry is wired. Never raises."""
+        No Proxmox API PUT from this off-host spoke (that storm caused the
+        CS_INGEST_TELEMETRY Request Timeouts). Per-host maps unchanged since the
+        last dispatch are skipped (signature cache), and only hosts whose agent
+        is currently connected are sent. The lock serializes dispatches so only
+        one runs at a time — but there's no min-interval, so a real tag change
+        dispatches immediately instead of waiting out a debounce window. No-op
+        until the client registry is wired. Never raises."""
         if not self._SIM_TAG_SYNC_ENABLED:
             return
         if self.registry is None:
             return  # nothing to sync until the client registry lands
-        now = time.time()
-        if now - self._sim_tag_last_ts < self._SIM_TAG_MIN_INTERVAL:
-            return  # debounced — already dispatched within the interval
         if self._sim_tag_sync_lock.locked():
             return  # a dispatch is already running — don't pile another on
         try:

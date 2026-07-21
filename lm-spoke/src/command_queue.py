@@ -280,7 +280,11 @@ class CommandQueue:
         for cmd in self.commands:
             if cmd.get("target") != target or cmd.get("action") != action:
                 continue
-            if cmd.get("status") not in {"pending", "delivered"}:
+            # Dedup only against still-PENDING commands. A `delivered` command
+            # can be stuck (agent went silent mid-op), so an operator's retry
+            # must be allowed to re-enqueue it — treating delivered as a
+            # duplicate would silently swallow that retry.
+            if cmd.get("status") != "pending":
                 continue
             if _args_signature(cmd.get("args", {})) == sig:
                 return cmd

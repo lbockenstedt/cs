@@ -146,3 +146,41 @@ def test_get_sim_quota_state_includes_monitored_checks(spoke_loop):
     mc = res["monitored_checks"]
     assert any(c["id"] == "A1" and c["name"] == "DNS fail MIA" for c in mc)
     assert any(c["id"] == "I9" and c["type"] == "insight" for c in mc)
+
+
+def test_get_sim_quota_state_includes_live_check_status(spoke_loop):
+    # The Engine State view shows whether each alert/insight is currently FIRING
+    # using the SAME indicator the dashboard Checks table uses (csStatusBadge on
+    # the per-check status), with NO extra API query — so the state response
+    # must surface the Central poller's in-memory {site: {check_id: {status}}}
+    # slice. INVERTED semantics: "ok" == the expected error IS present == firing.
+    s, loop, rec = spoke_loop
+    s.local_store.set_central_sites_config({
+        "sim_quotas": [], "site_mappings": {},
+        "monitored_checks": [{"type": "alert", "id": "A1", "name": "DNS fail", "site": "MIA"}],
+        "hardware_checks": [],
+    })
+    s.local_store.set_effective_sim_quotas([
+        {"alert_id": "A1", "alert_type": "alert", "sim_id": "dns_fail",
+         "count": 2, "site": "MIA", "enabled": True}])
+    # The poller writes spoke.central_status["status"] = {site: {check_id: {status, message}}}.
+    s.central_status = {"status": {"MIA": {"A1": {"status": "ok", "message": "1 active (as expected)"}}},
+                        "hardware_alerts": [], "client_count_status": {}}
+    res = _run(loop, s.handle_command("CS_GET_SIM_QUOTA_STATE", {}))
+    assert res["status"] == "SUCCESS"
+    assert res["check_status"]["MIA"]["A1"]["status"] == "ok"
+
+
+def test_get_sim_quota_state_check_status_empty_when_no_central(spoke_loop):
+    # No Central configured / no poll yet → central_status is {} → check_status
+    # is an empty dict (the UI renders "—" for every row, no crash).
+    s, loop, rec = spoke_loop
+    s.local_store.set_central_sites_config({
+        "sim_quotas": [], "site_mappings": {}, "monitored_checks": [],
+        "hardware_checks": [],
+    })
+    s.local_store.set_effective_sim_quotas([])
+    s.central_status = {}
+    res = _run(loop, s.handle_command("CS_GET_SIM_QUOTA_STATE", {}))
+    assert res["status"] == "SUCCESS"
+    assert res["check_status"] == {}

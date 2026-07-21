@@ -499,14 +499,15 @@ class CSControlPlane(AgentHostingControlPlane):
             interval = max(2, int(os.environ.get("CS_TELEMETRY_INTERVAL_S", "10")))
         except Exception:
             pass
-        # Conditional relay (default ON; CS_TELEMETRY_CONDITIONAL=0 to disable and
-        # fall back to the old "send every tick" behavior). When nothing in the
-        # state signature changed we SKIP the send — an idle fleet stops re-sending
-        # identical frames + stops churning the hub's cache/memo. Safeguards so it
-        # can never strand the hub: force a full send on the FIRST tick after
-        # (re)connect, and a heartbeat send at least every _HEARTBEAT_S regardless
-        # (also refreshes the rolling CPU/mem the sig deliberately ignores).
-        _CONDITIONAL = (os.environ.get("CS_TELEMETRY_CONDITIONAL", "1") != "0")
+        # Conditional relay (default OFF: relay EVERY ingested frame). The
+        # hand-maintained content signature was incomplete (missed qt_state,
+        # reclone progress, per-client gateway_reachable/ip), so real state
+        # changes could be stranded up to the heartbeat while the sig also told
+        # the hub to skip its broadcast. Relaying every frame removes that strand
+        # class — the payload already carries all state, and the FAST/SLOW +
+        # heartbeat cadence and _relay_wake early-send are all preserved.
+        # Set CS_TELEMETRY_CONDITIONAL=1 to re-enable the old skip-unchanged gate.
+        _CONDITIONAL = (os.environ.get("CS_TELEMETRY_CONDITIONAL", "0") != "0")
         _HEARTBEAT_S = 60
         _FAST = min(interval, 3)      # a state change just happened → stay snappy
         _SLOW = max(interval, 30)     # idle → back off (heartbeat still bounds it)
@@ -614,10 +615,14 @@ class CSControlPlane(AgentHostingControlPlane):
                 _do_send = ((not _CONDITIONAL) or _force_send or _changed
                             or _due_heartbeat or _draining_now)
                 if _do_send:
-                    # Carry the content sig so the HUB can skip its memo
-                    # invalidation + browser broadcast on a heartbeat frame whose
-                    # content didn't actually change (see main._handle_cs_telemetry).
-                    payload["_content_sig"] = _sig
+                    # Carry the content sig ONLY when conditional relay is enabled,
+                    # so the HUB can skip its memo invalidation + browser broadcast
+                    # on an unchanged heartbeat frame (see main._handle_cs_telemetry).
+                    # With conditional relay OFF (the default) we relay every frame
+                    # AND omit the sig so the hub never suppresses its broadcast —
+                    # every ingested state change reflects immediately (no strand).
+                    if _CONDITIONAL:
+                        payload["_content_sig"] = _sig
                     msg = {
                         "header": {
                             "message_id": str(uuid.uuid4()),
