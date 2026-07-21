@@ -5958,16 +5958,19 @@ async function csRenderVmServerUsb() {
     // Start the live countdown ticker so the QT badges' "clears in" timer ticks
     // between telemetry pulses (idempotent — one interval for the whole page).
     csStartShedTicker();
-    // "Clear USB Quarantine" — releases dongles the agent has sidelined (dmesg
-    // quarantine AND destroy-fail bus exclusions) so they can be provisioned again.
+    // Two release actions; both also force-unbind driver-bound dongles from the
+    // host driver (agent side). They differ only in which state store they clear.
     const _usbHost0 = (typeof csVmSelectedHost === 'function' ? csVmSelectedHost() : null) || {};
-    const _usbHost = _usbHost0.hostname || _usbHost0.spoke_hostname || _usbHost0.spoke_id || '';
-    const _clearUsbBtn = `<button onclick="csClearUsbQuarantine('${csEscape(String(_usbHost0.spoke_id || ''))}','${csEscape(String(_usbHost))}')" title="Clear this host's USB dongle quarantine + destroy-fail bus exclusions (repeated spin-up/down trips the latter) so sidelined dongles can be provisioned again" class="text-[11px] font-bold px-3 py-1.5 rounded-md border border-amber-300 bg-amber-50 text-amber-700 hover:bg-amber-100 whitespace-nowrap">Clear USB Quarantine</button>`;
+    const _usbSid = csEscape(String(_usbHost0.spoke_id || ''));
+    const _usbHost = csEscape(String(_usbHost0.hostname || _usbHost0.spoke_hostname || _usbHost0.spoke_id || ''));
+    const _btnCls = 'text-[11px] font-bold px-3 py-1.5 rounded-md border border-amber-300 bg-amber-50 text-amber-700 hover:bg-amber-100 whitespace-nowrap';
+    const _clearQtBtn = `<button onclick="csClearUsbQuarantine('${_usbSid}','${_usbHost}')" title="Clear the dmesg quarantine list (incl. the 5-strike permanent flag) + force-release driver-bound dongles on this host. Leaves the exclusion list intact." class="${_btnCls}">Clear Quarantine</button>`;
+    const _clearExclBtn = `<button onclick="csClearUsbExclusions('${_usbSid}','${_usbHost}')" title="Clear the destroy-fail bus exclusions (repeated spin-up/down trips these) + force-release driver-bound dongles on this host. Leaves the quarantine list intact." class="${_btnCls}">Clear Exclusion List</button>`;
     csSet(`<div>${csVmHostBanner()}
       ${dbgBox}
       <div class="flex items-center justify-between gap-3 mb-4">
-        <p class="text-[11px] text-slate-400 min-w-0">Release dongles the agent has sidelined — dmesg quarantine <em>and</em> destroy-fail bus exclusions — so they can be provisioned again.</p>
-        ${_clearUsbBtn}
+        <p class="text-[11px] text-slate-400 min-w-0">Release sidelined dongles. Both actions also force-unbind a driver-bound dongle from the host (no reboot); they differ only in which state store they clear.</p>
+        <div class="flex items-center gap-2">${_clearQtBtn}${_clearExclBtn}</div>
       </div>
       ${summary}
       ${qtBox}
@@ -6123,16 +6126,23 @@ window.csClearCommands = async function () {
     } catch (e) { console.error('csClearCommands: clear failed', e); if (typeof showToast === 'function') showToast('Clear failed: ' + (e.message || e), 'error'); }
 };
 
-// Release dongles the agent has sidelined (dmesg quarantine + destroy-fail bus
-// exclusions) so they can be provisioned again.
-window.csClearUsbQuarantine = async function (spokeId, host) {
-    if (!confirm(`Release dongles on ${host || 'this host'}?\n\nClears the USB dongle quarantine and the destroy-fail bus exclusions (what repeated spin-up/down trips) so sidelined dongles are picked up on the next provision pass. Safe to run anytime.`)) return;
+// Two dongle-release actions. Both force-unbind driver-bound dongles from the
+// host driver (agent side); they differ only in which state store they clear.
+async function _csUsbClearCmd(host, action, doneMsg) {
     try {
         const r = await csFetch(`/${csTenant()}/proxmx/command?tenant_id=${csTenant()}`, {
-            method: 'POST', body: JSON.stringify({ action: 'clear_usb_quarantine', target: host || 'proxmox', type: 'clear_usb_quarantine', args: {} }) });
-        if (typeof csPushToast === 'function') csPushToast(r, 'USB quarantine cleared — dongles will be picked up on the next provision pass');
-        else if (typeof showToast === 'function') showToast('USB quarantine cleared', 'success');
-    } catch (e) { console.error('csClearUsbQuarantine failed', e); if (typeof showToast === 'function') showToast('Clear USB quarantine failed: ' + (e.message || e), 'error'); }
+            method: 'POST', body: JSON.stringify({ action, target: host || 'proxmox', type: action, args: {} }) });
+        if (typeof csPushToast === 'function') csPushToast(r, doneMsg);
+        else if (typeof showToast === 'function') showToast(doneMsg, 'success');
+    } catch (e) { console.error(action + ' failed', e); if (typeof showToast === 'function') showToast(action + ' failed: ' + (e.message || e), 'error'); }
+}
+window.csClearUsbQuarantine = async function (spokeId, host) {
+    if (!confirm(`Clear USB quarantine on ${host || 'this host'}?\n\nClears the dmesg quarantine list (incl. the 5-strike permanent flag) and force-unbinds any driver-bound dongle from the host driver. Leaves the exclusion list intact.`)) return;
+    _csUsbClearCmd(host, 'clear_usb_quarantine', 'Quarantine cleared + driver-bound dongles released — available on the next provision pass');
+};
+window.csClearUsbExclusions = async function (spokeId, host) {
+    if (!confirm(`Clear USB exclusion list on ${host || 'this host'}?\n\nClears the destroy-fail bus exclusions (what repeated spin-up/down trips) and force-unbinds any driver-bound dongle from the host driver. Leaves the quarantine list intact.`)) return;
+    _csUsbClearCmd(host, 'clear_usb_exclusions', 'Exclusion list cleared + driver-bound dongles released — available on the next provision pass');
 };
 
 window.csCmdDelete = async function (btn) {
