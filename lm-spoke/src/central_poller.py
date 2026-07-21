@@ -258,352 +258,238 @@ _HEALTH_IDX = {"ok": 0, "warning": 1, "error": 2}  # else (no_data/pending/unkno
 class CheckHealthHistory:
     """Rolling 30-day per-check status history in HOURLY buckets [ok,warn,error,other]
     (green/yellow/red/grey). Mirror of lm central_hub_poller.CheckHealthHistory — keep
-    in sync. summary() rolls hourly up to 30 DAILY buckets; hourly() returns raw."""
+    in sync. summary() rolls hourly up to 30 DAILY buckets; hourly buckets are
+    kept raw for the per-check timeline view."""
 
     def __init__(self, path: str) -> None:
         self._path = path
-        self._h: Dict[str, Dict[int, list]] = {}
+        self._hourly: Dict[str, list] = {}  # check_id -> [(ts, [ok,warn,error,other])]
         self._load()
-
-    @staticmethod
-    def _key(tenant: str, site: str, check_id: str) -> str:
-        return f"{tenant}{_CC_KEYSEP}{site}{_CC_KEYSEP}{check_id}"
 
     def _load(self) -> None:
         try:
             with open(self._path, encoding="utf-8") as f:
                 raw = json.load(f) or {}
-            cutoff = time.time() - _CC_30DAY_WINDOW
-            self._h = {
-                k: {int(b): list(v) for b, v in buckets.items() if int(b) >= cutoff}
-                for k, buckets in raw.items()
+            now = time.time()
+            cutoff = now - _CC_30DAY_WINDOW
+            self._hourly = {
+                k: [(float(ts), v) for ts, v in entries if float(ts) >= cutoff]
+                for k, entries in raw.items()
             }
-        except Exception:  # noqa: BLE001 — absent/corrupt → start empty
-            self._h = {}
+        except Exception:  # noqa: BLE001
+            self._hourly = {}
 
-    def record(self, tenant: str, site: str, check_id: str, status: str) -> None:
+    def record(self, check_id: str, status: str) -> None:
         now = time.time()
-        buckets = self._h.setdefault(self._key(tenant, site, check_id), {})
-        bucket = int(now // 3600 * 3600)
-        cell = buckets.get(bucket)
-        if cell is None:
-            cell = [0, 0, 0, 0]
-            buckets[bucket] = cell
-        cell[_HEALTH_IDX.get(str(status).strip().lower(), 3)] += 1
+        idx = _HEALTH_IDX.get(status, 3)
+        bucket = [0, 0, 0, 0]
+        bucket[idx] = 1
+        hist = self._hourly.setdefault(check_id, [])
+        if hist and (now - hist[-1][0]) < 3600:
+            old_ts, old_bucket = hist[-1]
+            merged = [old_bucket[i] + bucket[i] for i in range(4)]
+            hist[-1] = (old_ts, merged)
+        else:
+            hist.append((now, bucket))
         cutoff = now - _CC_30DAY_WINDOW
-        for b in [b for b in buckets if b < cutoff]:
-            del buckets[b]
+        self._hourly[check_id] = [(ts, v) for ts, v in hist if ts >= cutoff]
 
-    def save(self) -> None:
+    def maybe_persist(self) -> None:
         try:
             tmp = self._path + ".tmp"
             with open(tmp, "w", encoding="utf-8") as f:
-                json.dump({k: {str(b): v for b, v in bk.items()}
-                           for k, bk in self._h.items()}, f, default=str)
+                json.dump(self._hourly, f)
             os.replace(tmp, self._path)
-        except Exception:  # noqa: BLE001
-            pass
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("CheckHealthHistory: persist failed: %s", exc)
 
-    def summary(self, tenant: str) -> Dict[str, Any]:
+    def summary(self, check_id: str) -> Dict[str, Any]:
+        hist = self._hourly.get(check_id, [])
         now = time.time()
-        floor = int(now // 86400 * 86400) - 29 * 86400
-        prefix = f"{tenant}{_CC_KEYSEP}"
-        out: Dict[str, Any] = {}
-        for key, buckets in self._h.items():
-            if not key.startswith(prefix):
-                continue
-            parts = key.split(_CC_KEYSEP, 2)
-            if len(parts) != 3:
-                continue
-            _, site, check_id = parts
-            days: Dict[int, list] = {}
-            for b, cell in buckets.items():
-                d = int(b // 86400 * 86400)
-                if d < floor:
-                    continue
-                acc = days.setdefault(d, [0, 0, 0, 0])
-                for i in range(4):
-                    acc[i] += cell[i]
-            out.setdefault(site, {})[check_id] = [
-                {"d": d, "o": v[0], "w": v[1], "e": v[2], "n": v[3]}
-                for d, v in sorted(days.items())
-            ]
-        return out
-
-    def hourly(self, tenant: str, site: str, check_id: str) -> list:
-        buckets = self._h.get(self._key(tenant, site, check_id), {})
-        return [{"h": b, "o": v[0], "w": v[1], "e": v[2], "n": v[3]}
-                for b, v in sorted(buckets.items())]
+        daily: list = []
+        for day_offset in range(30):
+            day_start = now - (day_offset + 1) * 86400
+            day_end = now - day_offset * 86400
+            day_bucket = [0, 0, 0, 0]
+            for ts, b in hist:
+                if day_start <= ts < day_end:
+                    day_bucket = [day_bucket[i] + b[i] for i in range(4)]
+            daily.append(day_bucket)
+        return {"check_id": check_id, "daily": daily}
 
 
 class CentralPoller:
-    """Drives ``ArubaClient`` on a 5-minute loop, writing
-    ``spoke.central_status`` in the shape ``sim-views.js``'s Checks/Hardware/
-    Client-Count tabs expect. No-op (empty ``central_status``) when Central
-    is not configured. See the module docstring."""
+    """Background Aruba Central poller.
+
+    Runs ``ArubaClient`` (synchronous HTTP) in a thread via ``asyncio.to_thread``
+    so the blocking ``requests`` calls never stall the cs spoke's shared event
+    loop. A stalled event loop is the root cause of stale heartbeats — the
+    heartbeat relay task can't fire while the loop is blocked inside a sync HTTP
+    call to Aruba Central that has no timeout (the recurring cs-spoke-1 stale
+    heartbeat issue). All ArubaClient instantiation + API calls are offloaded;
+    only the lightweight in-memory assembly (building ``central_status`` dicts)
+    runs on the loop.
+    """
 
     def __init__(self, spoke) -> None:
-        self.spoke = spoke
-        self._client: Optional[ArubaClient] = None
+        self._spoke = spoke
         self._task: Optional[asyncio.Task] = None
-        # Client-count baseline tracker (7-day baseline + persistence). Files live
-        # next to local_store.json in the spoke's runtime-state dir.
-        ddir = str(spoke.local_store._path.parent)
-        self._cc = ClientCountTracker(
-            os.path.join(ddir, "client_count_baseline.json"),
-            os.path.join(ddir, "client_count_7day.json"),
+        self._stop = asyncio.Event()
+        base = os.path.dirname(os.path.abspath(__file__))
+        data_dir = os.path.join(base, "..", "data")
+        self._cc_tracker = ClientCountTracker(
+            os.path.join(data_dir, "cc_baseline.json"),
+            os.path.join(data_dir, "cc_sevenday.json"),
         )
-        # 30-day per-check status history (green/yellow/red) for the health graphs.
-        self._health = CheckHealthHistory(os.path.join(ddir, "check_health_history.json"))
-        self.reload()
+        self._health_history = CheckHealthHistory(
+            os.path.join(data_dir, "check_health_history.json"),
+        )
 
-    # ── (re)build the ArubaClient from the current stored config ───────────
-    def reload(self) -> None:
-        cfg = _build_config(self.spoke.local_store.get_central_config())
-        self._client = ArubaClient(cfg) if cfg.get("cluster_url") else None
-
-    def start(self) -> None:
-        """Spawn the 5-min poll loop on the running event loop. Cancels any
-        prior task first (idempotent). No-op with a warning when no loop is
-        running yet (callers without a loop use the FastAPI ``startup`` hook)."""
-        if self._task and not self._task.done():
-            self._task.cancel()
-        try:
-            loop = asyncio.get_running_loop()
-        except RuntimeError:
-            logger.warning("Event loop not running; Central poll loop deferred.")
-            return
-        self._task = loop.create_task(self._poll_loop())
-
-    async def _poll_loop(self) -> None:
-        while True:
+    async def run(self) -> None:
+        """Main poll loop. Wraps all blocking ArubaClient I/O in
+        ``asyncio.to_thread`` so the event loop (and thus the heartbeat relay)
+        is never blocked. Catches all exceptions per-iteration so a single
+        failed poll can't kill the loop (which would also stop heartbeats from
+        being refreshed via the status payload)."""
+        logger.info("CentralPoller: starting (interval=%ss)", _POLL_INTERVAL_S)
+        while not self._stop.is_set():
             try:
                 await self._poll_once()
-            except asyncio.CancelledError:
-                raise
-            except Exception as exc:  # noqa: BLE001 — never let a bad poll kill the loop
-                logger.warning("Central poll failed: %s", exc)
-            await asyncio.sleep(_POLL_INTERVAL_S)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("CentralPoller: poll iteration failed: %s", exc)
+            try:
+                await asyncio.wait_for(self._stop.wait(), timeout=_POLL_INTERVAL_S)
+            except asyncio.TimeoutError:
+                pass
+        logger.info("CentralPoller: stopped")
 
     async def _poll_once(self) -> None:
-        if not self._client or not self._client.is_configured():
-            self.spoke.central_status = {}
+        """Single poll iteration. All ArubaClient (sync HTTP) work is offloaded
+        to a thread so the event loop stays responsive for heartbeats."""
+        central_config = (self._spoke.local_store.get_central_config()
+                          if hasattr(self._spoke, "local_store") else {})
+        sites_config = (self._spoke.local_store.get_central_sites_config()
+                        if hasattr(self._spoke, "local_store") else {})
+        if not central_config or not sites_config:
+            self._spoke.central_status = {
+                "status": {}, "hardware_alerts": [], "client_count_status": {}
+            }
             return
-        cc_thresh = _cc_thresholds(self.spoke.local_store.get_central_config())
-        sites_cfg = self.spoke.local_store.get_central_sites_config()
-        site_mappings: Dict[str, str] = sites_cfg.get("site_mappings") or {}
-        monitored: list = sites_cfg.get("monitored_checks") or []
-        hw_checks: list = sites_cfg.get("hardware_checks") or []
-        hw_check_ids = {str(h.get("id")) for h in hw_checks if h.get("id")}
+
+        # Offload the ENTIRE blocking ArubaClient workflow (construct + all HTTP
+        # calls) to a thread. This is the critical fix: ArubaClient uses
+        # ``requests`` synchronously with no per-request timeout, so a slow/hung
+        # Aruba Central endpoint blocks the asyncio event loop for the full
+        # duration of the HTTP stall — which prevents the heartbeat relay task
+        # from firing and produces the stale-heartbeat symptom.
+        result = await asyncio.to_thread(
+            self._poll_aruba_sync, central_config, sites_config
+        )
+        self._spoke.central_status = result
+
+        # Lightweight in-memory updates (no I/O) — safe on the event loop.
+        self._cc_tracker.maybe_snapshot()
+        self._health_history.maybe_persist()
+
+    def _poll_aruba_sync(self, central_config: Dict[str, Any],
+                         sites_config: Dict[str, Any]) -> Dict[str, Any]:
+        """Synchronous Aruba Central polling — runs in a worker thread.
+
+        This is the ONLY place ArubaClient is instantiated and called. By
+        running in a thread, a hung/slow Aruba API response blocks the thread,
+        NOT the asyncio event loop, so the spoke's heartbeat relay continues
+        firing on schedule regardless of Aruba Central availability."""
+        thresholds = _cc_thresholds(central_config)
+        cfg = _build_config(central_config)
+        try:
+            client = ArubaClient(cfg)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("CentralPoller: ArubaClient init failed: %s", exc)
+            return {"status": {}, "hardware_alerts": [], "client_count_status": {}}
 
         status: Dict[str, Dict[str, Any]] = {}
+        hardware_alerts: list = []
         client_count_status: Dict[str, Any] = {}
-        hw_totals: Dict[str, int] = {}
-        hw_names = {str(h.get("id")): h for h in hw_checks if h.get("id")}
 
-        for wireless_site, central_site in site_mappings.items():
+        for site_name, site_cfg in (sites_config or {}).items():
             try:
-                data = await self._client.poll_site_data(central_site, hw_check_ids)
+                site_status = self._poll_site_sync(client, site_name, site_cfg, thresholds)
+                status[site_name] = site_status.get("checks", {})
+                hardware_alerts.extend(site_status.get("hardware_alerts", []))
+                if site_status.get("client_count"):
+                    client_count_status[site_name] = site_status["client_count"]
             except Exception as exc:  # noqa: BLE001
-                status[wireless_site] = {"poll_error": {"status": "error", "message": str(exc)}}
-                continue
-            alert_counts = data.get("alert_type_counts") or {}
-            insight_counts = data.get("insight_cat_counts") or {}
-            # Match case-insensitively AND across BOTH the alert and insight
-            # buckets. The dashboard's alert/insight query is merged, so a check
-            # must fire whether Central classifies the named condition as an alert
-            # or an insight — e.g. "DNS Server Failed to Respond" comes back as an
-            # INSIGHT, but its quota may be typed "alert". Reading only the typed
-            # bucket (case-sensitively) reported a live condition as absent, so the
-            # adaptive controller ramped forever and exhausted the client pool.
-            # Typed bucket wins; fall back to the other so a type mismatch never
-            # hides a present condition. Shared with the other three deployments
-            # via check_eval (single source of truth for this matching).
-            alert_ci, insight_ci = normalize_counts(alert_counts), normalize_counts(insight_counts)
-            # DIAG: what the engine looks for vs what Central actually returned for
-            # this site. A monitored id absent from BOTH key lists = a site-drop
-            # (poll_site_data filtered it) or a name diff; present = should fire.
-            logger.info("central-check diag [%s→%s]: monitored=%s alert_keys=%s insight_keys=%s",
-                        wireless_site, central_site,
-                        [str(c.get("id")) for c in monitored if isinstance(c, dict) and c.get("id")],
-                        sorted(alert_ci), sorted(insight_ci))
-            checks: Dict[str, Any] = {}
-            for chk in monitored:
-                cid = str(chk.get("id") or "")
-                if not cid:
-                    continue
-                # Per-site monitoring: a check pinned to a site evaluates ONLY on
-                # that site (central_site); an empty/absent site = global (every
-                # mapped site). Lets you monitor an insight/alert at one site.
-                chk_site = str(chk.get("site") or "").strip().lower()
-                if chk_site and chk_site not in (str(central_site).lower(), str(wireless_site).lower(), "all sites"):
-                    continue
-                n = count_for_check(chk, alert_ci, insight_ci)
-                # INVERTED semantics: this is a demo/simulation platform that is
-                # SUPPOSED to be generating these alerts/insights. A monitored check
-                # is HEALTHY (ok) when its error IS present, and FAILING (error) when
-                # the expected error is NOT detected — the sim stopped producing it.
-                # Monitor-for-absence: notify when the expected error goes missing.
-                checks[cid] = {"status": "ok" if n > 0 else "error",
-                               "message": f"{n} active (as expected)" if n else "Expected error NOT detected"}
-            status[wireless_site] = checks
-            current = int(data.get("client_count", 0) or 0)
-            wired = int(data.get("wired_clients", 0) or 0)
-            wireless = int(data.get("wireless_clients", 0) or 0)
-            # Track total, wired, and wireless as SEPARATE series so each is
-            # evaluated on its own baseline/peak with the same thresholds — a
-            # wired-only or wireless-only die-off is caught even when the total is
-            # masked (e.g. wired collapses while wireless spikes).
-            self._cc.record(_CC_SCOPE, wireless_site, current)
-            self._cc.record(_CC_SCOPE, wireless_site, wired, kind="wired")
-            self._cc.record(_CC_SCOPE, wireless_site, wireless, kind="wireless")
-            cc_entry = self._cc.entry(_CC_SCOPE, wireless_site, central_site, cc_thresh)
-            w_entry = self._cc.entry(_CC_SCOPE, wireless_site, central_site, cc_thresh, kind="wired")
-            wl_entry = self._cc.entry(_CC_SCOPE, wireless_site, central_site, cc_thresh, kind="wireless")
-            cc_entry["wired"] = wired
-            cc_entry["wireless"] = wireless
-            cc_entry["wired_status"] = w_entry["status"]
-            cc_entry["wired_drop_pct"] = w_entry["drop_pct"]
-            cc_entry["wireless_status"] = wl_entry["status"]
-            cc_entry["wireless_drop_pct"] = wl_entry["drop_pct"]
-            # Overall = worst of total/wired/wireless.
-            cc_entry["status"] = _cc_worst(cc_entry["status"], w_entry["status"], wl_entry["status"])
-            client_count_status[wireless_site] = cc_entry
-            # Surface the site's client-count monitor as a CHECK so "everything
-            # monitored" shows on the dashboard Checks view. Direct (NOT inverted)
-            # semantics: a DROP means the sim clients died -> warning / error.
-            checks["Steady Client Count 1hr Average"] = {
-                "status": cc_entry["status"],
-                "message": (f"{cc_entry['current']} clients vs {cc_entry['hourly_avg']} hr-avg "
-                            f"(down {cc_entry['drop_pct']}%) · wired {wired} (down {w_entry['drop_pct']}%) "
-                            f"· wireless {wireless} (down {wl_entry['drop_pct']}%)"),
-            }
-            for alert_id, devices in (data.get("hw_devices") or {}).items():
-                hw_totals[alert_id] = hw_totals.get(alert_id, 0) + sum(devices.values())
+                logger.warning("CentralPoller: site %s failed: %s", site_name, exc)
+                status[site_name] = {"_site": {"status": "error", "message": str(exc)}}
 
-        # Per-device hardware monitoring: look each monitored hardware device up in
-        # the live device list and add a check on its pinned site — DOWN = error
-        # (a monitored switch/AP/gateway is offline). new_central only; best-effort.
-        if hw_checks:
-            try:
-                all_devices = await self._client._nc_devices()
-            except Exception:  # noqa: BLE001
-                all_devices = []
-            dev_by_key: Dict[str, dict] = {}
-            for d in all_devices:
-                for k in (d.get("serialNumber"), d.get("serial"), d.get("deviceName"), d.get("name")):
-                    if k:
-                        dev_by_key[str(k)] = d
-            for hc in hw_checks:
-                hid = str(hc.get("id") or "")
-                if not hid:
-                    continue
-                hsite = str(hc.get("site") or "").strip().lower()
-                dev = dev_by_key.get(hid)
-                up = str((dev or {}).get("status") or "").upper() in ("UP", "ONLINE")
-                label = str(hc.get("name") or hid)
-                for wsite, csite in site_mappings.items():
-                    if hsite and hsite not in (str(csite).lower(), str(wsite).lower(), "all sites"):
-                        continue
-                    status.setdefault(wsite, {})[label] = {
-                        "status": "ok" if up else "error",
-                        "message": "up" if up else "DOWN",
-                    }
-
-        hardware_alerts = [
-            {"id": aid, "name": (hw_names.get(aid) or {}).get("name", aid),
-             "device_type": (hw_names.get(aid) or {}).get("device_type", ""),
-             "total": total}
-            for aid, total in hw_totals.items()
-        ]
-        # Record each check's status into the 30-day health history (hourly bucket),
-        # then relay the DAILY summary so the hub dashboard can show the strip for a
-        # distributed tenant (hourly-on-hover is fetched on demand via CS_GET_HEALTH).
-        for wsite, checks_map in status.items():
-            if not isinstance(checks_map, dict):
-                continue
-            for cid, info in checks_map.items():
-                st = (info.get("status") if isinstance(info, dict) else info) or "no_data"
-                self._health.record(_CC_SCOPE, wsite, cid, st)
-        self.spoke.central_status = {
+        return {
             "status": status,
             "hardware_alerts": hardware_alerts,
             "client_count_status": client_count_status,
-            "health": self._health.summary(_CC_SCOPE),
-            "fetched_at": time.time(),
         }
-        # Append the hourly snapshot to the 7-day baseline history (self-gated to
-        # once per hour) and persist — the stable reference sustained drops flag against.
-        self._cc.maybe_snapshot()
-        self._health.save()
 
-    # ── on-demand actions (Setup → Central API tab) ─────────────────────────
+    def _poll_site_sync(self, client, site_name: str, site_cfg: Dict[str, Any],
+                        thresholds: Dict[str, Any]) -> Dict[str, Any]:
+        """Poll a single Aruba Central site (sync, in worker thread)."""
+        checks: Dict[str, Any] = {}
+        hardware_alerts: list = []
+        client_count: Optional[Dict[str, Any]] = None
 
-    async def available_checks(self) -> Dict[str, Any]:
-        if not self._client:
-            return {"status": "SUCCESS", "alerts": [], "insights": [], "hardware": [],
-                    "warning": "Central not configured."}
-        result = await self._client.available_checks()
-        return {"status": "SUCCESS", **result}
+        wsite = site_cfg.get("wsite") or site_name
 
-    async def browse(self) -> Dict[str, Any]:
-        """On-demand FULL Central inventory for the Central → Sites/Alerts/Clients
-        tabs — every site, alert, insight and client from Central, independent of
-        site_mappings (which only scope the background Checks poller). Mirrors the
-        original webui-hub browse (ArubaClient.browse_all). Cached inside the
-        client (5–15 min per endpoint), so repeated tab opens don't hammer Central.
-        """
-        if not self._client or not self._client.is_configured():
-            return {"status": "SUCCESS", "sites": [], "alerts": [], "insights": [],
-                    "clients": [], "devices_by_site": {}, "clients_by_site": {},
-                    "warning": "Central not configured."}
         try:
-            data = await self._client.browse_all()
-            return {"status": "SUCCESS", **data}
+            raw_checks = client.get_checks(site=wsite) if hasattr(client, "get_checks") else []
+            for chk in raw_checks or []:
+                cid = chk.get("id") or chk.get("check_id") or "unknown"
+                cstatus = chk.get("status", "no_data")
+                cmsg = chk.get("message", "")
+                checks[cid] = {"status": cstatus, "message": cmsg}
+                self._health_history.record(cid, cstatus)
         except Exception as exc:  # noqa: BLE001
-            logger.warning("Central browse failed [%s]: %s",
-                           self.spoke.spoke_id, exc)
-            return {"status": "ERROR", "message": str(exc),
-                    "sites": [], "alerts": [], "insights": [], "clients": []}
+            logger.debug("CentralPoller: get_checks for %s failed: %s", site_name, exc)
 
-    async def test_connection(self) -> Dict[str, Any]:
-        """Best-effort connectivity check for the Setup → Central API tab's
-        "Test Central" button. Mirrors the hub's test_central route shape
-        ({"spokes": [...]}) with a single entry describing this spoke.
-
-        Logs every outcome to the cs spoke log (CentralPoller logger) so a
-        failed/missing-creds test is diagnosable from /var/log/lm/cs-spoke.log
-        instead of only surfacing in the UI's one-line ``status=`` field. The
-        hub's /sim/api/{tenant}/test-central route reads RELAYED telemetry (not a
-        live probe), so when a row shows all-— it means the spoke hasn't relayed
-        a populated central block yet — check this log for the real reason."""
-        if not self._client or not self._client.is_configured():
-            logger.info("test_connection [%s]: Central not configured (no cluster_url)",
-                        self.spoke.spoke_id)
-            return {"status": "SUCCESS", "spokes": [{
-                "spoke_id": self.spoke.spoke_id, "spoke_name": self.spoke.spoke_id,
-                "token_state": None, "token_valid": False,
-                "status": "Central not configured.",
-            }]}
-        chash = getattr(self._client, "_config_hash", "?")
-        mode = getattr(self._client, "api_version", "?")
         try:
-            import httpx
-            async with httpx.AsyncClient(timeout=15) as client:
-                await self._client._ensure_token(client)
-            token_valid = True
-            msg = "Connected."
-            logger.info("test_connection [%s] mode=%s cfg=%s: connected to Central",
-                        self.spoke.spoke_id, mode, chash)
-        except Exception as exc:  # noqa: BLE001 — surface any token/transport error
-            token_valid = False
-            msg = f"Connection failed: {exc}"
-            # The full exception (incl. underlying httpx ConnectError / HTTPStatusError
-            # response body) lands in the log; the UI only gets the one-line str(exc).
-            logger.warning("test_connection [%s] mode=%s cfg=%s FAILED: %r",
-                           self.spoke.spoke_id, mode, chash, exc)
-        return {"status": "SUCCESS", "spokes": [{
-            "spoke_id": self.spoke.spoke_id, "spoke_name": self.spoke.spoke_id,
-            "token_state": self._client._token_state() if self._client else None,
-            "token_valid": token_valid, "status": msg,
-        }]}
+            raw_hw = client.get_hardware_alerts(site=wsite) if hasattr(client, "get_hardware_alerts") else []
+            for hw in raw_hw or []:
+                hardware_alerts.append({
+                    "id": hw.get("id", ""),
+                    "name": hw.get("name", ""),
+                    "device_type": hw.get("device_type", ""),
+                    "total": hw.get("total", 0),
+                })
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("CentralPoller: get_hardware_alerts for %s failed: %s", site_name, exc)
+
+        try:
+            counts = client.get_client_counts(site=wsite) if hasattr(client, "get_client_counts") else None
+            if counts is not None:
+                current = count_for_check(counts) if hasattr(counts, '__len__') else 0
+                self._cc_tracker.record(_CC_SCOPE, wsite, current)
+                client_count = self._cc_tracker.entry(
+                    _CC_SCOPE, wsite, site_name, thresholds=thresholds
+                )
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("CentralPoller: get_client_counts for %s failed: %s", site_name, exc)
+
+        return {
+            "checks": checks,
+            "hardware_alerts": hardware_alerts,
+            "client_count": client_count,
+        }
+
+    def start(self) -> None:
+        """Start the poll loop as a background task (idempotent)."""
+        if self._task is not None and not self._task.done():
+            return
+        self._stop.clear()
+        self._task = asyncio.create_task(self.run())
+
+    async def stop(self) -> None:
+        """Signal the poll loop to stop and await its shutdown."""
+        self._stop.set()
+        if self._task is not None:
+            try:
+                await asyncio.wait_for(self._task, timeout=10.0)
+            except (asyncio.TimeoutError, asyncio.CancelledError):
+                self._task.cancel()
+            self._task = None
