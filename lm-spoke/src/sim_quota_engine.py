@@ -599,9 +599,15 @@ class SimQuotaEngine:
         * a SHAREABLE quota (``multi`` True) may stack onto presence / traffic /
           other shareable sims, but NEVER onto a client an EXCLUSIVE sim
           monopolizes (e.g. ssidpw_fail — the client can't even associate);
-        * an EXCLUSIVE quota (``multi`` False) monopolizes its client, so it only
-          takes a client running NO other sim (a presence-homed client qualifies
-          — presence runs no sim).
+        * an EXCLUSIVE quota (``multi`` False) monopolizes its client. It may
+          DISPLACE bucket-default ambient/multi traffic (www_traffic/iperf/… the
+          exclusive sim dominates — a client that e.g. can't even associate isn't
+          doing that traffic anyway), but never steals a client the ENGINE already
+          packed under another quota, nor one running a bucket-default EXCLUSIVE
+          sim. A presence-homed client qualifies (presence runs no sim). Blocking
+          on displaceable bucket traffic used to starve exclusive quotas in HUB
+          mode — every bucket runs traffic sims, so the whole pool looked "busy"
+          and WPA/Max-Assoc-style quotas sat at 0/N with no eligible client.
         """
         if hostname in assigned:
             return False
@@ -615,8 +621,15 @@ class SimQuotaEngine:
             return False
         if multi:
             return not self._exclusive_running(hostname, c)
-        active = self._client_active_sims(c) | self._engine_sims_for(hostname)
-        return not (active - {sim_id})
+        # EXCLUSIVE: never steal a client the engine already packed under ANOTHER
+        # quota (multi or exclusive) — that would break its contribution there.
+        if self._engine_sims_for(hostname):
+            return False
+        # Otherwise take it as long as it isn't running a bucket-default EXCLUSIVE
+        # sim; a client running only displaceable bucket-default multi/traffic is
+        # fair game (the exclusive sim dominates once assigned).
+        excl_bucket = {s for s in self._client_active_sims(c) if not self._sim_multi(s)}
+        return not (excl_bucket - {sim_id})
 
     # ── assign / release ─────────────────────────────────────────────────────
     async def _assign(self, hostname: str, sim_id: str, site: str,
