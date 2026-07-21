@@ -472,6 +472,11 @@ class CSControlPlane(AgentHostingControlPlane):
             for q in payload.get("command_queue") or []:
                 q = q or {}
                 parts.append(("q", q.get("id") or q.get("cs_cmd_id"), q.get("status")))
+            # Per-site pool counts drive hub-side per-site quota apportionment —
+            # a shift in which sites a spoke serves must force a send so the hub
+            # re-apportions on the next push, not at the next heartbeat.
+            parts.append(("pool", tuple(sorted(
+                (str(k), str(v)) for k, v in (payload.get("pool_by_site") or {}).items()))))
             parts.append(("drain", bool(payload.get("draining"))))
             return hashlib.sha1(json.dumps(parts, sort_keys=True, default=str).encode()).hexdigest()
         except Exception:
@@ -592,6 +597,20 @@ class CSControlPlane(AgentHostingControlPlane):
                         payload["qt_state"] = getattr(_eng, "_qt_telemetry", {}) or {}
                     except Exception as e:  # noqa: BLE001
                         logger.debug("qt_state telemetry overlay failed: %s", e)
+                # Quota-engine per-site pool → telemetry so the hub can apportion
+                # a site-scoped quota ONLY across spokes that actually hold
+                # clients for that site (per-site apportionment), instead of
+                # every bound cs spoke. The engine computes pool_counts() each
+                # reconcile anyway; surfacing by_site here lets the hub's push
+                # path read it from the CS_TELEMETRY cache with NO synchronous
+                # CS_GET_SIM_QUOTA_STATE forward per push. Best-effort: never
+                # break telemetry over a pool read.
+                _qe = getattr(cs_mod, "sim_quota_engine", None)
+                if _qe is not None:
+                    try:
+                        payload["pool_by_site"] = ((_qe.pool_counts() or {}).get("by_site") or {})
+                    except Exception as e:  # noqa: BLE001
+                        logger.debug("pool_by_site telemetry overlay failed: %s", e)
                 # Draining flag: True while a self-update is running (git pull +
                 # about to os._exit+relaunch). The hub reads this and, while set,
                 # queues CS_CONFIG_UPDATE (and other request/reply) pushes to the
