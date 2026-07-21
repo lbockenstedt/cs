@@ -47,7 +47,8 @@ from fastapi import (
 from fastapi.staticfiles import StaticFiles
 # Response classes are canonically starlette's; fastapi re-exports them in newer
 # versions but not all, so import from the source for cross-version safety.
-from starlette.responses import FileResponse, JSONResponse, PlainTextResponse
+from starlette.responses import (FileResponse, HTMLResponse, JSONResponse,
+                                 PlainTextResponse)
 
 import sim_config
 import resource_pressure
@@ -671,7 +672,20 @@ def build_client_api_app(spoke) -> FastAPI:
         app.mount("/static", StaticFiles(directory=str(_STATIC_DIR)), name="static")
 
         @app.get("/")
-        async def dashboard() -> FileResponse:
-            return FileResponse(str(_STATIC_DIR / "dashboard.html"))
+        async def dashboard() -> HTMLResponse:
+            # Serve dashboard.html with a cache-busting version stamped into the
+            # sim-views.js <script src>. Without it the un-versioned
+            # /static/sim-views.js is held by the browser cache, so a JS change
+            # (e.g. a new Config child renderer) yields a stale JS + fresh HTML
+            # mismatch → "ReferenceError: csRenderX is not defined" until a manual
+            # cache clear. The version = sim-views.js mtime, so it changes on every
+            # repo pull that updates the file. Mirrors the hub's
+            # index.html ?v=__WEBUI_VERSION__ scheme.
+            html = (_STATIC_DIR / "dashboard.html").read_text(encoding="utf-8")
+            try:
+                ver = str(int((_STATIC_DIR / "sim-views.js").stat().st_mtime))
+            except OSError:
+                ver = "0"
+            return HTMLResponse(html.replace("__CS_VERSION__", ver))
 
     return app
