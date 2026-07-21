@@ -59,26 +59,33 @@ detect_eth_adapter() {
 }
 
 # Detect the ACTIVE PHY type dynamically — NOT from simulation.conf's sim_phy
-# (which is the configured INTENT). Picks the interface carrying the default
-# route (the box's actual uplink), falling back to the first carrier-up non-lo
-# iface, and classifies it:
+# (which is the configured INTENT). Classifies ONLY the interface that owns the
+# DEFAULT ROUTE (the box's real uplink, the one with a gateway):
 #   wireless  → the negotiated 802.11 standard (ac/ax/n/g) via `iw dev link`
 #               (VHT=ac, HE=ax, HT=n; legacy rates → g), else just "wireless"
 #   ethernet  → "ethernet"
 #   other     → the driver iface prefix (e.g. "br", "ppp")
+# The backend/management API NIC gets an IP but NO default gateway (often a
+# 169.254 link-local), so it is NEVER selected — that gateway-less NIC being
+# grabbed by the old "first carrier-up iface" fallback (while wifi was still
+# associating) was the "PHY shows ethernet for a few cycles then corrects"
+# symptom. No default route yet → stay "unknown"; never guess "ethernet".
 # Sets $phy_type. Best-effort + offline-tolerant (no network I/O — `iw`/`ip`
 # read kernel/netlink state). Used by dashboard.sh so the PHY row reflects what
 # is actually connected, not the config's choice.
 detect_phy_type() {
   phy_type="unknown"
-  local iface=""
+  local iface base
   iface=$(ip route show default 2>/dev/null \
     | awk '/default/{for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}')
-  if [[ -z "$iface" ]]; then
-    iface=$(ip -br a 2>/dev/null | awk '$1!="lo" && $2 ~ /UP/ {print $1; exit}')
-  fi
   [[ -z "$iface" ]] && return 0
-  local base="${iface%%@*}"
+  # Belt-and-suspenders: never classify off a link-local-only (169.254 APIPA)
+  # interface — a NIC that never got a real DHCP lease. (A gateway-less iface
+  # can't hold a default route, so this only guards a pathological route.)
+  if ! ip -4 -o addr show dev "$iface" 2>/dev/null | grep 'inet ' | grep -qv '169\.254\.'; then
+    return 0
+  fi
+  base="${iface%%@*}"
   case "$base" in
     wl*)  phy_type="wireless"; _detect_wifi_std "$iface" ;;
     en*|eth*) phy_type="ethernet" ;;
