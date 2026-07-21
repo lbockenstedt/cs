@@ -1,5 +1,5 @@
 #!/bin/bash
-version=1.4
+version=1.5
 LOG_FILE=/usr/local/scripts/sim.log
 
 echo $(date) | tee -a ${LOG_FILE}
@@ -480,7 +480,7 @@ report_status() {
   # (its heartbeat rides a separate backend network, so absence here ≠ offline).
   sim_ip=$(ip -4 -o route get 1.1.1.1 2>/dev/null | grep -oP 'src \K\S+' | head -n1)
   [[ "${gateway_reachable:-}" == "true" ]] && gateway_json=true
-  for sim in dns_fail iperf download www_traffic ping_test ssidpw_fail auth_fail dhcp_fail collab; do
+  for sim in dns_fail assoc_fail port_flap iperf download www_traffic ping_test ssidpw_fail auth_fail dhcp_fail collab; do
     if [[ "${!sim}" == "on" ]]; then
       [[ $first == true ]] && first=false || active_simulations+=","
       active_simulations+="\"$sim\""

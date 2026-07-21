@@ -1445,8 +1445,6 @@ function csSimBtnClass(on, isOverride) {
 }
 
 function csClientSimBar(c, host) {
-    const active = new Set((Array.isArray(c.active_simulations) ? c.active_simulations : [])
-        .map(s => String(s).toLowerCase()));
     const cfg = c.effective_config || c.config || {};
     const ov = c.overrides || {};
     // A per-client override WINS (so a set override reflects + stays across
@@ -1460,12 +1458,21 @@ function csClientSimBar(c, host) {
     // (the pruned-override object only carries REAL deviations from the bucket,
     // so this is the signal to render border-only purple).
     const isOv = f => Object.prototype.hasOwnProperty.call(ov, f);
+    // "Running now" = active_simulations (what the client is actually executing
+    // this cycle). In hub/engine mode ambient + quota sims are runtime-only and
+    // never land in the config, so the config-based on-state shows them OFF —
+    // surface a distinct pulsing-dot + emerald ring for what's live without
+    // changing the enabled=resolved-config button semantics.
+    const runSet = new Set((Array.isArray(c.active_simulations) ? c.active_simulations : [])
+        .map(s => String(s).toLowerCase()));
     const btns = CS_CONTROL_FLAGS.map(f => {
         const on = isOn(f);
         const ovFlag = isOv(f);
-        return `<button data-cs-sim-host="${csEscape(host)}" data-cs-sim-flag="${csEscape(f)}" data-cs-sim-on="${on ? '1' : '0'}" data-cs-sim-ov="${ovFlag ? '1' : '0'}"
-          onclick="csSimToggle(this)" title="${ovFlag ? 'Override' : 'Bucket'}: ${csEscape(f)} ${on ? 'on' : 'off'} on ${csEscape(host)} — click to ${on ? 'disable' : 'enable'}"
-          class="${csSimBtnClass(on, ovFlag)}">${csEscape(f)}</button>`;
+        const run = runSet.has(String(f).toLowerCase());
+        const runDot = run ? '<span class="inline-block w-1.5 h-1.5 rounded-full bg-emerald-500 animate-pulse mr-1 align-middle" title="running now"></span>' : '';
+        return `<button data-cs-sim-host="${csEscape(host)}" data-cs-sim-flag="${csEscape(f)}" data-cs-sim-on="${on ? '1' : '0'}" data-cs-sim-ov="${ovFlag ? '1' : '0'}" data-cs-sim-running="${run ? '1' : '0'}"
+          onclick="csSimToggle(this)" title="${ovFlag ? 'Override' : 'Bucket'}: ${csEscape(f)} ${on ? 'on' : 'off'} on ${csEscape(host)}${run ? ' · RUNNING now' : ''} — click to ${on ? 'disable' : 'enable'}"
+          class="${csSimBtnClass(on, ovFlag)}${run ? ' ring-2 ring-emerald-400' : ''}">${runDot}${csEscape(f)}</button>`;
     }).join('');
     return `<div class="flex flex-wrap items-center gap-1.5">
       ${btns}
