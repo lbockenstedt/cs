@@ -1252,31 +1252,59 @@ pkill -f 'firefox-esr.*--headless' || true
 # box still tries to patch each cycle. No-ops if it already ran.
 #------------------------------------------------------------
 _run_apt_once
-if [[ "$allow_offline" == "yes" ]]; then
-  #------------------------------------------------------------
-  #Bringing all interfaces down to make it look like the device is offline.
-  #Otherwise they get triggered as IOT since they are always connected.
-  #------------------------------------------------------------
-  echo Bringing all interfaces down | tee -a ${LOG_FILE}
-  if [[ -n ${wladapter} ]]; then sudo ip link set dev $wladapter down; fi
-  if [[ -n ${eadapter} ]]; then sudo ip link set dev $eadapter down; fi
-  echo Sleeping for $rn_offline_time seconds \(interruptible by update signal\)
-  echo ------------------------------| tee -a ${LOG_FILE}
-  #------------------------------------------------------------
-  #Sleep for up to 4 hours to show the device left. Interruptible: a USR1 from
-  #agent.sh (restart_sim / kill_switch) kills this sleep early so a pushed
-  #config change / repurpose lands immediately instead of after the offline
-  #window — the interfaces come back up below and the outer loop re-reads config.
-  #------------------------------------------------------------
-  _isleep "$rn_offline_time"
-  #------------------------------------------------------------
-  #Bringing all interfaces back up to call home/update scripts
-  #------------------------------------------------------------
-  echo Bringing all interfaces online | tee -a ${LOG_FILE}
-  if [[ -n ${eadapter} ]]; then sudo ip link set dev $eadapter up; fi
-  if [[ -n ${wladapter} ]]; then sudo ip link set dev $wladapter up; fi
-  echo ------------------------------| tee -a ${LOG_FILE}
-fi
+#------------------------------------------------------------
+#DISABLED 2026-07-21 — allow_offline offline-window block commented out intact
+#to isolate it as the cause of clients disconnecting from the network too often.
+#This was the only place the loop deliberately takes BOTH adapters link-down
+#(up to a 4h _isleep) after the sim cycle. Restore by removing the '# ' prefixes
+#on the lines below (the helper, the if/fi, and every body line) when confirmed.
+#
+# QUEUED FEATURE (also commented out, activate with the block above): when the
+# hub engine is actively controlling a SPECIFIC simulation for this client, the
+# client is NOT allowed to go offline — a link-down blackout of up to 4h would
+# silence the sim and stop the insight/alert it exists to fire. "Engine
+# controlling a specific sim" = a [username] override has turned ON one of the
+# engine-owned failure sims (dhcp_fail/dns_fail/assoc_fail/port_flap/
+# ssidpw_fail/auth_fail). Ambient traffic (ping/download/iperf/www) is a local
+# roll, NOT per-client engine control, so it does NOT block offline.
+# Connectivity pinning (wsite/ssid/ssidpw) is intentionally excluded too — every
+# hub-mode client has it, so including it would disable the offline feature
+# entirely. Activate by uncommenting _engine_driving_sim + the && ! gate below.
+#------------------------------------------------------------
+#_engine_driving_sim() {
+#  [[ "${dhcp_fail:-off}" == "on" || "${dns_fail:-off}" == "on" || \
+#     "${assoc_fail:-off}" == "on" || "${port_flap:-off}" == "on" || \
+#     "${ssidpw_fail:-off}" == "on" || "${auth_fail:-off}" == "on" ]]
+#}
+#------------------------------------------------------------
+#if [[ "$allow_offline" == "yes" ]] && ! _engine_driving_sim; then
+#  #------------------------------------------------------------
+#  #Bringing all interfaces down to make it look like the device is offline.
+#  #Otherwise they get triggered as IOT since they are always connected.
+#  #------------------------------------------------------------
+#  echo Bringing all interfaces down | tee -a ${LOG_FILE}
+#  if [[ -n ${wladapter} ]]; then sudo ip link set dev $wladapter down; fi
+#  # mgmt guard (#3): never take the eth adapter down if it's carrying a
+#  # 169.253.* mgmt IP — that would strand the box for the whole offline
+#  # window. Matches the ea_down() guard used at the pre-sim disable step.
+#  if [[ -n ${eadapter} ]] && ! ea_is_mgmt; then sudo ip link set dev $eadapter down; fi
+#  echo Sleeping for $rn_offline_time seconds \(interruptible by update signal\)
+#  echo ------------------------------| tee -a ${LOG_FILE}
+#  #------------------------------------------------------------
+#  #Sleep for up to 4 hours to show the device left. Interruptible: a USR1 from
+#  #agent.sh (restart_sim / kill_switch) kills this sleep early so a pushed
+#  #config change / repurpose lands immediately instead of after the offline
+#  #window — the interfaces come back up below and the outer loop re-reads config.
+#  #------------------------------------------------------------
+#  _isleep "$rn_offline_time"
+#  #------------------------------------------------------------
+#  #Bringing all interfaces back up to call home/update scripts
+#  #------------------------------------------------------------
+#  echo Bringing all interfaces online | tee -a ${LOG_FILE}
+#  if [[ -n ${eadapter} ]]; then sudo ip link set dev $eadapter up; fi
+#  if [[ -n ${wladapter} ]]; then sudo ip link set dev $wladapter up; fi
+#  echo ------------------------------| tee -a ${LOG_FILE}
+#fi
 #------------------------------------------------------------
 #Looping Script
 #------------------------------------------------------------
