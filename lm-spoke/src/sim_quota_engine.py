@@ -847,6 +847,7 @@ class SimQuotaEngine:
             })
 
         for site, srules in by_site.items():
+            await asyncio.sleep(0)  # yield per site — the weighted spread scales to 1000s of clients
             # Spare = online clients physically here (RF chamber) OR assignable
             # (tenant-pool), that no harvest quota already claimed this sweep.
             spare = [h for h in online
@@ -876,12 +877,16 @@ class SimQuotaEngine:
             # Hand out the spare clients per allocation (order is arbitrary — these
             # are random clients; no stickiness needed).
             i = 0
+            placed = 0
             for r in srules:
                 take = alloc.get(r["name"], 0)
                 for h in spare[i:i + take]:
                     await self._place(h, r["cell"])
                     self._claimed_site[h] = site
                     actions["assigned"] += 1
+                    placed += 1
+                    if placed % 200 == 0:
+                        await asyncio.sleep(0)  # keep the loop responsive at 1000s of clients
                 i += take
 
     # ── reconcile ────────────────────────────────────────────────────────────
@@ -960,6 +965,10 @@ class SimQuotaEngine:
             # _diag_reason + quota_diagnostics().
             self._quota_diag: Dict[str, Any] = {}
             for q in quotas:
+                # Yield each quota so a large sweep can't monopolize the event loop
+                # and starve the WS keepalive (a >5s block drops the hub link with
+                # 1011 keepalive ping timeout → flap).
+                await asyncio.sleep(0)
                 key = _quota_key(q)
                 sim_id = q.get("sim_id") or ""
                 multi = bool(q.get("multi_capable"))
@@ -1128,7 +1137,11 @@ class SimQuotaEngine:
                 # State so "underfilled 0/N" is self-explaining instead of opaque.
                 blocked: Dict[str, int] = {}
                 eligible_free = not_harvestable = 0
+                _seen = 0
                 for h, c in clients.items():
+                    _seen += 1
+                    if _seen % 250 == 0:
+                        await asyncio.sleep(0)  # this pass is O(clients) PER quota — yield at 1000s scale
                     if h in assigned:
                         continue
                     if not self._is_harvestable(c, now):
@@ -1178,13 +1191,22 @@ class SimQuotaEngine:
             await self._reconcile_engine_keys(clients)
             await self._reconcile_prune_defaults(clients)
 
-            self._save_ledger()
+            await asyncio.to_thread(self._save_ledger)
             if any(actions.values()):
                 logger.info("SimQuotaEngine reconcile: %s", actions)
             # Dongle-quarantine detection runs at the tail of each sweep (after
             # the ledger/overrides are settled). Synchronous analysis; sheds are
             # fired as background tasks. Populates _qt_telemetry for the relay.
             self._quarantine_sweep(now)
+            # Diagnostic: with the cooperative yields above a large sweep no longer
+            # BLOCKS the loop, but wall-clock can still grow with fleet size — log
+            # it so an operator can correlate sweep cost with scale (and confirm the
+            # sweep is no longer the source of a >5s keepalive stall).
+            _swept = time.time() - now
+            if _swept > 3.0:
+                logger.info("SimQuotaEngine reconcile: swept %d quota(s) / %d client(s) "
+                            "in %.1fs (cooperatively yielded — non-blocking)",
+                            len(quotas), len(clients), _swept)
             return actions
 
     async def reset(self) -> Dict[str, Any]:
@@ -1201,7 +1223,7 @@ class SimQuotaEngine:
             # removes it (reverting clients to their bucket defaults).
             await self._reconcile_engine_keys(clients)
             await self._reconcile_prune_defaults(clients)
-            self._save_ledger()
+            await asyncio.to_thread(self._save_ledger)
             logger.info("SimQuotaEngine: ledger reset — re-shuffling from scratch")
         return await self.reconcile()
 
