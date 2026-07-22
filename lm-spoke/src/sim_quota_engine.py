@@ -1007,6 +1007,12 @@ class SimQuotaEngine:
                 # so `or {}` would rebind to a fresh dict and mutations wouldn't
                 # land in the ledger).
                 assigned = entry.setdefault("clients", {})
+                # STICKINESS: the clients this quota held entering the sweep. The
+                # top-up prefers these so, when the eligible pool > target, the SAME
+                # clients stay assigned instead of the set reshuffling every sweep
+                # (the observed assign/release thrash — amplified by sim clients
+                # flapping their WS and by shareable⇄exclusive contention).
+                _prev_holders = set(assigned)
 
                 # Walk the ledger: keep eligible clients, drop ineligible ones.
                 # An offline client is NOT released outright — the sim keeps
@@ -1094,6 +1100,10 @@ class SimQuotaEngine:
                                and (not scope_site or self._effective_site(h, c) == scope_site
                                     or h in homed_here
                                     or (self._is_tenant_pool_client(h) and self._site_ok_for(h, scope_site)))]
+                    # Sticky: pick clients this quota already held first, so a
+                    # sweep with spare eligibles keeps the current set instead of
+                    # swapping in a fresh subset (stops the oscillation).
+                    in_site.sort(key=lambda h: h not in _prev_holders)
                     picks = in_site[:need]
                     if q.get("rehome") and len(picks) < need:
                         # Cross-site fallback: any other-site eligible runner.
@@ -1110,6 +1120,7 @@ class SimQuotaEngine:
                                  and self._cell_ok_for(h, claim_key)
                                  and self._site_ok_for(h, scope_site)
                                  and (not scope_site or self._effective_site(h, c) != scope_site)]
+                        cross.sort(key=lambda h: h not in _prev_holders)  # sticky here too
                         picks += cross[:need - len(picks)]
                     for h in picks:
                         await self._assign(h, sim_id, scope_site, cell=cell)
