@@ -57,6 +57,16 @@ OFFLINE_TTL_S = 3600.0           # keep an offline runner this long before
                                  # the VM through a WS blip; release only a
                                  # truly-gone client so it can rejoin the pool).
 RECONCILE_INTERVAL_S = 60.0      # periodic self-heal sweep
+# Trailing-edge debounce for event-driven reconciles (trigger()). A burst of sim
+# clients connecting/disconnecting used to fire a full O(quotas×clients) reconcile
+# PER event — a reconcile storm (many sweeps/second) that pegged the loop and
+# spammed assign/release churn. Coalesce a burst into ONE sweep this long after the
+# LAST trigger. Env-overridable.
+try:
+    import os as _os
+    RECONCILE_DEBOUNCE_S = max(0.2, float(_os.environ.get("LM_SIM_RECONCILE_DEBOUNCE_S", "1.5")))
+except Exception:  # noqa: BLE001
+    RECONCILE_DEBOUNCE_S = 1.5
 
 # ── Dongle-quarantine (Chunk 3) ─────────────────────────────────────────────
 # A T2 (USB-dongle) client that NEVER connected (no SSID / no IP) within the
@@ -1304,11 +1314,33 @@ class SimQuotaEngine:
             await asyncio.sleep(RECONCILE_INTERVAL_S)
 
     def trigger(self) -> None:
-        """Immediate best-effort reconcile (on effective-quota push)."""
+        """Debounced best-effort reconcile (effective-quota push, sim-config change,
+        or a sim client connecting/disconnecting). Trailing-edge: each call resets a
+        short timer and the sweep runs once RECONCILE_DEBOUNCE_S after the LAST
+        trigger — so a burst of client WS churn coalesces into ONE reconcile instead
+        of a storm of full sweeps (which pegged the loop + thrashed assign/release).
+        The 60s periodic loop is the backstop if a burst never quiets."""
         try:
-            asyncio.create_task(self.reconcile(), name="sim-quota-reconcile-now")
+            loop = asyncio.get_running_loop()
         except RuntimeError:
-            pass  # no running loop yet — the periodic loop will catch it
+            return  # no running loop yet — the periodic loop will catch it
+        t = getattr(self, "_debounce_task", None)
+        if t is not None and not t.done():
+            t.cancel()   # reset the timer — coalesce this burst into the pending sweep
+        self._debounce_task = loop.create_task(
+            self._debounced_reconcile(), name="sim-quota-reconcile-debounced")
+
+    async def _debounced_reconcile(self) -> None:
+        try:
+            await asyncio.sleep(RECONCILE_DEBOUNCE_S)
+        except asyncio.CancelledError:
+            return  # superseded by a newer trigger within the debounce window
+        try:
+            await self.reconcile()
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:  # noqa: BLE001 — a sweep must not kill the trigger path
+            logger.warning("SimQuotaEngine debounced reconcile failed: %s", e)
 
     # ── introspection (for the Chunk 4 quota-state view) ─────────────────────
     def snapshot(self) -> Dict[str, Any]:
