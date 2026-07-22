@@ -1178,6 +1178,17 @@ echo "lm-component-update-restart: $UNIT rollback also failed; left for manual r
 exit 1
 HELPER
 chmod 0755 /usr/local/bin/lm-component-update-restart
+
+# lmctl — standard operator CLI (update / debug / logs / status / restart /
+# recover / harden / stall). Symlink to the copy in the core checkout so it
+# tracks SPOKE_UPDATE automatically; fall back to a static copy if scripts/ isn't
+# present in this layout. `lmctl help` lists commands.
+if [ -f "$LM_DIR/scripts/lmctl" ]; then
+    chmod +x "$LM_DIR/scripts/lmctl" 2>/dev/null || true
+    ln -sf "$LM_DIR/scripts/lmctl" /usr/local/bin/lmctl
+    ok "lmctl installed (→ $LM_DIR/scripts/lmctl)"
+fi
+
 # Grant svc_lm passwordless sudo ONLY for the watchdog path (mirrors the hub's
 # NOPASSWD: /usr/local/bin/lm-update-restart in install_all.sh). /etc/sudoers.d
 # is created by the sudo package's postinst (installed above); mkdir here too
