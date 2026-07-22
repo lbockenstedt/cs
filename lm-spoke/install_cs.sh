@@ -1076,6 +1076,18 @@ done
 HEALTHY="$STATE_DIR/healthy"
 PENDING="$STATE_DIR/pending_update.json"
 
+# Self-link the lmctl operator CLI on every update. The spoke self-update runs as
+# the non-root service user and can't write the root-owned /usr/local/bin symlink;
+# this watchdog runs as root right after each SPOKE_UPDATE pulls fresh code, so it
+# is the natural place to keep lmctl current WITHOUT a reinstall. Idempotent.
+for _lmctl in /opt/lm/scripts/lmctl /opt/lm/cs/lm-spoke/scripts/lmctl; do
+    if [ -f "$_lmctl" ]; then
+        chmod +x "$_lmctl" 2>/dev/null || true
+        ln -sf "$_lmctl" /usr/local/bin/lmctl 2>/dev/null || true
+        break
+    fi
+done
+
 # 0 if the component is healthy (marker present) OR booted-but-pending-auth
 # (active, not crash-looping); 1 if still failing (crash-loop / failed / unknown).
 unit_ok() {
