@@ -971,6 +971,10 @@ WantedBy=multi-user.target
 SYSD
 
 systemctl daemon-reload
+# Clear any prior 'start-limit-hit'/failed state so a reinstall over a spoke that
+# systemd previously PARKED (the bug StartLimitIntervalSec=0 above prevents going
+# forward) actually starts instead of staying dead.
+systemctl reset-failed lm-cs 2>/dev/null || true
 systemctl enable lm-cs
 if [ "$CLONE_MODE" = "1" ]; then
     # Golden-image prep: enable for next boot but do NOT start now — starting
