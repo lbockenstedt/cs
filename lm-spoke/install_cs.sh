@@ -941,6 +941,14 @@ cat > /etc/systemd/system/lm-cs.service <<SYSD
 [Unit]
 Description=Lab Manager Spoke - Generic Agent
 After=network.target
+# Never let a burst of restarts trip systemd's start-rate limit and PARK the
+# service dead ("start-limit-hit" → systemd refuses to revive it even with
+# Restart=always). This is how cs-svr-05 went permanently down: flapping
+# reconnects + self-update restarts + hub-contact-watchdog restarts stacked past
+# the default 5-in-10s limit. A spoke that keeps restarting is far better than a
+# dead one; a genuine bad build is caught by update_recovery/dep_guard, not by
+# starving the restart budget. (The Kea units already set this.)
+StartLimitIntervalSec=0
 
 [Service]
 Type=simple
