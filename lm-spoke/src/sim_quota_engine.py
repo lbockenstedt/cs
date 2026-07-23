@@ -904,11 +904,6 @@ class SimQuotaEngine:
         """One sweep: align the ledger + overrides with effective_sim_quotas."""
         async with self._reconcile_lock:
             quotas = self.spoke.local_store.get_effective_sim_quotas() or []
-            # Adaptive vs fixed discriminator (max > min). Adaptive quotas carry
-            # min/max through the hub push (apply_adaptive_targets only rewrites
-            # count); fixed quotas have neither, so this is False for them and
-            # they are enforced as a FLOOR (see the over-N trim below).
-            from sim_quota import adaptive_is_on
             now = time.time()
             clients = self._all_clients()
             eff_keys = {_quota_key(q) for q in quotas}
@@ -1146,20 +1141,11 @@ class SimQuotaEngine:
                 # target. Release OFFLINE-kept extras first (they're not producing
                 # anyway), then the most-recently-added producing (the substitute,
                 # not a returning original earlier in the ledger).
-                #
-                # FLOOR vs CEILING: only an ADAPTIVE quota is a hard ceiling —
-                # its controller keeps the count inside [min,max], so trimming
-                # live/producing clients above the target is correct. A FIXED
-                # (non-adaptive) quota is a FLOOR: the operator's `count` means
-                # "at least N", more may be added. So for a fixed quota we only
-                # reclaim dead OFFLINE assignments (hygiene — they aren't
-                # producing, so this never drops the live floor) and never trim
-                # producing above the target.
                 over = len(assigned) - target
                 if over > 0:
                     offline_extras = [h for h in assigned if h not in producing]
                     to_release = offline_extras[:over]
-                    if adaptive_is_on(q) and len(to_release) < over:
+                    if len(to_release) < over:
                         to_release += producing[target:][:over - len(to_release)]
                     for h in to_release:
                         from_site = assigned.pop(h, "")
