@@ -872,14 +872,38 @@ class SimQuotaEngine:
                 "all": bool(r.get("all")),
             })
 
+        # Cross-site spread for TENANT-POOL spare (assignable-anywhere clients):
+        # an unclaimed tenant-pool client is eligible for EVERY site, so the old
+        # per-site filter let whichever site sorted first swallow them all —
+        # piling every drone onto one server/site. Instead distribute them across
+        # the weighted sites (ambient_site_weights; default even) so drones spread
+        # across servers/sites and a single server failure can't drop a whole
+        # site's worth. Physically RF-bound clients still stay on their chamber.
+        sites = list(by_site.keys())
+        try:
+            site_w = self.spoke.local_store.get_ambient_site_weights() or {}
+        except Exception:  # noqa: BLE001
+            site_w = {}
+        weights = {s: max(0.0, float(site_w.get(s, 1) or 0)) for s in sites}
+        if sum(weights.values()) <= 0:
+            weights = {s: 1.0 for s in sites}          # unset / all-zero → even split
+        spread_site: Dict[str, str] = {}
+        _counts = {s: 0 for s in sites}
+        for h in (h for h in online
+                  if h not in self._claimed_site and self._is_tenant_pool_client(h)):
+            # weighted round-robin: place on the site most UNDER its target share.
+            s = min(sites, key=lambda s: (_counts[s] / weights[s]) if weights[s] > 0 else float("inf"))
+            spread_site[h] = s
+            _counts[s] += 1
+
         for site, srules in by_site.items():
             await asyncio.sleep(0)  # yield per site — the weighted spread scales to 1000s of clients
-            # Spare = online clients physically here (RF chamber) OR assignable
-            # (tenant-pool), that no harvest quota already claimed this sweep.
+            # Spare = online clients physically here (RF chamber) OR a tenant-pool
+            # client this sweep's cross-site spread assigned here, that no harvest
+            # quota already claimed this sweep.
             spare = [h for h in online
                      if h not in self._claimed_site
-                     and (self._physical_site_of(h) == site
-                          or (self._is_tenant_pool_client(h) and self._site_ok_for(h, site)))]
+                     and (self._physical_site_of(h) == site or spread_site.get(h) == site)]
             if not spare:
                 continue
             weighted = [r for r in srules if r["weight"] > 0]

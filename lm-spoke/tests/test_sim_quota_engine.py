@@ -49,12 +49,24 @@ class _FakeLocalStore:
     def __init__(self, quotas, pxmx_site_map=None):
         self._q = quotas
         self._map = pxmx_site_map or {}
+        self._matrix = []          # ssid_matrix (cell defs)
+        self._weights = []         # ssid_weights (per-cell spread rules)
+        self._site_w = {}          # ambient_site_weights (cross-site spread)
 
     def get_effective_sim_quotas(self):
         return list(self._q)
 
     def get_pxmx_site_map(self):
         return dict(self._map)
+
+    def get_ssid_matrix(self):
+        return list(self._matrix)
+
+    def get_ssid_weights(self):
+        return list(self._weights)
+
+    def get_ambient_site_weights(self):
+        return dict(self._site_w)
 
 
 class _FakeDeploy:
@@ -660,3 +672,45 @@ def test_same_source_same_site_still_stacks(tmp_path):
     dns = set(eng._ledger["alert:Central:dns_fail:MIA"]["clients"])
     assert len(pres) == 3 and len(dns) == 3
     assert pres == dns, "same-source presence+sim must stack onto the same clients"
+
+
+def test_reconcile_weighted_spreads_tenant_pool_across_sites(tmp_path):
+    # 4 tenant-pool (unmapped → assignable-anywhere) clients, NO harvest quota →
+    # all spare. Two weighted SSID cells at sites A and B (even weights). The
+    # spare must SPREAD across both sites, not pile onto whichever sorts first
+    # (the cross-site randomization fix). Physically-bound clients are untouched.
+    clients = {f"c{i}": _client(f"c{i}", "") for i in range(4)}
+    spoke = _FakeSpoke(clients, [], tmp_path)
+    spoke.local_store._matrix = [
+        {"name": "A-cell", "site": "A", "ssid": "ssidA", "ssidpw": "pwA", "enabled": True},
+        {"name": "B-cell", "site": "B", "ssid": "ssidB", "ssidpw": "pwB", "enabled": True},
+    ]
+    spoke.local_store._weights = [
+        {"ssid": "A-cell", "site": "A", "weight": 1},
+        {"ssid": "B-cell", "site": "B", "weight": 1},
+    ]
+    eng = SimQuotaEngine(spoke)
+    _run(eng.reconcile())
+    wsites = sorted(spoke.registry.clients[h].get("overrides", {}).get("wsite") for h in clients)
+    assert wsites.count("A") == 2, wsites   # even split, not 4/0
+    assert wsites.count("B") == 2, wsites
+
+
+def test_reconcile_weighted_site_weights_bias_the_spread(tmp_path):
+    # ambient_site_weights {A:3, B:1} → 6 spare split 4-to-A / 2-to-B (weighted).
+    clients = {f"c{i}": _client(f"c{i}", "") for i in range(6)}
+    spoke = _FakeSpoke(clients, [], tmp_path)
+    spoke.local_store._matrix = [
+        {"name": "A-cell", "site": "A", "ssid": "ssidA", "ssidpw": "pwA", "enabled": True},
+        {"name": "B-cell", "site": "B", "ssid": "ssidB", "ssidpw": "pwB", "enabled": True},
+    ]
+    spoke.local_store._weights = [
+        {"ssid": "A-cell", "site": "A", "weight": 1},
+        {"ssid": "B-cell", "site": "B", "weight": 1},
+    ]
+    spoke.local_store._site_w = {"A": 3, "B": 1}
+    eng = SimQuotaEngine(spoke)
+    _run(eng.reconcile())
+    wsites = [spoke.registry.clients[h].get("overrides", {}).get("wsite") for h in clients]
+    assert wsites.count("A") == 4, wsites
+    assert wsites.count("B") == 2, wsites
