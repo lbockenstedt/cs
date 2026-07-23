@@ -614,3 +614,49 @@ def test_reconcile_presence_substitute_on_offline(tmp_path):
     after = set(eng._ledger["presence::MIA"]["clients"])
     assert dead not in after                       # dead client released
     assert len(after) == 3                         # substitute filled → still N
+
+
+# ── Source-aware claim_key (Phase 4: Central/Mist separate clients) ─────────
+
+def _q(alert_id, sim_id, count, site="MIA"):
+    return {"alert_id": alert_id, "alert_type": "alert", "sim_id": sim_id,
+            "count": count, "site": site, "enabled": True}
+
+
+def test_cross_source_same_site_keeps_separate_clients(tmp_path):
+    # A Central dns_fail@MIA and a Mist dns_fail@MIA each want 3 clients. They
+    # must NOT share — each row runs its OWN clients (the prefix is the only
+    # seam). 6 clients in the pool → 3 for Central, 3 for Mist, no overlap.
+    clients = {f"c{i}": _client(f"c{i}", "MIA") for i in range(6)}
+    spoke = _FakeSpoke(clients, [
+        _q("Central:dns_fail", "dns_fail", 3),
+        _q("Mist:dns_fail", "dns_fail", 3),
+    ], tmp_path)
+    eng = SimQuotaEngine(spoke)
+    _run(eng.reconcile())
+    cen = set(eng._ledger["alert:Central:dns_fail:MIA"]["clients"])
+    mist = set(eng._ledger["alert:Mist:dns_fail:MIA"]["clients"])
+    assert len(cen) == 3 and len(mist) == 3
+    assert not (cen & mist), "cross-source rows must keep separate clients"
+    # Distinct ledger keys → independent counts/learning.
+    assert "alert:Central:dns_fail:MIA" in eng._ledger
+    assert "alert:Mist:dns_fail:MIA" in eng._ledger
+
+
+def test_same_source_same_site_still_stacks(tmp_path):
+    # Same-source stacking is unchanged: a Central PRESENCE quota (Clients
+    # Associated) homes 3 clients at MIA, and a Central dns_fail at MIA stacks
+    # onto them (same claim "central:MIA" → reuses the homed clients). Source-
+    # scoping must not regress this. Total distinct clients = 3, shared.
+    clients = {f"c{i}": _client(f"c{i}", "MIA") for i in range(6)}
+    spoke = _FakeSpoke(clients, [
+        {"alert_id": "", "sim_id": "", "count": 3, "site": "MIA",
+         "multi_capable": True, "rehome": False, "enabled": True},
+        _q("Central:dns_fail", "dns_fail", 3),
+    ], tmp_path)
+    eng = SimQuotaEngine(spoke)
+    _run(eng.reconcile())
+    pres = set(eng._ledger["presence::MIA"]["clients"])
+    dns = set(eng._ledger["alert:Central:dns_fail:MIA"]["clients"])
+    assert len(pres) == 3 and len(dns) == 3
+    assert pres == dns, "same-source presence+sim must stack onto the same clients"

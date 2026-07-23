@@ -38,6 +38,48 @@ SIM_QUOTA_KEYS = ("alert_id", "alert_type", "sim_id", "count", "site",
                   "multi_capable", "rehome", "enabled", "learning", "learn_knobs")
 ALERT_TYPES = ("alert", "insight")
 
+# Source prefix: Central and Mist are separate products. A quota row's
+# ``alert_id`` carries a ``Central:`` / ``Mist:`` prefix (applied in the hub's
+# sim-quota catalog/picker) so a Central ``dns_fail`` and a Mist ``dns_fail``
+# are distinct dedup/adaptive keys. The prefix is the ONLY seam between the two
+# products; the bare id is what the dashboard Checks view / poller status keys
+# by. ``parse_alert_source`` splits it back out (defaults to central for legacy
+# / bare / unknown ids). Mirrored in lm/core/src/simulations/sim_quota.py.
+SOURCE_PREFIXES = {"central": "Central", "mist": "Mist"}
+_PREFIX_TO_SOURCE = {"central": "central", "mist": "mist"}
+
+
+def parse_alert_source(alert_id: str) -> Tuple[str, str]:
+    """Split a (possibly prefixed) ``alert_id`` into ``(source, bare_id)``.
+
+    ``"Central:DNS Fail"`` → ``("central", "DNS Fail")``;
+    ``"Mist:ap_offline"`` → ``("mist", "ap_offline")``;
+    ``"DNS Fail"`` (legacy / untethered-display) → ``("central", "DNS Fail")``.
+    An unknown/empty prefix falls back to ``central`` (bare). Returns the source
+    as the canonical lowercase key (``"central"``/``"mist"``)."""
+    aid = str(alert_id or "").strip()
+    if ":" in aid:
+        prefix, _, rest = aid.partition(":")
+        src = _PREFIX_TO_SOURCE.get(prefix.strip().lower())
+        if src and rest.strip():
+            return src, rest.strip()
+    return "central", aid
+
+
+def prefixed_alert_id(source: str, bare_id: str) -> str:
+    """Render a bare alert id with its product prefix:
+    ``prefixed_alert_id("mist", "ap_offline")`` → ``"Mist:ap_offline"``.
+    An unknown/empty source defaults to Central. A bare_id that is ALREADY
+    prefixed is returned unchanged (idempotent)."""
+    src = str(source or "central").strip().lower()
+    if src not in SOURCE_PREFIXES:
+        src = "central"
+    bid = str(bare_id or "").strip()
+    cur_src, cur_bare = parse_alert_source(bid)
+    if cur_src != "central" or bid != cur_bare:
+        return bid
+    return f"{SOURCE_PREFIXES[src]}:{bid}" if bid else bid
+
 # Per-sim metadata defaults. category: "failure" sims produce a network condition
 # Aruba reports as an alert/insight; "traffic" sims are baseline load generators
 # (the default bucket state — the abundant generic pool the quota draws from).

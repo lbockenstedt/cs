@@ -45,6 +45,8 @@ import uuid
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
+from sim_quota import parse_alert_source
+
 logger = logging.getLogger("SimQuotaEngine")
 
 HARVEST_WINDOW_S = 1800.0        # a client seen within the last 30 min is
@@ -993,7 +995,14 @@ class SimQuotaEngine:
                 # claim = the SHARING + EXCLUSIVITY identity: the SSID cell name
                 # for a cell quota, else the (physical) site. Quotas with the same
                 # claim share clients; different claims can't hold the same client.
-                claim_key = str(cell.get("name") or scope_site) if cell else scope_site
+                # SOURCE-SCOPED (Phase 4): the row's source (Central/Mist, parsed
+                # from its prefixed alert_id) prefixes the claim so a Central row
+                # and a Mist row on the SAME cell/site keep SEPARATE clients — each
+                # runs its own, counts/learning independent per row. Same-source
+                # rows still share/stack as before. The prefix is the only seam.
+                _src, _ = parse_alert_source(str(q.get("alert_id") or ""))
+                _base_claim = str(cell.get("name") or scope_site) if cell else scope_site
+                claim_key = f"{_src}:{_base_claim}"
                 target = int(q.get("count") or 1)
                 # A PRESENCE quota (sim_id empty — "Clients Associated") homes N
                 # clients to the site and runs no sim; it's still a real ledger
