@@ -35,6 +35,27 @@ logger = logging.getLogger("CentralPoller")
 
 _POLL_INTERVAL_S = 300  # 5 min — matches aruba.py's own cache TTLs
 
+# Central refreshes several metrics on the 5-MINUTE WALL CLOCK (:00, :05, :10 …).
+# Querying inside that window returns transitional / half-updated values that read
+# as a FALSE POSITIVE — a check flips only because Central is mid-refresh, not
+# because anything really changed. So never let a poll land within
+# _BOUNDARY_GUARD_S of a 5-minute boundary; delay into the safe zone first.
+_CENTRAL_UPDATE_PERIOD_S = 300
+_BOUNDARY_GUARD_S = 60
+
+
+def _boundary_guard_delay(now: float) -> float:
+    """Seconds to wait so a poll does NOT fall within ``_BOUNDARY_GUARD_S`` of a
+    5-minute wall-clock boundary. ``now`` is epoch seconds (UTC-aligned, so
+    ``now % 300`` = seconds since the last 5-minute mark). 0 = already in the safe
+    zone (60s..240s past the boundary)."""
+    phase = now % _CENTRAL_UPDATE_PERIOD_S
+    if phase < _BOUNDARY_GUARD_S:                                  # just AFTER a boundary
+        return _BOUNDARY_GUARD_S - phase
+    if phase > _CENTRAL_UPDATE_PERIOD_S - _BOUNDARY_GUARD_S:       # just BEFORE the next boundary
+        return (_CENTRAL_UPDATE_PERIOD_S - phase) + _BOUNDARY_GUARD_S
+    return 0.0
+
 # Client-count baseline constants — ported verbatim from the source webui-spoke
 # (server.py). The alarm baseline is a 7-DAY rolling average of hourly snapshots
 # (NOT the 1h average), so a prolonged client drop stays flagged instead of the
@@ -377,6 +398,12 @@ class CentralPoller:
 
     async def _poll_loop(self) -> None:
         while True:
+            _guard = _boundary_guard_delay(time.time())
+            if _guard > 0:
+                logger.info("Central poll: within %ds of a 5-min clock boundary — "
+                            "delaying %.0fs to avoid a mid-refresh false positive.",
+                            _BOUNDARY_GUARD_S, _guard)
+                await asyncio.sleep(_guard)
             try:
                 await self._poll_once()
             except asyncio.CancelledError:
