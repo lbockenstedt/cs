@@ -4860,20 +4860,14 @@ async function csRenderVmServer() {
         </div>
         <div id="cs-fleet-reclone-progress" class="mt-2 text-[11px] text-slate-500 space-y-1">No reclone in progress.</div>
       </div>
-      <div class="hpe-card rounded-lg p-4 shadow-sm">
-        <div class="mb-2">
-          <p class="text-[11px] font-bold text-slate-400 uppercase tracking-wider mb-2">Auto-Provisioning</p>
+      <div class="hpe-card rounded-lg p-4 shadow-sm flex flex-col">
+        <div class="flex items-center justify-between mb-2">
+          <p class="text-[11px] font-bold text-slate-400 uppercase tracking-wider">Auto-Provisioning</p>
           <button id="cs-autoprov-enable-btn" onclick="csToggleAutoProvision()" class="px-3 py-1 rounded-md text-xs font-bold border">Enable</button>
         </div>
-        <div class="flex gap-4">
-          <div class="flex-1 min-w-0">
-            <div id="cs-autoprov-status" class="text-[10px] text-slate-500 space-y-1">Status: loading…</div>
-          </div>
-          <div class="flex-1 min-w-0 border-l border-slate-100 pl-3">
-            <div class="text-[9px] font-bold text-slate-400 uppercase tracking-wider mb-1">Provisioning now</div>
-            <div id="cs-autoprov-live" class="text-[11px] text-slate-500 space-y-1">loading…</div>
-          </div>
-        </div>
+        <div class="text-[9px] font-bold text-slate-400 uppercase tracking-wider mb-1">Provisioning now</div>
+        <div id="cs-autoprov-live" class="text-[11px] text-slate-500 grid grid-cols-1 sm:grid-cols-2 gap-x-4 gap-y-1 content-start flex-1 min-h-0 overflow-y-auto">loading…</div>
+        <div id="cs-autoprov-status" class="text-[10px] text-slate-500 space-y-1 mt-2 pt-2 border-t border-slate-100">Status: loading…</div>
       </div>
     </div>`;
 
@@ -4964,7 +4958,7 @@ function csAutoProvLivePanel() {
     const el = csEl('cs-autoprov-live');
     if (!el) return;
     if (!csAutoProvOn) {
-        el.innerHTML = `<div class="text-slate-400">Auto-Provisioning is off.</div>`;
+        el.innerHTML = `<div class="col-span-full text-slate-400">Auto-Provisioning is off.</div>`;
         return;
     }
     // Aggregate the fleet's in-flight VMs. Prefer the authoritative per-host
@@ -4996,7 +4990,7 @@ function csAutoProvLivePanel() {
         return true;
     });
     if (!uniq.length) {
-        el.innerHTML = `<div class="text-slate-400">No active provisioning work.</div>`;
+        el.innerHTML = `<div class="col-span-full text-slate-400">No active provisioning work.</div>`;
         return;
     }
     el.innerHTML = uniq.map(f => {
@@ -5008,7 +5002,7 @@ function csAutoProvLivePanel() {
             : st === 'recloning' ? { label: 'Recloning' }
             : csAutoProvPhaseMeta(st);
         const name = f.name || (f.vmid != null ? `VM ${f.vmid}` : '—');
-        return `<div class="truncate"><span>${ic}</span> <b>${csEscape(name)}</b>
+        return `<div class="truncate min-w-0"><span>${ic}</span> <b>${csEscape(name)}</b>
             <span class="text-slate-400">${csEscape(meta.label)}</span>
             <span class="text-slate-300">${csEscape(f.host)}</span></div>`;
     }).join('');
