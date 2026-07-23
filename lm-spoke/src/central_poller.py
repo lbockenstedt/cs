@@ -361,26 +361,76 @@ class CentralPoller:
     """Drives ``ArubaClient`` on a 5-minute loop, writing
     ``spoke.central_status`` in the shape ``sim-views.js``'s Checks/Hardware/
     Client-Count tabs expect. No-op (empty ``central_status``) when Central
-    is not configured. See the module docstring."""
+    is not configured. See the module docstring.
 
-    def __init__(self, spoke) -> None:
+    Parameterized by ``instance`` so ONE class serves BOTH cloud Central and an
+    on-prem Aruba Central appliance (same Aruba Central API/``ArubaClient``,
+    separate config + sites-config + status slot + tracker shard files so the two
+    never step on each other). Default ``instance="central"`` reproduces the
+    original behavior byte-identically (the safety anchor for the refactor)."""
+
+    # Per-instance wiring: which local_store config/sites getter to read, which
+    # spoke status attr to write, and the shard filenames for the client-count
+    # baseline + 30-day health history (different filenames = separate persisted
+    # state, so cloud Central and on-prem monitoring the same site keep separate
+    # baselines — the no-stepping guarantee at the spoke layer).
+    _INSTANCES = {
+        "central": {
+            "config_getter": "get_central_config",
+            "sites_getter": "get_central_sites_config",
+            "status_attr": "central_status",
+            "cc_baseline": "client_count_baseline.json",
+            "cc_7day": "client_count_7day.json",
+            "health_file": "check_health_history.json",
+        },
+        "central_on_prem": {
+            "config_getter": "get_central_on_prem_config",
+            "sites_getter": "get_central_on_prem_sites_config",
+            "status_attr": "central_on_prem_status",
+            "cc_baseline": "central_on_prem_client_count_baseline.json",
+            "cc_7day": "central_on_prem_client_count_7day.json",
+            "health_file": "central_on_prem_check_health_history.json",
+        },
+    }
+
+    def __init__(self, spoke, instance: str = "central") -> None:
+        if instance not in self._INSTANCES:
+            raise ValueError(f"unknown CentralPoller instance: {instance!r}")
         self.spoke = spoke
+        self._inst_name = instance
+        self._inst = self._INSTANCES[instance]
         self._client: Optional[ArubaClient] = None
         self._task: Optional[asyncio.Task] = None
         # Client-count baseline tracker (7-day baseline + persistence). Files live
-        # next to local_store.json in the spoke's runtime-state dir.
+        # next to local_store.json in the spoke's runtime-state dir; per-instance
+        # filenames keep cloud Central's baselines separate from on-prem's.
         ddir = str(spoke.local_store._path.parent)
         self._cc = ClientCountTracker(
-            os.path.join(ddir, "client_count_baseline.json"),
-            os.path.join(ddir, "client_count_7day.json"),
+            os.path.join(ddir, self._inst["cc_baseline"]),
+            os.path.join(ddir, self._inst["cc_7day"]),
         )
-        # 30-day per-check status history (green/yellow/red) for the health graphs.
-        self._health = CheckHealthHistory(os.path.join(ddir, "check_health_history.json"))
+        # 30-day per-check status history (green/yellow/red) for the health graphs;
+        # per-instance filename so on-prem history doesn't merge with cloud's.
+        self._health = CheckHealthHistory(os.path.join(ddir, self._inst["health_file"]))
         self.reload()
+
+    # ── per-instance local_store / status accessors ─────────────────────────
+    # Thin wrappers so the poll loop reads/writes THIS instance's config, sites
+    # config, and status slot — cloud Central reads central_config/central_status,
+    # on-prem reads central_on_prem_config/central_on_prem_status. The default
+    # instance reproduces the original hardcoded behavior exactly.
+    def _cfg(self) -> Dict[str, Any]:
+        return getattr(self.spoke.local_store, self._inst["config_getter"])()
+
+    def _sites_cfg(self) -> Dict[str, Any]:
+        return getattr(self.spoke.local_store, self._inst["sites_getter"])()
+
+    def _set_status(self, val: Dict[str, Any]) -> None:
+        setattr(self.spoke, self._inst["status_attr"], val)
 
     # ── (re)build the ArubaClient from the current stored config ───────────
     def reload(self) -> None:
-        cfg = _build_config(self.spoke.local_store.get_central_config())
+        cfg = _build_config(self._cfg())
         self._client = ArubaClient(cfg) if cfg.get("cluster_url") else None
 
     def start(self) -> None:
@@ -414,10 +464,10 @@ class CentralPoller:
 
     async def _poll_once(self) -> None:
         if not self._client or not self._client.is_configured():
-            self.spoke.central_status = {}
+            self._set_status({})
             return
-        cc_thresh = _cc_thresholds(self.spoke.local_store.get_central_config())
-        sites_cfg = self.spoke.local_store.get_central_sites_config()
+        cc_thresh = _cc_thresholds(self._cfg())
+        sites_cfg = self._sites_cfg()
         site_mappings: Dict[str, str] = sites_cfg.get("site_mappings") or {}
         monitored: list = sites_cfg.get("monitored_checks") or []
         hw_checks: list = sites_cfg.get("hardware_checks") or []
@@ -552,13 +602,13 @@ class CentralPoller:
             for cid, info in checks_map.items():
                 st = (info.get("status") if isinstance(info, dict) else info) or "no_data"
                 self._health.record(_CC_SCOPE, wsite, cid, st)
-        self.spoke.central_status = {
+        self._set_status({
             "status": status,
             "hardware_alerts": hardware_alerts,
             "client_count_status": client_count_status,
             "health": self._health.summary(_CC_SCOPE),
             "fetched_at": time.time(),
-        }
+        })
         # Append the hourly snapshot to the 7-day baseline history (self-gated to
         # once per hour) and persist — the stable reference sustained drops flag against.
         self._cc.maybe_snapshot()

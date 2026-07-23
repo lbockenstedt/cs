@@ -133,6 +133,16 @@ class CSSpoke(AgentCommandsMixin, SimCommandsMixin, ConfigCommandsMixin,
         # CSControlPlane.run()/run_standalone_mode() (needs a running loop).
         self.central_status: Dict[str, Any] = {}
         self.central_poller = CentralPoller(self)
+        # Central On-Prem twin of central_status/central_poller — a SECOND Aruba
+        # Central instance (same ArubaClient/API as cloud Central, separate
+        # config + status slot + tracker shard files). Populated by a second
+        # CentralPoller(instance="central_on_prem") in the same Simulations
+        # Checks/Hardware/Client-Count shape so the on-prem tab renders on-prem
+        # data identically and INDEPENDENTLY of cloud Central (no stepping on each
+        # other). Started by CSControlPlane.run()/run_standalone_mode() alongside
+        # the cloud Central + Mist loops.
+        self.central_on_prem_status: Dict[str, Any] = {}
+        self.central_on_prem_poller = CentralPoller(self, instance="central_on_prem")
         # Juniper Mist twin of central_status/central_poller — populated by
         # MistPoller in the same Simulations Checks/Hardware/Client-Count shape
         # so sim-views.js's tabs render Mist data identically. Started by

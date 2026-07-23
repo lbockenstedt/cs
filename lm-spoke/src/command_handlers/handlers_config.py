@@ -142,6 +142,64 @@ class ConfigCommandsMixin:
         if cmd in ("CS_CENTRAL_BROWSE",):
             return await self.central_poller.browse()
 
+        # ── Aruba Central On-Prem (twin of the Central handlers above — a SECOND
+        # Aruba Central instance via the SAME ArubaClient/API, just a separate
+        # config + sites-config + status slot). The on-prem poller
+        # (self.central_on_prem_poller) reads/writes its own slots so cloud Central
+        # and on-prem never step on each other.
+        if cmd in ("CS_GET_CENTRAL_ON_PREM_CONFIG",):
+            return {"status": "SUCCESS",
+                    "central_on_prem_config": self.local_store.get_central_on_prem_config()}
+
+        if cmd in ("CS_SET_CENTRAL_ON_PREM_CONFIG",):
+            self._merge_central_on_prem_config(d.get("central_on_prem_config") or {})
+            return {"status": "SUCCESS"}
+
+        if cmd in ("CS_GET_CENTRAL_ON_PREM_SITES_CONFIG",):
+            return {"status": "SUCCESS", **self.local_store.get_central_on_prem_sites_config()}
+
+        if cmd in ("CS_SET_CENTRAL_ON_PREM_SITES_CONFIG",):
+            cfg = d if isinstance(d, dict) else {}
+            # Validate sim_quotas against this tenant's simulation.conf sims
+            # (same drop-unknown + surface-errors pass as the Central twin). The
+            # rows here carry Central On-Prem:-prefixed alert_ids.
+            try:
+                import sim_quota
+                sims = [s["sim_id"] for s in sim_quota.available_sims(self.settings.config_dir)]
+                clean, errs = sim_quota.validate_sim_quotas(cfg.get("sim_quotas"), sims)
+                if errs:
+                    logger.warning("CS_SET_CENTRAL_ON_PREM_SITES_CONFIG: sim_quotas errors: %s", errs)
+                cfg = {**cfg, "sim_quotas": clean}
+            except Exception as exc:  # noqa: BLE001 — never block the save
+                logger.warning("sim_quotas validate failed (central_on_prem): %s", exc)
+            self.local_store.set_central_on_prem_sites_config(cfg)
+            self.central_on_prem_poller.reload()
+            return {"status": "SUCCESS"}
+
+        if cmd in ("CS_GET_CENTRAL_ON_PREM_AVAILABLE",):
+            return await self.central_on_prem_poller.available_checks()
+
+        if cmd in ("CS_TEST_CENTRAL_ON_PREM",):
+            return await self.central_on_prem_poller.test_connection()
+
+        if cmd in ("CS_CENTRAL_ON_PREM_BROWSE",):
+            return await self.central_on_prem_poller.browse()
+
+        if cmd == "CS_GET_CENTRAL_ON_PREM_HEALTH":
+            # 30-day per-check health for a DISTRIBUTED on-prem Central tenant
+            # (twin of CS_GET_HEALTH / CS_GET_MIST_HEALTH). Daily summaries ride
+            # in central_on_prem_status already; this serves the on-hover HOURLY
+            # breakdown for one check.
+            h = getattr(self.central_on_prem_poller, "_health", None)
+            if h is None:
+                return {"hourly": []}
+            site = d.get("site")
+            check = d.get("check")
+            from central_poller import _CC_SCOPE
+            if site and check:
+                return {"hourly": h.hourly(_CC_SCOPE, site, check)}
+            return {"daily": h.summary(_CC_SCOPE)}
+
         # ── Juniper Mist API (twin of the Central handlers above) ──────────
         if cmd in ("CS_GET_MIST_CONFIG",):
             return {"status": "SUCCESS", "mist_config": self.local_store.get_mist_config()}
@@ -384,6 +442,29 @@ class ConfigCommandsMixin:
         self.mist_poller.reload()
         return merged
 
+    def _merge_central_on_prem_config(self, cfg: Dict[str, Any]) -> Dict[str, Any]:
+        """Sentinel-merge a Central On-Prem API config patch into local_store and
+        rebuild the on-prem poller's ArubaClient. Twin of ``_merge_central_config``:
+        shared by CS_SET_CENTRAL_ON_PREM_CONFIG (standalone local UI) and the
+        hub-pushed CS_CONFIG_UPDATE path (_apply_hub_config) so BOTH entry points
+        persist creds AND reload the on-prem client. Same ArubaClient/API as cloud
+        Central — only the config slot + the poller reloaded differ.
+
+        Sentinel rule: an empty/None value KEEPS the stored value (so a partial
+        save — e.g. changing only Mode, or a hub push that omits unchanged
+        secrets — never wipes creds). A new key with an empty value is still
+        written (first-time provisioning of a placeholder field)."""
+        current = self.local_store.get_central_on_prem_config()
+        merged = dict(current)
+        for k, v in (cfg or {}).items():
+            if v not in (None, ""):
+                merged[k] = v
+            elif k not in current:
+                merged[k] = v
+        self.local_store.set_central_on_prem_config(merged)
+        self.central_on_prem_poller.reload()
+        return merged
+
     def _apply_hub_config(self, patch: Dict[str, Any]) -> list:
         """Apply a hub-pushed CS_CONFIG_UPDATE patch to the cs settings store.
 
@@ -434,6 +515,25 @@ class ConfigCommandsMixin:
                 self.local_store.set_mist_sites_config(msc)
                 self.mist_poller.reload()
                 applied.append("mist_sites_config")
+        # Aruba Central On-Prem creds pushed from the hub (Setup -> Central On-Prem
+        # API -> Save). Twin of the central_config branch above (same ArubaClient,
+        # separate config slot + on-prem poller): WITHOUT it the push is silently
+        # dropped and the on-prem poller keeps _client=None, so the on-prem site
+        # dropdown / Sites-Alerts-Clients tabs stay empty.
+        if "central_on_prem_config" in patch:
+            opc = patch.get("central_on_prem_config")
+            self._merge_central_on_prem_config(opc if isinstance(opc, dict) else {})
+            applied.append("central_on_prem_config")
+        # Hub-pushed central_on_prem_sites_config (monitored_checks/hardware_checks/
+        # site_mappings + sim_quotas with Central On-Prem:-prefixed ids): apply to
+        # local_store + reload the on-prem poller so a hub-side Config -> Sim Quotas
+        # / Central On-Prem save reaches this spoke.
+        if "central_on_prem_sites_config" in patch:
+            opc = patch.get("central_on_prem_sites_config")
+            if isinstance(opc, dict):
+                self.local_store.set_central_on_prem_sites_config(opc)
+                self.central_on_prem_poller.reload()
+                applied.append("central_on_prem_sites_config")
         # Hub-pushed effective sim quotas (global defaults merged with this
         # tenant's overrides, enabled-only) — the SimQuotaEngine's input. Persist
         # + trigger a reconcile so the engine picks up the new target set.

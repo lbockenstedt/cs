@@ -360,6 +360,12 @@ class CSControlPlane(AgentHostingControlPlane):
         # dashboard's Simulations tab AND (via _cs_telemetry_relay_loop below)
         # the hub's Simulations tab when this spoke is hub-connected.
         cs_spoke.central_poller.start()
+        # Start the Central On-Prem poll loop (twin of the cloud Central loop
+        # above — a second Aruba Central instance via the SAME ArubaClient, just
+        # a separate config/status slot). Same 5-min cadence; writes
+        # cs_spoke.central_on_prem_status in the central_status shape so the
+        # on-prem tab renders on-prem data independently of cloud Central.
+        cs_spoke.central_on_prem_poller.start()
         # Start the Juniper Mist poll loop (twin of the Central loop above).
         # Same 5-min cadence; writes cs_spoke.mist_status in the central_status
         # shape so the hub/local Simulations tabs render Mist data identically.
@@ -551,6 +557,11 @@ class CSControlPlane(AgentHostingControlPlane):
                 # overlay this spoke's real CentralPoller output so a
                 # hub-connected deployment's Simulations tab gets live data too.
                 payload["central"] = getattr(cs_mod, "central_status", {}) or {}
+                # Central On-Prem twin: overlay this spoke's real on-prem
+                # CentralPoller output so a hub-connected deployment's Simulations
+                # tab gets live on-prem data too (same shape as the Central block
+                # above; the hub's data["central_on_prem"] read finds it).
+                payload["central_on_prem"] = getattr(cs_mod, "central_on_prem_status", {}) or {}
                 # Mist twin: overlay this spoke's real MistPoller output so a
                 # hub-connected deployment's Simulations tab gets live Mist
                 # data too (same shape as the Central block above).
@@ -697,6 +708,7 @@ class CSControlPlane(AgentHostingControlPlane):
         # hook rather than a direct call here (mirrors cs_spoke.demo.start()'s
         # own "needs a running loop" guard, just triggered later).
         app.add_event_handler("startup", spoke.central_poller.start)
+        app.add_event_handler("startup", spoke.central_on_prem_poller.start)
         app.add_event_handler("startup", spoke.mist_poller.start)
         if getattr(spoke, "sim_quota_engine", None) is not None:
             app.add_event_handler("startup", spoke.sim_quota_engine.start)
