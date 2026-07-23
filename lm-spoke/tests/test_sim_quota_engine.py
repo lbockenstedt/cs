@@ -45,6 +45,39 @@ class _FakeRegistry:
         return dict(e)
 
 
+class _ProvRegistry(_FakeRegistry):
+    """Fake registry WITH engine-key provenance + deletion revert, so drone
+    preemption (a displaced-off recorded in engine_keys, reverted by DELETION on
+    release) can be exercised. The plain _FakeRegistry lacks these, so _engine_set
+    falls back to set_overrides and _engine_remove sets "off" — fine for the
+    other tests, but it can't show a displaced default reverting to its bucket."""
+    async def set_engine_overrides(self, hostname, overrides):
+        e = self.clients.setdefault(hostname, {"hostname": hostname})
+        cur = dict(e.get("overrides") or {})
+        cur.update(overrides)
+        eng = list(e.get("engine_keys") or [])
+        for k in overrides:
+            if k not in eng:
+                eng.append(k)
+        e["overrides"] = cur
+        e["engine_keys"] = eng
+        return dict(e)
+
+    async def remove_engine_keys(self, hostname, keys):
+        e = self.clients.get(hostname)
+        if not e:
+            return {}
+        cur = dict(e.get("overrides") or {})
+        eng = list(e.get("engine_keys") or [])
+        for k in keys:
+            cur.pop(k, None)
+            if k in eng:
+                eng.remove(k)
+        e["overrides"] = cur
+        e["engine_keys"] = eng
+        return dict(e)
+
+
 class _FakeLocalStore:
     def __init__(self, quotas, pxmx_site_map=None):
         self._q = quotas
@@ -452,19 +485,66 @@ def test_reconcile_multi_capable_packs_onto_exclusive_runner(tmp_path):
     assert ov["dns_fail"] == "on" and ov["ping_test"] == "on"
 
 
-def test_reconcile_exclusive_skips_client_running_exclusive_via_bucket(tmp_path):
-    # c0's BUCKET default already runs assoc_fail (an exclusive sim) — no manual
-    # override, just the bucket profile. A dns_fail quota must NOT stack onto it
-    # (one failure sim per client, regardless of source); it picks c1 instead.
+def test_reconcile_exclusive_preempts_drone_running_exclusive_bucket_default(tmp_path):
+    # c0 is a DRONE: its bucket default runs assoc_fail (an exclusive sim), no
+    # manual override. A dns_fail quota now PREEMPTS the drone — harvest (the
+    # controlled few) wins over drones (the randomized many): it may harvest c0,
+    # turning assoc_fail OFF (recorded in _displaced) so its own exclusive sim
+    # runs cleanly. c0 sorts first, so it's the pick.
     clients = {"c0": _client("c0", "MIA", sim_flags={"assoc_fail": "on"}),
                "c1": _client("c1", "MIA")}
     spoke = _FakeSpoke(clients, [{"alert_id": "A", "sim_id": "dns_fail",
                                   "count": 1, "site": "MIA", "enabled": True}], tmp_path)
     eng = SimQuotaEngine(spoke)
     _run(eng.reconcile())
-    assert set(eng._ledger["alert:A:MIA"]["clients"].keys()) == {"c1"}
-    # c0's bucket assoc_fail left intact, engine never touched dns_fail on it.
-    assert "dns_fail" not in (clients["c0"].get("overrides") or {})
+    assigned = set(eng._ledger["alert:A:MIA"]["clients"].keys())
+    assert len(assigned) == 1
+    h = next(iter(assigned))
+    ov = spoke.registry.clients[h].get("overrides") or {}
+    assert ov.get("dns_fail") == "on"
+    if h == "c0":                                   # preempted the drone
+        assert ov.get("assoc_fail") == "off", ov
+        assert "assoc_fail" in eng._displaced.get("c0", set())
+
+
+def test_reconcile_preempt_reverts_displaced_on_release(tmp_path):
+    # dns_fail preempts drone c0 (bucket assoc_fail on) → assoc_fail turned OFF
+    # (recorded in _displaced). Remove the quota → c0 released: dns_fail reverts
+    # AND the displaced assoc_fail is restored by DELETION (back to its bucket
+    # default), _displaced cleared. _ProvRegistry exercises the deletion revert.
+    clients = {"c0": _client("c0", "MIA", sim_flags={"assoc_fail": "on"})}
+    spoke = _FakeSpoke(clients, [{"alert_id": "A", "sim_id": "dns_fail",
+                                  "count": 1, "site": "MIA", "enabled": True}], tmp_path)
+    spoke.registry = _ProvRegistry(clients)
+    eng = SimQuotaEngine(spoke)
+    _run(eng.reconcile())
+    ov = spoke.registry.clients["c0"]["overrides"]
+    assert ov.get("dns_fail") == "on" and ov.get("assoc_fail") == "off", ov
+    assert "assoc_fail" in eng._displaced.get("c0", set())
+    spoke.local_store._q = []                       # quota removed
+    _run(eng.reconcile())
+    ov = spoke.registry.clients["c0"]["overrides"]
+    assert "dns_fail" not in ov, ov                 # released → reverted by deletion
+    assert "assoc_fail" not in ov, ov               # displaced restored to bucket default
+    assert "c0" not in eng._displaced
+
+
+def test_preempt_displaced_off_is_not_a_human_pin(tmp_path):
+    # A human "off" on a non-engine key IS a pin; an engine-displaced "off"
+    # (recorded in _displaced) is NOT — otherwise a preempted drone would be
+    # wrongly skipped by every other quota.
+    clients = {"c0": _client("c0", "MIA",
+                             overrides={"assoc_fail": "off", "dns_fail": "on"})}
+    spoke = _FakeSpoke(clients, [], tmp_path)
+    eng = SimQuotaEngine(spoke)
+    c = spoke.registry.get("c0")
+    c["engine_keys"] = ["assoc_fail", "dns_fail"]   # engine set both
+    # No displaced record → the "off" reads as a human flip → pin.
+    assert eng._has_manual_sim_pin("c0", c) is True
+    # Record assoc_fail as displaced → the "off" is the engine's → NOT a pin
+    # (dns_fail is an engine "on", also not a pin).
+    eng._displaced["c0"] = {"assoc_fail"}
+    assert eng._has_manual_sim_pin("c0", c) is False
 
 # ── real-registry regression: wsite override must survive set_overrides prune ─
 # The fake registry used above doesn't prune, so it can't catch the bug where

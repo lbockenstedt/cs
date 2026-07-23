@@ -125,6 +125,13 @@ class SimQuotaEngine:
         # of re-reading config off disk for every client (O(quotas×clients) reads).
         self._sim_conf = None
         self._ledger_path: Optional[Path] = None
+        # Drone-preemption bookkeeping: hostname -> set of sims the engine turned
+        # OFF to free a drone for a harvested sim (its bucket-default exclusive).
+        # Persisted next to the ledger so a restart can still revert them AND tell
+        # them from a human "off" — both look identical in the registry
+        # (engine_keys + value "off"), so only this record distinguishes them.
+        self._displaced: Dict[str, set] = {}
+        self._displaced_path: Optional[Path] = None
         self._loop_task: Optional[asyncio.Task] = None
         self._reconcile_lock = asyncio.Lock()
         # Per-sweep hosting-server index + pxmx_site_map, refreshed at the top
@@ -141,9 +148,11 @@ class SimQuotaEngine:
             data_dir = Path(getattr(spoke, "data_dir", None) or ".")
             data_dir.mkdir(parents=True, exist_ok=True)
             self._ledger_path = data_dir / "sim_quota_ledger.json"
+            self._displaced_path = data_dir / "sim_quota_displaced.json"
         except Exception:  # noqa: BLE001
             self._ledger_path = None
         self._load_ledger()
+        self._load_displaced()
 
     # ── ledger persistence ───────────────────────────────────────────────────
     def _load_ledger(self) -> None:
@@ -165,6 +174,28 @@ class SimQuotaEngine:
                 json.dumps(self._ledger, indent=2, default=str), encoding="utf-8")
         except Exception as exc:  # noqa: BLE001
             logger.warning("SimQuotaEngine: ledger save failed: %s", exc)
+        self._save_displaced()
+
+    def _load_displaced(self) -> None:
+        if not self._displaced_path or not self._displaced_path.exists():
+            return
+        try:
+            raw = json.loads(self._displaced_path.read_text(encoding="utf-8")) or {}
+            if isinstance(raw, dict):
+                self._displaced = {str(h): set(v or []) for h, v in raw.items() if v}
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("SimQuotaEngine: displaced load failed: %s", exc)
+            self._displaced = {}
+
+    def _save_displaced(self) -> None:
+        if not self._displaced_path:
+            return
+        try:
+            self._displaced_path.write_text(
+                json.dumps({h: sorted(v) for h, v in self._displaced.items() if v}, indent=2),
+                encoding="utf-8")
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("SimQuotaEngine: displaced save failed: %s", exc)
 
     # ── client state helpers ─────────────────────────────────────────────────
     def _registry(self):
@@ -588,6 +619,14 @@ class SimQuotaEngine:
         active = self._client_active_sims(c) | self._engine_sims_for(hostname)
         return {s for s in active if not self._sim_multi(s)}
 
+    def _engine_exclusive_running(self, hostname: str) -> set:
+        """Exclusive (non-shareable) sims ANOTHER quota assigned to this client —
+        the only exclusivity a harvest may NOT preempt. Unlike ``_exclusive_running``
+        it ignores a drone's BUCKET-DEFAULT exclusive sim, which harvest IS allowed
+        to displace (``_assign`` turns it off): harvest (the controlled few) wins
+        over drones (the randomized many)."""
+        return {s for s in self._engine_sims_for(hostname) if not self._sim_multi(s)}
+
     def _has_manual_sim_pin(self, hostname: str, c: Dict[str, Any]) -> bool:
         """A human pinned a sim flag the engine didn't set on this client. The
         engine owns the keys it wrote — tracked in the registry's ``engine_keys``
@@ -600,9 +639,15 @@ class SimQuotaEngine:
         engine ``on`` set last sweep whose ledger entry has since dropped is a
         transient orphan (the tail's ``_reconcile_engine_keys`` reverts it) — it
         must NOT be misread as a human pin, or the diagnostic reports phantom
-        "human-pinned" clients and the engine needlessly skips harvesting them."""
+        "human-pinned" clients and the engine needlessly skips harvesting them.
+
+        An engine ``off`` recorded in ``_displaced`` is a drone default the engine
+        turned off to preempt the client (harvest wins over drones) — also the
+        engine's, NOT a human pin. Only an ``off`` that is engine-owned yet NOT in
+        ``_displaced`` is a human who flipped an engine key off."""
         eng = self._engine_sims_for(hostname)
         engine_keys = set(c.get("engine_keys") or ())
+        displaced = self._displaced.get(hostname) or set()
         ov = c.get("overrides") or {}
         for k, v in ov.items():
             if k == "wsite" or k in eng:
@@ -610,9 +655,9 @@ class SimQuotaEngine:
             vl = str(v).strip().lower()
             if vl not in ("on", "off"):
                 continue
-            if k in engine_keys and vl == "on":
-                continue        # engine-set (active or transient ledger orphan) — not a human pin
-            return True          # human set it, or flipped an engine key OFF
+            if k in engine_keys and (vl == "on" or k in displaced):
+                continue        # engine-set on, OR an engine-displaced off — not a human pin
+            return True          # human set it, or flipped a non-displaced engine key OFF
         return False
 
     def _pool_eligible(self, hostname: str, c: Dict[str, Any], sim_id: str,
@@ -623,17 +668,17 @@ class SimQuotaEngine:
         * no human manual pin on a sim flag the engine didn't set (respect
           provenance — never fight a human);
         * a SHAREABLE quota (``multi`` True) may stack onto presence / traffic /
-          other shareable sims, but NEVER onto a client an EXCLUSIVE sim
-          monopolizes (e.g. ssidpw_fail — the client can't even associate);
+          other shareable sims, and may PREEMPT a drone whose only exclusivity is
+          a bucket-default exclusive sim (``_assign`` turns that default off), but
+          NEVER a client an EXCLUSIVE sim from ANOTHER quota monopolizes;
         * an EXCLUSIVE quota (``multi`` False) monopolizes its client. It may
-          DISPLACE bucket-default ambient/multi traffic (www_traffic/iperf/… the
-          exclusive sim dominates — a client that e.g. can't even associate isn't
-          doing that traffic anyway), but never steals a client the ENGINE already
-          packed under another quota, nor one running a bucket-default EXCLUSIVE
-          sim. A presence-homed client qualifies (presence runs no sim). Blocking
-          on displaceable bucket traffic used to starve exclusive quotas in HUB
-          mode — every bucket runs traffic sims, so the whole pool looked "busy"
-          and WPA/Max-Assoc-style quotas sat at 0/N with no eligible client.
+          DISPLACE any bucket-default sim — ambient/multi traffic AND a drone's
+          bucket-default exclusive sim (harvest, the controlled few, wins over
+          drones, the randomized many) — but never steals a client the ENGINE
+          already packed under another quota. A presence-homed client qualifies
+          (presence runs no sim). Blocking on drone bucket defaults used to starve
+          quotas in HUB mode — the whole pool looked "busy" and WPA/Max-Assoc/DNS
+          quotas sat underfilled with no eligible client.
         """
         if hostname in assigned:
             return False
@@ -646,16 +691,17 @@ class SimQuotaEngine:
         if self._human_pinned_sim(hostname, sim_id):
             return False
         if multi:
-            return not self._exclusive_running(hostname, c)
+            # Preempt a drone's bucket-default exclusive; only ANOTHER quota's
+            # exclusive assignment blocks a shareable stack.
+            return not self._engine_exclusive_running(hostname)
         # EXCLUSIVE: never steal a client the engine already packed under ANOTHER
         # quota (multi or exclusive) — that would break its contribution there.
         if self._engine_sims_for(hostname):
             return False
-        # Otherwise take it as long as it isn't running a bucket-default EXCLUSIVE
-        # sim; a client running only displaceable bucket-default multi/traffic is
-        # fair game (the exclusive sim dominates once assigned).
-        excl_bucket = {s for s in self._client_active_sims(c) if not self._sim_multi(s)}
-        return not (excl_bucket - {sim_id})
+        # Otherwise it's a drone (bucket-default only) → preemptible. A conflicting
+        # bucket-default EXCLUSIVE sim is turned off by _assign so this quota's sim
+        # runs cleanly.
+        return True
 
     def _diag_reason(self, hostname: str, c: Dict[str, Any], sim_id: str,
                      multi: bool, scope_site: str, claim_key: str,
@@ -669,14 +715,13 @@ class SimQuotaEngine:
         if sim_id and self._human_pinned_sim(hostname, sim_id):
             return "human_pin"
         if multi:
-            if self._exclusive_running(hostname, c):
-                return "exclusive_monopolized"   # a non-shareable sim owns it
+            if self._engine_exclusive_running(hostname):
+                return "exclusive_monopolized"   # ANOTHER quota's exclusive sim owns it
         else:
             if self._engine_sims_for(hostname):
                 return "packed_other_quota"       # already serving another quota
-            if {s for s in self._client_active_sims(c)
-                    if not self._sim_multi(s)} - {sim_id}:
-                return "exclusive_bucket_default"
+            # a drone's bucket-default exclusive sim is now preemptible (harvest
+            # wins over drones) → no longer a block here
         # eligible on the sim rules — now check site/SSID reachability.
         if not self._cell_ok_for(hostname, claim_key):
             return "ssid_claimed_other_cell"
@@ -707,6 +752,22 @@ class SimQuotaEngine:
         # (wsite) so other stackable sims may still pack onto it.
         if sim_id:
             overrides[sim_id] = "on"
+            # Preempt a drone: turn OFF any EXCLUSIVE sim the client runs as a
+            # BUCKET DEFAULT (not sim_id, not owned by another quota). Two
+            # exclusive sims conflict, and an exclusive default (e.g. can't-
+            # associate) would also block a shareable sim we're assigning. Record
+            # each in _displaced so the tail can revert it to the bucket default
+            # once the client is no longer harvested, and so _has_manual_sim_pin
+            # tells it from a human "off". Human pins are excluded upstream
+            # (_pool_eligible); engine-owned sims belong to other quotas (also
+            # excluded), so this only suppresses a true bucket-default drone sim.
+            engine_owned = self._engine_sims_for(hostname)
+            disp = [s for s in self._client_active_sims(c)
+                    if s != sim_id and s not in engine_owned and not self._sim_multi(s)]
+            for s in disp:
+                overrides[s] = "off"
+            if disp:
+                self._displaced.setdefault(hostname, set()).update(disp)
         if site and site != from_site:
             overrides["wsite"] = site
         # Cell quota: also pin the client's SSID (+ password) to the cell, so a
@@ -1258,6 +1319,7 @@ class SimQuotaEngine:
             # human manual pin is never touched and served config is unchanged.
             await self._reconcile_engine_keys(clients)
             await self._reconcile_prune_defaults(clients)
+            await self._reconcile_displaced(clients)
 
             await asyncio.to_thread(self._save_ledger)
             if any(actions.values()):
@@ -1309,6 +1371,7 @@ class SimQuotaEngine:
             # removes it (reverting clients to their bucket defaults).
             await self._reconcile_engine_keys(clients)
             await self._reconcile_prune_defaults(clients)
+            await self._reconcile_displaced(clients)
             await asyncio.to_thread(self._save_ledger)
             logger.info("SimQuotaEngine: ledger reset — re-shuffling from scratch")
         return await self.reconcile()
@@ -1344,6 +1407,30 @@ class SimQuotaEngine:
                 await reg.remove_engine_keys(hostname, orphans)
                 logger.debug("SimQuotaEngine: removed orphan engine keys %s for %s",
                              orphans, hostname)
+
+    async def _reconcile_displaced(self, clients: Dict[str, Any]) -> None:
+        """Revert drone-displaced defaults once a client no longer runs any
+        harvested sim. When harvest preempts a drone, ``_assign`` turned an
+        exclusive bucket-default OFF (engine-owned "off") and recorded it in
+        ``_displaced``; that suppression is only needed while the client is
+        harvested. With no engine sim claim left, restore each displaced sim by
+        DELETION (back to its bucket default) — done HERE, not by the re-prune
+        pass (which only drops overrides that MATCH the bucket, whereas an
+        off-over-a-bucket-on never matches) — and forget the record. A record for
+        a client no longer in the registry is dropped without a revert."""
+        if not self._displaced:
+            return
+        reg = self._registry()
+        for hostname in list(self._displaced.keys()):
+            sims = self._displaced.get(hostname) or set()
+            if not sims or hostname not in clients:
+                self._displaced.pop(hostname, None)
+                continue
+            if self._engine_sims_for(hostname):
+                continue                      # still harvested → keep the suppression
+            if reg is not None and hasattr(reg, "remove_engine_keys"):
+                await self._engine_remove(hostname, sorted(sims))
+            self._displaced.pop(hostname, None)
 
     async def _reconcile_prune_defaults(self, clients: Dict[str, Any]) -> None:
         """Re-prune every client's on/off overrides against the CURRENT bucket
