@@ -10,14 +10,16 @@ Client-Count tabs already expect (the same ``central_status`` shape the Aruba
      "hardware_alerts": [{id, name, device_type, total}],
      "client_count_status": {site: {current, hourly_avg, drop_pct, status, ...}}}
 
-This is a near-twin of ``central_poller.CentralPoller`` — it REUSES the
-data-source-agnostic ``ClientCountTracker`` / ``CheckHealthHistory`` /
-``_cc_thresholds`` / ``_cc_worst`` helpers from ``central_poller`` so the
-client-count baseline + 30-day health history logic is shared verbatim (single
-source of truth), not forked. Only the data source (MistClient vs ArubaClient)
-and the config keys (mist_config / mist_sites_config vs central_config /
-central_sites_config) differ, plus separate on-disk baseline/history files so
-Mist and Central never share a baseline.
+This is a near-twin of ``central_poller.CentralPoller`` — it MIRRORS (does NOT
+import) the data-source-agnostic ``MistClientCountTracker`` /
+``MistCheckHealthHistory`` / ``_mist_cc_thresholds`` / ``_mist_cc_worst``
+helpers from the Mist-owned ``mist_tracker`` so the client-count baseline +
+30-day health history logic is duplicated, not shared across products (Central
+and Mist are separate products and must not share code). Only the data source
+(MistClient vs ArubaClient) and the config keys (mist_config /
+mist_sites_config vs central_config / central_sites_config) differ, plus
+separate on-disk baseline/history files so Mist and Central never share a
+baseline.
 
 ``alert_type_counts`` keys are the BARE Mist alarm ``type`` (no ``Mist:`` prefix)
 — the prefix is applied only in the sim-quota catalog layer (Setup → Sim Quotas),
@@ -33,12 +35,14 @@ from typing import Any, Dict, Optional
 
 from mist import MistClient
 from check_eval import count_for_check, normalize_counts
-# Reuse the data-source-agnostic helpers from the Aruba Central poller — the
-# client-count baseline tracker, the 30-day health history, the threshold
-# resolver + worst-of selector, and the single-tenant scope key. Sharing them
-# (vs forking) keeps the drop-detection + health-graph logic in ONE place.
-from central_poller import (
-    ClientCountTracker, CheckHealthHistory, _cc_thresholds, _cc_worst, _CC_SCOPE,
+# MIRROR (not import) the client-count baseline tracker, 30-day health history,
+# threshold resolver + worst-of selector, and single-tenant scope key from the
+# Mist-owned mist_tracker — Central and Mist are separate products and must not
+# share code. check_eval stays shared: it is a data-source-neutral matcher used
+# across the whole sim system, not Central-specific code.
+from mist_tracker import (
+    MistClientCountTracker, MistCheckHealthHistory,
+    _mist_cc_thresholds, _mist_cc_worst, _MIST_CC_SCOPE,
 )
 
 logger = logging.getLogger("MistPoller")
@@ -64,11 +68,11 @@ class MistPoller:
         self._task: Optional[asyncio.Task] = None
         # Separate baseline/history files so Mist + Central never share a series.
         ddir = str(spoke.local_store._path.parent)
-        self._cc = ClientCountTracker(
+        self._cc = MistClientCountTracker(
             os.path.join(ddir, "mist_client_count_baseline.json"),
             os.path.join(ddir, "mist_client_count_7day.json"),
         )
-        self._health = CheckHealthHistory(os.path.join(ddir, "mist_check_health_history.json"))
+        self._health = MistCheckHealthHistory(os.path.join(ddir, "mist_check_health_history.json"))
         self.reload()
 
     # ── (re)build the MistClient from the current stored config ─────────────
@@ -103,7 +107,7 @@ class MistPoller:
         if not self._client or not self._client.is_configured():
             self.spoke.mist_status = {}
             return
-        cc_thresh = _cc_thresholds(self.spoke.local_store.get_mist_config())
+        cc_thresh = _mist_cc_thresholds(self.spoke.local_store.get_mist_config())
         sites_cfg = self.spoke.local_store.get_mist_sites_config()
         site_mappings: Dict[str, str] = sites_cfg.get("site_mappings") or {}
         monitored: list = sites_cfg.get("monitored_checks") or []
@@ -147,19 +151,19 @@ class MistPoller:
             current = int(data.get("client_count", 0) or 0)
             wired = int(data.get("wired_clients", 0) or 0)
             wireless = int(data.get("wireless_clients", 0) or 0)
-            self._cc.record(_CC_SCOPE, wireless_site, current)
-            self._cc.record(_CC_SCOPE, wireless_site, wired, kind="wired")
-            self._cc.record(_CC_SCOPE, wireless_site, wireless, kind="wireless")
-            cc_entry = self._cc.entry(_CC_SCOPE, wireless_site, mist_site, cc_thresh)
-            w_entry = self._cc.entry(_CC_SCOPE, wireless_site, mist_site, cc_thresh, kind="wired")
-            wl_entry = self._cc.entry(_CC_SCOPE, wireless_site, mist_site, cc_thresh, kind="wireless")
+            self._cc.record(_MIST_CC_SCOPE, wireless_site, current)
+            self._cc.record(_MIST_CC_SCOPE, wireless_site, wired, kind="wired")
+            self._cc.record(_MIST_CC_SCOPE, wireless_site, wireless, kind="wireless")
+            cc_entry = self._cc.entry(_MIST_CC_SCOPE, wireless_site, mist_site, cc_thresh)
+            w_entry = self._cc.entry(_MIST_CC_SCOPE, wireless_site, mist_site, cc_thresh, kind="wired")
+            wl_entry = self._cc.entry(_MIST_CC_SCOPE, wireless_site, mist_site, cc_thresh, kind="wireless")
             cc_entry["wired"] = wired
             cc_entry["wireless"] = wireless
             cc_entry["wired_status"] = w_entry["status"]
             cc_entry["wired_drop_pct"] = w_entry["drop_pct"]
             cc_entry["wireless_status"] = wl_entry["status"]
             cc_entry["wireless_drop_pct"] = wl_entry["drop_pct"]
-            cc_entry["status"] = _cc_worst(cc_entry["status"], w_entry["status"], wl_entry["status"])
+            cc_entry["status"] = _mist_cc_worst(cc_entry["status"], w_entry["status"], wl_entry["status"])
             client_count_status[wireless_site] = cc_entry
             checks["Steady Client Count 1hr Average"] = {
                 "status": cc_entry["status"],
@@ -210,12 +214,12 @@ class MistPoller:
                 continue
             for cid, info in checks_map.items():
                 st = (info.get("status") if isinstance(info, dict) else info) or "no_data"
-                self._health.record(_CC_SCOPE, wsite, cid, st)
+                self._health.record(_MIST_CC_SCOPE, wsite, cid, st)
         self.spoke.mist_status = {
             "status": status,
             "hardware_alerts": hardware_alerts,
             "client_count_status": client_count_status,
-            "health": self._health.summary(_CC_SCOPE),
+            "health": self._health.summary(_MIST_CC_SCOPE),
             "fetched_at": time.time(),
         }
         self._cc.maybe_snapshot()
