@@ -590,15 +590,29 @@ class SimQuotaEngine:
 
     def _has_manual_sim_pin(self, hostname: str, c: Dict[str, Any]) -> bool:
         """A human pinned a sim flag the engine didn't set on this client. The
-        engine owns only the (sim_id, wsite) it set on ledger clients; any OTHER
-        sim-flag override (on/off) is a manual pin we must not fight."""
+        engine owns the keys it wrote — tracked in the registry's ``engine_keys``
+        PROVENANCE — and it only ever sets a sim flag ON. So a sim-flag override
+        is a HUMAN pin only when the engine didn't set it: the key isn't
+        engine-owned, OR it is but a human flipped it OFF (a value the engine
+        never writes).
+
+        Uses the provenance, NOT just the live ledger (``_engine_sims_for``): an
+        engine ``on`` set last sweep whose ledger entry has since dropped is a
+        transient orphan (the tail's ``_reconcile_engine_keys`` reverts it) — it
+        must NOT be misread as a human pin, or the diagnostic reports phantom
+        "human-pinned" clients and the engine needlessly skips harvesting them."""
         eng = self._engine_sims_for(hostname)
+        engine_keys = set(c.get("engine_keys") or ())
         ov = c.get("overrides") or {}
         for k, v in ov.items():
             if k == "wsite" or k in eng:
                 continue
-            if str(v).strip().lower() in ("on", "off"):
-                return True
+            vl = str(v).strip().lower()
+            if vl not in ("on", "off"):
+                continue
+            if k in engine_keys and vl == "on":
+                continue        # engine-set (active or transient ledger orphan) — not a human pin
+            return True          # human set it, or flipped an engine key OFF
         return False
 
     def _pool_eligible(self, hostname: str, c: Dict[str, Any], sim_id: str,
