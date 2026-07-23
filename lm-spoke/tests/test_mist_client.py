@@ -40,6 +40,10 @@ class _FakeClient:
     def __init__(self, routes):
         self.routes = routes
         self.gets = []
+        # params per get (parallel to gets) so a test can assert query params
+        # like the alarms-search ``duration`` window without breaking the
+        # ``gets`` substring checks other tests rely on.
+        self.params = []
 
     async def __aenter__(self):
         return self
@@ -49,6 +53,7 @@ class _FakeClient:
 
     async def get(self, url, headers=None, params=None, timeout=None):
         self.gets.append(url)
+        self.params.append(params or {})
         for needle, payload in self.routes.items():
             if needle in url:
                 return _FakeResp(payload)
@@ -186,6 +191,56 @@ def test_alarms_cached_within_ttl(monkeypatch):
     # Only ONE alarms HTTP call across the two reads (cache hit on the second).
     alarms_gets = [u for u in fake.gets if "/alarms/search" in u]
     assert len(alarms_gets) == 1
+
+
+def test_browse_passes_7d_duration_window(monkeypatch):
+    """browse_all + available_checks widen the alarms window to 7d — the Mist
+    /alarms/search endpoint DEFAULTS to 1d when ``duration`` is omitted, which
+    hid any alarm older than 24h and left the Alerts tab empty. Pin the wider
+    window so the gap (cs spoke shipped without the duration param) can't
+    silently regress. The dashboard poll keeps the 1d default (separate test)."""
+    routes = {
+        "/orgs/org-1/sites": [{"id": "s1", "name": "MIA"}],
+        "/alarms/search": {"results": [
+            {"type": "ap_offline", "site_id": "s1", "severity": "critical"}], "next": None},
+        "/sites/s1/stats/clients": [],
+    }
+    fake = _patch(monkeypatch, routes)
+    asyncio.run(_new_client().browse_all())
+    # The browse alarms call MUST request duration=7d (not the 1d default).
+    browse_params = [p for u, p in zip(fake.gets, fake.params) if "/alarms/search" in u]
+    assert browse_params, "browse_all should have fetched alarms"
+    assert all(p.get("duration") == "7d" for p in browse_params), browse_params
+
+
+def test_poll_keeps_1d_default_duration(monkeypatch):
+    """The dashboard active-alarm poll (poll_site_data) keeps the 1d default —
+    current problems only — distinct cache key from the 7d browse window."""
+    routes = {
+        "/orgs/org-1/sites": [{"id": "s1", "name": "MIA"}],
+        "/alarms/search": {"results": [
+            {"type": "ap_offline", "site_id": "s1", "severity": "critical"}], "next": None},
+        "/sites/s1/stats/clients": [],
+    }
+    fake = _patch(monkeypatch, routes)
+    asyncio.run(_new_client().poll_site_data("MIA"))
+    poll_params = [p for u, p in zip(fake.gets, fake.params) if "/alarms/search" in u]
+    assert poll_params, "poll_site_data should have fetched alarms"
+    # 1d default (no explicit duration) — current-problems-only window.
+    assert all(p.get("duration") == "1d" for p in poll_params), poll_params
+
+
+def test_fetch_alarms_failure_sets_warning(monkeypatch):
+    """A failed alarms fetch returns ([], warning) — NOT a silent empty list —
+    so the Alerts tab can distinguish 'no alarms in window' from 'call failed'."""
+    fake = _patch(monkeypatch, {"/orgs/org-1/sites": []})
+
+    async def _boom(client, path, params=None):
+        raise RuntimeError("boom")
+    monkeypatch.setattr(MistClient, "_get", _boom)
+    alarms, warning = asyncio.run(_new_client()._fetch_alarms())
+    assert alarms == []
+    assert warning and "boom" in warning
 
 
 def test_available_checks_falls_back_when_no_alarms(monkeypatch):
