@@ -310,6 +310,31 @@ class LocalStore:
             self._data["mist_sites_config"] = cfg or {}
             self._save()
 
+    # ── Central On-Prem API config (a SECOND, independent Aruba Central instance
+    # pointing at an on-prem appliance — same ArubaClient as cloud Central, just a
+    # separate config slot so the two never overwrite each other). Mirrors
+    # central_config; the on-prem poller reads this slot. Hub-pushed in distributed
+    # mode (the spoke holds the creds); in centralized mode the hub holds them and
+    # the spoke is a relay — same as cloud Central.
+    def get_central_on_prem_config(self) -> Dict[str, Any]:
+        return dict(self._data.get("central_on_prem_config") or {})
+
+    def set_central_on_prem_config(self, cfg: Dict[str, Any]) -> None:
+        with self._lock:
+            self._data["central_on_prem_config"] = cfg or {}
+            self._save()
+
+    # ── Central On-Prem sites config (which sites to poll + monitored checks).
+    # Mirrors central_sites_config — fully independent from the cloud Central
+    # sites config so the two instances don't share mappings/monitored checks.
+    def get_central_on_prem_sites_config(self) -> Dict[str, Any]:
+        return dict(self._data.get("central_on_prem_sites_config") or {})
+
+    def set_central_on_prem_sites_config(self, cfg: Dict[str, Any]) -> None:
+        with self._lock:
+            self._data["central_on_prem_sites_config"] = cfg or {}
+            self._save()
+
     # ── pxmx server → site map (engine site resolver) ──────────────────────────
     # An operator assigns each connected pxmx server (the agent host = its short
     # hostname, the same key as connected_agents[agent_id]["hostname"] and
