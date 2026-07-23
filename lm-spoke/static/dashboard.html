@@ -72,6 +72,12 @@
                 data-view="Clients" role="tab" aria-selected="false">Clients</button>
         <button class="cs-tab-btn px-4 py-2 text-sm font-semibold rounded-t-lg border border-b-0 border-transparent text-slate-500"
                 data-view="Central" role="tab" aria-selected="false">Central</button>
+        <!-- Central On-Prem — a SECOND Aruba Central instance (same Aruba API,
+             separate config/sites/telemetry slots). Mirrors the cloud Central
+             tab but reads the on-prem config + poller so the two never step on
+             each other. -->
+        <button class="cs-tab-btn px-4 py-2 text-sm font-semibold rounded-t-lg border border-b-0 border-transparent text-slate-500"
+                data-view="Central On-Prem" role="tab" aria-selected="false">Central On-Prem</button>
         <button class="cs-tab-btn px-4 py-2 text-sm font-semibold rounded-t-lg border border-b-0 border-transparent text-slate-500"
                 data-view="Mist" role="tab" aria-selected="false">Mist</button>
         <button class="cs-tab-btn px-4 py-2 text-sm font-semibold rounded-t-lg border border-b-0 border-transparent text-slate-500"
@@ -90,6 +96,11 @@
                 data-view="Auto-Provisioning" role="tab" aria-selected="false">Auto-Provisioning</button>
         <button class="cs-tab-btn px-4 py-2 text-sm font-semibold rounded-t-lg border border-b-0 border-transparent text-slate-500"
                 data-view="Central API Setup" role="tab" aria-selected="false">Central API Setup</button>
+        <!-- Central On-Prem API Setup — creds/cluster_url for the on-prem
+             Aruba Central instance (mirrors the cloud Central API Setup tab;
+             separate config slot so saving here does not overwrite cloud). -->
+        <button class="cs-tab-btn px-4 py-2 text-sm font-semibold rounded-t-lg border border-b-0 border-transparent text-slate-500"
+                data-view="Central On-Prem API Setup" role="tab" aria-selected="false">Central On-Prem API Setup</button>
         <button class="cs-tab-btn px-4 py-2 text-sm font-semibold rounded-t-lg border border-b-0 border-transparent text-slate-500"
                 data-view="Mist API Setup" role="tab" aria-selected="false">Mist API Setup</button>
     </nav>
@@ -170,6 +181,7 @@
             'Engine Diagnostic': () => csRenderEngineDiag(),
             'Auto-Provisioning': () => renderAutoProvisioning(),
             'Central API Setup': () => csRenderSetupCentralApi(),
+            'Central On-Prem API Setup': () => csRenderSetupCentralOnPremApi(),
             'Mist API Setup': () => csRenderSetupMistApi(),
         };
 
