@@ -1219,6 +1219,24 @@ class SimQuotaEngine:
             # the ledger/overrides are settled). Synchronous analysis; sheds are
             # fired as background tasks. Populates _qt_telemetry for the relay.
             self._quarantine_sweep(now)
+            # Publish an immutable end-of-sweep snapshot so the Engine-State view
+            # (snapshot / quota_diagnostics / pool_counts / placement_warnings)
+            # always reads mutually-consistent numbers from ONE completed sweep.
+            # Reading the live self._ledger / _quota_diag mid-sweep — via an
+            # unlocked endpoint call landing on a cooperative yield (and, worse,
+            # pool_counts() re-loading the host-index caches the running sweep
+            # depends on) — produced internally-impossible pairs like "4/7 with
+            # 14 free-eligible" and "7/5 over max". Built here under the reconcile
+            # lock in one synchronous (yield-free) block, so a reader sees only
+            # the previous complete snapshot or this one — never a half-built one.
+            self._published = {
+                "ledger": {k: {"sim_id": e.get("sim_id"), "site": e.get("site"),
+                               "clients": list((e.get("clients") or {}).keys())}
+                           for k, e in self._ledger.items()},
+                "diagnostics": [{"key": k, **v} for k, v in self._quota_diag.items()],
+                "pool": self._compute_pool_counts(now),
+                "placement_warnings": list(getattr(self, "_placement_warnings", []) or []),
+            }
             # Diagnostic: with the cooperative yields above a large sweep no longer
             # BLOCKS the loop, but wall-clock can still grow with fleet size — log
             # it so an operator can correlate sweep cost with scale (and confirm the
@@ -1355,14 +1373,23 @@ class SimQuotaEngine:
 
     # ── introspection (for the Chunk 4 quota-state view) ─────────────────────
     def snapshot(self) -> Dict[str, Any]:
-        # Hide ignored hostnames from the ledger view immediately (the next
+        # Serve the immutable end-of-sweep snapshot (see reconcile's publish
+        # block) so the ledger view is always consistent with the diagnostics /
+        # pool the same call returns. Pre-first-sweep, fall back to the live
+        # persisted ledger. Hide ignored hostnames at read time (the next
         # reconcile also drops them from the ledger proper).
         ignored = self._ignored_hostnames()
+        pub = getattr(self, "_published", None)
+        led = pub.get("ledger") if pub else None
+        if led is None:
+            led = {k: {"sim_id": e.get("sim_id"), "site": e.get("site"),
+                       "clients": list((e.get("clients") or {}).keys())}
+                   for k, e in self._ledger.items()}
         return {
             key: {"sim_id": e.get("sim_id"), "site": e.get("site"),
-                  "clients": [h for h in (e.get("clients") or {}).keys()
+                  "clients": [h for h in (e.get("clients") or [])
                               if str(h).strip().lower() not in ignored]}
-            for key, e in self._ledger.items()
+            for key, e in led.items()
         }
 
     def quota_diagnostics(self) -> List[Dict[str, Any]]:
@@ -1370,22 +1397,26 @@ class SimQuotaEngine:
         target/producing + eligible-free + not-harvestable + blocked-reason
         counts. Powers the Config → Engine State 'why underfilled' view so an
         opaque '0/N underfilled' names WHICH clients are blocked and by what.
-        Empty until the first sweep runs."""
+        Served from the published end-of-sweep snapshot so it stays consistent
+        with snapshot()/pool_counts(). Empty until the first sweep runs."""
+        pub = getattr(self, "_published", None)
+        if pub is not None:
+            return list(pub.get("diagnostics") or [])
         diag = getattr(self, "_quota_diag", None) or {}
         return [{"key": k, **v} for k, v in diag.items()]
 
     def placement_warnings(self) -> List[Dict[str, Any]]:
         """SSID cells that couldn't reach their hold-N floor last sweep (pool too
-        small). Consumed by the Quota State view."""
+        small). Consumed by the Quota State view (published snapshot)."""
+        pub = getattr(self, "_published", None)
+        if pub is not None:
+            return list(pub.get("placement_warnings") or [])
         return list(getattr(self, "_placement_warnings", []) or [])
 
-    def pool_counts(self) -> Dict[str, Any]:
-        """A CHEAP count of the current harvestable pool — one O(n) pass over the
-        client registry, NO ledger/accounting (this is the ~99% we deliberately
-        don't track per-client). Returns total online, per-physical-site counts,
-        and the tenant-pool (assignable-anywhere) count."""
-        now = time.time()
-        self._refresh_host_index()
+    def _compute_pool_counts(self, now: float) -> Dict[str, Any]:
+        """One O(n) pass over the registry using the CURRENT host-index caches
+        (no refresh — the caller owns cache vintage). Total online, per-physical-
+        site counts, and the tenant-pool (assignable-anywhere) count."""
         out = {"online": 0, "by_site": {}, "tenant_pool": 0}
         for h, c in self._all_clients().items():
             if not self._is_harvestable(c, now):
@@ -1398,3 +1429,17 @@ class SimQuotaEngine:
                 if s:
                     out["by_site"][s] = out["by_site"].get(s, 0) + 1
         return out
+
+    def pool_counts(self) -> Dict[str, Any]:
+        """The harvestable-pool count from the published end-of-sweep snapshot so
+        it's consistent with snapshot()/quota_diagnostics(). Pre-first-sweep,
+        compute live — but NEVER refresh the shared host index while a sweep holds
+        the reconcile lock, since that would clobber the caches the running sweep
+        depends on and desync its fill vs diagnostic passes (the root cause of the
+        impossible '4/7 with 14 free' pairs)."""
+        pub = getattr(self, "_published", None)
+        if pub and pub.get("pool") is not None:
+            return dict(pub["pool"])
+        if not self._reconcile_lock.locked():
+            self._refresh_host_index()
+        return self._compute_pool_counts(time.time())
