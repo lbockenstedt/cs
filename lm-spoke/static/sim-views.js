@@ -3326,7 +3326,6 @@ function csRenderSimQuotaEditor() {
             <select data-cs-sq="site" class="w-full bg-white border border-slate-300 rounded-md px-2 py-1.5 text-sm mt-1">${siteOpts}</select>
           </label>
           <label class="text-xs text-slate-500 flex flex-col gap-1">
-            <span class="flex items-center gap-1"><input data-cs-sq="multi_capable" type="checkbox" ${isPresence ? 'checked disabled' : (r.multi_capable ? 'checked' : '')}> Multi-capable</span>
             <span class="flex items-center gap-1"><input data-cs-sq="rehome" type="checkbox" ${r.rehome ? 'checked' : ''}> Re-home</span>
             <span class="flex items-center gap-1"><input data-cs-sq="enabled" type="checkbox" ${r.enabled ? 'checked' : ''}> Enabled</span>
             ${(!isPresence && knobSims.has(r.sim_id)) ? `<span class="flex items-center gap-1" title="Ratchet this sim's intensity knobs (e.g. dns_fail_rate/duration) down to the minimum that still fires the alert."><input data-cs-sq="learn_knobs" type="checkbox" ${r.learn_knobs ? 'checked' : ''}> Learn floor</span>` : ''}
@@ -3374,7 +3373,6 @@ function csSimQuotaSyncFromDom() {
             sim_id,
             count: parseInt(g('count').value || '1', 10) || 1,
             site: g('site').value,
-            multi_capable: !!g('multi_capable').checked,
             rehome: !!g('rehome').checked,
             enabled: !!g('enabled').checked,
             learn_knobs: !!((g('learn_knobs') || {}).checked),
@@ -3612,6 +3610,11 @@ async function csRenderSimQuotaState() {
                 <button onclick="csResetToKnownGood(${csEscape(JSON.stringify(ak))})" class="bg-[#01A982]/10 hover:bg-[#01A982]/20 text-[#01A982] border border-[#01A982] px-2 py-0.5 rounded text-[10px] font-bold">Reset to known-good</button>
             </div>`;
         };
+        // Diagnostics carry the engine's EFFECTIVE (global) sharing per quota —
+        // sharing is a global sim property now (Simulation-Sharing tile), not a
+        // per-quota flag, so the Multi column reflects that, not q.multi_capable.
+        const diagByKey = {};
+        (st.diagnostics || []).forEach(d => { if (d && d.key) diagByKey[d.key] = d; });
         const rows = eff.map(q => {
             const k = keyOf(q);
             const e = ledger[k] || {};
@@ -3642,7 +3645,7 @@ async function csRenderSimQuotaState() {
               <td class="px-2 py-1.5 text-xs">${simCell}</td>
               <td class="px-2 py-1.5 text-xs">${csEscape(q.site || '<all>')}</td>
               <td class="px-2 py-1.5 text-xs text-center">${fill}</td>
-              <td class="px-2 py-1.5 text-xs text-center">${q.multi_capable ? '✓' : '—'}</td>
+              <td class="px-2 py-1.5 text-xs text-center" title="Shareable (stacks onto other sims) — set globally in Setup → Simulations Sharing">${(diagByKey[k] ? diagByKey[k].multi : q.multi_capable) ? '✓' : '—'}</td>
               <td class="px-2 py-1.5 text-xs text-center">${q.rehome ? '✓' : '—'}</td>
               <td class="px-2 py-1.5 text-xs">${chips(clients) || '<span class="text-slate-400 italic">none</span>'}${kgLine(q)}${diagLine(q, k)}</td>
             </tr>`;

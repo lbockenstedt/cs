@@ -1082,7 +1082,13 @@ class SimQuotaEngine:
                 await asyncio.sleep(0)
                 key = _quota_key(q)
                 sim_id = q.get("sim_id") or ""
-                multi = bool(q.get("multi_capable"))
+                # Sharing is GLOBAL, not per-quota: a quota stacks only if the SIM
+                # itself is shareable (Simulation-Sharing tile / SIM_META via
+                # _sim_multi), never a stale per-quota flag. That divergence made
+                # the keep-loop see a client's OWN harvested sim as an exclusive
+                # sim monopolizing it → release-and-re-pick every sweep (churn). A
+                # presence quota (no sim) always stacks.
+                multi = True if not sim_id else self._sim_multi(sim_id)
                 site = q.get("site") or ""
                 # If `site` names an SSID cell (e.g. "MIA-PSK"), scope to the
                 # cell's PHYSICAL site for all in-site/pool/claim tests, and pin
