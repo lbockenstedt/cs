@@ -73,6 +73,8 @@
         <button class="cs-tab-btn px-4 py-2 text-sm font-semibold rounded-t-lg border border-b-0 border-transparent text-slate-500"
                 data-view="Central" role="tab" aria-selected="false">Central</button>
         <button class="cs-tab-btn px-4 py-2 text-sm font-semibold rounded-t-lg border border-b-0 border-transparent text-slate-500"
+                data-view="Mist" role="tab" aria-selected="false">Mist</button>
+        <button class="cs-tab-btn px-4 py-2 text-sm font-semibold rounded-t-lg border border-b-0 border-transparent text-slate-500"
                 data-view="API Server" role="tab" aria-selected="false">API Server</button>
         <button class="cs-tab-btn px-4 py-2 text-sm font-semibold rounded-t-lg border border-b-0 border-transparent text-slate-500"
                 data-view="Config" role="tab" aria-selected="false">Config</button>
@@ -88,6 +90,8 @@
                 data-view="Auto-Provisioning" role="tab" aria-selected="false">Auto-Provisioning</button>
         <button class="cs-tab-btn px-4 py-2 text-sm font-semibold rounded-t-lg border border-b-0 border-transparent text-slate-500"
                 data-view="Central API Setup" role="tab" aria-selected="false">Central API Setup</button>
+        <button class="cs-tab-btn px-4 py-2 text-sm font-semibold rounded-t-lg border border-b-0 border-transparent text-slate-500"
+                data-view="Mist API Setup" role="tab" aria-selected="false">Mist API Setup</button>
     </nav>
 
     <!-- Content — sim-views.js renders into these two containers. -->
@@ -166,6 +170,7 @@
             'Engine Diagnostic': () => csRenderEngineDiag(),
             'Auto-Provisioning': () => renderAutoProvisioning(),
             'Central API Setup': () => csRenderSetupCentralApi(),
+            'Mist API Setup': () => csRenderSetupMistApi(),
         };
 
         function activateTab(view) {
