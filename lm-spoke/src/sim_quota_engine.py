@@ -945,23 +945,24 @@ class SimQuotaEngine:
             site_w = self.spoke.local_store.get_ambient_site_weights() or {}
         except Exception:  # noqa: BLE001
             site_w = {}
-        # Cross-site weight per site. An EXPLICIT per-site load weight (Ambient
-        # distribution → Per-site) wins. When the operator hasn't set one, default
-        # to the SUM of that site's weighted cell rules — so a cell weighted 3 at
-        # one site draws ~3× the tenant-pool clients of a cell weighted 1 at
-        # another. Without this, the cell weight only affected the WITHIN-site
-        # split (a no-op with one cell per site, the typical setup) and the
-        # across-site split defaulted to even regardless of the cell weights the
-        # operator configured — the "per-cell counts off vs weights" symptom. A
-        # site with only `all` / weight-0 cells (sum 0) keeps a floor of 1 so it
-        # still receives an even share for its `all` cell to soak.
+        # Cross-site weight per site = per-site load weight × the SUM of that
+        # site's weighted cell rules. The cell-sum is what makes a site with more
+        # (or higher-weighted) cells draw a proportionally larger share of the
+        # tenant-pool — without it, every site got an EQUAL site share split
+        # across however many cells it had, so a 2-cell site starved each cell
+        # vs a 1-cell site (the "per-cell counts off vs weights" symptom: equal
+        # cell weights produced unequal per-cell counts). The per-site weight
+        # (Ambient distribution → Per-site, default 1) is a MULTIPLIER on top of
+        # the cell pull, so an operator can bias a whole site 2× without
+        # re-weighting every cell; 0 zeros a site out. A site whose cells are all
+        # `all` / weight-0 (sum 0) floors its base at 1 so it still receives an
+        # even share for its `all` cell to soak.
         weights: Dict[str, float] = {}
         for s in sites:
-            if s in site_w:
-                weights[s] = max(0.0, float(site_w.get(s) or 0))
-            else:
-                cell_sum = sum(r["weight"] for r in by_site.get(s, []))
-                weights[s] = max(1.0, float(cell_sum))
+            cell_sum = float(sum(r["weight"] for r in by_site.get(s, [])))
+            base = max(1.0, cell_sum)              # all/weight-0-only site → floor 1
+            sw = float(site_w.get(s, 1) or 0) if s in site_w else 1.0
+            weights[s] = max(0.0, sw * base)
         if sum(weights.values()) <= 0:
             weights = {s: 1.0 for s in sites}          # unset / all-zero → even split
         spread_site: Dict[str, str] = {}

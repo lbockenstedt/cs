@@ -840,3 +840,56 @@ def test_reconcile_weighted_all_only_site_keeps_even_share(tmp_path):
     wsites = [spoke.registry.clients[h].get("overrides", {}).get("wsite") for h in clients]
     assert wsites.count("A") == 2, wsites
     assert wsites.count("B") == 2, wsites
+
+
+def test_reconcile_weighted_multi_cell_site_gets_larger_share(tmp_path):
+    # The cells-per-site dilution fix: a site with MORE cells must draw a
+    # proportionally larger share of the tenant-pool so its per-cell count isn't
+    # starved. 12 spare, site A has two weight-1 cells (sum 2), site B has one
+    # weight-1 cell (sum 1), no ambient_site_weights → cross-site 2:1 → A gets
+    # 8 / B gets 4, then A splits 4/4. Per-cell: A1=4, A2=4, B1=4 (all equal),
+    # instead of the old 3/3/6 where B1 got double.
+    clients = {f"c{i}": _client(f"c{i}", "") for i in range(12)}
+    spoke = _FakeSpoke(clients, [], tmp_path)
+    spoke.local_store._matrix = [
+        {"name": "A1", "site": "A", "ssid": "ssidA1", "ssidpw": "pw", "enabled": True},
+        {"name": "A2", "site": "A", "ssid": "ssidA2", "ssidpw": "pw", "enabled": True},
+        {"name": "B1", "site": "B", "ssid": "ssidB1", "ssidpw": "pw", "enabled": True},
+    ]
+    spoke.local_store._weights = [
+        {"ssid": "A1", "site": "A", "weight": 1},
+        {"ssid": "A2", "site": "A", "weight": 1},
+        {"ssid": "B1", "site": "B", "weight": 1},
+    ]
+    eng = SimQuotaEngine(spoke)
+    _run(eng.reconcile())
+    wsites = [spoke.registry.clients[h].get("overrides", {}).get("wsite") for h in clients]
+    assert wsites.count("A") == 8, wsites          # 2-cell site gets 2× the 1-cell site
+    assert wsites.count("B") == 4, wsites
+    ssids = [spoke.registry.clients[h].get("overrides", {}).get("ssid") for h in clients]
+    assert ssids.count("ssidA1") == 4, ssids
+    assert ssids.count("ssidA2") == 4, ssids
+    assert ssids.count("ssidB1") == 4, ssids
+
+
+def test_reconcile_weighted_site_weight_multiplies_cell_sum(tmp_path):
+    # The per-site weight is a MULTIPLIER on the cell-sum, not an absolute share.
+    # site_w {A:2}, A-cell weight 2 (sum 2), B-cell weight 1 (sum 1, no site_w →
+    # multiplier 1) → cross-site weights A=2×2=4 vs B=1×1=1 → 10 spare splits
+    # 8 to A / 2 to B.
+    clients = {f"c{i}": _client(f"c{i}", "") for i in range(10)}
+    spoke = _FakeSpoke(clients, [], tmp_path)
+    spoke.local_store._matrix = [
+        {"name": "A-cell", "site": "A", "ssid": "ssidA", "ssidpw": "pw", "enabled": True},
+        {"name": "B-cell", "site": "B", "ssid": "ssidB", "ssidpw": "pw", "enabled": True},
+    ]
+    spoke.local_store._weights = [
+        {"ssid": "A-cell", "site": "A", "weight": 2},
+        {"ssid": "B-cell", "site": "B", "weight": 1},
+    ]
+    spoke.local_store._site_w = {"A": 2}
+    eng = SimQuotaEngine(spoke)
+    _run(eng.reconcile())
+    wsites = [spoke.registry.clients[h].get("overrides", {}).get("wsite") for h in clients]
+    assert wsites.count("A") == 8, wsites
+    assert wsites.count("B") == 2, wsites
