@@ -794,3 +794,49 @@ def test_reconcile_weighted_site_weights_bias_the_spread(tmp_path):
     wsites = [spoke.registry.clients[h].get("overrides", {}).get("wsite") for h in clients]
     assert wsites.count("A") == 4, wsites
     assert wsites.count("B") == 2, wsites
+
+
+def test_reconcile_weighted_cell_weights_default_the_cross_site_split(tmp_path):
+    # No ambient_site_weights set → the cross-site split defaults to the SUM of
+    # each site's weighted cell rules, so a cell weighted 3 at A draws 3× the
+    # tenant-pool clients of a cell weighted 1 at B (the operator's cell-weight
+    # intent). 8 spare, A-cell weight 3 / B-cell weight 1 → 6 to A / 2 to B.
+    clients = {f"c{i}": _client(f"c{i}", "") for i in range(8)}
+    spoke = _FakeSpoke(clients, [], tmp_path)
+    spoke.local_store._matrix = [
+        {"name": "A-cell", "site": "A", "ssid": "ssidA", "ssidpw": "pwA", "enabled": True},
+        {"name": "B-cell", "site": "B", "ssid": "ssidB", "ssidpw": "pwB", "enabled": True},
+    ]
+    spoke.local_store._weights = [
+        {"ssid": "A-cell", "site": "A", "weight": 3},
+        {"ssid": "B-cell", "site": "B", "weight": 1},
+    ]
+    # _site_w left empty → default to cell-weight sums.
+    eng = SimQuotaEngine(spoke)
+    _run(eng.reconcile())
+    wsites = [spoke.registry.clients[h].get("overrides", {}).get("wsite") for h in clients]
+    assert wsites.count("A") == 6, wsites
+    assert wsites.count("B") == 2, wsites
+
+
+def test_reconcile_weighted_all_only_site_keeps_even_share(tmp_path):
+    # A site whose only cell is an `all` (weight 0) cell must still receive an
+    # even share for its `all` cell to soak — the cell-sum default floors at 1,
+    # it must NOT drop to 0 and starve the `all` cell. 4 spare across two sites,
+    # A has a weighted cell (weight 1), B has only an `all` cell → 2 to A / 2 to
+    # B (B's `all` cell soaks its 2).
+    clients = {f"c{i}": _client(f"c{i}", "") for i in range(4)}
+    spoke = _FakeSpoke(clients, [], tmp_path)
+    spoke.local_store._matrix = [
+        {"name": "A-cell", "site": "A", "ssid": "ssidA", "ssidpw": "pwA", "enabled": True},
+        {"name": "B-all", "site": "B", "ssid": "ssidB", "ssidpw": "pwB", "enabled": True},
+    ]
+    spoke.local_store._weights = [
+        {"ssid": "A-cell", "site": "A", "weight": 1},
+        {"ssid": "B-all", "site": "B", "weight": 0, "all": True},
+    ]
+    eng = SimQuotaEngine(spoke)
+    _run(eng.reconcile())
+    wsites = [spoke.registry.clients[h].get("overrides", {}).get("wsite") for h in clients]
+    assert wsites.count("A") == 2, wsites
+    assert wsites.count("B") == 2, wsites
