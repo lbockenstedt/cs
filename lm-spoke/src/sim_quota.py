@@ -35,7 +35,7 @@ logger = logging.getLogger("CSSimQuota")
 # A sim-quota record, stored as a list under central_sites_config["sim_quotas"].
 # Backward-compatible: an absent "sim_quotas" key = no quotas (today's behavior).
 SIM_QUOTA_KEYS = ("alert_id", "alert_type", "sim_id", "count", "site",
-                  "multi_capable", "rehome", "enabled", "learning", "learn_knobs")
+                  "multi_capable", "rehome", "enabled", "learning")
 ALERT_TYPES = ("alert", "insight")
 
 # Source prefix: Central and Mist are separate products. A quota row's
@@ -250,17 +250,15 @@ def normalize_quota(raw: Any) -> Dict[str, Any]:
         else _as_bool(raw.get("multi_capable"), bool(meta.get("multi_capable", False))),
         "rehome": _as_bool(raw.get("rehome"), False),
         "enabled": _as_bool(raw.get("enabled"), False),
-        # `learning` ON = this row is the "learning lab" that runs the full
-        # thermostat (down-ratchet to find the floor, settle floor+20%, record a
-        # publishable learned_op). OFF (default) = a consumer: up-only, seeds/lifts
-        # from the tenant/global learned operating point, never down-ratchets (never
-        # risks stopping a firing alert). See design doc §9 / adaptive_step.
+        # `learning` ON = this row is the "learning lab": full thermostat (ramp
+        # up AND down continuously to re-evaluate the floor) AND tunes the sim's
+        # [simulation] intensity knobs (SIM_KNOBS[sim_id]) down to the floor that
+        # still fires, then publishes the learned count + knobs so production
+        # consumers go straight to learned + 20%. OFF (default) = a consumer
+        # (Adaptive): up-only, seeds/lifts from the learned op + knobs, never
+        # down-ratchets. The two are MUTUALLY EXCLUSIVE (both off = fixed count).
+        # See design doc §9 / adaptive_step. Mirrored in the hub twin.
         "learning": _as_bool(raw.get("learning"), False),
-        # `learn_knobs` ON = the config-value learner tunes this sim's
-        # [simulation] intensity knobs (SIM_KNOBS[sim_id]) one at a time, DOWN to
-        # the floor that still fires the alert. Orthogonal to `learning` (which
-        # modulates client count); a no-op for a sim with no declared knobs.
-        "learn_knobs": _as_bool(raw.get("learn_knobs"), False),
     }
     # Adaptive-controller fields (design doc §9) — carried through only when the
     # quota declares them, so a fixed-count quota stays exactly as before. The
@@ -413,5 +411,8 @@ def sim_quota_catalog(
         "sims": available_sims(config_dir),
         "sites": available_sites(config_dir, central_site_mappings),
         "suggested": dict(SUGGESTED_ALERT_SIM),
-        "meta": {k: dict(v) for k, v in SIM_META.items()},
+        # `knobs` per sim = the [simulation] key names the lab tunes (so the UI can
+        # label them on a Learning row); empty for sims with no declared knobs.
+        "meta": {k: {**dict(v), "knobs": [kn["key"] for kn in SIM_KNOBS.get(k, [])]}
+                 for k, v in SIM_META.items()},
     }
