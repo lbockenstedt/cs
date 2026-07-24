@@ -4070,6 +4070,7 @@ window.csSimQuotaSave = async function () {
     const mistRows = rows.filter(r => _csQuotaSource(r.alert_id) === 'mist');
     const allErrs = [];
     const cleanRows = [];
+    let wipeBlocked = false;
     try {
         if (centralRows.length) {
             const cfg = await csFetch(`/${csTenant()}/central-sites-config?tenant_id=${csTenant()}`) || {};
@@ -4082,6 +4083,7 @@ window.csSimQuotaSave = async function () {
             const r = await csFetch(`/${csTenant()}/central-sites-config?tenant_id=${csTenant()}`, { method: 'POST', body: JSON.stringify(body) });
             cleanRows.push(...(Array.isArray(r && r.sim_quotas) ? r.sim_quotas : centralRows));
             allErrs.push(...(Array.isArray(r && r.sim_quota_errors) ? r.sim_quota_errors : []));
+            if (r && r.sim_quotas_wipe_blocked) wipeBlocked = true;
         }
         if (mistRows.length) {
             const mcfg = await csFetch(`/${csTenant()}/mist-sites-config?tenant_id=${csTenant()}`) || {};
@@ -4094,11 +4096,20 @@ window.csSimQuotaSave = async function () {
             const r = await csFetch(`/${csTenant()}/mist-sites-config?tenant_id=${csTenant()}`, { method: 'POST', body: JSON.stringify(body) });
             cleanRows.push(...(Array.isArray(r && r.sim_quotas) ? r.sim_quotas : mistRows));
             allErrs.push(...(Array.isArray(r && r.sim_quota_errors) ? r.sim_quota_errors : []));
+            if (r && r.sim_quotas_wipe_blocked) wipeBlocked = true;
         }
         // Server re-validates + dedups; adopt its cleaned rows so the UI matches.
         csSimQuotaRows = cleanRows.map(csSimQuotaRowFromServer);
         csRenderSimQuotaEditor();
-        if (allErrs.length) showToast(`Saved with ${allErrs.length} issue(s): ${allErrs.join('; ')}`, 'error');
+        if (wipeBlocked) {
+            // Anti-blast safeguard fired: the server refused to wipe the existing
+            // quotas (a stale simulation.conf would have dropped them all) and
+            // returned the preserved rows, which we re-adopted above. Surface it
+            // so the operator knows the save didn't clear their quotas and can
+            // fix the drifted sim catalog (Setup → Simulations) if intended.
+            showToast('⚠️ Quota wipe blocked — existing sim quotas preserved '
+                + '(likely a stale simulation.conf). Re-checking sims in Setup may be needed.', 'error');
+        } else if (allErrs.length) showToast(`Saved with ${allErrs.length} issue(s): ${allErrs.join('; ')}`, 'error');
         else showToast('Sim quotas saved.', 'success');
     } catch (e) {
         console.error('csSimQuotaSave: save failed', e);

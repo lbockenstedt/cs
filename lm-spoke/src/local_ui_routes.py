@@ -391,7 +391,8 @@ def build_local_ui_router(spoke) -> APIRouter:
     async def set_central_sites(tenant: str, request: Request):
         body = await request.json()
         res = await _cmd("CS_SET_CENTRAL_SITES_CONFIG", body if isinstance(body, dict) else {})
-        return {"saved": res.get("status") == "SUCCESS", "pushed_to_spokes": 1}
+        return {"saved": res.get("status") == "SUCCESS", "pushed_to_spokes": 1,
+                "sim_quotas_wipe_blocked": bool(res.get("sim_quotas_wipe_blocked"))}
 
     @router.get("/{tenant}/central/available")
     async def get_central_available(tenant: str):

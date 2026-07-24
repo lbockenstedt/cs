@@ -120,18 +120,30 @@ class ConfigCommandsMixin:
             # the UI can report them. The rest of central_sites_config
             # (monitored_checks/hardware_checks/site_mappings) passes through
             # unchanged — sim_quotas is an additive field.
+            wipe_blocked = False
             try:
                 import sim_quota
                 sims = [s["sim_id"] for s in sim_quota.available_sims(self.settings.config_dir)]
                 clean, errs = sim_quota.validate_sim_quotas(cfg.get("sim_quotas"), sims)
                 if errs:
                     logger.warning("CS_SET_CENTRAL_SITES_CONFIG: sim_quotas errors: %s", errs)
+                # Anti-blast safeguard: never let a save take sim_quotas from N>0
+                # to 0 without an explicit force_sim_quotas_clear. A stale
+                # simulation.conf (sims no longer lists the quota sims) makes
+                # validate_sim_quotas drop every row — wiping the whole table.
+                existing_quotas = (self.local_store.get_central_sites_config() or {}).get("sim_quotas") or []
+                clean, wipe_blocked = sim_quota.guard_sim_quota_wipe(existing_quotas, clean, d)
+                if wipe_blocked:
+                    logger.error("CS_SET_CENTRAL_SITES_CONFIG: sim_quotas wipe BLOCKED — "
+                                 "save would drop %d quota(s) to 0 (stale sim_ids or empty send) "
+                                 "without force_sim_quotas_clear; existing quotas preserved",
+                                 len(existing_quotas))
                 cfg = {**cfg, "sim_quotas": clean}
             except Exception as exc:  # noqa: BLE001 — never block the save
                 logger.warning("sim_quotas validate failed: %s", exc)
             self.local_store.set_central_sites_config(cfg)
             self.central_poller.reload()
-            return {"status": "SUCCESS"}
+            return {"status": "SUCCESS", "sim_quotas_wipe_blocked": wipe_blocked}
 
         if cmd in ("CS_GET_CENTRAL_AVAILABLE",):
             return await self.central_poller.available_checks()
@@ -163,18 +175,26 @@ class ConfigCommandsMixin:
             # Validate sim_quotas against this tenant's simulation.conf sims
             # (same drop-unknown + surface-errors pass as the Central twin). The
             # rows here carry Central On-Prem:-prefixed alert_ids.
+            wipe_blocked = False
             try:
                 import sim_quota
                 sims = [s["sim_id"] for s in sim_quota.available_sims(self.settings.config_dir)]
                 clean, errs = sim_quota.validate_sim_quotas(cfg.get("sim_quotas"), sims)
                 if errs:
                     logger.warning("CS_SET_CENTRAL_ON_PREM_SITES_CONFIG: sim_quotas errors: %s", errs)
+                existing_quotas = (self.local_store.get_central_on_prem_sites_config() or {}).get("sim_quotas") or []
+                clean, wipe_blocked = sim_quota.guard_sim_quota_wipe(existing_quotas, clean, d)
+                if wipe_blocked:
+                    logger.error("CS_SET_CENTRAL_ON_PREM_SITES_CONFIG: sim_quotas wipe BLOCKED — "
+                                 "save would drop %d quota(s) to 0 (stale sim_ids or empty send) "
+                                 "without force_sim_quotas_clear; existing quotas preserved",
+                                 len(existing_quotas))
                 cfg = {**cfg, "sim_quotas": clean}
             except Exception as exc:  # noqa: BLE001 — never block the save
                 logger.warning("sim_quotas validate failed (central_on_prem): %s", exc)
             self.local_store.set_central_on_prem_sites_config(cfg)
             self.central_on_prem_poller.reload()
-            return {"status": "SUCCESS"}
+            return {"status": "SUCCESS", "sim_quotas_wipe_blocked": wipe_blocked}
 
         if cmd in ("CS_GET_CENTRAL_ON_PREM_AVAILABLE",):
             return await self.central_on_prem_poller.available_checks()
@@ -215,18 +235,26 @@ class ConfigCommandsMixin:
             cfg = d if isinstance(d, dict) else {}
             # Validate sim_quotas against this tenant's simulation.conf sims
             # (same drop-unknown + surface-errors pass as the Central twin).
+            wipe_blocked = False
             try:
                 import sim_quota
                 sims = [s["sim_id"] for s in sim_quota.available_sims(self.settings.config_dir)]
                 clean, errs = sim_quota.validate_sim_quotas(cfg.get("sim_quotas"), sims)
                 if errs:
                     logger.warning("CS_SET_MIST_SITES_CONFIG: sim_quotas errors: %s", errs)
+                existing_quotas = (self.local_store.get_mist_sites_config() or {}).get("sim_quotas") or []
+                clean, wipe_blocked = sim_quota.guard_sim_quota_wipe(existing_quotas, clean, d)
+                if wipe_blocked:
+                    logger.error("CS_SET_MIST_SITES_CONFIG: sim_quotas wipe BLOCKED — "
+                                 "save would drop %d quota(s) to 0 (stale sim_ids or empty send) "
+                                 "without force_sim_quotas_clear; existing quotas preserved",
+                                 len(existing_quotas))
                 cfg = {**cfg, "sim_quotas": clean}
             except Exception as exc:  # noqa: BLE001 — never block the save
                 logger.warning("sim_quotas validate failed (mist): %s", exc)
             self.local_store.set_mist_sites_config(cfg)
             self.mist_poller.reload()
-            return {"status": "SUCCESS"}
+            return {"status": "SUCCESS", "sim_quotas_wipe_blocked": wipe_blocked}
 
         if cmd in ("CS_GET_MIST_AVAILABLE",):
             return await self.mist_poller.available_checks()
