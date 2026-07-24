@@ -3852,7 +3852,7 @@ function csRenderSimQuotaEditor() {
           <label class="text-xs text-slate-500">Site
             <select data-cs-sq="site" class="w-full bg-white border border-slate-300 rounded-md px-2 py-1.5 text-sm mt-1">${siteOpts}</select>
           </label>
-          <label class="text-xs text-slate-500 flex flex-col gap-1">
+          <label class="text-xs text-slate-500 flex flex-wrap gap-x-3 gap-y-1">
             <span class="flex items-center gap-1"><input data-cs-sq="rehome" type="checkbox" ${r.rehome ? 'checked' : ''}> Re-home</span>
             <span class="flex items-center gap-1"><input data-cs-sq="enabled" type="checkbox" ${r.enabled ? 'checked' : ''}> Enabled</span>
             ${(!isPresence && knobSims.has(r.sim_id)) ? `<span class="flex items-center gap-1" title="Ratchet this sim's intensity knobs (e.g. dns_fail_rate/duration) down to the minimum that still fires the alert."><input data-cs-sq="learn_knobs" type="checkbox" ${r.learn_knobs ? 'checked' : ''}> Learn floor</span>` : ''}
