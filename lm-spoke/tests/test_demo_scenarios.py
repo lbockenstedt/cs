@@ -90,8 +90,9 @@ def test_effective_flags_layer_on_registry_overrides(spoke_loop):
         "CS_DEMO_SCENARIO", {"hostname": "host-a", "scenario": "dhcp_fail"}))
     # Effective flags = demo only (dhcp_fail=on) — sim_load stays in registry.
     eff = spoke.demo.effective_flags("host-a")
-    assert eff == {"dns_fail": "off", "dhcp_fail": "on", "assoc_fail": "off",
-                   "auth_fail": "off", "ssidpw_fail": "off", "port_flap": "off"}
+    assert eff == {"dns_fail": "off", "dns_latency": "off", "dhcp_fail": "on",
+                   "assoc_fail": "off", "auth_fail": "off", "ssidpw_fail": "off",
+                   "port_flap": "off"}
     # Registry override untouched by the demo.
     entry = spoke.registry.get("host-a")
     assert entry["overrides"] == {"sim_load": "50"}

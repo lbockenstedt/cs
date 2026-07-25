@@ -26,8 +26,8 @@ from typing import Any, Awaitable, Callable, Dict, List, Optional
 logger = logging.getLogger("CSDemo")
 
 DEMO_TTL_SECONDS = 120 * 60  # 120 minutes
-FAILURE_FLAGS = ("dns_fail", "dhcp_fail", "assoc_fail", "auth_fail",
-                 "ssidpw_fail", "port_flap")
+FAILURE_FLAGS = ("dns_fail", "dns_latency", "dhcp_fail", "assoc_fail",
+                 "auth_fail", "ssidpw_fail", "port_flap")
 
 
 def build_scenarios() -> Dict[str, Dict[str, str]]:

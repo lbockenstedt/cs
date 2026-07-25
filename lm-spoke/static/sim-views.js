@@ -1626,7 +1626,7 @@ async function csDemoLoad() {
 
 function csDemoOptions(activeScenario) {
     const names = Object.keys(window._csDemoScenarios || {});
-    if (!names.length) names.push('normal', 'dns_fail', 'dhcp_fail', 'assoc_fail', 'auth_fail', 'ssidpw_fail', 'port_flap');
+    if (!names.length) names.push('normal', 'dns_fail', 'dns_latency', 'dhcp_fail', 'assoc_fail', 'auth_fail', 'ssidpw_fail', 'port_flap');
     return names.map(n => `<option value="${csEscape(n)}" ${n === activeScenario ? 'selected' : ''}>${csEscape(n)}</option>`).join('');
 }
 
@@ -1714,7 +1714,7 @@ window.csDemoClear = async function (btn) {
 // PERSISTED registry overrides (sticky across reconnects/reboots). The panel
 // is an expandable row beneath each client; opening it fetches the host's
 // current overrides and seeds the toggles.
-const CS_CONTROL_FLAGS = ['kill_switch', 'dns_fail', 'iperf', 'download',
+const CS_CONTROL_FLAGS = ['kill_switch', 'dns_fail', 'dns_latency', 'iperf', 'download',
     'www_traffic', 'ping_test', 'ssidpw_fail', 'auth_fail', 'dhcp_fail',
     'port_flap', 'assoc_fail'];
 const CS_CONTROL_COLS = 11;  // Clients-table column count (panel colspan)
@@ -3393,7 +3393,7 @@ function csIniSplit(content) {
 const CS_ONOFF_KEYS = new Set([
     'kill_switch', 'rapid_update', 'github_repo', 'smb_repo', 'site_based_ssid',
     'ssidpw_fail', 'auth_fail', 'syslog', 'web_server',
-    'dhcp_fail', 'dns_fail', 'assoc_fail', 'port_flap', 'ping_test',
+    'dhcp_fail', 'dns_fail', 'dns_latency', 'assoc_fail', 'port_flap', 'ping_test',
     'download', 'www_traffic', 'iperf',
 ]);
 
@@ -3413,6 +3413,11 @@ const CS_SIM_SECTION_FIELDS = {
         ['allow_offline', 'Allow Offline'], ['ssidpw_fail', 'Ssidpw Fail'],
         ['auth_fail', 'Auth Fail'], ['syslog', 'Syslog'],
         ['web_server', 'Web Server'],
+        ['dns_fail_rate', 'DNS Fail Rate (/min)'],
+        ['dns_fail_duration', 'DNS Fail Duration (s)'],
+        ['dns_latency_rate', 'DNS Latency Rate (/min)'],
+        ['dns_latency_duration', 'DNS Latency Duration (s)'],
+        ['dns_max_inflight', 'DNS Max In-Flight Digs'],
     ],
     server: [['server_url', 'Server Url']],
     address: [
@@ -3429,7 +3434,7 @@ const CS_SIM_SECTION_FIELDS = {
 // Per-bucket [s0]–[s9] field schema (identical for each bucket).
 const CS_SIM_BUCKET_FIELDS = [
     ['wsite', 'Wsite'], ['ssid', 'Ssid'], ['ssidpw', 'Ssidpw'],
-    ['dhcp_fail', 'Dhcp Fail'], ['dns_fail', 'Dns Fail'],
+    ['dhcp_fail', 'Dhcp Fail'], ['dns_fail', 'Dns Fail'], ['dns_latency', 'Dns Latency'],
     ['assoc_fail', 'Assoc Fail'], ['port_flap', 'Port Flap'],
     ['ping_test', 'Ping Test'], ['download', 'Download'],
     ['www_traffic', 'Www Traffic'], ['iperf', 'Iperf'],
