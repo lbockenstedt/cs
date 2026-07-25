@@ -506,6 +506,48 @@ def build_client_api_app(spoke) -> FastAPI:
             return []
         return sorted(p.name for p in sd.iterdir() if p.is_file())
 
+    @app.get("/api/scripts/manifest")
+    async def api_scripts_manifest(platform: str = Query(...)) -> Dict[str, str]:
+        """Per-file sha256 of the mirrored client scripts — the CONTENT-HASH gate
+        that replaces the fragile monotonic VERSION gate. update.sh fetches this,
+        compares each hash to its local file, and syncs on ANY mismatch (or a
+        locally-missing file). No version number, no downgrade guard, no CI-bump
+        dependency: the client simply mirrors the served bytes, self-correcting on
+        a rollback/reset/frozen-VERSION.
+
+        Scoped to the files the client mirrors 1:1 into /usr/local/scripts — .sh,
+        .py, .txt, and VERSION — and EXCLUDES kill_switch.txt (update.sh fetches
+        that live, never copies it, so including it would report 'changed' forever
+        and re-sync every cycle). Cached per (dir, newest-mtime) so a fleet polling
+        this doesn't re-hash unchanged files each time. Returns {} for an unknown/
+        empty platform → update.sh treats {} as 'no manifest' and falls back to the
+        VERSION gate (old-spoke compatibility)."""
+        import hashlib
+        sd = _scripts_dir(platform)
+        if not sd.is_dir():
+            return {}
+        files = [p for p in sorted(sd.iterdir())
+                 if p.is_file()
+                 and p.name != "kill_switch.txt"
+                 and (p.suffix in (".sh", ".py", ".txt") or p.name == "VERSION")]
+        try:
+            newest = max((p.stat().st_mtime for p in files), default=0.0)
+        except OSError:
+            newest = 0.0
+        cache = api_scripts_manifest._cache  # type: ignore[attr-defined]
+        hit = cache.get(platform)
+        if hit and hit[0] == newest:
+            return hit[1]
+        out: Dict[str, str] = {}
+        for p in files:
+            try:
+                out[p.name] = hashlib.sha256(p.read_bytes()).hexdigest()
+            except OSError:
+                continue
+        cache[platform] = (newest, out)
+        return out
+    api_scripts_manifest._cache = {}  # type: ignore[attr-defined]
+
     @app.get("/api/scripts/{platform}/{filename:path}")
     async def api_scripts_get(platform: str, filename: str) -> FileResponse:
         return FileResponse(str(resolve_script_path(platform, filename)))

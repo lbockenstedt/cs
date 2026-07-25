@@ -1,5 +1,5 @@
 #!/bin/bash
-version=.15
+version=.16
 pkill -f firefox
 log="/usr/local/scripts/sim.log"
 debug="/usr/local/scripts/debug-update.log"
@@ -65,6 +65,45 @@ _version_cmp() {
     done
     echo "equal"
     return 0
+}
+
+#------------------------------------------------------------
+# CONTENT-HASH sync decision ($1 = server_url) — the robust replacement for the
+# monotonic VERSION gate. Fetches the spoke's per-file sha256 manifest and
+# compares each to the local file under /usr/local/scripts. Echoes:
+#   changed  — a served script differs (or is missing locally) → full sync
+#   same     — every served script matches → config-only
+#   unknown  — no manifest endpoint / empty / no sha256sum → caller falls back
+#              to the legacy VERSION compare (old-spoke compatibility)
+# No version number, no downgrade guard, no CI-bump dependency: the client
+# mirrors the served bytes, so a rollback/reset/frozen-VERSION all self-correct.
+# Manifest is scoped to /usr/local/scripts-mirrored files (excludes kill_switch.txt,
+# which is fetched live); per-host config is NOT in it (fetched separately).
+#------------------------------------------------------------
+_scripts_sync_decision() {
+    local url="$1" manifest
+    manifest=$(curl -sS --max-time 10 "$url/api/scripts/manifest?platform=linux" 2>/dev/null)
+    case "$manifest" in
+        '{}'|'') echo "unknown"; return ;;   # empty/no files → fall back
+        \{*\}) ;;                             # JSON object → parse
+        *) echo "unknown"; return ;;          # not JSON (404 body, error) → fall back
+    esac
+    command -v sha256sum >/dev/null 2>&1 || { echo "unknown"; return; }
+    local line f h local_h decision="same"
+    # Flat {"file":"hash",...} — filenames + hex hashes contain no ':' or ',',
+    # so strip braces, split on commas, split each pair on the first colon.
+    while IFS= read -r line; do
+        [[ -z "$line" ]] && continue
+        f="${line%%:*}"; h="${line#*:}"
+        f="${f//[\"[:space:]]/}"; h="${h//[\"[:space:]]/}"
+        [[ -z "$f" || -z "$h" ]] && continue
+        if [[ ! -f "/usr/local/scripts/$f" ]]; then decision="changed"; break; fi
+        local_h=$(sha256sum "/usr/local/scripts/$f" 2>/dev/null | awk '{print $1}')
+        [[ "$local_h" != "$h" ]] && { decision="changed"; break; }
+        # printf adds a trailing \n so `read` doesn't DROP the last manifest entry
+        # (a change in the last file would otherwise go undetected).
+    done < <(printf '%s\n' "$manifest" | tr -d '{}' | tr ',' '\n')
+    echo "$decision"
 }
 
 #------------------------------------------------------------
@@ -297,16 +336,24 @@ if [[ "$web_server" == "on" && -n "$server_url" ]]; then
     echo "Tier 1: Trying Web Server ($server_url)..." | tee -a "$debug"
 
     if check_api_up "$server_url"; then
-        # Version check — only do full sync if remote VERSION differs from local
-        local_ver=$(cat /usr/local/scripts/VERSION 2>/dev/null | tr -d '[:space:]')
-        remote_ver=$(curl -sS --max-time 5 \
-            "$server_url/api/scripts/linux/VERSION" 2>/dev/null | tr -d '[:space:]')
-        echo "Version check: local=$local_ver remote=$remote_ver" | tee -a "$debug"
-        _vcmp=""
-        [[ -n "$remote_ver" ]] && _vcmp=$(_version_cmp "$remote_ver" "$local_ver")
-        if [[ -z "$remote_ver" ]]; then
+        # Sync decision by CONTENT HASH (per-file sha256 manifest) — the robust
+        # replacement for the monotonic VERSION gate. Falls back to the legacy
+        # VERSION compare ONLY for an old spoke with no manifest endpoint.
+        _decision=$(_scripts_sync_decision "$server_url")
+        if [[ "$_decision" == "unknown" ]]; then
+            local_ver=$(cat /usr/local/scripts/VERSION 2>/dev/null | tr -d '[:space:]')
+            remote_ver=$(curl -sS --max-time 5 \
+                "$server_url/api/scripts/linux/VERSION" 2>/dev/null | tr -d '[:space:]')
+            echo "manifest unavailable — VERSION fallback: local=$local_ver remote=$remote_ver" | tee -a "$debug"
+            if [[ -z "$remote_ver" ]]; then _decision="skip"
+            elif [[ "$(_version_cmp "$remote_ver" "$local_ver")" == "equal" ]]; then _decision="same"
+            else _decision="changed"; fi
+        else
+            echo "content-hash sync decision: $_decision" | tee -a "$debug"
+        fi
+        if [[ "$_decision" == "skip" ]]; then
             echo "remote VERSION empty — skipping sync" | tee -a "$debug" "$log"
-        elif [[ "$_vcmp" == "equal" ]]; then
+        elif [[ "$_decision" == "same" ]]; then
             echo "Already up to date (v$local_ver) — checking for config changes..." | tee -a "$debug" "$log"
             # Scripts are current, but simulation.conf may have changed independently.
             # Always fetch and apply it so kill_switch / other config tweaks propagate
@@ -352,10 +399,10 @@ if [[ "$web_server" == "on" && -n "$server_url" ]]; then
 
             source_found=true
         else
-            # Sync on ANY difference (newer OR older) — downgrades/resets/
-            # rollbacks MUST land, so a hand-reset or a lower served VERSION is
-            # applied rather than skipped. The served build is authoritative.
-            echo "Version differs (local $local_ver → served $remote_ver) — syncing..." | tee -a "$debug" "$log"
+            # Scripts differ from the spoke (content-hash mismatch, or the VERSION
+            # fallback saw a difference in EITHER direction) — sync. Downgrades/
+            # resets/rollbacks land too; the served build is authoritative.
+            echo "Scripts differ from spoke — syncing (${local_ver:+local v$local_ver → }served)..." | tee -a "$debug" "$log"
             tmp_web=$(mktemp -d)
             sync_ok=true
 
