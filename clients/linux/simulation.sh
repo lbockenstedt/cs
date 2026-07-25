@@ -131,7 +131,15 @@ _update_due() {
     return 1
   fi
   _upd_last=$now
-  printf '%s' "$now" > "$_UPD_STAMP" 2>/dev/null || true
+  # Persist the stamp. GROUP the redirect under 2>/dev/null — a bare
+  # `> file 2>/dev/null` does NOT suppress a redirection-OPEN failure (the error
+  # is printed before the stderr redirect applies), so a root-owned stamp (see
+  # below) leaked "permission denied" every gate check. chmod 0666 so any tier
+  # can rewrite it: update.sh may run as root (startup.sh at boot) and would
+  # otherwise leave it root:644, locking the unprivileged sim user out. In-memory
+  # _upd_last above still gates this process even if the write can't land.
+  { printf '%s' "$now" > "$_UPD_STAMP"; } 2>/dev/null || true
+  chmod 0666 "$_UPD_STAMP" 2>/dev/null || true
   return 0
 }
 

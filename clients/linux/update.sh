@@ -659,7 +659,16 @@ echo "Update complete" | tee -a "$debug"
 # Refresh the rapid_update time-gate stamp (see simulation.sh _update_due) so
 # ANY completed update run — sourced from the sim loop, startup.sh, or a
 # standalone `bash update.sh` (agent update_now) — counts toward the 60s gate.
-date +%s > /tmp/client-sim-update.stamp 2>/dev/null || true
+# GROUP the redirect under 2>/dev/null (a bare `> file 2>/dev/null` does NOT
+# suppress a redirection-open failure) and chmod 0666 so the unprivileged sim
+# user can rewrite it: this line often runs as root (startup.sh at boot), which
+# would otherwise leave the stamp root:644 and lock simulation.sh out of it.
+{ date +%s > /tmp/client-sim-update.stamp; } 2>/dev/null || true
+# chmod in our own context; if the stamp is already root-owned from a prior boot
+# (locking a sim-user run out), heal it via sudo -n best-effort so it recovers
+# WITHOUT waiting for the next reboot. Scoped-sudo boxes just fall through.
+chmod 0666 /tmp/client-sim-update.stamp 2>/dev/null \
+  || sudo -n chmod 0666 /tmp/client-sim-update.stamp 2>/dev/null || true
 
 #============================================================
 # Activate a new simulation.sh WITHOUT a reboot (sudo-free)
