@@ -90,30 +90,25 @@ def _ok(name: str, detail: str = "", tool: str = "") -> PrimResult:
     return {"name": name, "ok": True, "detail": detail, "tool": tool}
 
 
-# ── dns_fail ──────────────────────────────────────────────────────────────────
-async def sim_dns_fail(profile: Dict[str, str], ctx: SimCtx) -> PrimResult:
-    """Query each dns_fail.txt record against the bad-record/bad-ip/latency servers.
-
-    Mirrors ``dns_fail.sh``: ``dig @<server> <record>`` over the union of
-    ``dns_bad_record_*`` + ``dns_bad_ip_*`` + ``dns_latency_*``. These servers
-    either don't respond or return bogus answers — the point is to generate DNS
-    failure alerts, so timeouts/exceptions are expected and swallowed.
-    """
+# ── dns_fail / dns_latency ────────────────────────────────────────────────────
+# Two DISTINCT DNS conditions, split so each drives its own Central alert:
+#   dns_fail    — query unreachable/bogus servers (dns_bad_record_* + dns_bad_ip_*)
+#                 → lookups fail  → DNS-failure alert.
+#   dns_latency — query slow responders (dns_latency_*)
+#                 → lookups are slow → DNS-latency alert.
+# Both share the same fire-and-forget shape (mirrors dns_fail.sh / dns_latency.sh);
+# only the server set differs. _dns_query is the shared engine.
+async def _dns_query(sim_id: str, profile: Dict[str, str], ctx: SimCtx,
+                     server_keys: "list[str]", target_label: str) -> PrimResult:
     records = ctx.data_lines("dns_fail.txt")
     if not records:
-        return _ok("dns_fail", "no dns_fail.txt records", "none")
+        return _ok(sim_id, "no dns_fail.txt records", "none")
     records = records[: ctx.dns_max_records]
 
-    servers = [
-        profile.get(f"dns_bad_record_{i}", "") for i in (1, 2, 3)
-    ] + [
-        profile.get(f"dns_bad_ip_{i}", "") for i in (1, 2, 3)
-    ] + [
-        profile.get(f"dns_latency_{i}", "") for i in (1, 2, 3)
-    ]
+    servers = [profile.get(k, "") for k in server_keys]
     servers = [s for s in servers if s]
     if not servers:
-        return _degraded("dns_fail", "dns_bad_*", "no DNS targets configured")
+        return _degraded(sim_id, target_label, "no DNS targets configured")
 
     digs = 0
     if _HAS_DNSPYTHON:
@@ -128,11 +123,11 @@ async def sim_dns_fail(profile: Dict[str, str], ctx: SimCtx) -> PrimResult:
                         try:
                             r.resolve(rec, "A")
                         except Exception:
-                            pass  # expected — failure IS the simulation
+                            pass  # expected — the failure/slowness IS the simulation
                         count += 1
             return count
         digs = await asyncio.to_thread(_query)
-        return _ok("dns_fail", f"{digs} queries to {len(servers)} servers", "dnspython")
+        return _ok(sim_id, f"{digs} queries to {len(servers)} servers", "dnspython")
 
     # Fallback: subprocess dig if present.
     if shutil.which("dig"):
@@ -142,9 +137,28 @@ async def sim_dns_fail(profile: Dict[str, str], ctx: SimCtx) -> PrimResult:
                 for srv in servers:
                     cmds.append(["dig", f"@{srv}", rec, "+time=2", "+tries=1"])
         digs = await _run_batched(cmds, per_timeout=3.0, concurrency=4)
-        return _ok("dns_fail", f"{digs} dig queries", "dig")
+        return _ok(sim_id, f"{digs} dig queries", "dig")
 
-    return _degraded("dns_fail", "dnspython|dig", "install dnspython or dig")
+    return _degraded(sim_id, "dnspython|dig", "install dnspython or dig")
+
+
+async def sim_dns_fail(profile: Dict[str, str], ctx: SimCtx) -> PrimResult:
+    """Query dns_fail.txt records against the UNREACHABLE/bogus servers
+    (``dns_bad_record_*`` + ``dns_bad_ip_*``) so lookups FAIL — drives the DNS
+    failure alert. The slow-server (``dns_latency_*``) set is handled separately
+    by ``sim_dns_latency`` so a genuine latency condition isn't lumped in as a
+    failure. Mirrors ``dns_fail.sh``."""
+    keys = [f"dns_bad_record_{i}" for i in (1, 2, 3)] + [f"dns_bad_ip_{i}" for i in (1, 2, 3)]
+    return await _dns_query("dns_fail", profile, ctx, keys, "dns_bad_*")
+
+
+async def sim_dns_latency(profile: Dict[str, str], ctx: SimCtx) -> PrimResult:
+    """Query dns_fail.txt records against the SLOW responders (``dns_latency_*``)
+    so lookups are delayed — drives the DNS latency alert (distinct from the
+    unreachable-server failure alert dns_fail produces). Mirrors
+    ``dns_latency.sh``."""
+    keys = [f"dns_latency_{i}" for i in (1, 2, 3)]
+    return await _dns_query("dns_latency", profile, ctx, keys, "dns_latency_*")
 
 
 # ── ping_test ─────────────────────────────────────────────────────────────────
@@ -431,6 +445,7 @@ async def _run_batched(cmds: list[list[str]], per_timeout: float, concurrency: i
 # engine directly; dhcp_fail is included here as a best-effort primitive.
 PRIMITIVES: Dict[str, PrimFn] = {
     "dns_fail": sim_dns_fail,
+    "dns_latency": sim_dns_latency,
     "ping_test": sim_ping_test,
     "download": sim_download,
     "www_traffic": sim_www_traffic,

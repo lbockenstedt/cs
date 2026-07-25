@@ -81,6 +81,7 @@ refresh_config() {
   ssid=$(get_value "$simulation_id" 'ssid')
   dhcp_fail=$(get_value "$simulation_id" 'dhcp_fail')
   dns_fail=$(get_value "$simulation_id" 'dns_fail')
+  dns_latency=$(get_value "$simulation_id" 'dns_latency')
   assoc_fail=$(get_value "$simulation_id" 'assoc_fail')
   port_flap=$(get_value "$simulation_id" 'port_flap')
   ping_test=$(get_value "$simulation_id" 'ping_test')
@@ -187,6 +188,7 @@ sys.stdout.write(json.dumps(d))' 2>/dev/null)
         local active_sims=() active_sims_json="[]"
         [[ "$dhcp_fail"   == "on" ]] && active_sims+=("dhcp_fail")
         [[ "$dns_fail"    == "on" ]] && active_sims+=("dns_fail")
+        [[ "$dns_latency" == "on" ]] && active_sims+=("dns_latency")
         [[ "$assoc_fail"  == "on" ]] && active_sims+=("assoc_fail")
         [[ "$port_flap"   == "on" ]] && active_sims+=("port_flap")
         [[ "$ping_test"   == "on" ]] && active_sims+=("ping_test")
@@ -283,6 +285,7 @@ get_script_flag() {
     agent.sh)       echo "always"       ;;
     update.sh)      echo "always"       ;;
     dns_fail.sh)    echo "$dns_fail"    ;;
+    dns_latency.sh) echo "$dns_latency" ;;
     download.sh)    echo "$download"    ;;
     iperf.sh)       echo "$iperf"       ;;
     ping_test.sh)   echo "$ping_test"   ;;
@@ -443,8 +446,8 @@ while true; do
   # WHY: Bash associative arrays have no guaranteed iteration order so the
   # flags would appear in a different sequence every refresh. Parallel arrays
   # give consistent ordering so the operator can scan quickly.
-  flag_labels=("Kill Switch" "DHCP Fail" "DNS Fail" "WWW Traffic" "iPerf" "Download" "Port Flap" "Bad SSID PW" "Auth Fail")
-  flag_values=("$kill_switch" "$dhcp_fail" "$dns_fail" "$www_traffic" "$iperf" "$download" "$port_flap" "$ssidpw_fail" "$auth_fail")
+  flag_labels=("Kill Switch" "DHCP Fail" "DNS Fail" "DNS Latency" "WWW Traffic" "iPerf" "Download" "Port Flap" "Bad SSID PW" "Auth Fail")
+  flag_values=("$kill_switch" "$dhcp_fail" "$dns_fail" "$dns_latency" "$www_traffic" "$iperf" "$download" "$port_flap" "$ssidpw_fail" "$auth_fail")
   printf "  %sSimulations:%s\n" "$BOLD" "$RST"
   col=0
   for i in "${!flag_labels[@]}"; do

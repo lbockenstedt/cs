@@ -41,15 +41,15 @@ logger = logging.getLogger("CSConfig")
 # Used by effective_client_fields to let a rotating client's REPORTED flags win
 # over its home-bucket profile for the Clients view.
 _SIM_TOGGLE_KEYS = (
-    "dhcp_fail", "dns_fail", "assoc_fail", "port_flap", "ping_test", "download",
-    "iperf", "www_traffic", "ssidpw_fail", "auth_fail", "kill_switch",
+    "dhcp_fail", "dns_fail", "dns_latency", "assoc_fail", "port_flap", "ping_test",
+    "download", "iperf", "www_traffic", "ssidpw_fail", "auth_fail", "kill_switch",
 )
 
 SIM_FLAG_KEYS = (
     "kill_switch", "rapid_update", "sim_load", "github_repo", "repo_location",
     "site_based_ssid", "iperf_bw", "ssidpw_fail", "auth_fail", "allow_offline",
     "web_server", "server_url",
-    "wsite", "ssid", "ssidpw", "dhcp_fail", "dns_fail", "assoc_fail",
+    "wsite", "ssid", "ssidpw", "dhcp_fail", "dns_fail", "dns_latency", "assoc_fail",
     "port_flap", "ping_test", "download", "iperf", "www_traffic", "sim_phy",
     "l1", "smb_address", "ping_address", "iperf_server",
     "dns_latency_1", "dns_latency_2", "dns_latency_3",

@@ -21,9 +21,10 @@ source '/usr/local/scripts/ini-parser.sh'
 source '/usr/local/scripts/common.sh'
 process_ini_file '/usr/local/scripts/simulation.conf'
 dnsfile=$(< /usr/local/scripts/dns_fail.txt)
-dns_latency_1=$(get_value 'address' 'dns_latency_1')
-dns_latency_2=$(get_value 'address' 'dns_latency_2')
-dns_latency_3=$(get_value 'address' 'dns_latency_3')
+# dns_fail queries UNREACHABLE / bogus servers only (dns_bad_record_* +
+# dns_bad_ip_*) so the lookups FAIL. The slow-responder set (dns_latency_*) is a
+# DIFFERENT condition (high DNS latency, not failure) and now lives in its own
+# dns_latency.sh so each drives its own Central alert.
 dns_bad_ip_1=$(get_value 'address' 'dns_bad_ip_1')
 dns_bad_ip_2=$(get_value 'address' 'dns_bad_ip_2')
 dns_bad_ip_3=$(get_value 'address' 'dns_bad_ip_3')
@@ -45,14 +46,12 @@ apply_override() {
   val=$(get_value "$username" "$var")
   [[ -n ${val} ]] && declare -g "$var=$val"
 }
-for key in dns_latency_1 dns_latency_2 dns_latency_3 \
-           dns_bad_ip_1 dns_bad_ip_2 dns_bad_ip_3 \
+for key in dns_bad_ip_1 dns_bad_ip_2 dns_bad_ip_3 \
            dns_bad_record_1 dns_bad_record_2 dns_bad_record_3; do
   apply_override "$key"
 done
 bad_records=($dns_bad_record_1 $dns_bad_record_2 $dns_bad_record_3)
 bad_ips=($dns_bad_ip_1 $dns_bad_ip_2 $dns_bad_ip_3)
-latencies=($dns_latency_1 $dns_latency_2 $dns_latency_3)
 #------------------------------------------------------------
 # Fire-and-forget DNS failures
 #
@@ -85,7 +84,6 @@ echo "$(date) Firing DNS failures at ${rate_per_minute}/min for ${burst_seconds}
 if (( VERBOSE )); then
   echo "[verbose] bad_records : ${bad_records[*]:-<none>}"
   echo "[verbose] bad_ips     : ${bad_ips[*]:-<none>}"
-  echo "[verbose] latencies   : ${latencies[*]:-<none>}"
   echo "[verbose] records file: $(wc -l < /usr/local/scripts/dns_fail.txt 2>/dev/null) lines"
   echo "[verbose] pause between lookups: ${pause_between}s   (foreground — slower than sim mode)"
   echo "----------------------------------------"
@@ -97,7 +95,7 @@ stop_at=$((SECONDS + burst_seconds))
 fired=0
 while (( SECONDS < stop_at )); do
   for record in $dnsfile; do
-    for server in "${bad_records[@]}" "${bad_ips[@]}" "${latencies[@]}"; do
+    for server in "${bad_records[@]}" "${bad_ips[@]}"; do
 
       # Stop the moment the burst window closes (break out of both loops).
       (( SECONDS >= stop_at )) && break 2

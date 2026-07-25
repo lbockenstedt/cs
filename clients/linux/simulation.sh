@@ -271,7 +271,7 @@ if [[ "$web_server" == "on" ]]; then
   sim_phy=$(get_value 'simulation' 'sim_phy'); sim_phy="${sim_phy:-wireless}"
   # Start every sim OFF. The engine turns failure sims on via the [username]
   # override applied further down; the roll below is what turns AMBIENT traffic on.
-  for sim in dhcp_fail dns_fail assoc_fail port_flap ssidpw_fail auth_fail \
+  for sim in dhcp_fail dns_fail dns_latency assoc_fail port_flap ssidpw_fail auth_fail \
              ping_test download iperf www_traffic; do declare -g "$sim=off"; done
   #
   # Ambient distribution — two-step model (level, then weighted split)
@@ -329,6 +329,7 @@ else
   ssidpw=$(get_value $simulation_id 'ssidpw')
   dhcp_fail=$(get_value $simulation_id 'dhcp_fail')
   dns_fail=$(get_value $simulation_id 'dns_fail')
+  dns_latency=$(get_value $simulation_id 'dns_latency')
   assoc_fail=$(get_value $simulation_id 'assoc_fail')
   port_flap=$(get_value $simulation_id 'port_flap')
   ping_test=$(get_value $simulation_id 'ping_test')
@@ -391,6 +392,7 @@ echo Simulation Load: $sim_load | tee -a ${LOG_FILE}
 echo Kill Switch: $kill_switch | tee -a ${LOG_FILE}
 echo DHCP Fail: $dhcp_fail | tee -a ${LOG_FILE}
 echo DNS Fail: $dns_fail | tee -a ${LOG_FILE}
+echo DNS Latency: $dns_latency | tee -a ${LOG_FILE}
 echo WWW Traffic: $www_traffic | tee -a ${LOG_FILE}
 echo iPerf: $iperf | tee -a ${LOG_FILE}
 echo "Collab: $collab app=${collab_app:-teams} server=${collab_server:-unset}" | tee -a ${LOG_FILE}
@@ -462,7 +464,7 @@ report_status() {
   # (its heartbeat rides a separate backend network, so absence here ≠ offline).
   sim_ip=$(ip -4 -o route get 1.1.1.1 2>/dev/null | grep -oP 'src \K\S+' | head -n1)
   [[ "${gateway_reachable:-}" == "true" ]] && gateway_json=true
-  for sim in dns_fail assoc_fail port_flap iperf download www_traffic ping_test ssidpw_fail auth_fail dhcp_fail collab; do
+  for sim in dns_fail dns_latency assoc_fail port_flap iperf download www_traffic ping_test ssidpw_fail auth_fail dhcp_fail collab; do
     if [[ "${!sim}" == "on" ]]; then
       [[ $first == true ]] && first=false || active_simulations+=","
       active_simulations+="\"$sim\""
@@ -476,10 +478,10 @@ report_status() {
   fi
   local payload
   printf -v payload \
-    '{"hostname":"%s","simulation_id":"%s","platform":"%s","iteration":%s,"connected_ssid":"%s","ip":"%s","gateway_reachable":%s,"active_simulations":[%s],"errors":%s,"config":{"kill_switch":"%s","dns_fail":"%s","iperf":"%s","www_traffic":"%s","download":"%s","ping_test":"%s","ssidpw_fail":"%s","auth_fail":"%s","dhcp_fail":"%s","collab":"%s"}}' \
+    '{"hostname":"%s","simulation_id":"%s","platform":"%s","iteration":%s,"connected_ssid":"%s","ip":"%s","gateway_reachable":%s,"active_simulations":[%s],"errors":%s,"config":{"kill_switch":"%s","dns_fail":"%s","dns_latency":"%s","iperf":"%s","www_traffic":"%s","download":"%s","ping_test":"%s","ssidpw_fail":"%s","auth_fail":"%s","dhcp_fail":"%s","collab":"%s"}}' \
     "$(json_escape "$hostname")" "$(json_escape "${simulation_id:-}")" "$(json_escape "$platform")" \
     "$iteration" "$(json_escape "${connected_ssid:-}")" "$(json_escape "${sim_ip:-}")" "$gateway_json" "$active_simulations" "$errors_json" \
-    "$(json_escape "${kill_switch:-off}")" "$(json_escape "${dns_fail:-off}")" "$(json_escape "${iperf:-off}")" \
+    "$(json_escape "${kill_switch:-off}")" "$(json_escape "${dns_fail:-off}")" "$(json_escape "${dns_latency:-off}")" "$(json_escape "${iperf:-off}")" \
     "$(json_escape "${www_traffic:-off}")" "$(json_escape "${download:-off}")" "$(json_escape "${ping_test:-off}")" \
     "$(json_escape "${ssidpw_fail:-off}")" "$(json_escape "${auth_fail:-off}")" "$(json_escape "${dhcp_fail:-off}")" \
     "$(json_escape "${collab:-off}")"
@@ -839,6 +841,15 @@ if [ "$kill_switch" != "on" ]; then
     fi
    #------------------------------------------------------------
    #End DNS Fail Simulation
+   #------------------------------------------------------------
+   #Running DNS Latency simulation (slow responders → DNS-latency alert; the
+   # split-out sibling of dns_fail, which now only hits unreachable servers)
+   #------------------------------------------------------------
+    if [[ "$dns_latency" == "on" ]]; then
+     run_simulation "dns_latency.sh" 30
+    fi
+   #------------------------------------------------------------
+   #End DNS Latency Simulation
    #------------------------------------------------------------
     #Running DHCP Fail simulation
     #------------------------------------------------------------
