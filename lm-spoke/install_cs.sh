@@ -829,6 +829,17 @@ else
     git clone -q https://github.com/lbockenstedt/cs.git "$LM_DIR/cs"
 fi
 
+# Every clone/pull above ran as ROOT, so each repo's .git/objects is root-owned.
+# Chown EVERY repo's .git ($LM_DIR/.git + $LM_DIR/cs/.git) to the spoke user NOW —
+# not only via the recursive $LM_DIR chown at the end — so the ongoing, unattended
+# self-update (lm.self_update runs as $SVC_USER) can write objects. A root-owned
+# .git/objects is the exact "insufficient permission for adding an object to
+# repository database .git/objects" that fails `git fetch` and strands the spoke
+# on stale code forever (it can't even pull the fix for itself). Belt-and-braces
+# with the final chown + the runtime self-heal in self_update.py.
+find "$LM_DIR" -maxdepth 2 -type d -name .git \
+    -exec chown -R "$SVC_USER:$SVC_USER" {} + 2>/dev/null || true
+
 # ── Python venv ───────────────────────────────────────────────────────────────
 rm -rf "$LM_DIR/cs/venv"
 python3 -m venv "$LM_DIR/cs/venv"
