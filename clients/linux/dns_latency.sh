@@ -1,5 +1,5 @@
 #!/bin/bash
-version=.05
+version=.06
 log="/usr/local/scripts/sim.log"
 debug="/usr/local/scripts/debug-dns-latency.log"
 echo DNS Latency Script Version $version | tee "$debug"
@@ -65,12 +65,16 @@ burst_seconds=$(get_value 'simulation' 'dns_latency_duration')
 [[ -z "$burst_seconds"   ]] && burst_seconds=60
 (( rate_per_minute < 200 )) && rate_per_minute=200
 
-# Self-throttle ceiling: a prior burst that DOSed its OWN default gateway
-# persisted a lower sustainable rate (dns_ceiling_penalize in common.sh); start
-# there so we converge instead of re-DOSing. Shared with dns_fail (same dig
-# capacity). min(configured, persisted); no state file => configured.
-_configured_rate=$rate_per_minute
-rate_per_minute=$(dns_ceiling_rate "$rate_per_minute")
+# Per-run rate override for manual ceiling / recovery testing (parallels
+# DNS_MAX_INFLIGHT): DNS_LATENCY_RATE=<n> forces the rate AND bypasses the
+# persisted self-throttle. Otherwise apply the persisted self-throttle ceiling
+# (dns_ceiling_penalize in common.sh; shared with dns_fail — same dig capacity).
+if [[ "${DNS_LATENCY_RATE:-}" =~ ^[0-9]+$ ]]; then
+  _configured_rate=$DNS_LATENCY_RATE; rate_per_minute=$DNS_LATENCY_RATE
+else
+  _configured_rate=$rate_per_minute
+  rate_per_minute=$(dns_ceiling_rate "$rate_per_minute")
+fi
 
 # Seconds to wait between each launch to hit the target rate.
 pause_between=$(awk "BEGIN { printf \"%.3f\", 60 / $rate_per_minute }")

@@ -1,5 +1,5 @@
 #!/bin/bash
-version=.09
+version=.10
 log="/usr/local/scripts/sim.log"
 debug="/usr/local/scripts/debug-dns-fail.log"
 echo DNS Failure Script Version $version | tee "$debug"
@@ -78,12 +78,19 @@ burst_seconds=$(get_value 'simulation' 'dns_fail_duration')
 [[ -z "$burst_seconds"   ]] && burst_seconds=60
 (( rate_per_minute < 200 )) && rate_per_minute=200
 
-# Self-throttle ceiling: a prior burst that DOSed its OWN default gateway
-# persisted a lower sustainable rate (dns_ceiling_penalize in common.sh). Start
-# there, not at the configured rate, so we converge on a stable rate instead of
-# re-DOSing every cycle. min(configured, persisted); no state file => configured.
-_configured_rate=$rate_per_minute
-rate_per_minute=$(dns_ceiling_rate "$rate_per_minute")
+# Per-run rate override for manual ceiling / recovery testing (parallels
+# DNS_MAX_INFLIGHT): DNS_FAIL_RATE=<n> forces the rate AND bypasses the persisted
+# self-throttle, so you can deliberately drive a client to its DOS ceiling and
+# watch it bail + recover (e.g. DNS_FAIL_RATE=5000 DNS_MAX_INFLIGHT=1500 bash
+# dns_fail.sh). Otherwise apply the persisted self-throttle ceiling: a prior
+# burst that DOSed its OWN gateway ratcheted this rate down (dns_ceiling_penalize
+# in common.sh); start there so we converge instead of re-DOSing every cycle.
+if [[ "${DNS_FAIL_RATE:-}" =~ ^[0-9]+$ ]]; then
+  _configured_rate=$DNS_FAIL_RATE; rate_per_minute=$DNS_FAIL_RATE
+else
+  _configured_rate=$rate_per_minute
+  rate_per_minute=$(dns_ceiling_rate "$rate_per_minute")
+fi
 
 # Seconds to wait between each launch to hit the target rate.
 # Example: 600 per minute -> 60/600 -> 0.1 second between lookups.
