@@ -1,5 +1,5 @@
 #!/bin/bash
-version=.05
+version=.06
 log="/usr/local/scripts/sim.log"
 debug="/usr/local/scripts/debug-dns-fail.log"
 echo DNS Failure Script Version $version | tee "$debug"
@@ -80,6 +80,12 @@ burst_seconds=$(get_value 'simulation' 'dns_fail_duration')
 # Example: 600 per minute -> 60/600 -> 0.1 second between lookups.
 pause_between=$(awk "BEGIN { printf \"%.3f\", 60 / $rate_per_minute }")
 
+# CPU guard: cap the number of background dig processes in flight at once. The
+# rate/pause alone doesn't bound this — a slow or unreachable resolver keeps each
+# dig alive up to its +time timeout, so a fast rate stacks hundreds of concurrent
+# digs and pegs the CPU. ~100 keeps the burst intense without overrunning the box.
+_MAX_INFLIGHT=100
+
 echo "$(date) Firing DNS failures at ${rate_per_minute}/min for ${burst_seconds}s" | tee -a "$debug"
 if (( VERBOSE )); then
   echo "[verbose] bad_records : ${bad_records[*]:-<none>}"
@@ -106,6 +112,13 @@ while (( SECONDS < stop_at )); do
         printf '%s [dig @%s %s] rc=%s -> %s\n' "$(date '+%H:%M:%S')" \
                "$server" "$record" "$_rc" "${_out:-<empty>}"
       else
+        # Throttle to at most _MAX_INFLIGHT concurrent digs. `wait -n` (bash
+        # 4.3+) blocks until ONE background dig finishes, then we launch the next;
+        # the sleep fallback covers older bash. jobs -rp counts only running
+        # background jobs (the digs — nothing else is backgrounded here).
+        while (( $(jobs -rp 2>/dev/null | wc -l) >= _MAX_INFLIGHT )); do
+          wait -n 2>/dev/null || sleep "$pause_between"
+        done
         # Launch the lookup in the background and move straight on.
         dig +time=1 +tries=1 +short @"$server" "$record" >/dev/null 2>&1 &
       fi
