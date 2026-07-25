@@ -1,5 +1,5 @@
 #!/bin/bash
-version=.13
+version=.14
 log="/usr/local/scripts/sim.log"
 debug="/usr/local/scripts/debug-dns-fail.log"
 echo DNS Failure Script Version $version | tee "$debug"
@@ -133,22 +133,17 @@ fi
 stop_at=$((SECONDS + burst_seconds))
 fired=0
 _burst_start=$SECONDS
-# Gateway circuit-breaker: watch our OWN default gateway during the flood. If the
-# flood knocks it offline we've DOSed the box → bail (below) + ratchet down 20%.
-# Guards against FALSE ratcheting to the floor:
-#  (a) START GATE — if the gateway is already down at burst start, the adapter is
-#      still re-associating from a PRIOR bail (not this burst's fault): skip the
-#      burst entirely, no flood, no penalty. simulation.sh's cycle-top recovery
-#      brings it back and the next cycle re-fires cleanly.
-#  (b) 3 consecutive ~2s misses (~6s down) required, so a WiFi ping blip / a
-#      single dropped packet during the client's own scan can't trip it.
+# Gateway circuit-breaker: watch our OWN default gateway during the flood. If it
+# goes OFFLINE we've DOSed it → bail + drop the OPERATING rate 20% for next burst
+# (converges to the sustainable rate in a few steps). START GATE: if the gateway
+# is already down at burst start (adapter still recovering from a prior bail),
+# skip this burst — no flood, no penalty.
 _dfgw=$(dns_default_gw)
-if (( ! VERBOSE )) && [[ -n "$_dfgw" ]] && ! dns_gw_alive "$_dfgw"; then
-  echo "$(date) default gateway $_dfgw not reachable at burst start (adapter still recovering?) — skipping this burst, no throttle change" | tee -a "$debug"
+if (( ! VERBOSE )) && [[ -n "$_dfgw" ]] && dns_gw_confirmed_down "$_dfgw"; then
+  echo "$(date) default gateway $_dfgw offline at burst start (recovering?) — skipping this burst, no throttle change" | tee -a "$debug"
   exit 0
 fi
 _gw_next_check=$((SECONDS + 2))
-_gw_misses=0
 _bailed=0
 while (( SECONDS < stop_at )); do
   for record in $dnsfile; do
@@ -157,33 +152,21 @@ while (( SECONDS < stop_at )); do
       # Stop the moment the burst window closes (break out of both loops).
       (( SECONDS >= stop_at )) && break 2
 
-      # Self-DOS check (skip verbose/manual mode — foreground, can't DOS).
+      # Gateway check (~every 2s, skip verbose/manual mode). A quick single ping;
+      # on a miss, CONFIRM with 5 pings and declare the gateway OFFLINE only if
+      # ALL 5 fail (a real outage, not a WiFi/busy-VM blip). Offline → bail + drop
+      # the OPERATING rate 20%.
       if (( ! VERBOSE )) && [[ -n "$_dfgw" ]] && (( SECONDS >= _gw_next_check )); then
         _gw_next_check=$((SECONDS + 2))
-        if dns_gw_alive "$_dfgw"; then
-          _gw_misses=0
-        else
-          _gw_misses=$((_gw_misses + 1))
-          if (( _gw_misses >= 3 )); then
-            # Confirm a REAL outage before the sticky ratchet: a strong multi-packet
-            # probe. If the gateway still replies, the single-ping misses were
-            # transient (busy VM / WiFi jitter) — reset and keep flooding, do NOT
-            # throttle down. Only a fully-failed probe counts as a self-DOS.
-            if ! dns_gw_confirmed_down "$_dfgw"; then
-              _gw_misses=0
-            else
-              _elapsed=$(( SECONDS - _burst_start )); (( _elapsed < 1 )) && _elapsed=1
-              _achieved=$(awk -v f="$fired" -v e="$_elapsed" 'BEGIN { printf "%d", f / e * 60 }')
-              _newrate=$(dns_ceiling_penalize "$_achieved")
-              # Learning: this is the ceiling (the rate that DOSes) — settle 20%
-              # below it and STOP probing up (converged).
-              (( _learn )) && dns_ceiling_mark_converged
-              echo "$(date) DNS flood knocked out default gateway $_dfgw after ${fired} digs (~${_achieved}/min) — BAILING; $( (( _learn )) && echo "ceiling FOUND, settling at" || echo "next burst throttles to") ${_newrate}/min" | tee -a "$debug"
-              kill $(jobs -p) 2>/dev/null
-              _bailed=1
-              break 2
-            fi
-          fi
+        if ! dns_gw_alive "$_dfgw" && dns_gw_confirmed_down "$_dfgw"; then
+          # -20% of the OPERATING rate (not the noisy measured 'achieved', which
+          # came out ≈ the rate and barely moved the ceiling → a ~1 decrement).
+          _newrate=$(dns_ceiling_penalize "$rate_per_minute")
+          (( _learn )) && dns_ceiling_mark_converged
+          echo "$(date) default gateway $_dfgw OFFLINE (5/5 pings failed) after ${fired} digs at ${rate_per_minute}/min — BAILING; $( (( _learn )) && echo "ceiling FOUND, settling at" || echo "throttling to") ${_newrate}/min next burst" | tee -a "$debug"
+          kill $(jobs -p) 2>/dev/null
+          _bailed=1
+          break 2
         fi
       fi
 

@@ -1,5 +1,5 @@
 #!/bin/bash
-version=.09
+version=.10
 log="/usr/local/scripts/sim.log"
 debug="/usr/local/scripts/debug-dns-latency.log"
 echo DNS Latency Script Version $version | tee "$debug"
@@ -112,18 +112,16 @@ fi
 stop_at=$((SECONDS + burst_seconds))
 fired=0
 _burst_start=$SECONDS
-# Gateway circuit-breaker (shared logic with dns_fail). Guards against false
-# ratcheting: (a) START GATE — if the gateway is already down at burst start the
-# adapter is still re-associating from a prior bail (not our fault): skip the
-# burst, no flood, no penalty; (b) 3 consecutive ~2s misses (~6s down) required
-# so a WiFi ping blip can't trip it.
+# Gateway circuit-breaker (shared logic with dns_fail): if the gateway goes
+# OFFLINE we've DOSed it → bail + drop the OPERATING rate 20% for next burst.
+# START GATE: skip the burst if the gateway is already offline at start (adapter
+# recovering). Offline = 5/5 pings fail (dns_gw_confirmed_down).
 _dfgw=$(dns_default_gw)
-if (( ! VERBOSE )) && [[ -n "$_dfgw" ]] && ! dns_gw_alive "$_dfgw"; then
-  echo "$(date) default gateway $_dfgw not reachable at burst start (adapter still recovering?) — skipping this burst, no throttle change" | tee -a "$debug"
+if (( ! VERBOSE )) && [[ -n "$_dfgw" ]] && dns_gw_confirmed_down "$_dfgw"; then
+  echo "$(date) default gateway $_dfgw offline at burst start (recovering?) — skipping this burst, no throttle change" | tee -a "$debug"
   exit 0
 fi
 _gw_next_check=$((SECONDS + 2))
-_gw_misses=0
 _bailed=0
 while (( SECONDS < stop_at )); do
   for record in $dnsfile; do
@@ -132,29 +130,17 @@ while (( SECONDS < stop_at )); do
       # Stop the moment the burst window closes (break out of both loops).
       (( SECONDS >= stop_at )) && break 2
 
-      # Self-DOS check (skip verbose/manual mode — foreground, can't DOS).
+      # Gateway check (~every 2s): single ping, then CONFIRM with 5 pings — OFFLINE
+      # only if ALL 5 fail. Offline → bail + drop the OPERATING rate 20%.
       if (( ! VERBOSE )) && [[ -n "$_dfgw" ]] && (( SECONDS >= _gw_next_check )); then
         _gw_next_check=$((SECONDS + 2))
-        if dns_gw_alive "$_dfgw"; then
-          _gw_misses=0
-        else
-          _gw_misses=$((_gw_misses + 1))
-          if (( _gw_misses >= 3 )); then
-            # Confirm a REAL outage before the sticky ratchet (see dns_fail): a
-            # strong multi-packet probe. Reply => transient miss, reset & keep going.
-            if ! dns_gw_confirmed_down "$_dfgw"; then
-              _gw_misses=0
-            else
-              _elapsed=$(( SECONDS - _burst_start )); (( _elapsed < 1 )) && _elapsed=1
-              _achieved=$(awk -v f="$fired" -v e="$_elapsed" 'BEGIN { printf "%d", f / e * 60 }')
-              _newrate=$(dns_ceiling_penalize "$_achieved")
-              (( _learn )) && dns_ceiling_mark_converged
-              echo "$(date) DNS latency flood knocked out default gateway $_dfgw after ${fired} digs (~${_achieved}/min) — BAILING; $( (( _learn )) && echo "ceiling FOUND, settling at" || echo "next burst throttles to") ${_newrate}/min" | tee -a "$debug"
-              kill $(jobs -p) 2>/dev/null
-              _bailed=1
-              break 2
-            fi
-          fi
+        if ! dns_gw_alive "$_dfgw" && dns_gw_confirmed_down "$_dfgw"; then
+          _newrate=$(dns_ceiling_penalize "$rate_per_minute")
+          (( _learn )) && dns_ceiling_mark_converged
+          echo "$(date) default gateway $_dfgw OFFLINE (5/5 pings failed) after ${fired} digs at ${rate_per_minute}/min — BAILING; $( (( _learn )) && echo "ceiling FOUND, settling at" || echo "throttling to") ${_newrate}/min next burst" | tee -a "$debug"
+          kill $(jobs -p) 2>/dev/null
+          _bailed=1
+          break 2
         fi
       fi
 

@@ -17,7 +17,7 @@
 #
 # Every helper here replaces copies that had drifted between simulation.sh,
 # dashboard.sh and startup.sh — edit HERE (clients/lib/), not per-script.
-version=.04
+version=.05
 
 # ── script version reporting ─────────────────────────────────────────────────
 # So an operator can tell FOR SURE which script + which deployment is running.
@@ -207,13 +207,13 @@ dns_default_gw() { ip route 2>/dev/null | grep -oP 'default via \K\S+' | head -1
 # client as a dead gateway and false-ratchets the rate down).
 dns_gw_alive() { local gw="${1:-}"; [[ -n "$gw" ]] && ping -c1 -W2 "$gw" >/dev/null 2>&1; }
 
-# Stronger "is it REALLY down?" probe, used to confirm before the sticky bail +
-# ratchet: 4 packets over ~1.2s. Returns 0 (down) only when EVERY packet is lost —
-# so a transient single-ping timeout (busy VM / WiFi jitter) can't trigger a
-# throttle-down; only a sustained outage does.
+# "Is the gateway REALLY offline?" — 5 pings, and return 0 (offline) ONLY when
+# ALL 5 fail. `ping -c5` exits 0 if ANY of the 5 replies, so `! ping -c5` is true
+# only on a clean 5/5 loss = a real outage, not a WiFi/busy-VM blip. Used to
+# confirm before the sticky bail + rate throttle.
 dns_gw_confirmed_down() {
   local gw="${1:-}"; [[ -n "$gw" ]] || return 1
-  ! ping -c4 -W2 -i0.3 "$gw" >/dev/null 2>&1
+  ! ping -c5 -W2 -i0.3 "$gw" >/dev/null 2>&1
 }
 
 # Persisted rate, empty if none/invalid. NB: `$(< f 2>/dev/null)` is NOT the bash
