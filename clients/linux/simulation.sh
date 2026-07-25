@@ -550,7 +550,20 @@ run_simulation() {
   # at their +time=1 timeout, so the parent kill is enough. `pkill -f` excludes
   # THIS shell (-f matches the launched `bash <path>` line, not run_simulation).
   pkill -f "/usr/local/scripts/$script" 2>/dev/null
-  nohup bash "/usr/local/scripts/$script" >> /usr/local/scripts/sim.log 2>&1 &
+  case "$script" in
+    dns_fail.sh|dns_latency.sh)
+      # DNS sims: surface each fire-and-forget dig on the LIVE console (this
+      # loop's stdout — a terminal when simulation.sh is run interactively) AND
+      # still append to sim.log, via tee. nohup's stdout is the PIPE (not a tty),
+      # so it won't hijack output to nohup.out; when the sim is killed on the next
+      # single-instance relaunch, the pipe EOFs and tee exits — no orphan. Other
+      # sims stay quiet in the log only.
+      nohup bash "/usr/local/scripts/$script" 2>&1 | tee -a /usr/local/scripts/sim.log &
+      ;;
+    *)
+      nohup bash "/usr/local/scripts/$script" >> /usr/local/scripts/sim.log 2>&1 &
+      ;;
+  esac
   _rsleep "$sleep_time"
  fi
 }
