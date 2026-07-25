@@ -1,5 +1,5 @@
 #!/bin/bash
-version=.02
+version=.03
 log="/usr/local/scripts/sim.log"
 debug="/usr/local/scripts/debug-dns-latency.log"
 echo DNS Latency Script Version $version | tee "$debug"
@@ -104,6 +104,10 @@ while (( SECONDS < stop_at )); do
         while (( $(jobs -rp 2>/dev/null | wc -l) >= _MAX_INFLIGHT )); do
           wait -n 2>/dev/null || sleep "$pause_between"
         done
+        # Print the launch so the fire-and-forget activity is visible in the
+        # terminal / sim.log, then launch in the background. $SECONDS (seconds into
+        # the burst) is a fork-free marker to gauge the rate.
+        printf '[+%ss] dig @%s %s\n' "$SECONDS" "$server" "$record"
         dig +time=1 +tries=1 +short @"$server" "$record" >/dev/null 2>&1 &
       fi
 

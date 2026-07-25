@@ -1,15 +1,17 @@
 #!/bin/bash
-version=.06
+version=.07
 log="/usr/local/scripts/sim.log"
 debug="/usr/local/scripts/debug-dns-fail.log"
 echo DNS Failure Script Version $version | tee "$debug"
 #------------------------------------------------------------
-# Verbose / manual mode: pass --verbose (or export VERBOSE=1) to watch each
-# lookup on stdout. Normal sim runs use fire-and-forget background digs with
-# suppressed output (Central's DNS-fail alarm is rate-based — see below), which
-# makes a manual `bash dns_fail.sh` silent. Verbose runs each dig in the
-# FOREGROUND and prints server/record/exit/result so you can see what's
-# happening. The burst window + rate still apply.
+# Normal (default) mode: fire-and-forget background digs, but PRINT each launch
+# to stdout so you can watch the sim run in a terminal (`bash dns_fail.sh`) or in
+# sim.log. We never wait for the answer — the failure IS the sim. The timestamp
+# is a fork-free `$SECONDS` marker, so the visibility costs no extra process per
+# dig.
+# Verbose / manual mode: pass --verbose (or export VERBOSE=1) to run each dig in
+# the FOREGROUND and print server/record/exit/RESULT (slower — one at a time —
+# for detailed debugging). The burst window + rate still apply in both modes.
 #------------------------------------------------------------
 VERBOSE=0
 [[ "${VERBOSE:-0}" == "1" ]] && VERBOSE=1
@@ -119,7 +121,12 @@ while (( SECONDS < stop_at )); do
         while (( $(jobs -rp 2>/dev/null | wc -l) >= _MAX_INFLIGHT )); do
           wait -n 2>/dev/null || sleep "$pause_between"
         done
-        # Launch the lookup in the background and move straight on.
+        # Print the launch so the fire-and-forget activity is visible in the
+        # terminal / sim.log, then launch in the background and move straight on —
+        # we never wait for the result. $SECONDS (seconds into the burst) is a
+        # fork-free marker to gauge the rate, so the visibility costs no extra
+        # process per dig.
+        printf '[+%ss] dig @%s %s\n' "$SECONDS" "$server" "$record"
         dig +time=1 +tries=1 +short @"$server" "$record" >/dev/null 2>&1 &
       fi
 
