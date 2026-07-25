@@ -1,5 +1,5 @@
 #!/bin/bash
-version=.13
+version=.14
 # WHY: dashboard.sh is a read-only live monitor. It runs in its own terminal
 # window (launched by startup.desktop) so the operator can always see
 # what's happening without interrupting the simulation loop in the other pane.
@@ -10,11 +10,13 @@ source '/usr/local/scripts/common.sh'
 #------------------------------------------------------------
 # Simulation Dashboard (Read-only live monitor)
 #------------------------------------------------------------
-# 120s (was 60): the dashboard does a full clear + redraw each cycle, and on a
-# desktop client that full-screen repaint churns the compositor (mutter) — a
-# longer interval halves that repaint rate to cut idle CPU. The server
-# throttle_interval can still only RAISE this, never lower it.
-refresh_rate=120
+# 5s: live-monitoring refresh so fast-moving state (e.g. the DNS ceiling
+# converging, active sims) is near-real-time instead of up to two minutes stale.
+# The dashboard does a full clear + redraw each cycle; on a desktop client that
+# full-screen repaint churns the compositor (mutter), so this trades a little
+# idle CPU for usable freshness. The server throttle_interval can still only
+# RAISE this under load, never lower it.
+refresh_rate=5
 CACHE_DIR="/tmp/client-sim-dash"
 
 # Terminal colors — degrade gracefully if tput is unavailable (e.g. SSH without TERM)
