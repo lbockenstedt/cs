@@ -1,5 +1,5 @@
 #!/bin/bash
-version=.03
+version=.04
 log="/usr/local/scripts/sim.log"
 debug="/usr/local/scripts/debug-dns-latency.log"
 echo DNS Latency Script Version $version | tee "$debug"
@@ -68,13 +68,18 @@ burst_seconds=$(get_value 'simulation' 'dns_latency_duration')
 # Seconds to wait between each launch to hit the target rate.
 pause_between=$(awk "BEGIN { printf \"%.3f\", 60 / $rate_per_minute }")
 
-# CPU guard: cap the number of background dig processes in flight at once. The
-# rate/pause alone doesn't bound this — a slow resolver keeps each dig alive up
-# to its +time timeout, so a fast rate stacks hundreds of concurrent digs and
-# pegs the CPU. ~100 keeps the burst intense without overrunning the box.
-_MAX_INFLIGHT=100
+# CPU guard: cap the number of background dig processes in flight at once. Knob
+# for finding a client's ceiling by trial and error: precedence is the
+# DNS_MAX_INFLIGHT env var (instant per-run: `DNS_MAX_INFLIGHT=40 bash
+# dns_latency.sh`) > [simulation] dns_max_inflight (fleet-wide via config, no
+# script redeploy) > default 100. Floored at 1. Shared knob with dns_fail — it's
+# the client's dig capacity, and both are exclusive sims (one runs at a time).
+_MAX_INFLIGHT="${DNS_MAX_INFLIGHT:-}"
+[[ "$_MAX_INFLIGHT" =~ ^[0-9]+$ ]] || _MAX_INFLIGHT=$(get_value 'simulation' 'dns_max_inflight')
+[[ "$_MAX_INFLIGHT" =~ ^[0-9]+$ ]] || _MAX_INFLIGHT=100
+(( _MAX_INFLIGHT < 1 )) && _MAX_INFLIGHT=1
 
-echo "$(date) Firing DNS latency lookups at ${rate_per_minute}/min for ${burst_seconds}s" | tee -a "$debug"
+echo "$(date) Firing DNS latency lookups at ${rate_per_minute}/min for ${burst_seconds}s (max ${_MAX_INFLIGHT} digs in flight)" | tee -a "$debug"
 if (( VERBOSE )); then
   echo "[verbose] latencies   : ${latencies[*]:-<none>}"
   echo "[verbose] records file: $(wc -l < /usr/local/scripts/dns_fail.txt 2>/dev/null) lines"

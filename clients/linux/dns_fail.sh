@@ -1,5 +1,5 @@
 #!/bin/bash
-version=.07
+version=.08
 log="/usr/local/scripts/sim.log"
 debug="/usr/local/scripts/debug-dns-fail.log"
 echo DNS Failure Script Version $version | tee "$debug"
@@ -84,11 +84,17 @@ pause_between=$(awk "BEGIN { printf \"%.3f\", 60 / $rate_per_minute }")
 
 # CPU guard: cap the number of background dig processes in flight at once. The
 # rate/pause alone doesn't bound this — a slow or unreachable resolver keeps each
-# dig alive up to its +time timeout, so a fast rate stacks hundreds of concurrent
-# digs and pegs the CPU. ~100 keeps the burst intense without overrunning the box.
-_MAX_INFLIGHT=100
+# dig alive up to its +time timeout, so a fast rate stacks concurrent digs and
+# pegs the CPU. This is the knob for finding a client's ceiling by trial and
+# error: precedence is the DNS_MAX_INFLIGHT env var (instant per-run sweep:
+# `DNS_MAX_INFLIGHT=40 bash dns_fail.sh`) > [simulation] dns_max_inflight (fleet-
+# wide, pushed via config, no script redeploy) > default 100. Floored at 1.
+_MAX_INFLIGHT="${DNS_MAX_INFLIGHT:-}"
+[[ "$_MAX_INFLIGHT" =~ ^[0-9]+$ ]] || _MAX_INFLIGHT=$(get_value 'simulation' 'dns_max_inflight')
+[[ "$_MAX_INFLIGHT" =~ ^[0-9]+$ ]] || _MAX_INFLIGHT=100
+(( _MAX_INFLIGHT < 1 )) && _MAX_INFLIGHT=1
 
-echo "$(date) Firing DNS failures at ${rate_per_minute}/min for ${burst_seconds}s" | tee -a "$debug"
+echo "$(date) Firing DNS failures at ${rate_per_minute}/min for ${burst_seconds}s (max ${_MAX_INFLIGHT} digs in flight)" | tee -a "$debug"
 if (( VERBOSE )); then
   echo "[verbose] bad_records : ${bad_records[*]:-<none>}"
   echo "[verbose] bad_ips     : ${bad_ips[*]:-<none>}"
