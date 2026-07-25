@@ -257,6 +257,7 @@ def build_local_ui_router(spoke) -> APIRouter:
     @router.get("/aggregate/api-server")
     async def aggregate_api_server():
         ks = await _cmd("CS_GET_KILL_SWITCH")
+        rp = await _cmd("CS_GET_REPO_STATUS")
         return {"spokes": [{
             "spoke_id": spoke.spoke_id,
             "spoke_name": spoke.spoke_id,
@@ -269,6 +270,7 @@ def build_local_ui_router(spoke) -> APIRouter:
                     "repo_synced": True,
                     "repo_error": None,
                     "version": spoke.get_version(),
+                    "repo": (rp or {}).get("repo"),
                 },
                 "services": {
                     "simulation_engine": "killed" if ks.get("kill_switch") else "running",

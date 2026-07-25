@@ -3301,6 +3301,14 @@ async function csRenderApiServer() {
               ${csStat('Status', h.status || a.status || '—')}${csStat('Clients', h.clients != null ? h.clients : '—')}
               ${csStat('Repo Synced', h.repo_synced === undefined ? '—' : (h.repo_synced ? 'Yes' : 'No'))}${csStat('Version', h.version || a.version || '—')}
             </div>
+            ${h.repo ? (() => { const rp = h.repo, rs = rp.scripts || {}; return `
+            <div class="grid grid-cols-2 md:grid-cols-4 gap-3 pt-1 border-t border-slate-100">
+              ${csStat('Branch', rp.configured_branch || '—')}${csStat('Deploy VERSION', rp.served_version || '—')}
+              ${csStat('simulation.sh', rs['simulation.sh'] || '—')}${csStat('dns_latency.sh', rp.dns_latency_present ? (rs['dns_latency.sh'] || 'yes') : 'MISSING')}
+            </div>
+            ${(rp.configured_branch && rp.configured_branch !== 'main') ? `<p class="text-xs text-amber-600">⚠️ Tracks branch <b>${csEscape(rp.configured_branch)}</b>, not <b>main</b> — main pushes won't reach this spoke.</p>` : ''}
+            ${!rp.dns_latency_present ? `<p class="text-xs text-red-500">⚠️ dns_latency.sh missing — serving pre-split scripts.</p>` : ''}
+            <p class="text-[11px] text-slate-400 font-mono">head ${csEscape(rp.head || '?')} · checked-out ${csEscape(rp.checked_out_branch || '?')} · source ${csEscape(rp.source_of_truth || '?')} · dns_fail ${csEscape(rs['dns_fail.sh'] || '?')}</p>`; })() : ''}
             ${h.repo_error ? `<p class="text-xs text-red-500">Repo error: ${csEscape(h.repo_error)}</p>` : ''}
             <div><p class="text-[11px] font-bold text-slate-400 uppercase tracking-wider mb-1">Services</p>${csTable(['Service', 'Status'], svcRows)}</div>
             <details class="text-xs"><summary class="cursor-pointer text-slate-400">Raw payload</summary>${csJsonDump(sp)}</details>

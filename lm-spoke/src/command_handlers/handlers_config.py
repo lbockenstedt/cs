@@ -23,6 +23,64 @@ logger = logging.getLogger("CSSpoke")
 class ConfigCommandsMixin:
     async def _dispatch_config(self, cmd: str, d: Dict[str, Any]) -> Optional[Dict[str, Any]]:
 
+        # ── repo / update status (Setup → Diagnostics → API Server) ──────────
+        # Lets an operator confirm FROM THE UI which branch + build this spoke's
+        # checkout is serving to clients — the answer to "did my push reach the
+        # spoke?" without touching the CLI. Reads the served scripts dir
+        # (clients/linux, the same dir /api/scripts serves) + the tenant's
+        # github_config branch. Best-effort; never raises.
+        if cmd in ("CS_GET_REPO_STATUS",):
+            import re as _re
+            try:
+                repo_root = self.settings.config_dir.parent
+                linux = repo_root / "clients" / "linux"
+                gc = getattr(self, "_github_config", None) or {}
+
+                def _script_ver(fn: str):
+                    p = linux / fn
+                    if not p.is_file():
+                        return None
+                    try:
+                        for line in p.read_text(errors="replace").splitlines()[:5]:
+                            m = _re.match(r"^version=(\S+)", line)
+                            if m:
+                                return m.group(1)
+                    except Exception:  # noqa: BLE001
+                        return "?"
+                    return "?"
+
+                served_version = None
+                vf = linux / "VERSION"
+                if vf.is_file():
+                    try:
+                        served_version = vf.read_text(errors="replace").strip()
+                    except Exception:  # noqa: BLE001
+                        served_version = None
+                head = checked_out = ""
+                try:
+                    head = (await self._git("rev-parse", "--short", "HEAD")).strip()
+                    checked_out = (await self._git("rev-parse", "--abbrev-ref", "HEAD")).strip()
+                except Exception:  # noqa: BLE001 — git may be absent / non-repo dir
+                    pass
+                return {"status": "SUCCESS", "repo": {
+                    "configured_branch": str(gc.get("repo_branch") or "main"),
+                    "checked_out_branch": checked_out,
+                    "head": head,
+                    "source_of_truth": str(gc.get("source_of_truth")
+                                           or gc.get("config_source")
+                                           or ("github" if gc.get("repo_url") else "hub")),
+                    "served_version": served_version,
+                    "scripts": {
+                        "simulation.sh": _script_ver("simulation.sh"),
+                        "dns_fail.sh": _script_ver("dns_fail.sh"),
+                        "dns_latency.sh": _script_ver("dns_latency.sh"),
+                    },
+                    "dns_latency_present": (linux / "dns_latency.sh").is_file(),
+                }}
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("CS_GET_REPO_STATUS failed: %s", exc)
+                return {"status": "SUCCESS", "repo": {"error": str(exc)}}
+
         # ── config ─────────────────────────────────────────────────────────
         if cmd in ("CS_GET_CONFIG",):
             # Return the MERGED config (base repo file + hub-managed override
