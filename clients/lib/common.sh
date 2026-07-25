@@ -44,7 +44,12 @@ derive_bucket() {
   fi
   bucket=$(python3 -c "import zlib; print(zlib.crc32('${HOSTNAME}'.encode()) % 10)")
   if [[ "$bucket" =~ ^[0-9]$ ]]; then
-    printf '%s %s\n' "$HOSTNAME" "$bucket" > "$_BUCKET_CACHE" 2>/dev/null || true
+    # startup.sh sources this as ROOT at boot and populates the cache (root:644),
+    # so a later sim-user write on a miss would fail. GROUP the redirect (a bare
+    # `> file 2>/dev/null` does NOT suppress a redirection-open failure) and
+    # chmod 0666 so any tier can rewrite it.
+    { printf '%s %s\n' "$HOSTNAME" "$bucket" > "$_BUCKET_CACHE"; } 2>/dev/null || true
+    chmod 0666 "$_BUCKET_CACHE" 2>/dev/null || true
   fi
 }
 
