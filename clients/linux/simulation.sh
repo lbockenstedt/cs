@@ -532,6 +532,16 @@ run_simulation() {
  local script=$1
  local sleep_time=$2
  if [ -f "/usr/local/scripts/$script" ]; then
+  # Single-instance: kill any still-running copy of THIS sim before launching a
+  # fresh one. run_simulation fires every inner-loop iteration (~40s), but a
+  # sim's burst can run far longer (e.g. dns_fail_duration=600s), so without this
+  # the same script stacks into 10-15 overlapping copies — each a dig/traffic
+  # flood — which pegs the CPU and saturates the link (the per-instance 100-dig
+  # cap only bounds ONE copy). Match the exact script PATH so we never hit a
+  # different sim (dns_fail.sh vs dns_latency.sh). Orphaned child digs self-expire
+  # at their +time=1 timeout, so the parent kill is enough. `pkill -f` excludes
+  # THIS shell (-f matches the launched `bash <path>` line, not run_simulation).
+  pkill -f "/usr/local/scripts/$script" 2>/dev/null
   nohup bash "/usr/local/scripts/$script" >> /usr/local/scripts/sim.log 2>&1 &
   _rsleep "$sleep_time"
  fi
