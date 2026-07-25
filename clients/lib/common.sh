@@ -17,7 +17,7 @@
 #
 # Every helper here replaces copies that had drifted between simulation.sh,
 # dashboard.sh and startup.sh — edit HERE (clients/lib/), not per-script.
-version=.01
+version=.02
 
 # ── script version reporting ─────────────────────────────────────────────────
 # So an operator can tell FOR SURE which script + which deployment is running.
@@ -179,4 +179,52 @@ json_escape() {
   value=${value//$'\r'/\\r}
   value=${value//$'\t'/\\t}
   printf '%s' "$value"
+}
+
+# ── DNS flood self-throttle (gateway circuit-breaker) ───────────────────────
+# dns_fail / dns_latency flood background digs to trip Central's rate-based
+# alarm. Pushed too hard on a small VM the box saturates until its OWN default
+# gateway stops answering — the adapter drops association. That is the clean
+# "I've DOSed myself" signal: a client whose gateway is gone emits nothing
+# useful, so the sim BAILS (simulation.sh's cycle-top _wait_gateway recovery then
+# re-associates the adapter) and ratchets its sustainable rate DOWN 20%, persisted.
+# The next burst starts at that lower rate; if it DOSes again it drops another
+# 20%, converging on a stable rate in a couple of cycles — "close enough, not
+# wasteful". ONE shared ceiling for both DNS sims (same dig capacity). The stored
+# value is a rate in failures/min — the currency the quota engine will consume
+# once learning-mode reporting lands (Phase 2). Down-only in Phase 1: the upward
+# re-probe is a learning-mode behavior (Phase 2); clear the state file to reset.
+_DNS_CEILING_FILE="/usr/local/scripts/dns_ceiling.state"
+_DNS_RATE_FLOOR=30    # never throttle below this (below it a client is just broken)
+
+# Default-gateway IP (the sim's real uplink), empty if there is no default route.
+dns_default_gw() { ip route 2>/dev/null | grep -oP 'default via \K\S+' | head -1; }
+
+# Return 0 iff the gateway answers a single quick (1s) ping.
+dns_gw_alive() { local gw="${1:-}"; [[ -n "$gw" ]] && ping -c1 -W1 "$gw" >/dev/null 2>&1; }
+
+# Effective per-burst rate = min(configured, persisted operating ceiling).
+dns_ceiling_rate() {
+  local configured=$1 saved=""
+  # NB: read only when the file exists — `$(< f 2>/dev/null)` is NOT the bash
+  # read-shortcut (the extra redirect makes it a null command that yields ""),
+  # and reading a missing file leaks a "No such file" error.
+  [[ -f "$_DNS_CEILING_FILE" ]] && saved=$(< "$_DNS_CEILING_FILE")
+  if [[ "$saved" =~ ^[0-9]+$ ]] && (( saved > 0 && saved < configured )); then
+    echo "$saved"
+  else
+    echo "$configured"
+  fi
+}
+
+# Gateway died while achieving $1 failures/min → persist a new ceiling of
+# achieved*0.8 (floored) and echo it. Cross-tier writable (same root/sim
+# ownership trap as client-sim-update.stamp): grouped redirect + world-writable.
+dns_ceiling_penalize() {
+  local achieved=$1 next
+  next=$(awk -v a="$achieved" 'BEGIN { printf "%d", a * 0.8 }')
+  (( next < _DNS_RATE_FLOOR )) && next=$_DNS_RATE_FLOOR
+  { printf '%s' "$next" > "$_DNS_CEILING_FILE"; } 2>/dev/null || true
+  chmod 0666 "$_DNS_CEILING_FILE" 2>/dev/null || true
+  echo "$next"
 }

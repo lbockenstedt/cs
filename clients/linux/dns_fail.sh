@@ -1,5 +1,5 @@
 #!/bin/bash
-version=.08
+version=.09
 log="/usr/local/scripts/sim.log"
 debug="/usr/local/scripts/debug-dns-fail.log"
 echo DNS Failure Script Version $version | tee "$debug"
@@ -78,6 +78,13 @@ burst_seconds=$(get_value 'simulation' 'dns_fail_duration')
 [[ -z "$burst_seconds"   ]] && burst_seconds=60
 (( rate_per_minute < 200 )) && rate_per_minute=200
 
+# Self-throttle ceiling: a prior burst that DOSed its OWN default gateway
+# persisted a lower sustainable rate (dns_ceiling_penalize in common.sh). Start
+# there, not at the configured rate, so we converge on a stable rate instead of
+# re-DOSing every cycle. min(configured, persisted); no state file => configured.
+_configured_rate=$rate_per_minute
+rate_per_minute=$(dns_ceiling_rate "$rate_per_minute")
+
 # Seconds to wait between each launch to hit the target rate.
 # Example: 600 per minute -> 60/600 -> 0.1 second between lookups.
 pause_between=$(awk "BEGIN { printf \"%.3f\", 60 / $rate_per_minute }")
@@ -94,7 +101,9 @@ _MAX_INFLIGHT="${DNS_MAX_INFLIGHT:-}"
 [[ "$_MAX_INFLIGHT" =~ ^[0-9]+$ ]] || _MAX_INFLIGHT=100
 (( _MAX_INFLIGHT < 1 )) && _MAX_INFLIGHT=1
 
-echo "$(date) Firing DNS failures at ${rate_per_minute}/min for ${burst_seconds}s (max ${_MAX_INFLIGHT} digs in flight)" | tee -a "$debug"
+_throttle_note=""
+(( rate_per_minute < _configured_rate )) && _throttle_note=" (self-throttled from ${_configured_rate}/min after a prior gateway DOS)"
+echo "$(date) Firing DNS failures at ${rate_per_minute}/min for ${burst_seconds}s (max ${_MAX_INFLIGHT} digs in flight)${_throttle_note}" | tee -a "$debug"
 if (( VERBOSE )); then
   echo "[verbose] bad_records : ${bad_records[*]:-<none>}"
   echo "[verbose] bad_ips     : ${bad_ips[*]:-<none>}"
@@ -107,12 +116,40 @@ fi
 # against every bad/slow server.
 stop_at=$((SECONDS + burst_seconds))
 fired=0
+_burst_start=$SECONDS
+# Gateway circuit-breaker: watch our OWN default gateway during the flood. If we
+# flood hard enough to knock it offline we've DOSed the box — bail (below) and
+# ratchet the rate down 20% for next cycle. Checked ~every 2s; 2 consecutive
+# misses required so a single dropped ping doesn't false-trip.
+_dfgw=$(dns_default_gw)
+_gw_next_check=$((SECONDS + 2))
+_gw_misses=0
+_bailed=0
 while (( SECONDS < stop_at )); do
   for record in $dnsfile; do
     for server in "${bad_records[@]}" "${bad_ips[@]}"; do
 
       # Stop the moment the burst window closes (break out of both loops).
       (( SECONDS >= stop_at )) && break 2
+
+      # Self-DOS check (skip verbose/manual mode — foreground, can't DOS).
+      if (( ! VERBOSE )) && [[ -n "$_dfgw" ]] && (( SECONDS >= _gw_next_check )); then
+        _gw_next_check=$((SECONDS + 2))
+        if dns_gw_alive "$_dfgw"; then
+          _gw_misses=0
+        else
+          _gw_misses=$((_gw_misses + 1))
+          if (( _gw_misses >= 2 )); then
+            _elapsed=$(( SECONDS - _burst_start )); (( _elapsed < 1 )) && _elapsed=1
+            _achieved=$(awk -v f="$fired" -v e="$_elapsed" 'BEGIN { printf "%d", f / e * 60 }')
+            _newrate=$(dns_ceiling_penalize "$_achieved")
+            echo "$(date) DNS flood knocked out default gateway $_dfgw after ${fired} digs (~${_achieved}/min) — BAILING; next burst throttles to ${_newrate}/min" | tee -a "$debug"
+            kill $(jobs -p) 2>/dev/null
+            _bailed=1
+            break 2
+          fi
+        fi
+      fi
 
       if (( VERBOSE )); then
         # Foreground + visible: see each lookup's result (for manual debugging).
@@ -145,4 +182,8 @@ done
 # Let any lookups still in flight finish, then record how many we fired.
 # (Verbose mode runs foreground — no background jobs to wait on.)
 (( VERBOSE )) || wait 2>/dev/null
-echo "$(date) DNS failures fired: ${fired}" | tee -a "$debug"
+if (( _bailed )); then
+  echo "$(date) DNS failures fired: ${fired} (BAILED on gateway loss — self-throttling next burst)" | tee -a "$debug"
+else
+  echo "$(date) DNS failures fired: ${fired}" | tee -a "$debug"
+fi

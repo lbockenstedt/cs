@@ -1,5 +1,5 @@
 #!/bin/bash
-version=.04
+version=.05
 log="/usr/local/scripts/sim.log"
 debug="/usr/local/scripts/debug-dns-latency.log"
 echo DNS Latency Script Version $version | tee "$debug"
@@ -65,6 +65,13 @@ burst_seconds=$(get_value 'simulation' 'dns_latency_duration')
 [[ -z "$burst_seconds"   ]] && burst_seconds=60
 (( rate_per_minute < 200 )) && rate_per_minute=200
 
+# Self-throttle ceiling: a prior burst that DOSed its OWN default gateway
+# persisted a lower sustainable rate (dns_ceiling_penalize in common.sh); start
+# there so we converge instead of re-DOSing. Shared with dns_fail (same dig
+# capacity). min(configured, persisted); no state file => configured.
+_configured_rate=$rate_per_minute
+rate_per_minute=$(dns_ceiling_rate "$rate_per_minute")
+
 # Seconds to wait between each launch to hit the target rate.
 pause_between=$(awk "BEGIN { printf \"%.3f\", 60 / $rate_per_minute }")
 
@@ -79,7 +86,9 @@ _MAX_INFLIGHT="${DNS_MAX_INFLIGHT:-}"
 [[ "$_MAX_INFLIGHT" =~ ^[0-9]+$ ]] || _MAX_INFLIGHT=100
 (( _MAX_INFLIGHT < 1 )) && _MAX_INFLIGHT=1
 
-echo "$(date) Firing DNS latency lookups at ${rate_per_minute}/min for ${burst_seconds}s (max ${_MAX_INFLIGHT} digs in flight)" | tee -a "$debug"
+_throttle_note=""
+(( rate_per_minute < _configured_rate )) && _throttle_note=" (self-throttled from ${_configured_rate}/min after a prior gateway DOS)"
+echo "$(date) Firing DNS latency lookups at ${rate_per_minute}/min for ${burst_seconds}s (max ${_MAX_INFLIGHT} digs in flight)${_throttle_note}" | tee -a "$debug"
 if (( VERBOSE )); then
   echo "[verbose] latencies   : ${latencies[*]:-<none>}"
   echo "[verbose] records file: $(wc -l < /usr/local/scripts/dns_fail.txt 2>/dev/null) lines"
@@ -91,12 +100,39 @@ fi
 # every slow server.
 stop_at=$((SECONDS + burst_seconds))
 fired=0
+_burst_start=$SECONDS
+# Gateway circuit-breaker (shared logic with dns_fail): if the flood knocks our
+# OWN default gateway offline we've DOSed the box — bail + ratchet down 20% for
+# next cycle. ~every 2s, 2 consecutive misses required.
+_dfgw=$(dns_default_gw)
+_gw_next_check=$((SECONDS + 2))
+_gw_misses=0
+_bailed=0
 while (( SECONDS < stop_at )); do
   for record in $dnsfile; do
     for server in "${latencies[@]}"; do
 
       # Stop the moment the burst window closes (break out of both loops).
       (( SECONDS >= stop_at )) && break 2
+
+      # Self-DOS check (skip verbose/manual mode — foreground, can't DOS).
+      if (( ! VERBOSE )) && [[ -n "$_dfgw" ]] && (( SECONDS >= _gw_next_check )); then
+        _gw_next_check=$((SECONDS + 2))
+        if dns_gw_alive "$_dfgw"; then
+          _gw_misses=0
+        else
+          _gw_misses=$((_gw_misses + 1))
+          if (( _gw_misses >= 2 )); then
+            _elapsed=$(( SECONDS - _burst_start )); (( _elapsed < 1 )) && _elapsed=1
+            _achieved=$(awk -v f="$fired" -v e="$_elapsed" 'BEGIN { printf "%d", f / e * 60 }')
+            _newrate=$(dns_ceiling_penalize "$_achieved")
+            echo "$(date) DNS latency flood knocked out default gateway $_dfgw after ${fired} digs (~${_achieved}/min) — BAILING; next burst throttles to ${_newrate}/min" | tee -a "$debug"
+            kill $(jobs -p) 2>/dev/null
+            _bailed=1
+            break 2
+          fi
+        fi
+      fi
 
       if (( VERBOSE )); then
         _out=$(dig +time=1 +tries=1 +short @"$server" "$record" 2>&1); _rc=$?
@@ -124,4 +160,8 @@ done
 
 # Let any lookups still in flight finish, then record how many we fired.
 (( VERBOSE )) || wait 2>/dev/null
-echo "$(date) DNS latency lookups fired: ${fired}" | tee -a "$debug"
+if (( _bailed )); then
+  echo "$(date) DNS latency lookups fired: ${fired} (BAILED on gateway loss — self-throttling next burst)" | tee -a "$debug"
+else
+  echo "$(date) DNS latency lookups fired: ${fired}" | tee -a "$debug"
+fi
