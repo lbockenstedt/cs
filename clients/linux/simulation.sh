@@ -1,5 +1,5 @@
 #!/bin/bash
-version=1.7
+version=1.8
 LOG_FILE=/usr/local/scripts/sim.log
 
 echo $(date) | tee -a ${LOG_FILE}
@@ -543,24 +543,28 @@ run_simulation() {
  local script=$1
  local sleep_time=$2
  if [ -f "/usr/local/scripts/$script" ]; then
-  # Single-instance: kill any still-running copy of THIS sim before launching a
-  # fresh one. run_simulation fires every inner-loop iteration (~40s), but a
-  # sim's burst can run far longer (e.g. dns_fail_duration=600s), so without this
-  # the same script stacks into 10-15 overlapping copies — each a dig/traffic
-  # flood — which pegs the CPU and saturates the link (the per-instance 100-dig
-  # cap only bounds ONE copy). Match the exact script PATH so we never hit a
-  # different sim (dns_fail.sh vs dns_latency.sh). Orphaned child digs self-expire
-  # at their +time=1 timeout, so the parent kill is enough. `pkill -f` excludes
-  # THIS shell (-f matches the launched `bash <path>` line, not run_simulation).
-  pkill -f "/usr/local/scripts/$script" 2>/dev/null
+  # Single-instance, NON-DESTRUCTIVE: if a copy of THIS sim is already running,
+  # leave it running and just take the inter-sim pause. run_simulation fires every
+  # inner-loop pass (~30s), but a sim's burst runs far longer (dns_fail_duration=
+  # 600s). The old code pkill'd + relaunched on EVERY pass, which chopped the 600s
+  # burst into ~30s fragments and dropped fleet DNS volume below the controller's
+  # alert threshold (~200 failures/5min) — the DNS alert stopped firing. Skip-if-
+  # running lets the burst run to completion while still preventing the 10-15x
+  # stacking that pegged CPU. Match the exact script PATH so dns_fail.sh never
+  # matches dns_latency.sh; `pgrep -f` matches the launched `bash <path>` line
+  # (not run_simulation, whose cmdline is simulation.sh, nor tee's).
+  if pgrep -f "/usr/local/scripts/$script" >/dev/null 2>&1; then
+    _rsleep "$sleep_time"
+    return
+  fi
   case "$script" in
     dns_fail.sh|dns_latency.sh)
       # DNS sims: surface each fire-and-forget dig on the LIVE console (this
       # loop's stdout — a terminal when simulation.sh is run interactively) AND
       # still append to sim.log, via tee. nohup's stdout is the PIPE (not a tty),
-      # so it won't hijack output to nohup.out; when the sim is killed on the next
-      # single-instance relaunch, the pipe EOFs and tee exits — no orphan. Other
-      # sims stay quiet in the log only.
+      # so it won't hijack output to nohup.out; when the sim's burst finishes and
+      # it exits, the pipe EOFs and tee exits — no orphan. Other sims stay quiet
+      # in the log only.
       nohup bash "/usr/local/scripts/$script" 2>&1 | tee -a /usr/local/scripts/sim.log &
       ;;
     *)
