@@ -1,5 +1,5 @@
 #!/bin/bash
-version=.11
+version=.12
 # WHY: dashboard.sh is a read-only live monitor. It runs in its own terminal
 # window (launched by startup.desktop) so the operator can always see
 # what's happening without interrupting the simulation loop in the other pane.
@@ -64,6 +64,13 @@ refresh_config() {
   simsh_ver=$(grep -m1 '^version=' /usr/local/scripts/simulation.sh 2>/dev/null \
               | cut -d= -f2- | tr -d '[:space:]')
   [[ -n "$simsh_ver" ]] || simsh_ver="?"
+  # Deployed VERSION file — CI-maintained (can't drift), the definitive "which
+  # build landed here" anchor + the exact value update.sh's version-gate compares.
+  deploy_ver=$(< /usr/local/scripts/VERSION 2>/dev/null); [[ -n "$deploy_ver" ]] || deploy_ver="?"
+  # Active DNS sim script versions (read live from disk) so a box that didn't
+  # pick up a DNS-script change is obvious at a glance.
+  _sv() { local v; v=$(grep -m1 '^version=' "/usr/local/scripts/$1" 2>/dev/null | cut -d= -f2- | tr -d '[:space:]'); [[ -n "$v" ]] && printf '%s' "$v" || printf '?'; }
+  dnsf_ver=$(_sv dns_fail.sh); dnsl_ver=$(_sv dns_latency.sh)
   github_repo=$(get_value 'simulation' 'github_repo')
   repo_location=$(get_value 'simulation' 'repo_location')
   site_based_ssid=$(get_value 'simulation' 'site_based_ssid')
@@ -431,7 +438,8 @@ while true; do
   # 3-row × 2-col table (whitespace win). "-" placeholder when no wlan adapter;
   # Version (the per-box deploy indicator) always shows.
   _adp="${wladapter:--}"
-  printf "  %sAdapter:%s %-22s  %sVersion:%s %s\n" "$BOLD" "$RST" "$_adp" "$BOLD" "$RST" "$simsh_ver"
+  printf "  %sAdapter:%s %-22s  %sVersion:%s %s · deploy %s\n" "$BOLD" "$RST" "$_adp" "$BOLD" "$RST" "$simsh_ver" "$deploy_ver"
+  printf "  %sDNS sim:%s fail v%-6s          latency v%s\n" "$BOLD" "$RST" "$dnsf_ver" "$dnsl_ver"
   echo ""
   printf "  %sWiFi:%s    %s\n" "$BOLD" "$RST" "$(get_wifi_status)"
   printf "  %sGateway:%s %s\n" "$BOLD" "$RST" "$(get_gateway_status)"

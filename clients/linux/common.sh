@@ -17,6 +17,33 @@
 #
 # Every helper here replaces copies that had drifted between simulation.sh,
 # dashboard.sh and startup.sh — edit HERE (clients/lib/), not per-script.
+version=.01
+
+# ── script version reporting ─────────────────────────────────────────────────
+# So an operator can tell FOR SURE which script + which deployment is running.
+# The deployed VERSION file (/usr/local/scripts/VERSION) is CI-maintained and
+# can't drift, so it anchors each script's hand-bumped ``version=``.
+#   sim_version_banner <name> <version>  → one startup line for a single script
+#   sim_versions_report                  → a table of every deployed script's
+#                                          version (startup.sh prints it at boot)
+_sim_deploy_version() {
+  local v; v=$(< /usr/local/scripts/VERSION 2>/dev/null)
+  [[ -n "$v" ]] && printf '%s' "$v" || printf '?'
+}
+sim_version_banner() {
+  echo "[${1:-script} v${2:-?} · deploy $(_sim_deploy_version)] running" \
+    | tee -a /usr/local/scripts/sim.log 2>/dev/null
+}
+sim_versions_report() {
+  echo "=== client script versions (deploy $(_sim_deploy_version)) ===" \
+    | tee -a /usr/local/scripts/sim.log 2>/dev/null
+  local f v
+  for f in /usr/local/scripts/*.sh; do
+    v=$(grep -m1 -oE '^version=[^[:space:]]*' "$f" 2>/dev/null | cut -d= -f2)
+    printf '  %-22s v%s\n' "$(basename "$f")" "${v:-—}" \
+      | tee -a /usr/local/scripts/sim.log 2>/dev/null
+  done
+}
 
 # ── username ────────────────────────────────────────────────────────────────
 # Sets $username from $HOSTNAME: the prefix before the first '-' (the whole

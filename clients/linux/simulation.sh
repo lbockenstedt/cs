@@ -1,5 +1,5 @@
 #!/bin/bash
-version=1.6
+version=1.7
 LOG_FILE=/usr/local/scripts/sim.log
 
 echo $(date) | tee -a ${LOG_FILE}
@@ -182,6 +182,9 @@ _rsleep() {
   sleep $(( base + RANDOM % (base + 1) ))
 }
 
+# Announce which build is running (own version= + CI-maintained deploy VERSION).
+# Re-prints on every self-re-exec, so the terminal always shows the live build.
+sim_version_banner simulation.sh "$version"
 
 while true; do
   #------------------------------------------------------------

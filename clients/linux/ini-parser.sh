@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+version=.01
 # ============================================================================ #
 # GENERATED-COPY NOTICE — canonical source: clients/lib/ini-parser.sh          #
 # clients/linux/ini-parser.sh and clients/t3/ini-parser.sh are byte-identical  #

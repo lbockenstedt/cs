@@ -1,5 +1,5 @@
 #!/bin/bash
-version=.35
+version=.36
 echo ------------------------------| tee /usr/local/scripts/sim.log
 echo Startup Script Version $version | tee -a /usr/local/scripts/sim.log
 echo $(date) | tee -a /usr/local/scripts/sim.log
@@ -60,6 +60,11 @@ source '/usr/local/scripts/ini-parser.sh'
 # Shared helpers (derive_username/derive_bucket/adapter detection) — canonical
 # source clients/lib/common.sh.
 source '/usr/local/scripts/common.sh'
+#------------------------------------------------------------
+# Print a full table of every deployed script's version + the CI-maintained
+# deploy VERSION, so the boot terminal shows FOR SURE what code is on this box.
+#------------------------------------------------------------
+sim_versions_report
 #------------------------------------------------------------
 #Figuring out username from hostname used to parse config
 #------------------------------------------------------------
