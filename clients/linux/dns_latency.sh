@@ -1,5 +1,5 @@
 #!/bin/bash
-version=.07
+version=.08
 log="/usr/local/scripts/sim.log"
 debug="/usr/local/scripts/debug-dns-latency.log"
 echo DNS Latency Script Version $version | tee "$debug"
@@ -112,10 +112,16 @@ fi
 stop_at=$((SECONDS + burst_seconds))
 fired=0
 _burst_start=$SECONDS
-# Gateway circuit-breaker (shared logic with dns_fail): if the flood knocks our
-# OWN default gateway offline we've DOSed the box — bail + ratchet down 20% for
-# next cycle. ~every 2s, 2 consecutive misses required.
+# Gateway circuit-breaker (shared logic with dns_fail). Guards against false
+# ratcheting: (a) START GATE — if the gateway is already down at burst start the
+# adapter is still re-associating from a prior bail (not our fault): skip the
+# burst, no flood, no penalty; (b) 3 consecutive ~2s misses (~6s down) required
+# so a WiFi ping blip can't trip it.
 _dfgw=$(dns_default_gw)
+if (( ! VERBOSE )) && [[ -n "$_dfgw" ]] && ! dns_gw_alive "$_dfgw"; then
+  echo "$(date) default gateway $_dfgw not reachable at burst start (adapter still recovering?) — skipping this burst, no throttle change" | tee -a "$debug"
+  exit 0
+fi
 _gw_next_check=$((SECONDS + 2))
 _gw_misses=0
 _bailed=0
@@ -133,7 +139,7 @@ while (( SECONDS < stop_at )); do
           _gw_misses=0
         else
           _gw_misses=$((_gw_misses + 1))
-          if (( _gw_misses >= 2 )); then
+          if (( _gw_misses >= 3 )); then
             _elapsed=$(( SECONDS - _burst_start )); (( _elapsed < 1 )) && _elapsed=1
             _achieved=$(awk -v f="$fired" -v e="$_elapsed" 'BEGIN { printf "%d", f / e * 60 }')
             _newrate=$(dns_ceiling_penalize "$_achieved")

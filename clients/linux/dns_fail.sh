@@ -1,5 +1,5 @@
 #!/bin/bash
-version=.11
+version=.12
 log="/usr/local/scripts/sim.log"
 debug="/usr/local/scripts/debug-dns-fail.log"
 echo DNS Failure Script Version $version | tee "$debug"
@@ -133,11 +133,20 @@ fi
 stop_at=$((SECONDS + burst_seconds))
 fired=0
 _burst_start=$SECONDS
-# Gateway circuit-breaker: watch our OWN default gateway during the flood. If we
-# flood hard enough to knock it offline we've DOSed the box — bail (below) and
-# ratchet the rate down 20% for next cycle. Checked ~every 2s; 2 consecutive
-# misses required so a single dropped ping doesn't false-trip.
+# Gateway circuit-breaker: watch our OWN default gateway during the flood. If the
+# flood knocks it offline we've DOSed the box → bail (below) + ratchet down 20%.
+# Guards against FALSE ratcheting to the floor:
+#  (a) START GATE — if the gateway is already down at burst start, the adapter is
+#      still re-associating from a PRIOR bail (not this burst's fault): skip the
+#      burst entirely, no flood, no penalty. simulation.sh's cycle-top recovery
+#      brings it back and the next cycle re-fires cleanly.
+#  (b) 3 consecutive ~2s misses (~6s down) required, so a WiFi ping blip / a
+#      single dropped packet during the client's own scan can't trip it.
 _dfgw=$(dns_default_gw)
+if (( ! VERBOSE )) && [[ -n "$_dfgw" ]] && ! dns_gw_alive "$_dfgw"; then
+  echo "$(date) default gateway $_dfgw not reachable at burst start (adapter still recovering?) — skipping this burst, no throttle change" | tee -a "$debug"
+  exit 0
+fi
 _gw_next_check=$((SECONDS + 2))
 _gw_misses=0
 _bailed=0
@@ -155,7 +164,7 @@ while (( SECONDS < stop_at )); do
           _gw_misses=0
         else
           _gw_misses=$((_gw_misses + 1))
-          if (( _gw_misses >= 2 )); then
+          if (( _gw_misses >= 3 )); then
             _elapsed=$(( SECONDS - _burst_start )); (( _elapsed < 1 )) && _elapsed=1
             _achieved=$(awk -v f="$fired" -v e="$_elapsed" 'BEGIN { printf "%d", f / e * 60 }')
             _newrate=$(dns_ceiling_penalize "$_achieved")
