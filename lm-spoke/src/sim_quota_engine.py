@@ -1083,10 +1083,19 @@ class SimQuotaEngine:
             # sweep re-home isn't visible to a later sim quota via _effective_site
             # — the sim quotas instead consult the ledger (homed_here) below.
             # Order: PRESENCE first (home clients), then EXCLUSIVE (non-shareable,
-            # e.g. ssidpw_fail) sims so they claim bare clients before shareable
-            # sims (dns_fail) stack onto the rest, then the shareable sims.
+            # e.g. dns_fail / ssidpw_fail) sims so they claim bare clients before
+            # shareable sims stack onto the rest, then the shareable sims.
+            # Exclusivity is GLOBAL (_sim_multi — SIM_META / Sharing tile), the
+            # SAME authority the reconcile loop below uses (line ~1108). The sort
+            # previously keyed off the abandoned per-quota ``multi_capable`` flag
+            # (removed as an input by the "sharing is GLOBAL only" change, which
+            # fixed the loop but left this sort), so a stored row carrying a stale
+            # ``multi_capable=True`` sorted an EXCLUSIVE sim (e.g. dns_fail) into
+            # the shareable group — processed LAST, after other exclusives had
+            # claimed every bare client, leaving it 0 assigned (its Central alert
+            # then never fires). Keying off _sim_multi keeps sort + loop in sync.
             quotas = sorted(quotas, key=lambda q: 0 if not (q.get("sim_id") or "")
-                            else (1 if not bool(q.get("multi_capable")) else 2))
+                            else (1 if not self._sim_multi(q.get("sim_id") or "") else 2))
             # Per-quota candidate diagnostics for the Config → Engine State view —
             # rebuilt every sweep so an operator can see WHY a quota is underfilled
             # (how many clients are eligible vs blocked, and by what). See
