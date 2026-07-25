@@ -1,5 +1,5 @@
 #!/bin/bash
-version=1.8
+version=1.9
 LOG_FILE=/usr/local/scripts/sim.log
 
 echo $(date) | tee -a ${LOG_FILE}
@@ -487,11 +487,17 @@ report_status() {
     printf -v joined '"%s",' "${error_log[@]}"
     errors_json="[${joined%,}]"
   fi
+  # Report the client's learned DNS ceiling (failures/min it can sustain before
+  # self-DOSing its own gateway) up to the hub — the Phase-2 currency for the
+  # quota engine's per-client intensity dimension. 0 = not yet measured;
+  # dns_ceiling_converged=true once learning has found it.
+  local dns_ceiling; dns_ceiling=$(_dns_ceiling_saved); [[ "$dns_ceiling" =~ ^[0-9]+$ ]] || dns_ceiling=0
+  local dns_converged=false; dns_ceiling_converged && dns_converged=true
   local payload
   printf -v payload \
-    '{"hostname":"%s","simulation_id":"%s","platform":"%s","iteration":%s,"connected_ssid":"%s","ip":"%s","gateway_reachable":%s,"active_simulations":[%s],"errors":%s,"config":{"kill_switch":"%s","dns_fail":"%s","dns_latency":"%s","iperf":"%s","www_traffic":"%s","download":"%s","ping_test":"%s","ssidpw_fail":"%s","auth_fail":"%s","dhcp_fail":"%s","collab":"%s"}}' \
+    '{"hostname":"%s","simulation_id":"%s","platform":"%s","iteration":%s,"connected_ssid":"%s","ip":"%s","gateway_reachable":%s,"dns_ceiling":%s,"dns_ceiling_converged":%s,"active_simulations":[%s],"errors":%s,"config":{"kill_switch":"%s","dns_fail":"%s","dns_latency":"%s","iperf":"%s","www_traffic":"%s","download":"%s","ping_test":"%s","ssidpw_fail":"%s","auth_fail":"%s","dhcp_fail":"%s","collab":"%s"}}' \
     "$(json_escape "$hostname")" "$(json_escape "${simulation_id:-}")" "$(json_escape "$platform")" \
-    "$iteration" "$(json_escape "${connected_ssid:-}")" "$(json_escape "${sim_ip:-}")" "$gateway_json" "$active_simulations" "$errors_json" \
+    "$iteration" "$(json_escape "${connected_ssid:-}")" "$(json_escape "${sim_ip:-}")" "$gateway_json" "$dns_ceiling" "$dns_converged" "$active_simulations" "$errors_json" \
     "$(json_escape "${kill_switch:-off}")" "$(json_escape "${dns_fail:-off}")" "$(json_escape "${dns_latency:-off}")" "$(json_escape "${iperf:-off}")" \
     "$(json_escape "${www_traffic:-off}")" "$(json_escape "${download:-off}")" "$(json_escape "${ping_test:-off}")" \
     "$(json_escape "${ssidpw_fail:-off}")" "$(json_escape "${auth_fail:-off}")" "$(json_escape "${dhcp_fail:-off}")" \

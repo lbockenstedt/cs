@@ -17,7 +17,7 @@
 #
 # Every helper here replaces copies that had drifted between simulation.sh,
 # dashboard.sh and startup.sh — edit HERE (clients/lib/), not per-script.
-version=.02
+version=.03
 
 # ── script version reporting ─────────────────────────────────────────────────
 # So an operator can tell FOR SURE which script + which deployment is running.
@@ -194,8 +194,10 @@ json_escape() {
 # value is a rate in failures/min — the currency the quota engine will consume
 # once learning-mode reporting lands (Phase 2). Down-only in Phase 1: the upward
 # re-probe is a learning-mode behavior (Phase 2); clear the state file to reset.
-_DNS_CEILING_FILE="/usr/local/scripts/dns_ceiling.state"
-_DNS_RATE_FLOOR=30    # never throttle below this (below it a client is just broken)
+_DNS_CEILING_FILE="/usr/local/scripts/dns_ceiling.state"        # persisted rate (failures/min)
+_DNS_CONVERGED_FILE="/usr/local/scripts/dns_ceiling.converged"  # marker: learning found the ceiling
+_DNS_RATE_FLOOR=30      # never throttle below this (below it a client is just broken)
+_DNS_PROBE_MAX=20000    # cap the learning-mode upward probe (a client that never DOSes can't run away)
 
 # Default-gateway IP (the sim's real uplink), empty if there is no default route.
 dns_default_gw() { ip route 2>/dev/null | grep -oP 'default via \K\S+' | head -1; }
@@ -203,28 +205,62 @@ dns_default_gw() { ip route 2>/dev/null | grep -oP 'default via \K\S+' | head -1
 # Return 0 iff the gateway answers a single quick (1s) ping.
 dns_gw_alive() { local gw="${1:-}"; [[ -n "$gw" ]] && ping -c1 -W1 "$gw" >/dev/null 2>&1; }
 
-# Effective per-burst rate = min(configured, persisted operating ceiling).
-dns_ceiling_rate() {
-  local configured=$1 saved=""
-  # NB: read only when the file exists — `$(< f 2>/dev/null)` is NOT the bash
-  # read-shortcut (the extra redirect makes it a null command that yields ""),
-  # and reading a missing file leaks a "No such file" error.
+# Persisted rate, empty if none/invalid. NB: `$(< f 2>/dev/null)` is NOT the bash
+# read-shortcut (the extra redirect makes it a null command that yields ""), and
+# reading a missing file leaks a "No such file" error — so guard on -f.
+_dns_ceiling_saved() {
+  local saved=""
   [[ -f "$_DNS_CEILING_FILE" ]] && saved=$(< "$_DNS_CEILING_FILE")
-  if [[ "$saved" =~ ^[0-9]+$ ]] && (( saved > 0 && saved < configured )); then
-    echo "$saved"
+  [[ "$saved" =~ ^[0-9]+$ ]] && echo "$saved"
+}
+
+# Effective per-burst rate. $1=configured, $2=learn (1 in learning mode).
+#  production (learn=0): min(configured, persisted) — down-only self-throttle.
+#  learning  (learn=1):  the persisted PROBE value (MAY exceed configured — it's
+#                        hunting the ceiling from below), or configured to start.
+dns_ceiling_rate() {
+  local configured=$1 learn=${2:-0} saved
+  saved=$(_dns_ceiling_saved)
+  if (( learn )); then
+    [[ -n "$saved" ]] && (( saved > 0 )) && { echo "$saved"; return; }
+    echo "$configured"
   else
+    [[ -n "$saved" ]] && (( saved > 0 && saved < configured )) && { echo "$saved"; return; }
     echo "$configured"
   fi
 }
 
-# Gateway died while achieving $1 failures/min → persist a new ceiling of
-# achieved*0.8 (floored) and echo it. Cross-tier writable (same root/sim
-# ownership trap as client-sim-update.stamp): grouped redirect + world-writable.
+# Persist a rate (cross-tier writable — same root/sim ownership trap as
+# client-sim-update.stamp: grouped redirect + world-writable).
+_dns_ceiling_write() {
+  { printf '%s' "$1" > "$_DNS_CEILING_FILE"; } 2>/dev/null || true
+  chmod 0666 "$_DNS_CEILING_FILE" 2>/dev/null || true
+}
+
+# Gateway died while achieving $1 failures/min → persist ceiling = achieved*0.8
+# (floored) and echo it. The DOS edge: in production the safety ratchet, in
+# learning the ceiling we then hold 20% below.
 dns_ceiling_penalize() {
   local achieved=$1 next
   next=$(awk -v a="$achieved" 'BEGIN { printf "%d", a * 0.8 }')
   (( next < _DNS_RATE_FLOOR )) && next=$_DNS_RATE_FLOOR
-  { printf '%s' "$next" > "$_DNS_CEILING_FILE"; } 2>/dev/null || true
-  chmod 0666 "$_DNS_CEILING_FILE" 2>/dev/null || true
+  _dns_ceiling_write "$next"
   echo "$next"
 }
+
+# Learning mode, CLEAN burst (no DOS) → probe the rate UP 20% to hunt the ceiling.
+# $1 = the rate we just ran cleanly. Bounded by _DNS_PROBE_MAX. Echoes next rate.
+dns_ceiling_relax() {
+  local cur=$1 next
+  next=$(awk -v c="$cur" 'BEGIN { printf "%d", c * 1.2 }')
+  (( next > _DNS_PROBE_MAX )) && next=$_DNS_PROBE_MAX
+  (( next <= cur )) && next=$(( cur + 1 ))   # always make forward progress
+  _dns_ceiling_write "$next"
+  echo "$next"
+}
+
+# Convergence marker — learning stops probing UP once it has found the ceiling
+# (first DOS). Cleared (dns_ceiling_reset) to start a fresh learning run.
+dns_ceiling_converged()      { [[ -f "$_DNS_CONVERGED_FILE" ]]; }
+dns_ceiling_mark_converged() { { : > "$_DNS_CONVERGED_FILE"; } 2>/dev/null || true; chmod 0666 "$_DNS_CONVERGED_FILE" 2>/dev/null || true; }
+dns_ceiling_reset()          { rm -f "$_DNS_CEILING_FILE" "$_DNS_CONVERGED_FILE" 2>/dev/null || true; }

@@ -195,7 +195,8 @@ class ClientRegistry:
 
             for key in ("simulation_id", "platform", "iteration",
                         "connected_ssid", "ip", "gateway_reachable",
-                        "active_simulations", "config", "status", "has_usb"):
+                        "active_simulations", "config", "status", "has_usb",
+                        "dns_ceiling", "dns_ceiling_converged"):
                 if key in payload:
                     entry[key] = payload[key]
 

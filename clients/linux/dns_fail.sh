@@ -1,5 +1,5 @@
 #!/bin/bash
-version=.10
+version=.11
 log="/usr/local/scripts/sim.log"
 debug="/usr/local/scripts/debug-dns-fail.log"
 echo DNS Failure Script Version $version | tee "$debug"
@@ -78,18 +78,26 @@ burst_seconds=$(get_value 'simulation' 'dns_fail_duration')
 [[ -z "$burst_seconds"   ]] && burst_seconds=60
 (( rate_per_minute < 200 )) && rate_per_minute=200
 
+# Learning mode (Phase 2): the client HUNTS its own DOS ceiling — probe the rate
+# UP on clean bursts, settle 20% below the rate that finally DOSes, and report it
+# to the quota engine (so the engine skips per-client trial-and-error and only
+# solves the client-count dimension). OFF => production: down-only self-throttle
+# safety net, capped at the configured rate. Pushed via config (dns_learn=on when
+# a DNS quota is in Learning); DNS_LEARN=1 forces it per manual run.
+_dns_learn=$(get_value 'simulation' 'dns_learn')
+if [[ "${DNS_LEARN:-}" == "1" || "$_dns_learn" == "on" ]]; then _learn=1; else _learn=0; fi
+
 # Per-run rate override for manual ceiling / recovery testing (parallels
 # DNS_MAX_INFLIGHT): DNS_FAIL_RATE=<n> forces the rate AND bypasses the persisted
 # self-throttle, so you can deliberately drive a client to its DOS ceiling and
 # watch it bail + recover (e.g. DNS_FAIL_RATE=5000 DNS_MAX_INFLIGHT=1500 bash
-# dns_fail.sh). Otherwise apply the persisted self-throttle ceiling: a prior
-# burst that DOSed its OWN gateway ratcheted this rate down (dns_ceiling_penalize
-# in common.sh); start there so we converge instead of re-DOSing every cycle.
+# dns_fail.sh). Otherwise apply the persisted ceiling (min(configured,persisted)
+# in production; the upward-probing value in learning) — dns_ceiling_rate.
 if [[ "${DNS_FAIL_RATE:-}" =~ ^[0-9]+$ ]]; then
   _configured_rate=$DNS_FAIL_RATE; rate_per_minute=$DNS_FAIL_RATE
 else
   _configured_rate=$rate_per_minute
-  rate_per_minute=$(dns_ceiling_rate "$rate_per_minute")
+  rate_per_minute=$(dns_ceiling_rate "$rate_per_minute" "$_learn")
 fi
 
 # Seconds to wait between each launch to hit the target rate.
@@ -110,6 +118,7 @@ _MAX_INFLIGHT="${DNS_MAX_INFLIGHT:-}"
 
 _throttle_note=""
 (( rate_per_minute < _configured_rate )) && _throttle_note=" (self-throttled from ${_configured_rate}/min after a prior gateway DOS)"
+(( _learn )) && { dns_ceiling_converged && _throttle_note="${_throttle_note} [LEARNING: ceiling found]" || _throttle_note="${_throttle_note} [LEARNING: hunting ceiling]"; }
 echo "$(date) Firing DNS failures at ${rate_per_minute}/min for ${burst_seconds}s (max ${_MAX_INFLIGHT} digs in flight)${_throttle_note}" | tee -a "$debug"
 if (( VERBOSE )); then
   echo "[verbose] bad_records : ${bad_records[*]:-<none>}"
@@ -150,7 +159,10 @@ while (( SECONDS < stop_at )); do
             _elapsed=$(( SECONDS - _burst_start )); (( _elapsed < 1 )) && _elapsed=1
             _achieved=$(awk -v f="$fired" -v e="$_elapsed" 'BEGIN { printf "%d", f / e * 60 }')
             _newrate=$(dns_ceiling_penalize "$_achieved")
-            echo "$(date) DNS flood knocked out default gateway $_dfgw after ${fired} digs (~${_achieved}/min) — BAILING; next burst throttles to ${_newrate}/min" | tee -a "$debug"
+            # Learning: this is the ceiling (the rate that DOSes) — settle 20%
+            # below it and STOP probing up (converged).
+            (( _learn )) && dns_ceiling_mark_converged
+            echo "$(date) DNS flood knocked out default gateway $_dfgw after ${fired} digs (~${_achieved}/min) — BAILING; $( (( _learn )) && echo "ceiling FOUND, settling at" || echo "next burst throttles to") ${_newrate}/min" | tee -a "$debug"
             kill $(jobs -p) 2>/dev/null
             _bailed=1
             break 2
@@ -191,6 +203,11 @@ done
 (( VERBOSE )) || wait 2>/dev/null
 if (( _bailed )); then
   echo "$(date) DNS failures fired: ${fired} (BAILED on gateway loss — self-throttling next burst)" | tee -a "$debug"
+elif (( _learn && ! VERBOSE )) && ! dns_ceiling_converged; then
+  # Learning + clean burst: this rate was sustainable, so probe UP next burst to
+  # keep hunting the ceiling (until a burst DOSes -> converged, settle 20% below).
+  _probe=$(dns_ceiling_relax "$rate_per_minute")
+  echo "$(date) DNS failures fired: ${fired} (LEARNING: ${rate_per_minute}/min sustained — probing up to ${_probe}/min next burst)" | tee -a "$debug"
 else
   echo "$(date) DNS failures fired: ${fired}" | tee -a "$debug"
 fi
