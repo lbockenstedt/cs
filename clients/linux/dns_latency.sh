@@ -1,5 +1,5 @@
 #!/bin/bash
-version=.08
+version=.09
 log="/usr/local/scripts/sim.log"
 debug="/usr/local/scripts/debug-dns-latency.log"
 echo DNS Latency Script Version $version | tee "$debug"
@@ -140,14 +140,20 @@ while (( SECONDS < stop_at )); do
         else
           _gw_misses=$((_gw_misses + 1))
           if (( _gw_misses >= 3 )); then
-            _elapsed=$(( SECONDS - _burst_start )); (( _elapsed < 1 )) && _elapsed=1
-            _achieved=$(awk -v f="$fired" -v e="$_elapsed" 'BEGIN { printf "%d", f / e * 60 }')
-            _newrate=$(dns_ceiling_penalize "$_achieved")
-            (( _learn )) && dns_ceiling_mark_converged
-            echo "$(date) DNS latency flood knocked out default gateway $_dfgw after ${fired} digs (~${_achieved}/min) — BAILING; $( (( _learn )) && echo "ceiling FOUND, settling at" || echo "next burst throttles to") ${_newrate}/min" | tee -a "$debug"
-            kill $(jobs -p) 2>/dev/null
-            _bailed=1
-            break 2
+            # Confirm a REAL outage before the sticky ratchet (see dns_fail): a
+            # strong multi-packet probe. Reply => transient miss, reset & keep going.
+            if ! dns_gw_confirmed_down "$_dfgw"; then
+              _gw_misses=0
+            else
+              _elapsed=$(( SECONDS - _burst_start )); (( _elapsed < 1 )) && _elapsed=1
+              _achieved=$(awk -v f="$fired" -v e="$_elapsed" 'BEGIN { printf "%d", f / e * 60 }')
+              _newrate=$(dns_ceiling_penalize "$_achieved")
+              (( _learn )) && dns_ceiling_mark_converged
+              echo "$(date) DNS latency flood knocked out default gateway $_dfgw after ${fired} digs (~${_achieved}/min) — BAILING; $( (( _learn )) && echo "ceiling FOUND, settling at" || echo "next burst throttles to") ${_newrate}/min" | tee -a "$debug"
+              kill $(jobs -p) 2>/dev/null
+              _bailed=1
+              break 2
+            fi
           fi
         fi
       fi

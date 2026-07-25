@@ -17,7 +17,7 @@
 #
 # Every helper here replaces copies that had drifted between simulation.sh,
 # dashboard.sh and startup.sh — edit HERE (clients/lib/), not per-script.
-version=.03
+version=.04
 
 # ── script version reporting ─────────────────────────────────────────────────
 # So an operator can tell FOR SURE which script + which deployment is running.
@@ -202,8 +202,19 @@ _DNS_PROBE_MAX=20000    # cap the learning-mode upward probe (a client that neve
 # Default-gateway IP (the sim's real uplink), empty if there is no default route.
 dns_default_gw() { ip route 2>/dev/null | grep -oP 'default via \K\S+' | head -1; }
 
-# Return 0 iff the gateway answers a single quick (1s) ping.
-dns_gw_alive() { local gw="${1:-}"; [[ -n "$gw" ]] && ping -c1 -W1 "$gw" >/dev/null 2>&1; }
+# Return 0 iff the gateway answers a single ping (2s timeout — tolerant of a busy
+# small VM that can't service a 1s reply in time; a too-short timeout reads a slow
+# client as a dead gateway and false-ratchets the rate down).
+dns_gw_alive() { local gw="${1:-}"; [[ -n "$gw" ]] && ping -c1 -W2 "$gw" >/dev/null 2>&1; }
+
+# Stronger "is it REALLY down?" probe, used to confirm before the sticky bail +
+# ratchet: 4 packets over ~1.2s. Returns 0 (down) only when EVERY packet is lost —
+# so a transient single-ping timeout (busy VM / WiFi jitter) can't trigger a
+# throttle-down; only a sustained outage does.
+dns_gw_confirmed_down() {
+  local gw="${1:-}"; [[ -n "$gw" ]] || return 1
+  ! ping -c4 -W2 -i0.3 "$gw" >/dev/null 2>&1
+}
 
 # Persisted rate, empty if none/invalid. NB: `$(< f 2>/dev/null)` is NOT the bash
 # read-shortcut (the extra redirect makes it a null command that yields ""), and
