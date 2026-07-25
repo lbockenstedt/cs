@@ -3940,7 +3940,7 @@ function csRenderSimQuotaEditor() {
     csSet(`<div class="space-y-4">
       <div class="hpe-card rounded-lg p-5 shadow-sm">
         <div class="flex flex-wrap items-center justify-between gap-2 mb-2">
-          <h3 class="text-sm font-bold text-slate-500 uppercase tracking-wider">Sim Quotas ${helpIcon('cs', null, 'Simulations help')}</h3>
+          <h3 class="text-sm font-bold text-slate-500 uppercase tracking-wider">Sim Quotas ${helpIcon('cs', null, 'Simulations help')}${helpIcon('alert-generation', null, 'How to generate each alert (negative sims): config + quota settings')}</h3>
           <div class="flex gap-2">
             <button onclick="csSimQuotaAdd()" class="bg-[#01A982]/10 hover:bg-[#01A982]/20 text-[#01A982] border border-[#01A982] px-4 py-1.5 rounded-md text-sm font-bold shadow-sm">+ Add Quota</button>
             <button onclick="csSimQuotaSave()" class="bg-[#01A982]/10 hover:bg-[#01A982]/20 text-[#01A982] border border-[#01A982] px-4 py-1.5 rounded-md text-sm font-bold shadow-sm">Save Quotas</button>
