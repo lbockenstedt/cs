@@ -26,10 +26,18 @@ from __future__ import annotations
 import json
 import logging
 import re
+import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger("TokenStore")
+
+# A client seen within this window counts as ONLINE for sim-tag purposes —
+# mirrors client_rows.py ("online = last_seen within 300 s") and the quota
+# engine's QT_ONLINE_S. Online clients get their active_simulations as sim-
+# tags; a client that has aged out gets an empty set (its sim- tags are cleared,
+# manual tags preserved).
+_ONLINE_WINDOW_S = 300.0
 
 _SIM_TAG_PREFIX = "sim-"
 
@@ -108,21 +116,30 @@ def _client_sim_map(registry: Any) -> Dict[str, List[str]]:
     registry, mirroring legacy ``_sync_all_vm_sim_tags`` (3794-3819). Online
     clients get their ``active_simulations`` sanitized to ``sim-`` tags; offline
     clients get an empty list (clears their ``sim-`` tags but preserves manual
-    tags). Returns ``{}`` when no registry is wired (Phase 2/3 not landed)."""
+    tags). Returns ``{}`` when no registry is wired.
+
+    ClientRegistry exposes ``get_all()`` (a ``{hostname: entry}`` dict) and has
+    NO ``online`` field — so derive online from ``last_seen`` freshness here,
+    same 300 s window client_rows uses. (The prior code called a nonexistent
+    ``registry.get_clients()`` behind a ``hasattr`` guard, so it always fell to
+    ``[]`` and this map was permanently empty — sim-tag sync never fired.)"""
     if registry is None:
         return {}
-    out: Dict[str, List[str]] = {}
     try:
-        clients = registry.get_clients() if hasattr(registry, "get_clients") else []
+        clients = registry.get_all() if hasattr(registry, "get_all") else {}
     except Exception as e:  # noqa: BLE001
-        logger.debug("sim-tag map: registry.get_clients failed: %s", e)
+        logger.debug("sim-tag map: registry.get_all failed: %s", e)
         return {}
-    for c in clients or []:
+    now = time.time()
+    out: Dict[str, List[str]] = {}
+    for c in (clients or {}).values():
         try:
             host = str((c or {}).get("hostname") or (c or {}).get("name") or "").strip().lower()
             if not host:
                 continue
-            online = bool((c or {}).get("online", False))
+            last_seen = (c or {}).get("last_seen")
+            online = bool(isinstance(last_seen, (int, float))
+                          and (now - last_seen) < _ONLINE_WINDOW_S)
             sims = (c or {}).get("active_simulations") or []
             tags = [sanitize_tag(s) for s in sims] if online else []
             tags = [t for t in tags if t]

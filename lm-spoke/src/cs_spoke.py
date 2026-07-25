@@ -391,9 +391,19 @@ class CSSpoke(AgentCommandsMixin, SimCommandsMixin, ConfigCommandsMixin,
                     if self._sim_tag_cache.get(hostname) == sig:
                         continue
                     try:
-                        await self.control_plane.send_to_agent(
+                        resp = await self.control_plane.send_to_agent(
                             "PXMX_APPLY_SIM_TAGS", {"tags": vmid_map},
                             agent_id=aid, timeout=self._SIM_TAG_DISPATCH_TIMEOUT)
+                        # The agent ACKs immediately and applies in the background
+                        # (non-blocking, so tagging never stalls its serial command
+                        # loop). If it SKIPPED because a prior apply was still
+                        # running, this desired map was NOT applied — don't cache
+                        # the signature, so the next telemetry frame re-dispatches
+                        # it instead of the cache suppressing it forever.
+                        if (resp or {}).get("skipped"):
+                            logger.debug("sim-tags: agent %s busy, will re-dispatch (%s)",
+                                         aid, hostname)
+                            continue
                         self._sim_tag_cache[hostname] = sig
                         logger.debug("sim-tags: dispatched %d VM(s) to agent %s (%s)",
                                      len(vmid_map), aid, hostname)
