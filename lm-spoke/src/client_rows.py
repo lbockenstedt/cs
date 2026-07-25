@@ -107,6 +107,12 @@ def build_client_rows(spoke, now: float | None = None
             # rides a separate backend network, so online≠has-sim-IP).
             "ip": c.get("ip") or "",
             "gateway_reachable": bool(c.get("gateway_reachable")),
+            # Learned DNS ceiling (failures/min this client sustains before it
+            # self-DOSes its own gateway) + whether learning has converged on it.
+            # 0/None until measured. Phase-2 input to the quota engine's per-client
+            # intensity dimension; surfaced here so it's visible in the UI/relay.
+            "dns_ceiling": c.get("dns_ceiling") or 0,
+            "dns_ceiling_converged": bool(c.get("dns_ceiling_converged")),
             "simulation_id": eff_sim_id,
             "active_simulations": c.get("active_simulations") or [],
             "last_seen": last_seen if last_seen is not None else "—",
