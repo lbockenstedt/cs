@@ -1,5 +1,5 @@
 #!/bin/bash
-version=.14
+version=.15
 pkill -f firefox
 log="/usr/local/scripts/sim.log"
 debug="/usr/local/scripts/debug-update.log"
@@ -42,8 +42,11 @@ _return_or_exit() {
 # Compare two dotted-numeric versions ($1=remote, $2=local).
 # A leading dot means an implicit 0 major (".103" → 0.103, "1.50" → 1.50).
 # Echoes "newer", "equal" or "older" describing remote relative to local.
-# Used to gate syncs so we only pull when remote is STRICTLY NEWER — an equal
-# version is up-to-date and an older remote is never applied (no downgrade).
+# Used to gate syncs: "equal" = up to date (config-only fetch); ANY difference
+# ("newer" OR "older") triggers a full sync. Downgrades ARE applied on purpose —
+# a hand-reset or rollback of the served VERSION must land on the fleet (a frozen
+# or mis-set VERSION otherwise strands every client, which has bitten us before).
+# The served build is authoritative; the client mirrors it either direction.
 #------------------------------------------------------------
 _version_cmp() {
     local a="$1" b="$2"
@@ -303,8 +306,6 @@ if [[ "$web_server" == "on" && -n "$server_url" ]]; then
         [[ -n "$remote_ver" ]] && _vcmp=$(_version_cmp "$remote_ver" "$local_ver")
         if [[ -z "$remote_ver" ]]; then
             echo "remote VERSION empty — skipping sync" | tee -a "$debug" "$log"
-        elif [[ "$_vcmp" == "older" ]]; then
-            echo "remote older ($remote_ver < $local_ver) — skipping (no downgrade)" | tee -a "$debug" "$log"
         elif [[ "$_vcmp" == "equal" ]]; then
             echo "Already up to date (v$local_ver) — checking for config changes..." | tee -a "$debug" "$log"
             # Scripts are current, but simulation.conf may have changed independently.
@@ -351,7 +352,10 @@ if [[ "$web_server" == "on" && -n "$server_url" ]]; then
 
             source_found=true
         else
-            echo "Update available ($local_ver → $remote_ver) — syncing..." | tee -a "$debug" "$log"
+            # Sync on ANY difference (newer OR older) — downgrades/resets/
+            # rollbacks MUST land, so a hand-reset or a lower served VERSION is
+            # applied rather than skipped. The served build is authoritative.
+            echo "Version differs (local $local_ver → served $remote_ver) — syncing..." | tee -a "$debug" "$log"
             tmp_web=$(mktemp -d)
             sync_ok=true
 
@@ -541,8 +545,6 @@ if [[ "$source_found" == false && "$github_repo" == "on" ]]; then
         [[ -n "$remote_ver" ]] && _vcmp=$(_version_cmp "$remote_ver" "$local_ver")
         if [[ -z "$remote_ver" ]]; then
             echo "remote VERSION empty — skipping sync" | tee -a "$debug" "$log"
-        elif [[ "$_vcmp" == "older" ]]; then
-            echo "remote older ($remote_ver < $local_ver) — skipping (no downgrade)" | tee -a "$debug" "$log"
         elif [[ "$_vcmp" == "equal" ]]; then
             echo "Already up to date (v$local_ver) — checking for config changes..." | tee -a "$debug" "$log"
             # Scripts are current but configs/ may have changed. Always apply
@@ -552,7 +554,9 @@ if [[ "$source_found" == false && "$github_repo" == "on" ]]; then
             [[ -f "configs/user-overrides.conf" ]]  && cp --remove-destination "configs/user-overrides.conf"  /usr/local/scripts/user-overrides.conf
             source_found=true
         else
-            echo "Update available ($local_ver → $remote_ver) — copying files..." | tee -a "$debug" "$log"
+            # Sync on ANY difference (newer OR older) — see the web tier above:
+            # a reset/rollback to a lower served VERSION must be applied.
+            echo "Version differs (local $local_ver → served $remote_ver) — copying files..." | tee -a "$debug" "$log"
             if cd linux 2>/dev/null; then
                 shopt -s nullglob
                 desktop_files=( *.desktop )
