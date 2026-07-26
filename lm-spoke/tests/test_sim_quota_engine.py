@@ -140,7 +140,19 @@ class _FakeSettings:
 
 class _FakeSpoke:
     def __init__(self, clients, quotas, tmp_path, pxmx_site_map=None,
-                 name_to_host=None):
+                 name_to_host=None, pin_sites=False):
+        # pin_sites: PHYSICALLY pin each client to its config.wsite (RF-chamber
+        # model) by deriving the name_to_host + pxmx_site_map the engine now reads.
+        # The engine no longer treats a bare config.wsite as a physical pin — a
+        # client with no pxmx_site_map entry is a tenant-POOL client (assignable
+        # to any site via re-home). Tests that assert physical site-binding /
+        # re-home must opt in; default off keeps the tenant-pool tests unchanged.
+        if pin_sites and pxmx_site_map is None and name_to_host is None:
+            def _ws(c):
+                return str((c.get("config") or {}).get("wsite") or "").strip()
+            name_to_host = {h: f"__host_{_ws(c)}" for h, c in clients.items()}
+            pxmx_site_map = {f"__host_{_ws(c)}": _ws(c)
+                             for c in clients.values() if _ws(c)}
         self.registry = _FakeRegistry(clients)
         self.local_store = _FakeLocalStore(quotas, pxmx_site_map)
         self.settings = _FakeSettings()
@@ -269,7 +281,9 @@ def test_reconcile_trims_extras_when_count_reduced(tmp_path):
 
 def test_reconcile_skips_wrong_site(tmp_path):
     clients = {f"c{i}": _client(f"c{i}", "DFW") for i in range(5)}
-    spoke = _FakeSpoke(clients, [{"alert_id": "A", "sim_id": "dns_fail", "count": 3, "site": "MIA", "enabled": True}], tmp_path)
+    # Physically pin every client to DFW (RF chamber) so a MIA quota can't harvest
+    # them — the engine only pins via pxmx_site_map now, not a bare config.wsite.
+    spoke = _FakeSpoke(clients, [{"alert_id": "A", "sim_id": "dns_fail", "count": 3, "site": "MIA", "enabled": True}], tmp_path, pin_sites=True)
     eng = SimQuotaEngine(spoke)
     _run(eng.reconcile())
     # No MIA clients → nothing assigned, ledger entry empty.
