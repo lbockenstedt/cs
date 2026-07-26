@@ -1332,13 +1332,26 @@ class SimQuotaEngine:
                         actions["released"] += 1
                         continue
                     if not self._is_harvestable(c, now):
-                        # Offline: keep (sim still runs on the VM) unless it's
-                        # been gone long enough to be considered dead.
                         last_seen = float(c.get("last_seen") or 0)
                         if (now - last_seen) > OFFLINE_TTL_S:
+                            # Gone past OFFLINE_TTL_S → DEAD → release so a
+                            # substitute replaces it. This is the ONLY point we
+                            # churn a runner: the ample buffer up to here (a real
+                            # agent flaps offline for up to ~15 min while its VM
+                            # keeps running the sim) prevents thrashing.
                             await self._release(h, sim_id, from_site, key)
                             assigned.pop(h, None)
                             actions["released"] += 1
+                            continue
+                        # Offline but NOT dead: the sim still runs on its VM, so
+                        # it's still PRODUCING — keep it COUNTED (no substitute; the
+                        # fleet's ~20% availability buffer covers the gap). Without
+                        # this the runner dropped out of `producing` the moment it
+                        # passed HARVEST_WINDOW_S (30 min) → a substitute was picked
+                        # and the over-N trim evicted it, i.e. it churned at 30 min
+                        # instead of the intended 60 min OFFLINE_TTL.
+                        producing.append(h)
+                        actions["kept"] += 1
                         continue
                     if multi and sim_id and self._exclusive_running(h, c):
                         # This is a SHAREABLE sim but an EXCLUSIVE sim now

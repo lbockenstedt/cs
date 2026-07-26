@@ -18,7 +18,7 @@ SRC = HERE.parent / "src"
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
-from sim_quota_engine import SimQuotaEngine  # noqa: E402
+from sim_quota_engine import SimQuotaEngine, OFFLINE_TTL_S  # noqa: E402
 
 
 class _FakeRegistry:
@@ -194,9 +194,14 @@ def _bind_engine_loop():
 
 
 def _offline_recently():
-    """last_seen just past the 300s online window but within the 3600s dead-TTL:
-    offline (so it needs a substitute) but NOT dead (so it's kept in the ledger)."""
-    return time.time() - 400
+    """last_seen past the 30-min HARVEST_WINDOW_S (so the runner no longer counts
+    as PRODUCING → a substitute is picked to hold N) but within the 60-min
+    OFFLINE_TTL_S (so it's NOT dead → kept in the ledger). NOTE: the producing
+    window is HARVEST_WINDOW_S (1800s), NOT the 5-min online window — a client
+    seen in the last 30 min still counts (real agents flap offline for up to
+    ~15 min, and the TTL is what defines 'dead'). 40 min sits in the 30–60 min
+    no-longer-producing-but-not-dead band."""
+    return time.time() - 2400
 
 
 def test_reconcile_picks_from_pool_to_count(tmp_path):
@@ -212,29 +217,29 @@ def test_reconcile_picks_from_pool_to_count(tmp_path):
 
 
 def test_reconcile_self_heals_offline_runner(tmp_path):
-    # N=3. c0,c1,c2 assigned. c0 goes offline → kept in the ledger (the sim
-    # keeps running on the VM through a WS blip), producing drops to 2 → a
-    # substitute c3 is picked up so producing stays at 3. The offline c0 is
-    # NOT released (still in the ledger); when it returns, producing goes to 4
-    # → over N → the substitute is trimmed back.
+    # N=3. c0,c1,c2 assigned. c0 goes offline but is NOT dead (within OFFLINE_TTL):
+    # the sim still runs on its VM, so it stays COUNTED as producing — NO substitute
+    # (the fleet's ~20% availability buffer covers a brief agent-offline; real
+    # agents flap offline for up to ~15 min). Only once it's gone past the TTL
+    # (dead) is it released and REPLACED — the single point we churn.
     clients = {f"c{i}": _client(f"c{i}", "MIA") for i in range(5)}
     spoke = _FakeSpoke(clients, [{"alert_id": "A", "sim_id": "dns_fail", "count": 3, "site": "MIA", "enabled": True}], tmp_path)
     eng = SimQuotaEngine(spoke)
     _run(eng.reconcile())
     first = list(eng._ledger["alert:A:MIA"]["clients"].keys())
     offline = first[0]
-    spoke.registry.clients[offline]["last_seen"] = _offline_recently()   # WS blip
+    # Offline but within the TTL → kept + counted, no substitute, ledger stays N.
+    spoke.registry.clients[offline]["last_seen"] = _offline_recently()
     actions = _run(eng.reconcile())
-    assert actions["assigned"] == 1 and actions["released"] == 0
+    assert actions["assigned"] == 0 and actions["released"] == 0
     assigned = list(eng._ledger["alert:A:MIA"]["clients"].keys())
-    assert offline in assigned              # offline runner kept, not dropped
-    # 3 producing + the kept-offline one = 4 ledger entries, sim still on N=3.
-    assert len(assigned) == 4
-    # Original returns → producing 4 > 3 → trim one back to 3.
-    spoke.registry.clients[offline]["last_seen"] = time.time()
+    assert offline in assigned and len(assigned) == 3
+    # Gone past the TTL → dead → released + a substitute replaces it (still N=3).
+    spoke.registry.clients[offline]["last_seen"] = time.time() - (OFFLINE_TTL_S + 60)
     actions = _run(eng.reconcile())
-    assert actions["released"] == 1
-    assert len(eng._ledger["alert:A:MIA"]["clients"]) == 3
+    assert actions["released"] == 1 and actions["assigned"] == 1
+    assigned = list(eng._ledger["alert:A:MIA"]["clients"].keys())
+    assert offline not in assigned and len(assigned) == 3
 
 
 def test_reconcile_releases_when_quota_removed(tmp_path):
@@ -403,52 +408,52 @@ def test_reconcile_rehome_release_reverts_wsite(tmp_path):
 
 
 def test_reconcile_rehome_packed_multi_release_keeps_wsite(tmp_path):
-    # multi_capable packing × re-home edge: quota A (exclusive dns_fail) re-homes
-    # c0 DFW→MIA; quota B (multi ping_test, MIA) PACKS onto c0. Both record the
-    # NATURAL site (DFW) as from_site. Releasing B must NOT revert wsite (A still
+    # re-home reference counting with TWO STACKABLE (multi) sims — an exclusive sim
+    # would monopolize and B could never pack (confirmed: exclusive = one sim only).
+    # Tenant-pool env, single logically-DFW client so the pack is deterministic:
+    # quota A (ping_test) re-homes c0 DFW→MIA; quota B (download) PACKS onto c0.
+    # Both record the NATURAL site (DFW). Releasing B must NOT revert wsite (A still
     # needs c0 at MIA); only releasing A (the last re-homer) reverts to DFW.
-    clients = {f"c{i}": _client(f"c{i}", "DFW") for i in range(3)}
-    n2h = {"c0": "px2", "c1": "px2", "c2": "px2"}
-    site_map = {"px2": "DFW"}
+    clients = {"c0": _client("c0", "DFW")}
     quotas = [
-        {"alert_id": "A", "sim_id": "dns_fail", "count": 1, "site": "MIA",
-         "rehome": True, "enabled": True},
-        {"alert_id": "B", "sim_id": "ping_test", "count": 1, "site": "MIA",
+        {"alert_id": "A", "sim_id": "ping_test", "count": 1, "site": "MIA",
+         "rehome": True, "multi_capable": True, "enabled": True},
+        {"alert_id": "B", "sim_id": "download", "count": 1, "site": "MIA",
          "rehome": True, "multi_capable": True, "enabled": True},
     ]
-    spoke = _FakeSpoke(clients, quotas, tmp_path,
-                       pxmx_site_map=site_map, name_to_host=n2h)
+    spoke = _FakeSpoke(clients, quotas, tmp_path)
     eng = SimQuotaEngine(spoke)
     _run(eng.reconcile())
-    # A re-homed c0 to MIA (cross-site borrow, first DFW runner); B packed onto
-    # c0 (in-site once re-homed). Both ledger entries recorded the natural site
-    # DFW → both are recognized as re-homers.
+    # A re-homed c0 to MIA; B packed onto c0. Both ledger entries recorded the
+    # natural site DFW → both are recognized as re-homers.
     assert "c0" in eng._ledger["alert:A:MIA"]["clients"]
     assert "c0" in eng._ledger["alert:B:MIA"]["clients"]
     assert eng._ledger["alert:A:MIA"]["clients"]["c0"] == "DFW"
     assert eng._ledger["alert:B:MIA"]["clients"]["c0"] == "DFW"
     assert spoke.registry.clients["c0"]["overrides"]["wsite"] == "MIA"
-    assert spoke.registry.clients["c0"]["overrides"]["dns_fail"] == "on"
     assert spoke.registry.clients["c0"]["overrides"]["ping_test"] == "on"
+    assert spoke.registry.clients["c0"]["overrides"]["download"] == "on"
     # Drop ONLY B → A still re-homes c0, so wsite stays at MIA (not reverted to
-    # DFW) and dns_fail stays on; ping_test turns off.
+    # DFW) and ping_test stays on; download turns off.
     spoke.local_store._q = [quotas[0]]
     _run(eng.reconcile())
     assert "alert:B:MIA" not in eng._ledger
     assert spoke.registry.clients["c0"]["overrides"]["wsite"] == "MIA"
-    assert spoke.registry.clients["c0"]["overrides"]["dns_fail"] == "on"
-    assert spoke.registry.clients["c0"]["overrides"].get("ping_test") == "off"
-    # Drop A too → no re-homer remains → wsite reverts to DFW, dns_fail off.
+    assert spoke.registry.clients["c0"]["overrides"]["ping_test"] == "on"
+    assert spoke.registry.clients["c0"]["overrides"].get("download") == "off"
+    # Drop A too → no re-homer remains → wsite reverts to DFW, ping_test off.
     spoke.local_store._q = []
     _run(eng.reconcile())
     assert eng._ledger == {}
     assert spoke.registry.clients["c0"]["overrides"].get("wsite") == "DFW"
-    assert spoke.registry.clients["c0"]["overrides"].get("dns_fail") == "off"
+    assert spoke.registry.clients["c0"]["overrides"].get("ping_test") == "off"
 
 
-def test_reconcile_substitute_stops_when_original_returns(tmp_path):
-    # Quota N=2. c0,c1 assigned. c0 goes offline → c2 substitutes. c0 returns
-    # → over N by 1 → one (the substitute c2, last in) is released.
+def test_reconcile_offline_runner_replaced_only_when_dead(tmp_path):
+    # Quota N=2. c0,c1 assigned. c0 offline-but-alive (within OFFLINE_TTL) stays
+    # counted → NO substitute, ledger stays 2 (ample buffer, no thrashing). When
+    # c0 RETURNS before dying → nothing changed. Only once c0 is gone past the TTL
+    # (dead) is it released and a substitute replaces it — ledger stays exactly N.
     clients = {f"c{i}": _client(f"c{i}", "MIA") for i in range(4)}
     spoke = _FakeSpoke(clients, [{"alert_id": "A", "sim_id": "dns_fail", "count": 2, "site": "MIA", "enabled": True}], tmp_path)
     eng = SimQuotaEngine(spoke)
@@ -456,14 +461,21 @@ def test_reconcile_substitute_stops_when_original_returns(tmp_path):
     assigned = list(eng._ledger["alert:A:MIA"]["clients"].keys())
     assert len(assigned) == 2
     offline = assigned[0]
+    # Offline but alive → kept, no substitute.
     spoke.registry.clients[offline]["last_seen"] = _offline_recently()
-    _run(eng.reconcile())                     # substitute picked up
-    # Ledger now holds the offline-kept original + 2 producing = 3; producing=N=2.
-    assert len(eng._ledger["alert:A:MIA"]["clients"]) == 3
-    spoke.registry.clients[offline]["last_seen"] = time.time()  # returns
-    actions = _run(eng.reconcile())           # over N → trim back to 2
-    assert actions["released"] == 1
-    assert len(eng._ledger["alert:A:MIA"]["clients"]) == 2
+    _run(eng.reconcile())
+    assert set(eng._ledger["alert:A:MIA"]["clients"].keys()) == set(assigned)  # unchanged
+    # Returns before dying → still the same 2, no churn.
+    spoke.registry.clients[offline]["last_seen"] = time.time()
+    actions = _run(eng.reconcile())
+    assert actions["released"] == 0
+    assert set(eng._ledger["alert:A:MIA"]["clients"].keys()) == set(assigned)
+    # Now goes offline AND dies (past TTL) → released + replaced, ledger stays 2.
+    spoke.registry.clients[offline]["last_seen"] = time.time() - (OFFLINE_TTL_S + 60)
+    actions = _run(eng.reconcile())
+    assert actions["released"] == 1 and actions["assigned"] == 1
+    led = eng._ledger["alert:A:MIA"]["clients"]
+    assert offline not in led and len(led) == 2
 
 
 # ── multi_capable exclusivity / packing (Chunk 4) ────────────────────────────
@@ -505,10 +517,12 @@ def test_reconcile_multi_capable_packs_two_traffic_sims_on_same_clients(tmp_path
         assert spoke.registry.clients[h]["overrides"]["download"] == "on"
 
 
-def test_reconcile_multi_capable_packs_onto_exclusive_runner(tmp_path):
-    # One EXCLUSIVE (dns_fail N=1) + one MULTI (ping_test N=1) over 1 client.
-    # The traffic sim packs onto the client already running the failure sim.
-    clients = {"c0": _client("c0", "MIA")}
+def test_reconcile_multi_does_not_pack_onto_exclusive_runner(tmp_path):
+    # One EXCLUSIVE (dns_fail N=1) + one MULTI (ping_test N=1). An exclusive sim
+    # MONOPOLIZES its client — a traffic sim never stacks onto it (confirmed model:
+    # exclusive = ONE sim only, everything else may stack). With c0 taken by
+    # dns_fail, ping_test takes the OTHER free client, not packs onto c0.
+    clients = {"c0": _client("c0", "MIA"), "c1": _client("c1", "MIA")}
     spoke = _FakeSpoke(clients, [
         {"alert_id": "A", "sim_id": "dns_fail", "count": 1, "site": "MIA", "enabled": True},
         {"alert_id": "B", "sim_id": "ping_test", "count": 1, "site": "MIA",
@@ -516,10 +530,14 @@ def test_reconcile_multi_capable_packs_onto_exclusive_runner(tmp_path):
     ], tmp_path)
     eng = SimQuotaEngine(spoke)
     _run(eng.reconcile())
-    assert set(eng._ledger["alert:A:MIA"]["clients"].keys()) == {"c0"}
-    assert set(eng._ledger["alert:B:MIA"]["clients"].keys()) == {"c0"}
-    ov = spoke.registry.clients["c0"]["overrides"]
-    assert ov["dns_fail"] == "on" and ov["ping_test"] == "on"
+    dns = set(eng._ledger["alert:A:MIA"]["clients"].keys())
+    ping = set(eng._ledger["alert:B:MIA"]["clients"].keys())
+    assert dns == {"c0"}
+    assert ping == {"c1"}                       # did NOT pack onto the exclusive c0
+    assert dns.isdisjoint(ping)
+    assert spoke.registry.clients["c0"]["overrides"]["dns_fail"] == "on"
+    assert spoke.registry.clients["c0"]["overrides"].get("ping_test") in (None, "off")
+    assert spoke.registry.clients["c1"]["overrides"]["ping_test"] == "on"
 
 
 def test_reconcile_exclusive_preempts_drone_running_exclusive_bucket_default(tmp_path):
