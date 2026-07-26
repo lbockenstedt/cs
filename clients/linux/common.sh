@@ -17,7 +17,7 @@
 #
 # Every helper here replaces copies that had drifted between simulation.sh,
 # dashboard.sh and startup.sh — edit HERE (clients/lib/), not per-script.
-version=.07
+version=.08
 
 # ── script version reporting ─────────────────────────────────────────────────
 # So an operator can tell FOR SURE which script + which deployment is running.
@@ -196,7 +196,10 @@ json_escape() {
 # re-probe is a learning-mode behavior (Phase 2); clear the state file to reset.
 _DNS_CEILING_FILE="/usr/local/scripts/dns_ceiling.state"        # persisted rate (failures/min)
 _DNS_CONVERGED_FILE="/usr/local/scripts/dns_ceiling.converged"  # marker: learning found the ceiling
-_DNS_RATE_FLOOR=15      # never throttle below this (below it a client is just broken)
+_DNS_RATE_FLOOR=0       # 0 = a client that can't sustain ANY flood ratchets fully
+                        # OFF (sidelines itself) — a bad USB/hub client vs a
+                        # dedicated channel that sustains a firehose. rate 0 =
+                        # "don't flood this burst" (handled in the sim scripts).
 _DNS_PROBE_MAX=20000    # cap the learning-mode upward probe (a client that never DOSes can't run away)
 
 # Default-gateway IP (the sim's real uplink), empty if there is no default route.
@@ -250,11 +253,13 @@ _dns_ceiling_saved() {
 dns_ceiling_rate() {
   local configured=$1 learn=${2:-0} saved
   saved=$(_dns_ceiling_saved)
+  # NB: >= 0 (not > 0) so a persisted ceiling of 0 is HONORED — a fully-throttled
+  # (sidelined) client stays at 0, not silently reset to the configured rate.
   if (( learn )); then
-    [[ -n "$saved" ]] && (( saved > 0 )) && { echo "$saved"; return; }
+    [[ -n "$saved" ]] && (( saved >= 0 )) && { echo "$saved"; return; }
     echo "$configured"
   else
-    [[ -n "$saved" ]] && (( saved > 0 && saved < configured )) && { echo "$saved"; return; }
+    [[ -n "$saved" ]] && (( saved >= 0 && saved < configured )) && { echo "$saved"; return; }
     echo "$configured"
   fi
 }

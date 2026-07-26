@@ -1,5 +1,5 @@
 #!/bin/bash
-version=.11
+version=.12
 log="/usr/local/scripts/sim.log"
 debug="/usr/local/scripts/debug-dns-latency.log"
 echo DNS Latency Script Version $version | tee "$debug"
@@ -80,6 +80,13 @@ if [[ "${DNS_LATENCY_RATE:-}" =~ ^[0-9]+$ ]]; then
 else
   _configured_rate=$rate_per_minute
   rate_per_minute=$(dns_ceiling_rate "$rate_per_minute" "$_learn")
+fi
+
+# Ceiling 0 = can't sustain any flood (bad USB/hub) — sideline: don't flood, avoid
+# div-by-zero. Off until state clears / recloned / learning re-probes.
+if (( rate_per_minute <= 0 )); then
+  echo "$(date) DNS self-throttle floored this client to 0/min — can't sustain the flood (bad USB/hub?); sidelining, not flooding" | tee -a "$debug"
+  exit 0
 fi
 
 # Seconds to wait between each launch to hit the target rate.

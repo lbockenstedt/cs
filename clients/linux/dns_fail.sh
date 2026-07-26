@@ -1,5 +1,5 @@
 #!/bin/bash
-version=.15
+version=.16
 log="/usr/local/scripts/sim.log"
 debug="/usr/local/scripts/debug-dns-fail.log"
 echo DNS Failure Script Version $version | tee "$debug"
@@ -98,6 +98,15 @@ if [[ "${DNS_FAIL_RATE:-}" =~ ^[0-9]+$ ]]; then
 else
   _configured_rate=$rate_per_minute
   rate_per_minute=$(dns_ceiling_rate "$rate_per_minute" "$_learn")
+fi
+
+# A ceiling of 0 means this client can't sustain ANY flood — a bad USB/hub dongle
+# (a healthy dedicated channel sits far higher). Sideline it: don't flood, and
+# avoid the divide-by-zero in pause_between. Stays off until its state clears /
+# it's recloned / learning re-probes.
+if (( rate_per_minute <= 0 )); then
+  echo "$(date) DNS self-throttle floored this client to 0/min — can't sustain the flood (bad USB/hub?); sidelining, not flooding" | tee -a "$debug"
+  exit 0
 fi
 
 # Seconds to wait between each launch to hit the target rate.
