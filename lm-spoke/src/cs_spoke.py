@@ -381,13 +381,31 @@ class CSSpoke(AgentCommandsMixin, SimCommandsMixin, ConfigCommandsMixin,
                     hn = str((info or {}).get("hostname") or "").strip()
                     if hn:
                         hn_to_aid[hn] = aid
+                deploy_states = getattr(self.deploy, "proxmox_states", {}) or {}
                 for hostname, vmid_map in tag_map.items():
                     aid = hn_to_aid.get(hostname)
                     if not aid:
                         continue  # that host's agent isn't connected right now
-                    # skip re-send when this host's desired map is unchanged
+                    # Desired-vs-ACTUAL reconcile: fold each VM's LIVE sim- tags
+                    # (reported in telemetry) into the signature. A VM that drifted
+                    # — recloned, apply lost, or the tag never took — has the desired
+                    # map UNCHANGED but the tag missing on the box; without the actual
+                    # tags in the sig the cache suppresses the re-send forever (the
+                    # "SIMs with no labels that never self-correct" case). With them
+                    # in, the sig differs while the box is out of sync → it
+                    # re-dispatches, and converges once actual == desired.
+                    _actual = {}
+                    for vm in (deploy_states.get(hostname, {}) or {}).get("vms", []) or []:
+                        _vid = vm.get("vmid")
+                        if _vid is None:
+                            continue
+                        _actual[str(_vid)] = tuple(sorted(
+                            str(t) for t in (vm.get("tags") or [])
+                            if str(t).startswith("sim-")))
+                    # skip re-send only when desired AND the on-box tags are unchanged
                     sig = tuple(sorted(
-                        (str(v), tuple(sorted(t))) for v, t in vmid_map.items()))
+                        (str(v), tuple(sorted(t)), _actual.get(str(v), ()))
+                        for v, t in vmid_map.items()))
                     if self._sim_tag_cache.get(hostname) == sig:
                         continue
                     try:
