@@ -1,5 +1,5 @@
 #!/bin/bash
-version=.01
+version=0.01
 # agent.sh — Client websocket agent — v1.05
 # Launches a background websocket client that streams status and receives commands.
 

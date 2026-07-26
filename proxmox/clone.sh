@@ -19,7 +19,7 @@
 # Example:
 #   bash clone.sh delete 90001 90024 15 vmbr0 5 Simulations sim-rpi 100 usb
 #
-version=".11"
+version="0.01"
 
 source '/etc/pve/scripts/ini-parser.sh'
 process_ini_file '/etc/pve/scripts/client-setup.conf'

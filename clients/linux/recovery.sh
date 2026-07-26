@@ -13,7 +13,7 @@
 # Depends on (set by simulation.sh before this is CALLED, not when sourced):
 #   $ssid, $wsite, $site_based_ssid, $wladapter
 # Plus the shared state/helpers in network_common.sh.
-version=1.0
+version=0.01
 
 # manage_connection — bring an existing nmcli connection up or down.
 #   $1 = action     — "up" or "down".

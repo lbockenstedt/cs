@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-version=.01
+version=0.01
 
 set -uo pipefail
 

@@ -1,5 +1,5 @@
 #!/bin/bash
-version=.01
+version=0.01
 log="/usr/local/scripts/sim.log"
 debug="/usr/local/scripts/debug-collab.log"
 echo Collab Script Version $version | tee "$debug"

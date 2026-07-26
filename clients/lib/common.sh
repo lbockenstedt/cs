@@ -17,7 +17,7 @@
 #
 # Every helper here replaces copies that had drifted between simulation.sh,
 # dashboard.sh and startup.sh — edit HERE (clients/lib/), not per-script.
-version=.10
+version=0.01
 
 # ── script version reporting ─────────────────────────────────────────────────
 # So an operator can tell FOR SURE which script + which deployment is running.

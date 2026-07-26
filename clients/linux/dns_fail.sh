@@ -1,5 +1,5 @@
 #!/bin/bash
-version=.19
+version=0.01
 log="/usr/local/scripts/sim.log"
 debug="/usr/local/scripts/debug-dns-fail.log"
 echo DNS Failure Script Version $version | tee "$debug"

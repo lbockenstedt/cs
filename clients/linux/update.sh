@@ -1,5 +1,5 @@
 #!/bin/bash
-version=.16
+version=0.01
 pkill -f firefox
 log="/usr/local/scripts/sim.log"
 debug="/usr/local/scripts/debug-update.log"

@@ -16,7 +16,7 @@
 #   $LOG_FILE   — log path (set at the top of simulation.sh)
 #   $wladapter  — wifi adapter name (set by detect_wlan_adapter in common.sh)
 #   $eadapter   — wired adapter name (set by detect_eth_adapter in common.sh)
-version=1.0
+version=0.01
 
 # ----------------------------------------------------------------------------
 # Connection state — shared across all connect paths.

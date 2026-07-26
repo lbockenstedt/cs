@@ -20,7 +20,7 @@
 #   $dot1x_client_cert, $dot1x_private_key, $dot1x_ca_cert  (EAP-TLS only)
 #   $wladapter
 # Plus the shared state/helpers in network_common.sh.
-version=1.0
+version=0.01
 
 # connect_1x — normal genuine 1X associate. $1 = nmcli -w backstop (sec),
 # $2 = "reset" to force a radio cycle. Tracks the reconnect ramp (track=1).

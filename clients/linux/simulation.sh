@@ -1,5 +1,5 @@
 #!/bin/bash
-version=2.0
+version=0.01
 LOG_FILE=/usr/local/scripts/sim.log
 
 echo $(date) | tee -a ${LOG_FILE}

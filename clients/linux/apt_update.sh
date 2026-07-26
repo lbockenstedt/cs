@@ -1,5 +1,5 @@
 #!/bin/bash
-version=.05
+version=0.01
 log="/usr/local/scripts/sim.log"
 echo "apt update Script Version $version" | tee -a "$log"
 echo "$(date)" | tee -a "$log"

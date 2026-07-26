@@ -1,5 +1,5 @@
 #!/bin/bash
-version=.02
+version=0.01
 log="/usr/local/scripts/sim.log"
 debug="/usr/local/scripts/debug-www-traffic.log"
 echo WWW_Traffic Script Version $version | tee "$debug"

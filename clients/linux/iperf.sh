@@ -1,5 +1,5 @@
 #!/bin/bash
-version=.04
+version=0.01
 log="/usr/local/scripts/sim.log"
 debug="/usr/local/scripts/debug-iperf.log"
 echo iPerf Script Version $version | tee "$debug"

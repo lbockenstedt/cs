@@ -1,5 +1,5 @@
 #!/bin/bash
-version=.16
+version=0.01
 # WHY: dashboard.sh is a read-only live monitor. It runs in its own terminal
 # window (launched by startup.desktop) so the operator can always see
 # what's happening without interrupting the simulation loop in the other pane.

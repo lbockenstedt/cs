@@ -1,5 +1,5 @@
 #!/bin/bash
-version=.03
+version=0.01
 log="/usr/local/scripts/sim.log"
 debug="/usr/local/scripts/debug-download.log"
 echo Download Script Version $version | tee "$debug"

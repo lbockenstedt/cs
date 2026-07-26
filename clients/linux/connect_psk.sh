@@ -16,7 +16,7 @@
 # Plus the shared state/helpers in network_common.sh: _reconnect_fails,
 # _RADIO_CYCLE_AFTER, _wifi_busy, _wait_radio_ready, _wait_ssid_seen,
 # _connect_outcome, delete_matching_connections.
-version=1.0
+version=0.01
 
 # connect_wifi — the primary PSK wifi associate.
 #   $1 = wait      — nmcli -w backstop, in seconds (the silent-AP cap; we return

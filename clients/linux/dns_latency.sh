@@ -1,5 +1,5 @@
 #!/bin/bash
-version=.16
+version=0.01
 log="/usr/local/scripts/sim.log"
 debug="/usr/local/scripts/debug-dns-latency.log"
 echo DNS Latency Script Version $version | tee "$debug"
