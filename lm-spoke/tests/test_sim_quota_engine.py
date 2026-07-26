@@ -6,6 +6,7 @@ a stub spoke + in-memory fake registry so no sim_config / filesystem state is
 needed (config_dir=None → _effective_site reads c['config']['wsite']).
 """
 import asyncio
+import random
 import sys
 import time
 from pathlib import Path
@@ -85,6 +86,28 @@ class _FakeLocalStore:
         self._matrix = []          # ssid_matrix (cell defs)
         self._weights = []         # ssid_weights (per-cell spread rules)
         self._site_w = {}          # ambient_site_weights (cross-site spread)
+        # Sim-stacking config (empty defaults → no stacking, so the harvest tests
+        # above are unaffected; the stacking tests below set these).
+        self._randomizable = []
+        self._sim_weights = {}
+        self._sim_shareable = {}
+        self._stack_cap = 3
+        self._stack_rotation_s = 600
+
+    def get_randomizable_sims(self):
+        return list(self._randomizable)
+
+    def get_sim_weights(self):
+        return dict(self._sim_weights)
+
+    def get_sim_shareable(self):
+        return dict(self._sim_shareable)
+
+    def get_stack_cap(self):
+        return self._stack_cap
+
+    def get_stack_rotation_s(self):
+        return self._stack_rotation_s
 
     def get_effective_sim_quotas(self):
         return list(self._q)
@@ -893,3 +916,69 @@ def test_reconcile_weighted_site_weight_multiplies_cell_sum(tmp_path):
     wsites = [spoke.registry.clients[h].get("overrides", {}).get("wsite") for h in clients]
     assert wsites.count("A") == 8, wsites
     assert wsites.count("B") == 2, wsites
+
+
+# ── weighted multi-sim stacking (_reconcile_stacked) ─────────────────────────
+def _stack_on(spoke, host, sim):
+    return spoke.registry.clients[host].get("overrides", {}).get(sim) == "on"
+
+
+def test_stacking_off_when_no_randomizable(tmp_path):
+    """Opt-in: with randomizable_sims empty (default) the engine assigns no
+    ambient sims — preserves the pre-stacking behavior."""
+    clients = {f"c{i}": _client(f"c{i}", "DFW") for i in range(5)}
+    spoke = _FakeSpoke(clients, [], tmp_path)
+    _run(SimQuotaEngine(spoke).reconcile())
+    for h in clients:
+        assert not spoke.registry.clients[h].get("overrides")
+
+
+def test_stacking_fills_spare_clients_weighted_and_capped(tmp_path):
+    """randomizable {ping_test:w1, download:w3}, cap 2 → download reaches more
+    clients than ping_test (breadth ∝ weight), no client exceeds the cap, and
+    some clients carry BOTH (real stacking)."""
+    clients = {f"c{i}": _client(f"c{i}", "DFW") for i in range(30)}
+    spoke = _FakeSpoke(clients, [], tmp_path)
+    spoke.local_store._randomizable = ["ping_test", "download"]
+    spoke.local_store._sim_weights = {"ping_test": 1, "download": 3}
+    spoke.local_store._stack_cap = 2
+    random.seed(1234)
+    _run(SimQuotaEngine(spoke).reconcile())
+    sims = ("ping_test", "download")
+    pt = sum(1 for h in clients if _stack_on(spoke, h, "ping_test"))
+    dl = sum(1 for h in clients if _stack_on(spoke, h, "download"))
+    assert dl > pt, (pt, dl)                       # weight 3 → broader than weight 1
+    for h in clients:                              # cap respected
+        assert sum(1 for s in sims if _stack_on(spoke, h, s)) <= 2
+    stacked = sum(1 for h in clients
+                  if sum(1 for s in sims if _stack_on(spoke, h, s)) >= 2)
+    assert stacked > 0                             # some clients actually stacked
+
+
+def test_stacking_skips_exclusive_client_and_is_harvestable(tmp_path):
+    """A client running an EXCLUSIVE sim is never stacked; and a harvest quota
+    can still take a stacked client (harvest wins → stack cleared)."""
+    import random as _r
+    clients = {f"c{i}": _client(f"c{i}", "DFW") for i in range(8)}
+    # c0 runs an exclusive sim (ssidpw_fail) as a bucket default.
+    clients["c0"]["config"]["ssidpw_fail"] = "on"
+    # An exclusive dns_fail quota for 2 clients coexists with stacking.
+    spoke = _FakeSpoke(
+        clients, [{"alert_id": "A", "sim_id": "dns_fail", "count": 2,
+                   "site": "", "enabled": True}], tmp_path)
+    spoke.local_store._randomizable = ["ping_test", "download"]
+    spoke.local_store._stack_cap = 2
+    _r.seed(7)
+    eng = SimQuotaEngine(spoke)
+    _run(eng.reconcile())
+    # c0 (exclusive bucket default) is never given a stacked sim.
+    assert not _stack_on(spoke, "c0", "ping_test")
+    assert not _stack_on(spoke, "c0", "download")
+    # The dns_fail quota harvested 2 clients; a harvested client carries dns_fail
+    # and is NOT left holding a stacked sim (harvest cleared the stack).
+    harvested = [h for h in clients
+                 if spoke.registry.clients[h]["overrides"].get("dns_fail") == "on"]
+    assert len(harvested) == 2
+    for h in harvested:
+        assert not _stack_on(spoke, h, "ping_test")
+        assert not _stack_on(spoke, h, "download")

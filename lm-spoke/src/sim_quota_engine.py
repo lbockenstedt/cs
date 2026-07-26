@@ -40,6 +40,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import random
 import time
 import uuid
 from pathlib import Path
@@ -132,6 +133,16 @@ class SimQuotaEngine:
         # (engine_keys + value "off"), so only this record distinguishes them.
         self._displaced: Dict[str, set] = {}
         self._displaced_path: Optional[Path] = None
+        # Sim stacking (weighted multi-sim): hostname -> set of stacked sim_ids
+        # (shareable sims the ambient pool runs to fill a spare client up to
+        # stack_cap). Deliberately OUTSIDE the ledger so a stacked client stays
+        # fully harvestable — harvest (the controlled few, tied to alerts) preempts
+        # stacked traffic (the ambient many), exactly like a drone bucket default.
+        # Persisted so a restart keeps the shuffle stable + can revert cleanly;
+        # re-shuffled every stack_rotation_s (rotation clock below).
+        self._stacked: Dict[str, set] = {}
+        self._stack_rotation_ts: float = 0.0
+        self._stacked_path: Optional[Path] = None
         self._loop_task: Optional[asyncio.Task] = None
         self._reconcile_lock = asyncio.Lock()
         # Per-sweep hosting-server index + pxmx_site_map, refreshed at the top
@@ -149,10 +160,12 @@ class SimQuotaEngine:
             data_dir.mkdir(parents=True, exist_ok=True)
             self._ledger_path = data_dir / "sim_quota_ledger.json"
             self._displaced_path = data_dir / "sim_quota_displaced.json"
+            self._stacked_path = data_dir / "sim_quota_stacked.json"
         except Exception:  # noqa: BLE001
             self._ledger_path = None
         self._load_ledger()
         self._load_displaced()
+        self._load_stacked()
 
     # ── ledger persistence ───────────────────────────────────────────────────
     def _load_ledger(self) -> None:
@@ -175,6 +188,29 @@ class SimQuotaEngine:
         except Exception as exc:  # noqa: BLE001
             logger.warning("SimQuotaEngine: ledger save failed: %s", exc)
         self._save_displaced()
+        self._save_stacked()
+
+    def _load_stacked(self) -> None:
+        if not self._stacked_path or not self._stacked_path.exists():
+            return
+        try:
+            raw = json.loads(self._stacked_path.read_text(encoding="utf-8")) or {}
+            self._stacked = {str(h): set(v or [])
+                             for h, v in (raw.get("stacked") or {}).items() if v}
+            self._stack_rotation_ts = float(raw.get("rotation_ts") or 0.0)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("SimQuotaEngine: stacked load failed: %s", exc)
+            self._stacked = {}
+
+    def _save_stacked(self) -> None:
+        if not self._stacked_path:
+            return
+        try:
+            self._stacked_path.write_text(json.dumps(
+                {"stacked": {h: sorted(v) for h, v in self._stacked.items() if v},
+                 "rotation_ts": self._stack_rotation_ts}, indent=2), encoding="utf-8")
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("SimQuotaEngine: stacked save failed: %s", exc)
 
     def _load_displaced(self) -> None:
         if not self._displaced_path or not self._displaced_path.exists():
@@ -768,6 +804,17 @@ class SimQuotaEngine:
                 overrides[s] = "off"
             if disp:
                 self._displaced.setdefault(hostname, set()).update(disp)
+            # A client a quota harvests EXITS the ambient stacking layer: harvest
+            # (the controlled few, tied to alerts) wins over stacked traffic (the
+            # ambient many). Turn OFF its stacked sims (record in _displaced so
+            # they revert to the bucket default on release, and so a human "off" is
+            # still distinguishable) and drop it from _stacked so the next rotation
+            # doesn't double-manage it. This is what keeps a stacked client fully
+            # harvestable even while running multiple sims.
+            for s in self._stacked.pop(hostname, set()):
+                if s != sim_id and s not in engine_owned and s not in disp:
+                    overrides[s] = "off"
+                    self._displaced.setdefault(hostname, set()).add(s)
         if site and site != from_site:
             overrides["wsite"] = site
         # Cell quota: also pin the client's SSID (+ password) to the cell, so a
@@ -1017,6 +1064,98 @@ class SimQuotaEngine:
                         await asyncio.sleep(0)  # keep the loop responsive at 1000s of clients
                 i += take
 
+    # ── weighted multi-sim stacking (design: fill spare clients up to cap) ────
+    def _stackable_sims(self) -> List[str]:
+        """Shareable sims the ambient pool may STACK: the operator's randomizable
+        list (Config → the traffic sims the ambient pool runs — previously defined
+        but unused by the engine; this pass finally consumes it) INTERSECT
+        ``_sim_multi`` — never stack a sim the Sharing tile / SIM_META marks
+        non-shareable, so flipping DNS/DHCP off drops them automatically. Empty
+        randomizable → NO ambient stacking (opt-in; preserves prior behavior)."""
+        return [s for s in (getattr(self, "_randomizable", []) or [])
+                if self._sim_multi(s)]
+
+    async def _clear_all_stacked(self, clients: Dict[str, Any]) -> None:
+        """Revert every stacked sim (delete the override → bucket default) and
+        empty the layer. Used on re-shuffle and when stacking is disabled."""
+        for h, sims in list(self._stacked.items()):
+            if sims:
+                await self._engine_remove(h, list(sims))
+        self._stacked = {}
+
+    async def _reconcile_stacked(self, clients: Dict[str, Any], now: float,
+                                 actions: Dict[str, int]) -> None:
+        """Weighted multi-sim stacking over the SPARE pool. Fills each eligible
+        client up to ``stack_cap`` shareable sims; a sim's breadth (how many
+        clients run it) is proportional to its weight (weight 3 → ~3× the clients
+        of weight 1). Re-shuffled every ``stack_rotation_s`` so no client holds
+        the same set forever, and the per-client count VARIES (0..cap) — a client
+        may end a rotation with just one heavy sim. Stacked sims live outside the
+        ledger, so a stacked client stays fully harvestable; ``_assign`` clears a
+        client's stack when a quota harvests it (harvest wins over the ambient
+        many)."""
+        cap = int(getattr(self, "_stack_cap", 3) or 0)
+        candidates = self._stackable_sims()
+        if cap <= 0 or not candidates:
+            if self._stacked:                          # disabled → tear the layer down
+                await self._clear_all_stacked(clients)
+            return
+        # Rotation gate: only re-shuffle every stack_rotation_s. Between rotations
+        # the stacked overrides persist (registry + the tail's claimed union), and
+        # _assign already drops a client from the layer the sweep harvest takes it,
+        # so there is nothing to do until the next rotation.
+        rotation_s = float(getattr(self, "_stack_rotation_s", 600.0) or 600.0)
+        if self._stack_rotation_ts and (now - self._stack_rotation_ts) < rotation_s:
+            return
+        self._stack_rotation_ts = now
+        await self._clear_all_stacked(clients)         # release the old shuffle first
+        # Eligible spare pool: harvestable, NOT harvested this sweep (no ledger
+        # sim), NOT running any exclusive sim (off-network / monopolized), and no
+        # human pin — the ambient "random many" the layer fills.
+        pool = [h for h, c in clients.items()
+                if self._is_harvestable(c, now)
+                and not self._engine_sims_for(h)
+                and not self._exclusive_running(h, c)
+                and not self._has_manual_sim_pin(h, c)]
+        if not pool:
+            return
+        weights = getattr(self, "_sim_weights", {}) or {}
+
+        def _w(s: str) -> float:
+            try:
+                return max(0.0, float(weights.get(s, 1.0)))
+            except (TypeError, ValueError):
+                return 1.0
+
+        total_w = sum(_w(s) for s in candidates) or 1.0
+        N = len(pool)
+        random.shuffle(pool)
+        assign: Dict[str, set] = {h: set() for h in pool}
+        # Slot apportionment: total slots = N*cap, split ∝ weight → each sim
+        # targets (weight-share × N × cap) random clients (clamped ≤ N). Only
+        # clients still UNDER cap are eligible, so no client exceeds stack_cap;
+        # heavier sims reach more clients (breadth ∝ weight), lighter sims may
+        # leave a client with a single sim.
+        for s in candidates:
+            target = min(N, int(round(_w(s) / total_w * N * cap)))
+            if target <= 0:
+                continue
+            under = [h for h in pool if len(assign[h]) < cap]
+            random.shuffle(under)
+            for h in under[:target]:
+                assign[h].add(s)
+            await asyncio.sleep(0)                      # yield per sim (scales to 1000s)
+        placed = 0
+        for h, sims in assign.items():
+            if not sims:
+                continue
+            await self._engine_set(h, {s: "on" for s in sims})
+            self._stacked[h] = set(sims)
+            actions["assigned"] += 1
+            placed += 1
+            if placed % 200 == 0:
+                await asyncio.sleep(0)
+
     # ── reconcile ────────────────────────────────────────────────────────────
     async def reconcile(self) -> Dict[str, Any]:
         """One sweep: align the ledger + overrides with effective_sim_quotas."""
@@ -1043,6 +1182,16 @@ class SimQuotaEngine:
             except Exception:  # noqa: BLE001
                 self._sim_meta = None
                 self._sim_meta_keys = []
+            # Sim-stacking config (weighted multi-sim fill of the spare pool) —
+            # cached once per sweep like the shareability/meta above.
+            try:
+                self._stack_cap = int(self.spoke.local_store.get_stack_cap())
+                self._stack_rotation_s = float(self.spoke.local_store.get_stack_rotation_s())
+                self._sim_weights = dict(self.spoke.local_store.get_sim_weights() or {})
+                self._randomizable = list(self.spoke.local_store.get_randomizable_sims() or [])
+            except Exception:  # noqa: BLE001
+                self._stack_cap, self._stack_rotation_s = 3, 600.0
+                self._sim_weights, self._randomizable = {}, []
             # SSID-cell index for this sweep. A quota whose `site` names a cell
             # (e.g. "MIA-PSK") scopes to the cell's physical SITE and pins each
             # assigned client's ssid/ssidpw to the cell — a self-contained cell
@@ -1340,6 +1489,12 @@ class SimQuotaEngine:
             # across the site's weighted SSID cells. Stateless, no accounting.
             await self._reconcile_weighted(clients, now, actions)
 
+            # Weighted multi-sim STACKING: fill each spare (non-exclusive) client
+            # up to stack_cap shareable sims, breadth ∝ per-sim weight, re-shuffled
+            # every stack_rotation_s. Runs on the SAME spare pool the weighted
+            # placement just homed; stacked clients stay fully harvestable.
+            await self._reconcile_stacked(clients, now, actions)
+
             # Reconcile engine-owned override keys against the ledger: drop
             # orphaned engine-set sim flags (a transient _release failure left
             # sim_id=on after the ledger entry was dropped) and re-prune every
@@ -1398,6 +1553,11 @@ class SimQuotaEngine:
         async with self._reconcile_lock:
             clients = self._all_clients()
             self._ledger = {}
+            # Also drop the stacking layer + rotation clock so the tail reverts
+            # stacked sims too (they're in `claimed` only while _stacked holds
+            # them) and the next reconcile re-shuffles from scratch.
+            self._stacked = {}
+            self._stack_rotation_ts = 0.0
             # Ledger now empty → _engine_sims_for() is empty for everyone, so
             # _reconcile_engine_keys treats every engine-set sim as an orphan and
             # removes it (reverting clients to their bucket defaults).
@@ -1430,7 +1590,10 @@ class SimQuotaEngine:
             eng = list((c.get("engine_keys") or []))
             if not eng:
                 continue
-            claimed = self._engine_sims_for(hostname)
+            # Stacked sims are engine-set but live OUTSIDE the ledger, so union
+            # them into `claimed` — else the tail would revert them as orphans
+            # every sweep and stacking could never persist between rotations.
+            claimed = self._engine_sims_for(hostname) | self._stacked.get(hostname, set())
             ov = c.get("overrides") or {}
             orphans = [k for k in eng
                        if k != "wsite" and k not in claimed

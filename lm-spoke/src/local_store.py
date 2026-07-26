@@ -385,6 +385,52 @@ class LocalStore:
             self._data["sim_shareable"] = dict(mapping) if isinstance(mapping, dict) else {}
             self._save()
 
+    # sim_weights: per-sim STACKING weight (breadth). A shareable sim with weight
+    # 3 runs on ~3× the clients of a weight-1 sim. Missing / <=0 → weight 1. Only
+    # shareable (_sim_multi) sims stack, so a weight on a non-shareable sim is inert.
+    def get_sim_weights(self) -> dict:
+        v = self._data.get("sim_weights")
+        return dict(v) if isinstance(v, dict) else {}
+
+    def set_sim_weights(self, mapping: dict) -> None:
+        with self._lock:
+            self._data["sim_weights"] = dict(mapping) if isinstance(mapping, dict) else {}
+            self._save()
+
+    # stack_cap: max simultaneous stacked sims per spare client (default 3). 0
+    # disables stacking (the engine tears down any existing stacked assignments).
+    def get_stack_cap(self) -> int:
+        try:
+            v = int(self._data.get("stack_cap", 3))
+        except (TypeError, ValueError):
+            v = 3
+        return v if v >= 0 else 3
+
+    def set_stack_cap(self, n) -> None:
+        with self._lock:
+            try:
+                self._data["stack_cap"] = max(0, int(n))
+            except (TypeError, ValueError):
+                self._data["stack_cap"] = 3
+            self._save()
+
+    # stack_rotation_s: how often the stacked assignment re-shuffles (default 600s
+    # = 10 min). Floored at 30s so it can't thrash the sub-minute reconcile sweep.
+    def get_stack_rotation_s(self) -> int:
+        try:
+            v = int(self._data.get("stack_rotation_s", 600))
+        except (TypeError, ValueError):
+            v = 600
+        return v if v >= 30 else 600
+
+    def set_stack_rotation_s(self, s) -> None:
+        with self._lock:
+            try:
+                self._data["stack_rotation_s"] = max(30, int(s))
+            except (TypeError, ValueError):
+                self._data["stack_rotation_s"] = 600
+            self._save()
+
     # ── pool / SSID config (hub-pushed) — see docs/simulation-pool-and-quota-design.md ──
     # site_source: "pxmx" (site from the hosting PXMX server — RF chamber, the
     # common case) or "assigned" (weighted logical assignment + site-based SSID).
