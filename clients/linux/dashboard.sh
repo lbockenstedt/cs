@@ -1,5 +1,5 @@
 #!/bin/bash
-version=.14
+version=.15
 # WHY: dashboard.sh is a read-only live monitor. It runs in its own terminal
 # window (launched by startup.desktop) so the operator can always see
 # what's happening without interrupting the simulation loop in the other pane.
@@ -448,7 +448,7 @@ while true; do
   printf "  %sAdapter:%s %-22s  %sVersion:%s %s · deploy %s\n" "$BOLD" "$RST" "$_adp" "$BOLD" "$RST" "$simsh_ver" "$deploy_ver"
   printf "  %sDNS sim:%s fail v%-6s          latency v%s\n" "$BOLD" "$RST" "$dnsf_ver" "$dnsl_ver"
   if [[ -n "$dns_ceiling" ]]; then
-    printf "  %sDNS ceiling:%s ${YLW}%s/min${RST} (self-throttled after gateway DOS)%s\n" "$BOLD" "$RST" "$dns_ceiling" "$dns_ceiling_conv"
+    printf "  %sDNS ceiling:%s ${YLW}%s/min${RST}%s\n" "$BOLD" "$RST" "$dns_ceiling" "$dns_ceiling_conv"
   else
     printf "  %sDNS ceiling:%s — (running at configured rate)\n" "$BOLD" "$RST"
   fi
