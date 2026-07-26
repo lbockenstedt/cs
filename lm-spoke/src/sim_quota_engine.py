@@ -725,6 +725,28 @@ class SimQuotaEngine:
             return True          # human set it, or flipped a non-displaced engine key OFF
         return False
 
+    # ── per-quota client-tier policy (t1 = dedicated PCI, t2 = USB dongle) ────
+    @staticmethod
+    def _tier_of(c: Dict[str, Any]) -> str:
+        # Authoritative tier from the agent's passthrough classification, persisted
+        # onto the registry client (record_tiers_batch) — t1/t2/t3 or "".
+        return str((c or {}).get("tier") or "").lower()
+
+    def _tier_ok(self, c: Dict[str, Any], req_tier: str) -> bool:
+        """Hard tier gate: a 't1'/'t2' quota admits ONLY that tier (underfill
+        rather than degrade); 'best' (default) admits all — ordering prefers T1."""
+        if req_tier in ("t1", "t2"):
+            return self._tier_of(c) == req_tier
+        return True
+
+    def _tier_rank(self, c: Dict[str, Any], req_tier: str) -> int:
+        """Ordering rank under ``req_tier``. 'best' → prefer T1 (0) then T2 (1)
+        then other/unknown (2) — 'use all the T1 available, fall back to T2'. Hard
+        t1/t2 already filtered → uniform rank."""
+        if req_tier != "best":
+            return 0
+        return {"t1": 0, "t2": 1}.get(self._tier_of(c), 2)
+
     def _in_harvest_cooldown(self, hostname: str, now: float) -> bool:
         """True while ``hostname`` is inside its post-harvest cooldown window
         (``harvest_cooldown_s``, default 4h; 0 disables). Caller must exempt a
@@ -786,10 +808,10 @@ class SimQuotaEngine:
 
     def _diag_reason(self, hostname: str, c: Dict[str, Any], sim_id: str,
                      multi: bool, scope_site: str, claim_key: str,
-                     assigned: Dict[str, str]) -> Optional[str]:
+                     assigned: Dict[str, str], req_tier: str = "best") -> Optional[str]:
         """WHY ``hostname`` is not a usable top-up candidate for this quota, or
         None if it IS usable (in-site or re-homable). Read-only mirror of
-        _pool_eligible + the in_site/cross site tests, for the Engine State
+        _pool_eligible + the tier/in_site/cross tests, for the Engine State
         diagnostic. Caller pre-filters to harvestable + not already assigned."""
         if self._has_manual_sim_pin(hostname, c):
             return "human_pin"
@@ -798,6 +820,8 @@ class SimQuotaEngine:
         if (not self._engine_sims_for(hostname)
                 and self._in_harvest_cooldown(hostname, getattr(self, "_sweep_now", 0.0))):
             return "harvest_cooldown"
+        if not self._tier_ok(c, req_tier):
+            return "tier_mismatch"                # quota wants a tier this client isn't
         if multi:
             if self._engine_exclusive_running(hostname):
                 return "exclusive_monopolized"   # ANOTHER quota's exclusive sim owns it
@@ -1459,16 +1483,21 @@ class SimQuotaEngine:
                     # clients at OTHER sites are still excluded (RF isolation).
                     # _cell_ok_for excludes a client already claimed for a DIFFERENT
                     # cell this sweep (one SSID per client).
+                    # Per-quota tier policy: t1/t2 admit ONLY that tier; "best"
+                    # (default) admits all but the sort below prefers T1 → T2.
+                    req_tier = str(q.get("tier") or "best").strip().lower()
                     in_site = [h for h, c in clients.items()
                                if self._pool_eligible(h, c, sim_id, multi, now, assigned)
+                               and self._tier_ok(c, req_tier)
                                and self._cell_ok_for(h, claim_key)
                                and (not scope_site or self._effective_site(h, c) == scope_site
                                     or h in homed_here
                                     or (self._is_tenant_pool_client(h) and self._site_ok_for(h, scope_site)))]
-                    # Sticky: pick clients this quota already held first, so a
-                    # sweep with spare eligibles keeps the current set instead of
-                    # swapping in a fresh subset (stops the oscillation).
-                    in_site.sort(key=lambda h: h not in _prev_holders)
+                    # Order: TIER preference first (best → T1 then T2), then sticky
+                    # (clients this quota already held) so a sweep with spare
+                    # eligibles keeps the current set instead of swapping (anti-osc).
+                    in_site.sort(key=lambda h: (self._tier_rank(clients[h], req_tier),
+                                                h not in _prev_holders))
                     picks = in_site[:need]
                     if q.get("rehome") and len(picks) < need:
                         # Cross-site fallback: any other-site eligible runner.
@@ -1481,11 +1510,13 @@ class SimQuotaEngine:
                         # if not already claimed for another site this sweep.
                         cross = [h for h, c in clients.items()
                                  if self._pool_eligible(h, c, sim_id, multi, now, assigned)
+                                 and self._tier_ok(c, req_tier)
                                  and self._is_tenant_pool_client(h)
                                  and self._cell_ok_for(h, claim_key)
                                  and self._site_ok_for(h, scope_site)
                                  and (not scope_site or self._effective_site(h, c) != scope_site)]
-                        cross.sort(key=lambda h: h not in _prev_holders)  # sticky here too
+                        cross.sort(key=lambda h: (self._tier_rank(clients[h], req_tier),
+                                                  h not in _prev_holders))  # tier + sticky
                         picks += cross[:need - len(picks)]
                     for h in picks:
                         await self._assign(h, sim_id, scope_site, cell=cell)
@@ -1534,7 +1565,8 @@ class SimQuotaEngine:
                         not_harvestable += 1
                         continue
                     r = self._diag_reason(h, c, sim_id, multi, scope_site,
-                                          claim_key, assigned)
+                                          claim_key, assigned,
+                                          str(q.get("tier") or "best").strip().lower())
                     if r is None:
                         eligible_free += 1
                     else:

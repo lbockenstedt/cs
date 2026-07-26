@@ -35,7 +35,11 @@ logger = logging.getLogger("CSSimQuota")
 # A sim-quota record, stored as a list under central_sites_config["sim_quotas"].
 # Backward-compatible: an absent "sim_quotas" key = no quotas (today's behavior).
 SIM_QUOTA_KEYS = ("alert_id", "alert_type", "sim_id", "count", "site",
-                  "multi_capable", "rehome", "enabled", "learning")
+                  "multi_capable", "rehome", "enabled", "learning", "tier")
+# Per-quota client-tier policy. "best" (default) = prefer T1 (dedicated PCI —
+# highest reliability), fall back to T2 (USB dongle). "t1"/"t2" = that tier ONLY
+# (underfill rather than degrade a high-reliability sim onto an unreliable dongle).
+QUOTA_TIERS = ("best", "t1", "t2")
 ALERT_TYPES = ("alert", "insight")
 
 # Source prefix: Central and Mist are separate products. A quota row's
@@ -264,6 +268,9 @@ def normalize_quota(raw: Any) -> Dict[str, Any]:
         # down-ratchets. The two are MUTUALLY EXCLUSIVE (both off = fixed count).
         # See design doc §9 / adaptive_step. Mirrored in the hub twin.
         "learning": _as_bool(raw.get("learning"), False),
+        # Client-tier policy (see QUOTA_TIERS). "best" prefers T1 then T2.
+        "tier": (lambda t: t if t in QUOTA_TIERS else "best")(
+            str(raw.get("tier") or "best").strip().lower()),
     }
     # Adaptive-controller fields (design doc §9) — carried through only when the
     # quota declares them, so a fixed-count quota stays exactly as before. The

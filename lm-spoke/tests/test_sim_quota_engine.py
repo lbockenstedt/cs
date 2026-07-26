@@ -1047,3 +1047,50 @@ def test_harvest_cooldown_blocks_reharvest_until_expired(tmp_path):
                              "site": "MIA", "enabled": True}]
     _run(eng.reconcile())
     assert set(eng._ledger["alert:A:MIA"]["clients"].keys()) == {"c0", "c1"}
+
+
+# ── per-quota client-tier policy (T1 dedicated PCI / T2 dongle / Best) ────────
+def _tiered(host, site, tier):
+    c = _client(host, site)
+    c["tier"] = tier
+    return c
+
+
+def test_quota_tier_t1_only_underfills(tmp_path):
+    # 2 T1 + 2 T2. A tier='t1' quota (count 3) admits ONLY T1 → underfills to 2
+    # rather than degrade a high-reliability sim onto a dongle.
+    clients = {"c0": _tiered("c0", "MIA", "t1"), "c1": _tiered("c1", "MIA", "t1"),
+               "c2": _tiered("c2", "MIA", "t2"), "c3": _tiered("c3", "MIA", "t2")}
+    spoke = _FakeSpoke(clients, [{"alert_id": "A", "sim_id": "dns_fail", "count": 3,
+                                  "site": "MIA", "tier": "t1", "enabled": True}], tmp_path)
+    eng = SimQuotaEngine(spoke)
+    _run(eng.reconcile())
+    assert set(eng._ledger["alert:A:MIA"]["clients"].keys()) == {"c0", "c1"}
+
+
+def test_quota_tier_t2_only(tmp_path):
+    clients = {"c0": _tiered("c0", "MIA", "t1"), "c1": _tiered("c1", "MIA", "t1"),
+               "c2": _tiered("c2", "MIA", "t2"), "c3": _tiered("c3", "MIA", "t2")}
+    spoke = _FakeSpoke(clients, [{"alert_id": "A", "sim_id": "dns_fail", "count": 3,
+                                  "site": "MIA", "tier": "t2", "enabled": True}], tmp_path)
+    eng = SimQuotaEngine(spoke)
+    _run(eng.reconcile())
+    assert set(eng._ledger["alert:A:MIA"]["clients"].keys()) == {"c2", "c3"}
+
+
+def test_quota_tier_best_prefers_t1_then_falls_back(tmp_path):
+    # 'best' uses all T1 first, then falls back to T2.
+    clients = {"c0": _tiered("c0", "MIA", "t1"), "c1": _tiered("c1", "MIA", "t1"),
+               "c2": _tiered("c2", "MIA", "t2"), "c3": _tiered("c3", "MIA", "t2")}
+    # count 2 → both T1.
+    spoke = _FakeSpoke(clients, [{"alert_id": "A", "sim_id": "dns_fail", "count": 2,
+                                  "site": "MIA", "tier": "best", "enabled": True}], tmp_path)
+    eng = SimQuotaEngine(spoke)
+    _run(eng.reconcile())
+    assert set(eng._ledger["alert:A:MIA"]["clients"].keys()) == {"c0", "c1"}
+    # grow to 3 → T1 pair + one T2 (fallback).
+    spoke.local_store._q = [{"alert_id": "A", "sim_id": "dns_fail", "count": 3,
+                             "site": "MIA", "tier": "best", "enabled": True}]
+    _run(eng.reconcile())
+    got = set(eng._ledger["alert:A:MIA"]["clients"].keys())
+    assert {"c0", "c1"} <= got and len(got) == 3 and (got & {"c2", "c3"})
