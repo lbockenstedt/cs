@@ -431,6 +431,24 @@ class LocalStore:
                 self._data["stack_rotation_s"] = 600
             self._save()
 
+    # harvest_cooldown_s: after a client is HARVESTED (assigned an alert sim), it
+    # can't be re-harvested for this long — keeps Central data realistic (no client
+    # flapping in/out of harvest). Default 14400s (4h). 0 disables the cooldown.
+    def get_harvest_cooldown_s(self) -> int:
+        try:
+            v = int(self._data.get("harvest_cooldown_s", 14400))
+        except (TypeError, ValueError):
+            v = 14400
+        return v if v >= 0 else 14400
+
+    def set_harvest_cooldown_s(self, s) -> None:
+        with self._lock:
+            try:
+                self._data["harvest_cooldown_s"] = max(0, int(s))
+            except (TypeError, ValueError):
+                self._data["harvest_cooldown_s"] = 14400
+            self._save()
+
     # ── pool / SSID config (hub-pushed) — see docs/simulation-pool-and-quota-design.md ──
     # site_source: "pxmx" (site from the hosting PXMX server — RF chamber, the
     # common case) or "assigned" (weighted logical assignment + site-based SSID).

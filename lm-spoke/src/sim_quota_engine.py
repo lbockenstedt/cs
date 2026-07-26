@@ -143,6 +143,13 @@ class SimQuotaEngine:
         self._stacked: Dict[str, set] = {}
         self._stack_rotation_ts: float = 0.0
         self._stacked_path: Optional[Path] = None
+        # Harvest cooldown: hostname -> epoch of last HARVEST (alert-sim assign). A
+        # client that just finished a harvest rests `harvest_cooldown_s` (default
+        # 4h) before it can be re-harvested — keeps Central data realistic (no
+        # client flapping in/out of harvest). Persisted; a client CURRENTLY serving
+        # is exempt (kept/packed, not a fresh pick).
+        self._last_harvest: Dict[str, float] = {}
+        self._harvest_path: Optional[Path] = None
         self._loop_task: Optional[asyncio.Task] = None
         self._reconcile_lock = asyncio.Lock()
         # Per-sweep hosting-server index + pxmx_site_map, refreshed at the top
@@ -161,11 +168,13 @@ class SimQuotaEngine:
             self._ledger_path = data_dir / "sim_quota_ledger.json"
             self._displaced_path = data_dir / "sim_quota_displaced.json"
             self._stacked_path = data_dir / "sim_quota_stacked.json"
+            self._harvest_path = data_dir / "sim_quota_harvest.json"
         except Exception:  # noqa: BLE001
             self._ledger_path = None
         self._load_ledger()
         self._load_displaced()
         self._load_stacked()
+        self._load_harvest()
 
     # ── ledger persistence ───────────────────────────────────────────────────
     def _load_ledger(self) -> None:
@@ -189,6 +198,7 @@ class SimQuotaEngine:
             logger.warning("SimQuotaEngine: ledger save failed: %s", exc)
         self._save_displaced()
         self._save_stacked()
+        self._save_harvest()
 
     def _load_stacked(self) -> None:
         if not self._stacked_path or not self._stacked_path.exists():
@@ -211,6 +221,25 @@ class SimQuotaEngine:
                  "rotation_ts": self._stack_rotation_ts}, indent=2), encoding="utf-8")
         except Exception as exc:  # noqa: BLE001
             logger.warning("SimQuotaEngine: stacked save failed: %s", exc)
+
+    def _load_harvest(self) -> None:
+        if not self._harvest_path or not self._harvest_path.exists():
+            return
+        try:
+            raw = json.loads(self._harvest_path.read_text(encoding="utf-8")) or {}
+            self._last_harvest = {str(h): float(t) for h, t in raw.items()}
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("SimQuotaEngine: harvest-cooldown load failed: %s", exc)
+            self._last_harvest = {}
+
+    def _save_harvest(self) -> None:
+        if not self._harvest_path:
+            return
+        try:
+            self._harvest_path.write_text(
+                json.dumps(self._last_harvest, indent=2), encoding="utf-8")
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("SimQuotaEngine: harvest-cooldown save failed: %s", exc)
 
     def _load_displaced(self) -> None:
         if not self._displaced_path or not self._displaced_path.exists():
@@ -696,6 +725,15 @@ class SimQuotaEngine:
             return True          # human set it, or flipped a non-displaced engine key OFF
         return False
 
+    def _in_harvest_cooldown(self, hostname: str, now: float) -> bool:
+        """True while ``hostname`` is inside its post-harvest cooldown window
+        (``harvest_cooldown_s``, default 4h; 0 disables). Caller must exempt a
+        client currently serving a quota."""
+        cd = float(getattr(self, "_harvest_cooldown_s", 0) or 0)
+        if cd <= 0:
+            return False
+        return (now - float(self._last_harvest.get(hostname, 0.0))) < cd
+
     def _pool_eligible(self, hostname: str, c: Dict[str, Any], sim_id: str,
                        multi: bool, now: float, assigned: Dict[str, str]) -> bool:
         """Quota-aware pool eligibility for a top-up pick:
@@ -726,6 +764,13 @@ class SimQuotaEngine:
         # served config would honor the human, so counting it here would lie.
         if self._human_pinned_sim(hostname, sim_id):
             return False
+        # Harvest cooldown: a client that recently finished a harvest rests before
+        # it can be re-harvested (anti-flap → realistic Central data). A client
+        # CURRENTLY serving a quota is EXEMPT — it's being kept/packed, not freshly
+        # picked — so only a released-and-resting free client is blocked.
+        if (not self._engine_sims_for(hostname)
+                and self._in_harvest_cooldown(hostname, now)):
+            return False
         if multi:
             # Preempt a drone's bucket-default exclusive; only ANOTHER quota's
             # exclusive assignment blocks a shareable stack.
@@ -750,6 +795,9 @@ class SimQuotaEngine:
             return "human_pin"
         if sim_id and self._human_pinned_sim(hostname, sim_id):
             return "human_pin"
+        if (not self._engine_sims_for(hostname)
+                and self._in_harvest_cooldown(hostname, getattr(self, "_sweep_now", 0.0))):
+            return "harvest_cooldown"
         if multi:
             if self._engine_exclusive_running(hostname):
                 return "exclusive_monopolized"   # ANOTHER quota's exclusive sim owns it
@@ -788,6 +836,11 @@ class SimQuotaEngine:
         # (wsite) so other stackable sims may still pack onto it.
         if sim_id:
             overrides[sim_id] = "on"
+            # Stamp the harvest time → this client now rests `harvest_cooldown_s`
+            # before it can be re-harvested (see _in_harvest_cooldown). Only a real
+            # SIM harvest counts; a PRESENCE quota (sim_id empty) homes but doesn't
+            # harvest, so it doesn't consume the cooldown.
+            self._last_harvest[hostname] = float(getattr(self, "_sweep_now", 0.0)) or time.time()
             # Preempt a drone: turn OFF any EXCLUSIVE sim the client runs as a
             # BUCKET DEFAULT (not sim_id, not owned by another quota). Two
             # exclusive sims conflict, and an exclusive default (e.g. can't-
@@ -1162,6 +1215,7 @@ class SimQuotaEngine:
         async with self._reconcile_lock:
             quotas = self.spoke.local_store.get_effective_sim_quotas() or []
             now = time.time()
+            self._sweep_now = now          # for _assign / _diag_reason (no `now` arg)
             clients = self._all_clients()
             eff_keys = {_quota_key(q) for q in quotas}
             self._refresh_host_index()
@@ -1189,9 +1243,18 @@ class SimQuotaEngine:
                 self._stack_rotation_s = float(self.spoke.local_store.get_stack_rotation_s())
                 self._sim_weights = dict(self.spoke.local_store.get_sim_weights() or {})
                 self._randomizable = list(self.spoke.local_store.get_randomizable_sims() or [])
+                self._harvest_cooldown_s = float(self.spoke.local_store.get_harvest_cooldown_s())
             except Exception:  # noqa: BLE001
                 self._stack_cap, self._stack_rotation_s = 3, 600.0
                 self._sim_weights, self._randomizable = {}, []
+                self._harvest_cooldown_s = 14400.0
+            # Prune harvest-cooldown stamps that have fully expired (no longer
+            # block anything) so the map stays bounded to currently-cooling clients.
+            if self._harvest_cooldown_s > 0 and self._last_harvest:
+                _cut = now - self._harvest_cooldown_s
+                _stale = [h for h, t in self._last_harvest.items() if t < _cut]
+                for h in _stale:
+                    self._last_harvest.pop(h, None)
             # SSID-cell index for this sweep. A quota whose `site` names a cell
             # (e.g. "MIA-PSK") scopes to the cell's physical SITE and pins each
             # assigned client's ssid/ssidpw to the cell — a self-contained cell
@@ -1571,6 +1634,7 @@ class SimQuotaEngine:
             # them) and the next reconcile re-shuffles from scratch.
             self._stacked = {}
             self._stack_rotation_ts = 0.0
+            self._last_harvest = {}        # full re-shuffle → clear harvest cooldowns
             # Ledger now empty → _engine_sims_for() is empty for everyone, so
             # _reconcile_engine_keys treats every engine-set sim as an orphan and
             # removes it (reverting clients to their bucket defaults).

@@ -93,6 +93,7 @@ class _FakeLocalStore:
         self._sim_shareable = {}
         self._stack_cap = 3
         self._stack_rotation_s = 600
+        self._harvest_cooldown_s = 0     # off by default → existing tests unaffected
 
     def get_randomizable_sims(self):
         return list(self._randomizable)
@@ -108,6 +109,9 @@ class _FakeLocalStore:
 
     def get_stack_rotation_s(self):
         return self._stack_rotation_s
+
+    def get_harvest_cooldown_s(self):
+        return self._harvest_cooldown_s
 
     def get_effective_sim_quotas(self):
         return list(self._q)
@@ -1013,3 +1017,33 @@ def test_stacking_skips_exclusive_client_and_is_harvestable(tmp_path):
     for h in harvested:
         assert not _stack_on(spoke, h, "ping_test")
         assert not _stack_on(spoke, h, "download")
+
+
+# ── harvest cooldown (anti-flap) ─────────────────────────────────────────────
+def test_harvest_cooldown_blocks_reharvest_until_expired(tmp_path):
+    """A client that just finished a harvest can't be re-harvested until its
+    cooldown expires — a fresh quota picks a DIFFERENT client meanwhile; a client
+    CURRENTLY serving is exempt. cooldown 0 (default) would re-pick immediately."""
+    clients = {f"c{i}": _client(f"c{i}", "MIA") for i in range(2)}
+    q = {"alert_id": "A", "sim_id": "dns_fail", "count": 1, "site": "MIA", "enabled": True}
+    spoke = _FakeSpoke(clients, [dict(q)], tmp_path)
+    spoke.registry = _ProvRegistry(clients)           # provenance: released sim reverts cleanly
+    spoke.local_store._harvest_cooldown_s = 3600      # 1h
+    eng = SimQuotaEngine(spoke)
+    _run(eng.reconcile())
+    first = list(eng._ledger["alert:A:MIA"]["clients"].keys())[0]
+    # Release everything (remove the quota), then re-add it in the same window.
+    spoke.local_store._q = []
+    _run(eng.reconcile())
+    assert eng._ledger == {}
+    spoke.local_store._q = [dict(q)]
+    _run(eng.reconcile())
+    second = list(eng._ledger["alert:A:MIA"]["clients"].keys())[0]
+    assert second != first                            # cooling client NOT re-picked
+    # Expire `first`'s cooldown and grow the quota to 2 → it's allowed back
+    # (the now-serving `second` is exempt and kept).
+    eng._last_harvest[first] = time.time() - 4000     # past the 3600s window
+    spoke.local_store._q = [{"alert_id": "A", "sim_id": "dns_fail", "count": 2,
+                             "site": "MIA", "enabled": True}]
+    _run(eng.reconcile())
+    assert set(eng._ledger["alert:A:MIA"]["clients"].keys()) == {"c0", "c1"}

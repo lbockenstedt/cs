@@ -647,6 +647,11 @@ class ConfigCommandsMixin:
         if "stack_rotation_s" in patch:
             self.local_store.set_stack_rotation_s(patch.get("stack_rotation_s"))
             applied.append("stack_rotation_s")
+        # Harvest cooldown (anti-flap): a client can't be re-harvested for this
+        # long after an alert-sim assignment. See SimQuotaEngine._in_harvest_cooldown.
+        if "harvest_cooldown_s" in patch:
+            self.local_store.set_harvest_cooldown_s(patch.get("harvest_cooldown_s"))
+            applied.append("harvest_cooldown_s")
         # Knob-floor learner: the hub-computed [simulation] intensity knob values
         # (e.g. {"dns_fail_rate": 400}). Layered onto the served config at serve
         # time by client_api — see local_store.get_sim_knob_overrides.
