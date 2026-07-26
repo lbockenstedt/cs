@@ -17,7 +17,7 @@
 #
 # Every helper here replaces copies that had drifted between simulation.sh,
 # dashboard.sh and startup.sh — edit HERE (clients/lib/), not per-script.
-version=.06
+version=.07
 
 # ── script version reporting ─────────────────────────────────────────────────
 # So an operator can tell FOR SURE which script + which deployment is running.
@@ -214,6 +214,24 @@ dns_gw_alive() { local gw="${1:-}"; [[ -n "$gw" ]] && ping -c1 -W2 "$gw" >/dev/n
 dns_gw_confirmed_down() {
   local gw="${1:-}"; [[ -n "$gw" ]] || return 1
   ! ping -c5 -W2 -i0.3 "$gw" >/dev/null 2>&1
+}
+
+# RECOVERY HOLD: gateway is STABLY up = $2 (default 4) consecutive single pings
+# ALL reply, ~2s apart. The pre-flood gate. These dongles hang off a USB PCI card
+# passed through to the guest; on bus contention the guest CANNOT reset the bus
+# (it doesn't own the PCI device), so the only recovery is to remove the load and
+# let the bus clear. Resuming the flood the instant the adapter blips back
+# re-contends a bus that hasn't finished clearing → it never recovers. So the
+# flood stays OFF until the adapter answers several pings in a row (bus cleared),
+# THEN resumes at the throttled rate. $3 = seconds between pings (default 2).
+dns_gw_stable() {
+  local gw="${1:-}" n="${2:-4}" gap="${3:-2}" i
+  [[ -n "$gw" ]] || return 1
+  for (( i = 0; i < n; i++ )); do
+    dns_gw_alive "$gw" || return 1
+    (( i < n - 1 )) && sleep "$gap"
+  done
+  return 0
 }
 
 # Persisted rate, empty if none/invalid. NB: `$(< f 2>/dev/null)` is NOT the bash

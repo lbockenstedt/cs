@@ -1,5 +1,5 @@
 #!/bin/bash
-version=.10
+version=.11
 log="/usr/local/scripts/sim.log"
 debug="/usr/local/scripts/debug-dns-latency.log"
 echo DNS Latency Script Version $version | tee "$debug"
@@ -112,13 +112,14 @@ fi
 stop_at=$((SECONDS + burst_seconds))
 fired=0
 _burst_start=$SECONDS
-# Gateway circuit-breaker (shared logic with dns_fail): if the gateway goes
-# OFFLINE we've DOSed it → bail + drop the OPERATING rate 20% for next burst.
-# START GATE: skip the burst if the gateway is already offline at start (adapter
-# recovering). Offline = 5/5 pings fail (dns_gw_confirmed_down).
+# Gateway circuit-breaker (shared logic with dns_fail): OFFLINE → bail + drop the
+# OPERATING rate 20%. RECOVERY HOLD (start gate): the dongles are on a passed-
+# through USB PCI card the guest can't bus-reset, so recovery = remove load + let
+# the bus clear. Don't (re)start the flood until the gateway is STABLY up (several
+# pings in a row); until then hold it OFF so a recovering bus isn't re-contended.
 _dfgw=$(dns_default_gw)
-if (( ! VERBOSE )) && [[ -n "$_dfgw" ]] && dns_gw_confirmed_down "$_dfgw"; then
-  echo "$(date) default gateway $_dfgw offline at burst start (recovering?) — skipping this burst, no throttle change" | tee -a "$debug"
+if (( ! VERBOSE )) && [[ -n "$_dfgw" ]] && ! dns_gw_stable "$_dfgw"; then
+  echo "$(date) default gateway $_dfgw not stably up (USB bus still clearing?) — holding the flood OFF this burst so the adapter can recover" | tee -a "$debug"
   exit 0
 fi
 _gw_next_check=$((SECONDS + 2))
