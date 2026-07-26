@@ -294,3 +294,55 @@ dns_ceiling_upprobe() {
 
 # Clear the persisted self-throttle (fully recovered → back to the configured target).
 dns_ceiling_reset() { rm -f "$_DNS_CEILING_FILE" 2>/dev/null || true; }
+
+# ── DNS-latency server selection (self-healing) ──────────────────────────────
+# The dns_latency sim needs a server whose lookups take >= the latency threshold
+# so Central's DNS-latency alert fires. Real external DNS servers BLACKLIST a
+# flooding client over time — they start REFUSING FAST, so lookups are no longer
+# slow and the alert dies. So dns_latency.sh keeps a POOL of servers (any number)
+# and uses ONE confirmed slow, rotating to the next when the current drops below
+# the threshold (probed at burst start AND periodically mid-burst). A TIMEOUT
+# (~1s) counts as slow (kept) — a blacklist that DROPS packets still produces the
+# latency condition; only a FAST response (fast-refuse or genuinely quick) rotates.
+_DNS_LAT_STATE_FILE="/usr/local/scripts/dns_latency_server.state"  # persisted current server
+_DNS_LAT_MAX_PROBES=10   # cap the rotation walk so a mostly-blacklisted pool can't stall a burst
+
+# [simulation] dns_latency_threshold_ms (default 500) / dns_latency_recheck_s (default 30).
+dns_lat_threshold_ms() { local t; t=$(get_value 'simulation' 'dns_latency_threshold_ms'); [[ "$t" =~ ^[0-9]+$ ]] || t=500; printf '%s' "$t"; }
+dns_lat_recheck_s()    { local s; s=$(get_value 'simulation' 'dns_latency_recheck_s');    [[ "$s" =~ ^[0-9]+$ ]] || s=30;  printf '%s' "$s"; }
+
+# Wall-clock ms of ONE dig against $1 (record $2). A fast answer reads < threshold;
+# a slow answer OR a +time timeout (~1s) both read high — so both keep the server.
+dns_lat_probe_ms() {
+  local server="$1" record="${2:-example.com}" a b
+  a=$(date +%s%3N 2>/dev/null) || a=$(( $(date +%s) * 1000 ))
+  dig +time=1 +tries=1 +short @"$server" "$record" >/dev/null 2>&1
+  b=$(date +%s%3N 2>/dev/null) || b=$(( $(date +%s) * 1000 ))
+  printf '%s' "$(( b - a ))"
+}
+
+# True when $1's lookups are still slow enough (>= threshold) to feed the alert.
+dns_lat_ok() { local s="$1"; [[ -n "$s" ]] || return 1; (( $(dns_lat_probe_ms "$s" "${2:-}") >= $(dns_lat_threshold_ms) )); }
+
+_dns_lat_saved() { [[ -f "$_DNS_LAT_STATE_FILE" ]] && { local v; v=$(< "$_DNS_LAT_STATE_FILE"); printf '%s' "${v//[$'\n\r ']/}"; }; }
+_dns_lat_write() { { printf '%s' "$1" > "$_DNS_LAT_STATE_FILE"; } 2>/dev/null || true; chmod 0666 "$_DNS_LAT_STATE_FILE" 2>/dev/null || true; }
+
+# Pick a server from the pool (args after $1=record) whose lookups clear the
+# threshold. Starts from the persisted current (so a good one STICKS), probes it,
+# and only if it's dropped below threshold walks the rest for the first that
+# clears (capped at _DNS_LAT_MAX_PROBES). Persists + echoes the chosen server;
+# if none of the probed set clears, keeps current (else the first) best-effort.
+dns_lat_select() {
+  local record="$1"; shift
+  local pool=("$@"); (( ${#pool[@]} )) || { printf ''; return; }
+  local cur; cur=$(_dns_lat_saved)
+  local ordered=() s
+  [[ -n "$cur" ]] && for s in "${pool[@]}"; do [[ "$s" == "$cur" ]] && ordered+=("$s"); done
+  for s in "${pool[@]}"; do [[ "$s" == "$cur" ]] || ordered+=("$s"); done
+  local n=0
+  for s in "${ordered[@]}"; do
+    (( n++ >= _DNS_LAT_MAX_PROBES )) && break
+    if dns_lat_ok "$s" "$record"; then _dns_lat_write "$s"; printf '%s' "$s"; return; fi
+  done
+  local best="${cur:-${pool[0]}}"; _dns_lat_write "$best"; printf '%s' "$best"
+}

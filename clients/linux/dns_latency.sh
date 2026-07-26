@@ -1,5 +1,5 @@
 #!/bin/bash
-version=.14
+version=.15
 log="/usr/local/scripts/sim.log"
 debug="/usr/local/scripts/debug-dns-latency.log"
 echo DNS Latency Script Version $version | tee "$debug"
@@ -24,9 +24,11 @@ source '/usr/local/scripts/ini-parser.sh'
 source '/usr/local/scripts/common.sh'
 process_ini_file '/usr/local/scripts/simulation.conf'
 dnsfile=$(< /usr/local/scripts/dns_fail.txt)
-dns_latency_1=$(get_value 'address' 'dns_latency_1')
-dns_latency_2=$(get_value 'address' 'dns_latency_2')
-dns_latency_3=$(get_value 'address' 'dns_latency_3')
+# The dns_latency server POOL (any number). Prefer the [address] `dns_latency`
+# list (space-separated, UNLIMITED — real DNS servers blacklist a flooding client
+# over time, so we keep a big pool and rotate to a still-slow one); fall back to
+# the legacy dns_latency_1/2/3 keys when the list key is absent.
+dns_latency=$(get_value 'address' 'dns_latency')
 #------------------------------------------------------------
 # Per-user overrides — mirror simulation.sh's apply_override so a
 # user-overrides.conf [username] override of a dns_latency server actually
@@ -40,10 +42,23 @@ apply_override() {
   val=$(get_value "$username" "$var")
   [[ -n ${val} ]] && declare -g "$var=$val"
 }
-for key in dns_latency_1 dns_latency_2 dns_latency_3; do
-  apply_override "$key"
-done
-latencies=($dns_latency_1 $dns_latency_2 $dns_latency_3)
+apply_override 'dns_latency'
+dns_latency="${dns_latency//,/ }"          # tolerate comma- OR space-separated lists
+latencies=($dns_latency)
+if (( ${#latencies[@]} == 0 )); then
+  dns_latency_1=$(get_value 'address' 'dns_latency_1')
+  dns_latency_2=$(get_value 'address' 'dns_latency_2')
+  dns_latency_3=$(get_value 'address' 'dns_latency_3')
+  for key in dns_latency_1 dns_latency_2 dns_latency_3; do apply_override "$key"; done
+  latencies=($dns_latency_1 $dns_latency_2 $dns_latency_3)
+fi
+# Self-healing pick: use ONE server whose lookups are actually SLOW (>= the
+# latency threshold), rotating away from any blacklisted one (now refuses fast).
+# Persisted so a good server sticks; re-probed periodically in the burst below.
+_lat_probe_record=$(head -1 /usr/local/scripts/dns_fail.txt 2>/dev/null); [[ -n "$_lat_probe_record" ]] || _lat_probe_record="example.com"
+_lat_recheck_s=$(dns_lat_recheck_s)
+_current=$(dns_lat_select "$_lat_probe_record" "${latencies[@]}")
+[[ -n "$_current" ]] || _current="${latencies[0]}"
 #------------------------------------------------------------
 # Fire-and-forget slow DNS lookups
 #
@@ -101,7 +116,8 @@ _throttle_note=""
 (( rate_per_minute < _configured_rate )) && _throttle_note=" (self-throttled from ${_configured_rate}/min after a prior gateway DOS)"
 echo "$(date) Firing DNS latency lookups at ${rate_per_minute}/min for ${burst_seconds}s (max ${_MAX_INFLIGHT} digs in flight)${_throttle_note}" | tee -a "$debug"
 if (( VERBOSE )); then
-  echo "[verbose] latencies   : ${latencies[*]:-<none>}"
+  echo "[verbose] server pool : ${latencies[*]:-<none>}"
+  echo "[verbose] using server: ${_current:-<none>}  (threshold $(dns_lat_threshold_ms)ms, recheck every ${_lat_recheck_s}s)"
   echo "[verbose] records file: $(wc -l < /usr/local/scripts/dns_fail.txt 2>/dev/null) lines"
   echo "[verbose] pause between lookups: ${pause_between}s   (foreground — slower than sim mode)"
   echo "----------------------------------------"
@@ -123,48 +139,59 @@ if (( ! VERBOSE )) && [[ -n "$_dfgw" ]] && ! dns_gw_stable "$_dfgw"; then
   exit 0
 fi
 _gw_next_check=$((SECONDS + 2))
+_lat_next_check=$((SECONDS + _lat_recheck_s))
 _bailed=0
 while (( SECONDS < stop_at )); do
   for record in $dnsfile; do
-    for server in "${latencies[@]}"; do
 
-      # Stop the moment the burst window closes (break out of both loops).
-      (( SECONDS >= stop_at )) && break 2
+    # Stop the moment the burst window closes.
+    (( SECONDS >= stop_at )) && break 2
 
-      # Gateway check (~every 2s): single ping, then CONFIRM with 5 pings — OFFLINE
-      # only if ALL 5 fail. Offline → bail + drop the OPERATING rate 20%.
-      if (( ! VERBOSE )) && [[ -n "$_dfgw" ]] && (( SECONDS >= _gw_next_check )); then
-        _gw_next_check=$((SECONDS + 2))
-        if ! dns_gw_alive "$_dfgw" && dns_gw_confirmed_down "$_dfgw"; then
-          _newrate=$(dns_ceiling_penalize "$rate_per_minute")
-          echo "$(date) default gateway $_dfgw OFFLINE (5/5 pings failed) after ${fired} digs at ${rate_per_minute}/min — BAILING; throttling to ${_newrate}/min next burst" | tee -a "$debug"
-          kill $(jobs -p) 2>/dev/null
-          _bailed=1
-          break 2
+    # Gateway check (~every 2s): single ping, then CONFIRM with 5 pings — OFFLINE
+    # only if ALL 5 fail. Offline → bail + drop the OPERATING rate 20%.
+    if (( ! VERBOSE )) && [[ -n "$_dfgw" ]] && (( SECONDS >= _gw_next_check )); then
+      _gw_next_check=$((SECONDS + 2))
+      if ! dns_gw_alive "$_dfgw" && dns_gw_confirmed_down "$_dfgw"; then
+        _newrate=$(dns_ceiling_penalize "$rate_per_minute")
+        echo "$(date) default gateway $_dfgw OFFLINE (5/5 pings failed) after ${fired} digs at ${rate_per_minute}/min — BAILING; throttling to ${_newrate}/min next burst" | tee -a "$debug"
+        kill $(jobs -p) 2>/dev/null
+        _bailed=1
+        break 2
+      fi
+    fi
+
+    # Periodic latency re-check (~every _lat_recheck_s): if the current server has
+    # dropped BELOW the threshold (blacklisted → now refusing fast), rotate to the
+    # next confirmed-slow server so the latency alert stays fed.
+    if (( ! VERBOSE )) && (( SECONDS >= _lat_next_check )); then
+      _lat_next_check=$((SECONDS + _lat_recheck_s))
+      if ! dns_lat_ok "$_current" "$_lat_probe_record"; then
+        _new=$(dns_lat_select "$_lat_probe_record" "${latencies[@]}")
+        if [[ -n "$_new" && "$_new" != "$_current" ]]; then
+          echo "$(date) dns_latency: server $_current no longer slow (blacklisted?) — rotating to $_new" | tee -a "$debug"
+          _current="$_new"
         fi
       fi
+    fi
 
-      if (( VERBOSE )); then
-        _out=$(dig +time=1 +tries=1 +short @"$server" "$record" 2>&1); _rc=$?
-        printf '%s [dig @%s %s] rc=%s -> %s\n' "$(date '+%H:%M:%S')" \
-               "$server" "$record" "$_rc" "${_out:-<empty>}"
-      else
-        # Throttle to at most _MAX_INFLIGHT concurrent digs (CPU guard). `wait -n`
-        # (bash 4.3+) blocks until one background dig finishes; the sleep fallback
-        # covers older bash. jobs -rp counts only the running background digs.
-        while (( $(jobs -rp 2>/dev/null | wc -l) >= _MAX_INFLIGHT )); do
-          wait -n 2>/dev/null || sleep "$pause_between"
-        done
-        # Print the launch so the fire-and-forget activity is visible in the
-        # terminal / sim.log, then launch in the background. $SECONDS (seconds into
-        # the burst) is a fork-free marker to gauge the rate.
-        printf '[+%ss] dig @%s %s\n' "$SECONDS" "$server" "$record"
-        dig +time=1 +tries=1 +short @"$server" "$record" >/dev/null 2>&1 &
-      fi
+    # Fire against the single selected server.
+    if (( VERBOSE )); then
+      _out=$(dig +time=1 +tries=1 +short @"$_current" "$record" 2>&1); _rc=$?
+      printf '%s [dig @%s %s] rc=%s -> %s\n' "$(date '+%H:%M:%S')" \
+             "$_current" "$record" "$_rc" "${_out:-<empty>}"
+    else
+      # Throttle to at most _MAX_INFLIGHT concurrent digs (CPU guard). `wait -n`
+      # (bash 4.3+) blocks until one background dig finishes; the sleep fallback
+      # covers older bash. jobs -rp counts only the running background digs.
+      while (( $(jobs -rp 2>/dev/null | wc -l) >= _MAX_INFLIGHT )); do
+        wait -n 2>/dev/null || sleep "$pause_between"
+      done
+      printf '[+%ss] dig @%s %s\n' "$SECONDS" "$_current" "$record"
+      dig +time=1 +tries=1 +short @"$_current" "$record" >/dev/null 2>&1 &
+    fi
 
-      fired=$((fired + 1))
-      sleep "$pause_between"
-    done
+    fired=$((fired + 1))
+    sleep "$pause_between"
   done
 done
 
