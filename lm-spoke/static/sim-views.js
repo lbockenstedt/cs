@@ -1352,10 +1352,30 @@ async function csRenderClients(tier) {
     const t3 = rows.filter(c => csClassifyClient(c) === 't3').length;
     const online = rows.filter(c => c.online).length;
     const pills = csSummaryRow([[all, 'Clients'], [t1, 'T1'], [t2, 'T2'], [t3, 'T3'], [online, 'Online']]);
+    const fhBadge = csFleetHealthBadge(data && data.fleet_health);
     // Kill switch moved to the All/T1/T2 child strip (renderSecondaryNav →
     // csKillSwitchMountChip), pinned far right — no longer a content banner here.
-    csSet(`<div class="space-y-4">${demoCard}${pills}<div id="cs-client-body"></div></div>`);
+    csSet(`<div class="space-y-4">${fhBadge}${demoCard}${pills}<div id="cs-client-body"></div></div>`);
     csClientFilter();
+}
+
+// Fleet-health banner: working ÷ (provisioned − exclusive), judged against the
+// ~80% USB-dongle churn floor (NOT 100%). ≥75% OK, 50–75% WARNING (blink amber),
+// <50% CRITICAL (blink red). See cs/docs/t2-usb-dongle-throttle-recover.md.
+function csFleetHealthBadge(fh) {
+    if (!fh || fh.pct == null) return '';
+    const cls = fh.status === 'ok' ? 'bg-emerald-50 text-emerald-700 border-emerald-200'
+        : fh.status === 'warning' ? 'bg-amber-50 text-amber-800 border-amber-300 animate-pulse'
+        : fh.status === 'critical' ? 'bg-red-50 text-red-700 border-red-300 animate-pulse'
+        : 'bg-slate-50 text-slate-500 border-slate-200';
+    const label = fh.status === 'critical' ? 'CRITICAL' : fh.status === 'warning' ? 'LOW' : 'OK';
+    return `<div class="flex items-center gap-3 text-sm px-4 py-2 rounded-md border ${cls}"
+        title="Working clients (online + gateway reachable) ÷ provisioned, EXCLUDING exclusive failure sims (meant to be disconnected). Bands: ≥75% OK, 50–75% warning, <50% critical — ~80% is normal USB-dongle churn.">
+      <span class="font-bold">Fleet Health</span>
+      <span class="font-mono">${csEscape(String(fh.working))}/${csEscape(String(fh.eligible))} working · ${csEscape(String(fh.pct))}%</span>
+      <span class="text-[10px] font-bold uppercase tracking-wider px-1.5 py-0.5 rounded bg-white/60">${label}</span>
+      ${fh.exclusive ? `<span class="text-[11px] text-slate-500">(${csEscape(String(fh.exclusive))} exclusive excluded)</span>` : ''}
+    </div>`;
 }
 
 // "Purge Clients" — ports the original solutions-hpe cs-webui button
