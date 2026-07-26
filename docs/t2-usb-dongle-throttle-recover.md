@@ -63,6 +63,35 @@ Two implications:
    is built to absorb this noise (feedback against the *observed* alert, not a
    precomputed rate) precisely because the environment is non-sterile by design.
 
+## USB bus density — the 7-adapter limit (hard provisioning rule)
+
+The ~20% kill rate is only achievable at the **right density**. Packing too many
+adapters onto one USB bus makes contention — and therefore the kill rate — climb
+**exponentially, not linearly**:
+
+> **Do not put more than ~7 WiFi/Ethernet adapters on a single USB bus.** Past
+> ~7-per-bus, the kill rate is *much* higher than 20% and the fleet stops
+> self-healing (drops outpace recoveries).
+
+The reference topology that stays under that limit:
+
+- A **4-channel PCI USB card** — 4 independent USB buses on one card.
+- A **USB hub on each channel**, with up to **7 adapters per hub** → **~28
+  dongles per 4-channel card**, each bus at/under the 7-adapter limit.
+
+The *same* 4-channel PCI card is also how **T1** clients are built: instead of
+hanging dongles off it and passing the USB through, you **pass the entire PCI card
+through to one guest with a single network adapter on it**. One adapter, no bus
+contention, and the guest effectively owns a resettable device → reliable. The
+tradeoff is cost: a whole 4-channel card dedicated to **one** T1 client is
+expensive per port — which is exactly why the T2 (many-dongles-per-card, self-
+healing) model exists to scale cheaply.
+
+**Diagnostic tie-in:** if a host's fleet availability sits chronically *below* the
+~80% floor, the first thing to check is **density** — a bus with more than ~7
+adapters will run a permanently elevated kill rate no matter how well the
+per-client throttle behaves.
+
 ## The pattern every heavy sim must follow: throttle-and-recover
 
 Because the bus can't be reset, a heavy sim must (a) stay **under** the per-client
