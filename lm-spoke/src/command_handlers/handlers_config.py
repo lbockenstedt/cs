@@ -633,6 +633,20 @@ class ConfigCommandsMixin:
             if isinstance(sh, dict):
                 self.local_store.set_sim_shareable(sh)
                 applied.append("sim_shareable")
+        # Sim-stacking knobs (weighted multi-sim fill of the spare pool) — the
+        # SimQuotaEngine._reconcile_stacked inputs. randomizable_sims (below) is
+        # the on/off gate; these tune breadth + depth + churn.
+        if "sim_weights" in patch:
+            sw = patch.get("sim_weights")
+            if isinstance(sw, dict):
+                self.local_store.set_sim_weights(sw)
+                applied.append("sim_weights")
+        if "stack_cap" in patch:
+            self.local_store.set_stack_cap(patch.get("stack_cap"))
+            applied.append("stack_cap")
+        if "stack_rotation_s" in patch:
+            self.local_store.set_stack_rotation_s(patch.get("stack_rotation_s"))
+            applied.append("stack_rotation_s")
         # Knob-floor learner: the hub-computed [simulation] intensity knob values
         # (e.g. {"dns_fail_rate": 400}). Layered onto the served config at serve
         # time by client_api — see local_store.get_sim_knob_overrides.
