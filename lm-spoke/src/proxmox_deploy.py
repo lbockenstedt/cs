@@ -395,6 +395,23 @@ class ProxmoxDeploy:
                     tiers[str(v)] = t
         return tiers
 
+    def vm_health_index(self) -> Dict[str, str]:
+        """``{str(vmid): in-guest health state}`` from the agent-computed per-VM
+        ``health`` (pxmx ``_guest_health_probe`` over QGA, stamped on each ``vms``
+        entry). States: ``healthy`` / ``no_driver`` (USB enumerated but no netdev
+        bound) / ``no_assoc`` / ``no_gateway`` / ``not_visible``. The client-row
+        builders map hostname → vmid → this state and stamp it on the row so the
+        Hub UI can flag e.g. "USB present but no driver loaded". VMs with no probe
+        data are absent (None on the row)."""
+        health: Dict[str, str] = {}
+        for st in self.proxmox_states.values():
+            for vm in (st.get("vms") or []):
+                v = vm.get("vmid")
+                h = vm.get("health")
+                if v not in (None, "") and h:
+                    health[str(v)] = h
+        return health
+
     @staticmethod
     def client_has_usb(hostname: str, client: Dict[str, Any],
                        usb_vmids: set, name_to_vmid: Dict[str, str]) -> Tuple[Optional[str], bool]:

@@ -1449,6 +1449,23 @@ function csNormalizeClients(data) {
 // override on click. Columns: Hostname, Site, Sim-ID, PHY, OS, Status, Tier,
 // SSID, Last Seen, Errors, Demo.
 const CS_CLIENT_COLS = 11;
+// In-guest dongle health flag (agent QGA probe → spoke → hub). Rendered inline
+// by the hostname so a dongle that is USB-present but NOT WORKING (no driver
+// bound, never associated, or associated-but-no-gateway) is visibly flagged —
+// distinct from plain "offline". Empty for healthy / no probe data.
+function csHealthBadge(c) {
+    const h = c && c.health;
+    if (!h || h === 'healthy') return '';
+    const M = {
+        no_driver:   ['no driver', 'text-red-600',    'USB dongle present but NO network driver loaded (netdev missing) — reboot / firmware'],
+        not_visible: ['no USB',    'text-red-600',    'Guest cannot see the USB dongle (lsusb) — detached / wedged bus'],
+        no_gateway:  ['no gw',     'text-orange-600', 'Associated but default gateway unreachable — likely infrastructure, NOT the dongle'],
+        no_assoc:    ['no assoc',  'text-amber-600',  'Driver loaded but not associated to Wi-Fi'],
+    };
+    const m = M[h] || [String(h), 'text-slate-500', 'In-guest health: ' + h];
+    return `<span class="ml-1 text-[10px] font-semibold ${m[1]}" title="${csEscape(m[2])}">${csEscape(m[0])}</span>`;
+}
+
 function csRenderClientRows(rows) {
     const body = csEl('cs-client-body') || csEl('cs-content');
     if (!rows || rows.length === 0) {
@@ -1463,7 +1480,7 @@ function csRenderClientRows(rows) {
         const _demoOn = window._csDemoActive && window._csDemoActive[host];
         const _ls = csLastSeenAgo(c.last_seen);
         const line1 = `<tr class="border-t border-slate-100 ${_demoOn ? 'bg-amber-50' : ''}">
-          <td class="px-4 py-2 font-mono text-xs">${csEscape(host || '—')}${c.dns_ceiling ? `<span class="ml-1 text-[10px] font-semibold text-amber-600" title="Current DNS self-throttle rate (failures/min) the AIMD ratchet settled on for this dongle">DNS≤${csEscape(c.dns_ceiling)}/m</span>` : ''}</td>
+          <td class="px-4 py-2 font-mono text-xs">${csEscape(host || '—')}${c.dns_ceiling ? `<span class="ml-1 text-[10px] font-semibold text-amber-600" title="Current DNS self-throttle rate (failures/min) the AIMD ratchet settled on for this dongle">DNS≤${csEscape(c.dns_ceiling)}/m</span>` : ''}${csHealthBadge(c)}</td>
           <td class="px-4 py-2 text-slate-500">${csEscape(cfg.wsite || '—')}</td>
           <td class="px-4 py-2 font-mono text-xs text-slate-500">${csEscape(c.simulation_id || '—')}</td>
           <td class="px-4 py-2 text-slate-500">${csEscape(cfg.sim_phy || '—')}</td>

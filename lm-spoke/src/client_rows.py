@@ -55,8 +55,9 @@ def build_client_rows(spoke, now: float | None = None
     if deploy is not None:
         usb_vmids, name_to_vmid = deploy.usb_vmid_index()
         tier_index = deploy.vm_tier_index()
+        health_index = deploy.vm_health_index()
     else:
-        usb_vmids, name_to_vmid, tier_index = set(), {}, {}
+        usb_vmids, name_to_vmid, tier_index, health_index = set(), {}, {}, {}
 
     # Load the sim configs ONCE per call (mtime-cached) so each client's
     # authoritative Site/PHY/Sim-ID can be resolved from its hostname.
@@ -79,6 +80,7 @@ def build_client_rows(spoke, now: float | None = None
         else:
             vmid, has_usb = None, False
         tier = tier_index.get(str(vmid)) if vmid else None
+        health_state = health_index.get(str(vmid)) if vmid else None
         if vmid and tier:
             tier_updates[hostname] = {"tier": tier, "has_usb": has_usb}
         tier_stale = False
@@ -121,6 +123,11 @@ def build_client_rows(spoke, now: float | None = None
             # Authoritative tier (t1/t2/t3) from the agent's per-VM passthrough
             # classification; csClassifyClient prefers this over has_usb.
             "tier": tier,
+            # In-guest dongle health (agent QGA probe): healthy / no_driver /
+            # no_assoc / no_gateway / not_visible. None = no probe data. Surfaced
+            # as a small badge on the Clients row so a dongle that's USB-present
+            # but has no driver / no gateway is flagged (not just "offline").
+            "health": health_state,
             # True when `tier` came from the persisted last-known fallback (host
             # unresolvable) rather than a live join — an ASSUMED tier, not live.
             "tier_stale": tier_stale,
