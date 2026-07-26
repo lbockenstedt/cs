@@ -359,16 +359,17 @@ def test_reconcile_rehome_disabled_underfills_when_site_short(tmp_path):
 
 
 def test_reconcile_rehome_borrows_cross_site_when_enabled(tmp_path):
-    # Same layout, rehome=True → c0 in-site + c1,c2 borrowed from DFW and
-    # re-homed (wsite=MIA). The ledger records their original site (DFW) so a
-    # later release reverts.
-    clients = {f"c{i}": _client(f"c{i}", "DFW") for i in range(5)}
-    n2h = {"c0": "px1", "c1": "px2", "c2": "px2", "c3": "px2", "c4": "px2"}
-    site_map = {"px1": "MIA", "px2": "DFW"}
+    # TENANT-LEVEL environment (all SSIDs visible → clients are TENANT-POOL,
+    # assignable to any site). Re-home only applies here — in RF isolation a
+    # PXMX-pinned client can't leave its chamber. c0 is logically MIA (in-site),
+    # c1-c4 logically DFW; a MIA quota re-homes the DFW ones to MIA (wsite=MIA),
+    # and the ledger records their original site (DFW) so a later release reverts.
+    clients = {"c0": _client("c0", "MIA")}
+    for i in range(1, 5):
+        clients[f"c{i}"] = _client(f"c{i}", "DFW")
     spoke = _FakeSpoke(clients, [{"alert_id": "A", "sim_id": "dns_fail",
                                   "count": 3, "site": "MIA", "rehome": True,
-                                  "enabled": True}],
-                      tmp_path, pxmx_site_map=site_map, name_to_host=n2h)
+                                  "enabled": True}], tmp_path)
     eng = SimQuotaEngine(spoke)
     actions = _run(eng.reconcile())
     assigned = eng._ledger["alert:A:MIA"]["clients"]
@@ -381,15 +382,14 @@ def test_reconcile_rehome_borrows_cross_site_when_enabled(tmp_path):
 
 
 def test_reconcile_rehome_release_reverts_wsite(tmp_path):
-    # After a rehome assign, removing the quota releases the borrowed clients
-    # and reverts wsite back to their original site (DFW).
-    clients = {f"c{i}": _client(f"c{i}", "DFW") for i in range(5)}
-    n2h = {"c0": "px1", "c1": "px2", "c2": "px2", "c3": "px2", "c4": "px2"}
-    site_map = {"px1": "MIA", "px2": "DFW"}
+    # Tenant-level (tenant-pool) env: after a rehome assign, removing the quota
+    # releases the borrowed clients and reverts wsite to their original site (DFW).
+    clients = {"c0": _client("c0", "MIA")}
+    for i in range(1, 5):
+        clients[f"c{i}"] = _client(f"c{i}", "DFW")
     spoke = _FakeSpoke(clients, [{"alert_id": "A", "sim_id": "dns_fail",
                                   "count": 3, "site": "MIA", "rehome": True,
-                                  "enabled": True}],
-                      tmp_path, pxmx_site_map=site_map, name_to_host=n2h)
+                                  "enabled": True}], tmp_path)
     eng = SimQuotaEngine(spoke)
     _run(eng.reconcile())
     assert spoke.registry.clients["c1"]["overrides"]["wsite"] == "MIA"
@@ -607,8 +607,8 @@ def test_engine_rehome_wsite_survives_real_registry_prune(tmp_path):
         return {"wsite": "DFW", "dns_fail": "off"}
 
     reg = ClientRegistry(tmp_path / "data", bucket_resolver=_bucket)
-    # Seed two clients hosted on a DFW-mapped pxmx server (px2→DFW) so their
-    # NATURAL site is DFW while the quota wants MIA → the engine must re-home
+    # Tenant-level env: two TENANT-POOL clients (no pxmx_site_map) whose NATURAL
+    # (bucket) site is DFW while the quota wants MIA → the engine re-homes them
     # (set wsite=MIA). Seeding via the status-beacon path (no register() method).
     _run(reg.apply_status("c0", {"config": {"wsite": "DFW"}}))
     _run(reg.apply_status("c1", {"config": {"wsite": "DFW"}}))
@@ -616,8 +616,7 @@ def test_engine_rehome_wsite_survives_real_registry_prune(tmp_path):
     quotas = [{"alert_id": "A", "alert_type": "alert", "sim_id": "dns_fail",
                "count": 2, "site": "MIA", "rehome": True,
                "multi_capable": False, "enabled": True}]
-    spoke = _RealRegSpoke(reg, quotas, {"px2": "DFW"},
-                          {"c0": "px2", "c1": "px2"}, tmp_path)
+    spoke = _RealRegSpoke(reg, quotas, {}, {}, tmp_path)
     eng = SimQuotaEngine(spoke)
     _run(eng.reconcile())
 
