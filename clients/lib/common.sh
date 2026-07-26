@@ -17,7 +17,7 @@
 #
 # Every helper here replaces copies that had drifted between simulation.sh,
 # dashboard.sh and startup.sh — edit HERE (clients/lib/), not per-script.
-version=.05
+version=.06
 
 # ── script version reporting ─────────────────────────────────────────────────
 # So an operator can tell FOR SURE which script + which deployment is running.
@@ -196,7 +196,7 @@ json_escape() {
 # re-probe is a learning-mode behavior (Phase 2); clear the state file to reset.
 _DNS_CEILING_FILE="/usr/local/scripts/dns_ceiling.state"        # persisted rate (failures/min)
 _DNS_CONVERGED_FILE="/usr/local/scripts/dns_ceiling.converged"  # marker: learning found the ceiling
-_DNS_RATE_FLOOR=30      # never throttle below this (below it a client is just broken)
+_DNS_RATE_FLOOR=15      # never throttle below this (below it a client is just broken)
 _DNS_PROBE_MAX=20000    # cap the learning-mode upward probe (a client that never DOSes can't run away)
 
 # Default-gateway IP (the sim's real uplink), empty if there is no default route.
