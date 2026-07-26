@@ -3768,6 +3768,7 @@ function csSimQuotaRowFromServer(q) {
         sim_id: q.sim_id || '',
         count: q.count != null ? q.count : 10,
         site: q.site || '',
+        tier: q.tier || 'best',
         multi_capable: !!q.multi_capable,
         rehome: !!q.rehome,
         enabled: !!q.enabled,
@@ -3957,6 +3958,13 @@ function csRenderSimQuotaEditor() {
           <label class="text-xs text-slate-500">Site
             <select data-cs-sq="site" class="w-full bg-white border border-slate-300 rounded-md px-2 py-1.5 text-sm mt-1">${siteOpts}</select>
           </label>
+          <label class="text-xs text-slate-500" title="Client tier to harvest: Best = prefer T1 (dedicated PCI, most reliable) then fall back to T2 (USB dongle); T1/T2 = that tier only (underfill rather than degrade).">Tier
+            <select data-cs-sq="tier" class="w-full bg-white border border-slate-300 rounded-md px-2 py-1.5 text-sm mt-1">
+              <option value="best" ${(r.tier || 'best') === 'best' ? 'selected' : ''}>Best (T1→T2)</option>
+              <option value="t1" ${r.tier === 't1' ? 'selected' : ''}>T1 only</option>
+              <option value="t2" ${r.tier === 't2' ? 'selected' : ''}>T2 only</option>
+            </select>
+          </label>
           <button onclick="csSimQuotaDel(${i})" class="text-red-600 hover:text-red-800 text-xs font-bold py-1">Remove</button>
           <label class="text-xs text-slate-500 md:col-span-6 flex flex-wrap gap-x-3 gap-y-1">
             ${(!isPresence && tied) ? `<span class="flex items-center gap-1" title="Production consumer: ramps clients UP to trigger + keep the alert alive, seeded from the learned base + config, CAPPED at Max. Hits Max and still not firing → max-hit alert (lab/prod divergence). Mutually exclusive with Learning."><input data-cs-sq="adaptive" type="checkbox" onchange="csSimQuotaOnAdaptiveChange(this)" ${r.adaptive ? 'checked' : ''}> Adaptive (keep firing)</span>` : ''}
@@ -4008,6 +4016,7 @@ function csSimQuotaSyncFromDom() {
             alert_id: tied ? ((g('alert_id') || {}).value || '').trim() : '',
             sim_id,
             site: g('site').value,
+            tier: (g('tier') || {}).value || 'best',
             rehome: !!g('rehome').checked,
             enabled: !!g('enabled').checked,
             tied,
@@ -4110,6 +4119,7 @@ window.csSimQuotaAdd = function (preset) {
         sim_id: p.sim_id || '',
         count: p.count != null ? p.count : 10,
         site: p.site || '',
+        tier: p.tier || 'best',
         multi_capable: p.multi_capable != null ? !!p.multi_capable : false,
         rehome: p.rehome != null ? !!p.rehome : false,
         enabled: p.enabled != null ? !!p.enabled : false,
