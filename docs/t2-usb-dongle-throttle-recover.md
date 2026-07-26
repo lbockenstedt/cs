@@ -118,9 +118,17 @@ implementation:
   finished clearing, so it never recovers. Hold the flood OFF until it's solidly
   back, then resume at the (already-throttled) rate.
 
-**Per-client, self-tuning:** every dongle finds its own ceiling — they differ, and
-they drift, so the throttle is per-client and re-measured, never a fleet-wide
-fixed number.
+**Per-client, self-tuning — because not all clients are equal.** This is the whole
+reason the ratchet exists. Sustainable rate varies enormously by *hardware
+topology*: a lone adapter on its own bus can take a firehose; one of 7 behind a
+hub takes far less; a T1 PCI-passthrough client takes more still; different dongle
+models differ again. A single fleet-wide rate would *over-drive* the dense/weak
+clients (killing them) while *under-driving* the strong ones. The only thing that
+copes with that spread is **each client discovering its own ceiling** — so the
+throttle is per-client, self-measured, and continuously re-measured (capacity also
+drifts moment to moment). The ratchet is not a safety net on top of a fixed rate;
+it *is* the rate mechanism. Any fleet-wide number (e.g. the quota engine's average)
+is only a *starting point* each client then individualizes from.
 
 ## How the alert still fires despite low per-client rates
 
