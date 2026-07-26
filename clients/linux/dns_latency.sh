@@ -1,5 +1,5 @@
 #!/bin/bash
-version=.12
+version=.13
 log="/usr/local/scripts/sim.log"
 debug="/usr/local/scripts/debug-dns-latency.log"
 echo DNS Latency Script Version $version | tee "$debug"
@@ -183,6 +183,11 @@ if (( _bailed )); then
 elif (( _learn && ! VERBOSE )) && ! dns_ceiling_converged; then
   _probe=$(dns_ceiling_relax "$rate_per_minute")
   echo "$(date) DNS latency lookups fired: ${fired} (LEARNING: ${rate_per_minute}/min sustained — probing up to ${_probe}/min next burst)" | tee -a "$debug"
+elif (( ! _learn && ! VERBOSE )) && (( rate_per_minute > 0 && rate_per_minute < _configured_rate )) && (( RANDOM % _DNS_UPPROBE_EVERY == 0 )); then
+  # Production AIMD up-probe (see dns_fail): throttled + clean → occasionally nudge
+  # UP to re-test capacity; a DOS falls back 20%. Rides varying capacity (50→80).
+  _up=$(dns_ceiling_upprobe "$rate_per_minute" "$_configured_rate")
+  echo "$(date) DNS latency lookups fired: ${fired} — clean; probing rate UP ${rate_per_minute}→${_up}/min next burst (re-testing capacity)" | tee -a "$debug"
 else
   echo "$(date) DNS latency lookups fired: ${fired}" | tee -a "$debug"
 fi

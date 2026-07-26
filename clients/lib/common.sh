@@ -17,7 +17,7 @@
 #
 # Every helper here replaces copies that had drifted between simulation.sh,
 # dashboard.sh and startup.sh — edit HERE (clients/lib/), not per-script.
-version=.08
+version=.09
 
 # ── script version reporting ─────────────────────────────────────────────────
 # So an operator can tell FOR SURE which script + which deployment is running.
@@ -201,6 +201,7 @@ _DNS_RATE_FLOOR=0       # 0 = a client that can't sustain ANY flood ratchets ful
                         # dedicated channel that sustains a firehose. rate 0 =
                         # "don't flood this burst" (handled in the sim scripts).
 _DNS_PROBE_MAX=20000    # cap the learning-mode upward probe (a client that never DOSes can't run away)
+_DNS_UPPROBE_EVERY=5    # production AIMD: ~1 in N clean bursts, nudge the rate UP to re-test capacity
 
 # Default-gateway IP (the sim's real uplink), empty if there is no default route.
 dns_default_gw() { ip route 2>/dev/null | grep -oP 'default via \K\S+' | head -1; }
@@ -291,6 +292,26 @@ dns_ceiling_relax() {
   (( next <= cur )) && next=$(( cur + 1 ))   # always make forward progress
   _dns_ceiling_write "$next"
   echo "$next"
+}
+
+# Production AIMD up-probe (additive increase): on a clean burst while throttled
+# BELOW the configured target, nudge the rate ~+20% to test whether conditions
+# improved (dongle recovered, or the shared USB bus freed up as other clients
+# dropped off). If the nudge reaches the target, clear the throttle entirely
+# (fully recovered). $1=current rate, $2=configured target. Echoes the next rate.
+# A DOS at the higher rate is caught by the 20% multiplicative decrease — so the
+# client rides its VARYING capacity (e.g. 50→80 when things improve) instead of
+# staying pinned at a transient low. Caller gates on frequency + throttled state.
+dns_ceiling_upprobe() {
+  local cur=$1 configured=$2 next
+  next=$(awk -v c="$cur" 'BEGIN { printf "%d", c * 1.2 + 1 }')
+  if (( next >= configured )); then
+    dns_ceiling_reset      # recovered to the target — drop the throttle state
+    echo "$configured"
+  else
+    _dns_ceiling_write "$next"
+    echo "$next"
+  fi
 }
 
 # Convergence marker — learning stops probing UP once it has found the ceiling

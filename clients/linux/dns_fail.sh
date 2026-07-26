@@ -1,5 +1,5 @@
 #!/bin/bash
-version=.16
+version=.17
 log="/usr/local/scripts/sim.log"
 debug="/usr/local/scripts/debug-dns-fail.log"
 echo DNS Failure Script Version $version | tee "$debug"
@@ -220,6 +220,13 @@ elif (( _learn && ! VERBOSE )) && ! dns_ceiling_converged; then
   # keep hunting the ceiling (until a burst DOSes -> converged, settle 20% below).
   _probe=$(dns_ceiling_relax "$rate_per_minute")
   echo "$(date) DNS failures fired: ${fired} (LEARNING: ${rate_per_minute}/min sustained — probing up to ${_probe}/min next burst)" | tee -a "$debug"
+elif (( ! _learn && ! VERBOSE )) && (( rate_per_minute > 0 && rate_per_minute < _configured_rate )) && (( RANDOM % _DNS_UPPROBE_EVERY == 0 )); then
+  # Production AIMD up-probe: throttled below target + clean → occasionally nudge
+  # the rate UP to re-test capacity (dongle recovered / shared bus freed as other
+  # clients dropped off). A DOS at the higher rate falls back 20%, so a client
+  # rides its varying capacity (e.g. 50→80) instead of staying pinned low.
+  _up=$(dns_ceiling_upprobe "$rate_per_minute" "$_configured_rate")
+  echo "$(date) DNS failures fired: ${fired} — clean; probing rate UP ${rate_per_minute}→${_up}/min next burst (re-testing capacity)" | tee -a "$debug"
 else
   echo "$(date) DNS failures fired: ${fired}" | tee -a "$debug"
 fi
