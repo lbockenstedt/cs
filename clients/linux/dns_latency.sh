@@ -1,5 +1,5 @@
 #!/bin/bash
-version=.15
+version=.16
 log="/usr/local/scripts/sim.log"
 debug="/usr/local/scripts/debug-dns-latency.log"
 echo DNS Latency Script Version $version | tee "$debug"
@@ -23,7 +23,10 @@ done
 source '/usr/local/scripts/ini-parser.sh'
 source '/usr/local/scripts/common.sh'
 process_ini_file '/usr/local/scripts/simulation.conf'
-dnsfile=$(< /usr/local/scripts/dns_fail.txt)
+# RANDOMIZE the record order each burst (see dns_fail.sh) so the query stream
+# varies per client/burst instead of the same file-order first-N.
+dnsfile=$(shuf /usr/local/scripts/dns_fail.txt 2>/dev/null)
+[[ -n "$dnsfile" ]] || dnsfile=$(< /usr/local/scripts/dns_fail.txt)   # fallback if shuf absent
 # The dns_latency server POOL (any number). Prefer the [address] `dns_latency`
 # list (space-separated, UNLIMITED — real DNS servers blacklist a flooding client
 # over time, so we keep a big pool and rotate to a still-slow one); fall back to

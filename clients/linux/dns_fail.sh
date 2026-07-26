@@ -1,5 +1,5 @@
 #!/bin/bash
-version=.18
+version=.19
 log="/usr/local/scripts/sim.log"
 debug="/usr/local/scripts/debug-dns-fail.log"
 echo DNS Failure Script Version $version | tee "$debug"
@@ -22,7 +22,11 @@ done
 source '/usr/local/scripts/ini-parser.sh'
 source '/usr/local/scripts/common.sh'
 process_ini_file '/usr/local/scripts/simulation.conf'
-dnsfile=$(< /usr/local/scripts/dns_fail.txt)
+# RANDOMIZE the record order each burst so every client/burst queries a different
+# random subset of the (10k) bogus names instead of marching the same first-N in
+# file order — makes the failure traffic look like real, scattered typo lookups.
+dnsfile=$(shuf /usr/local/scripts/dns_fail.txt 2>/dev/null)
+[[ -n "$dnsfile" ]] || dnsfile=$(< /usr/local/scripts/dns_fail.txt)   # fallback if shuf absent
 # dns_fail queries UNREACHABLE / bogus servers only (dns_bad_record_* +
 # dns_bad_ip_*) so the lookups FAIL. The slow-responder set (dns_latency_*) is a
 # DIFFERENT condition (high DNS latency, not failure) and now lives in its own
