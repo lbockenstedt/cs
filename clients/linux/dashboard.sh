@@ -1,5 +1,5 @@
 #!/bin/bash
-version=.15
+version=.16
 # WHY: dashboard.sh is a read-only live monitor. It runs in its own terminal
 # window (launched by startup.desktop) so the operator can always see
 # what's happening without interrupting the simulation loop in the other pane.
@@ -77,7 +77,6 @@ refresh_config() {
   # gateway circuit-breaker found its DOS point). Empty = never DOSed / not
   # throttled (running at the configured rate). See dns_ceiling_* in common.sh.
   dns_ceiling=$(_dns_ceiling_saved 2>/dev/null)
-  dns_ceiling_conv=""; dns_ceiling_converged 2>/dev/null && dns_ceiling_conv=" (converged)"
   github_repo=$(get_value 'simulation' 'github_repo')
   repo_location=$(get_value 'simulation' 'repo_location')
   site_based_ssid=$(get_value 'simulation' 'site_based_ssid')
@@ -448,7 +447,7 @@ while true; do
   printf "  %sAdapter:%s %-22s  %sVersion:%s %s · deploy %s\n" "$BOLD" "$RST" "$_adp" "$BOLD" "$RST" "$simsh_ver" "$deploy_ver"
   printf "  %sDNS sim:%s fail v%-6s          latency v%s\n" "$BOLD" "$RST" "$dnsf_ver" "$dnsl_ver"
   if [[ -n "$dns_ceiling" ]]; then
-    printf "  %sDNS ceiling:%s ${YLW}%s/min${RST}%s\n" "$BOLD" "$RST" "$dns_ceiling" "$dns_ceiling_conv"
+    printf "  %sDNS ceiling:%s ${YLW}%s/min${RST}\n" "$BOLD" "$RST" "$dns_ceiling"
   else
     printf "  %sDNS ceiling:%s — (running at configured rate)\n" "$BOLD" "$RST"
   fi

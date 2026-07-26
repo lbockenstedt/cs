@@ -1,5 +1,5 @@
 #!/bin/bash
-version=.17
+version=.18
 log="/usr/local/scripts/sim.log"
 debug="/usr/local/scripts/debug-dns-fail.log"
 echo DNS Failure Script Version $version | tee "$debug"
@@ -78,26 +78,17 @@ burst_seconds=$(get_value 'simulation' 'dns_fail_duration')
 [[ -z "$burst_seconds"   ]] && burst_seconds=60
 (( rate_per_minute < 200 )) && rate_per_minute=200
 
-# Learning mode (Phase 2): the client HUNTS its own DOS ceiling — probe the rate
-# UP on clean bursts, settle 20% below the rate that finally DOSes, and report it
-# to the quota engine (so the engine skips per-client trial-and-error and only
-# solves the client-count dimension). OFF => production: down-only self-throttle
-# safety net, capped at the configured rate. Pushed via config (dns_learn=on when
-# a DNS quota is in Learning); DNS_LEARN=1 forces it per manual run.
-_dns_learn=$(get_value 'simulation' 'dns_learn')
-if [[ "${DNS_LEARN:-}" == "1" || "$_dns_learn" == "on" ]]; then _learn=1; else _learn=0; fi
-
 # Per-run rate override for manual ceiling / recovery testing (parallels
 # DNS_MAX_INFLIGHT): DNS_FAIL_RATE=<n> forces the rate AND bypasses the persisted
 # self-throttle, so you can deliberately drive a client to its DOS ceiling and
 # watch it bail + recover (e.g. DNS_FAIL_RATE=5000 DNS_MAX_INFLIGHT=1500 bash
-# dns_fail.sh). Otherwise apply the persisted ceiling (min(configured,persisted)
-# in production; the upward-probing value in learning) — dns_ceiling_rate.
+# dns_fail.sh). Otherwise apply the persisted self-throttle: min(configured,
+# persisted) — the AIMD ratchet's current per-client rate.
 if [[ "${DNS_FAIL_RATE:-}" =~ ^[0-9]+$ ]]; then
   _configured_rate=$DNS_FAIL_RATE; rate_per_minute=$DNS_FAIL_RATE
 else
   _configured_rate=$rate_per_minute
-  rate_per_minute=$(dns_ceiling_rate "$rate_per_minute" "$_learn")
+  rate_per_minute=$(dns_ceiling_rate "$rate_per_minute")
 fi
 
 # A ceiling of 0 means this client can't sustain ANY flood — a bad USB/hub dongle
@@ -127,7 +118,6 @@ _MAX_INFLIGHT="${DNS_MAX_INFLIGHT:-}"
 
 _throttle_note=""
 (( rate_per_minute < _configured_rate )) && _throttle_note=" (self-throttled from ${_configured_rate}/min after a prior gateway DOS)"
-(( _learn )) && { dns_ceiling_converged && _throttle_note="${_throttle_note} [LEARNING: ceiling found]" || _throttle_note="${_throttle_note} [LEARNING: hunting ceiling]"; }
 echo "$(date) Firing DNS failures at ${rate_per_minute}/min for ${burst_seconds}s (max ${_MAX_INFLIGHT} digs in flight)${_throttle_note}" | tee -a "$debug"
 if (( VERBOSE )); then
   echo "[verbose] bad_records : ${bad_records[*]:-<none>}"
@@ -174,8 +164,7 @@ while (( SECONDS < stop_at )); do
           # -20% of the OPERATING rate (not the noisy measured 'achieved', which
           # came out ≈ the rate and barely moved the ceiling → a ~1 decrement).
           _newrate=$(dns_ceiling_penalize "$rate_per_minute")
-          (( _learn )) && dns_ceiling_mark_converged
-          echo "$(date) default gateway $_dfgw OFFLINE (5/5 pings failed) after ${fired} digs at ${rate_per_minute}/min — BAILING; $( (( _learn )) && echo "ceiling FOUND, settling at" || echo "throttling to") ${_newrate}/min next burst" | tee -a "$debug"
+          echo "$(date) default gateway $_dfgw OFFLINE (5/5 pings failed) after ${fired} digs at ${rate_per_minute}/min — BAILING; throttling to ${_newrate}/min next burst" | tee -a "$debug"
           kill $(jobs -p) 2>/dev/null
           _bailed=1
           break 2
@@ -215,12 +204,7 @@ done
 (( VERBOSE )) || wait 2>/dev/null
 if (( _bailed )); then
   echo "$(date) DNS failures fired: ${fired} (BAILED on gateway loss — self-throttling next burst)" | tee -a "$debug"
-elif (( _learn && ! VERBOSE )) && ! dns_ceiling_converged; then
-  # Learning + clean burst: this rate was sustainable, so probe UP next burst to
-  # keep hunting the ceiling (until a burst DOSes -> converged, settle 20% below).
-  _probe=$(dns_ceiling_relax "$rate_per_minute")
-  echo "$(date) DNS failures fired: ${fired} (LEARNING: ${rate_per_minute}/min sustained — probing up to ${_probe}/min next burst)" | tee -a "$debug"
-elif (( ! _learn && ! VERBOSE )) && (( rate_per_minute > 0 && rate_per_minute < _configured_rate )) && (( RANDOM % _DNS_UPPROBE_EVERY == 0 )); then
+elif (( ! VERBOSE )) && (( rate_per_minute > 0 && rate_per_minute < _configured_rate )) && (( RANDOM % _DNS_UPPROBE_EVERY == 0 )); then
   # Production AIMD up-probe: throttled below target + clean → occasionally nudge
   # the rate UP to re-test capacity (dongle recovered / shared bus freed as other
   # clients dropped off). A DOS at the higher rate falls back 20%, so a client
