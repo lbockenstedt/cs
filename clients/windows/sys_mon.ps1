@@ -1,4 +1,4 @@
-$version = '.03'
+$version = '0.01'
 $logPath = 'C:\Scripts\sim_reboot.log'
 
 "Sys_Mon Script Version $version" | Tee-Object -FilePath $logPath -Append | Out-Null

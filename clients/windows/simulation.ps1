@@ -1,6 +1,10 @@
 . 'C:\Scripts\ini-parser.ps1'
+. 'C:\Scripts\common.ps1'
+. 'C:\Scripts\network_common.ps1'
+. 'C:\Scripts\connect_1x.ps1'
+. 'C:\Scripts\connect_psk.ps1'
 
-$version = '.03'
+$version = '0.01'
 $scriptRoot = 'C:\Scripts'
 $logPath = 'C:\Scripts\sim.log'
 $debugPath = 'C:\Scripts\debug-simulation.log'
@@ -82,7 +86,7 @@ function Send-Status {
         }
 
         $activeSimulations = @()
-        foreach ($name in @('dns_fail','iperf','download','www_traffic','ping_test','ssidpw_fail','auth_fail','dhcp_fail')) {
+        foreach ($name in @('dns_fail','dns_latency','collab','iperf','download','www_traffic','ping_test','ssidpw_fail','auth_fail','dhcp_fail')) {
             if ((Get-Variable -Name $name -Scope Script -ValueOnly -ErrorAction SilentlyContinue) -eq 'on') {
                 $activeSimulations += $name
             }
@@ -101,6 +105,8 @@ function Send-Status {
                 sim_phy = [string]$script:sim_phy
                 kill_switch = [string]$script:kill_switch
                 dns_fail = [string]$script:dns_fail
+                dns_latency = [string]$script:dns_latency
+                collab = [string]$script:collab
                 iperf = [string]$script:iperf
                 www_traffic = [string]$script:www_traffic
                 download = [string]$script:download
@@ -221,48 +227,11 @@ function Remove-WifiProfile {
 }
 
 function Connect-Wifi {
-    $adapter = Get-WifiAdapter
-    if (-not $adapter) {
-        Write-SimDebug 'No WiFi adapter found.'
-        return $false
-    }
-
-    Enable-NetAdapter -Name $adapter.Name -Confirm:$false -ErrorAction SilentlyContinue | Out-Null
-    Write-SimDebug 'Ensuring WiFi Adapter is ON'
-    Start-Sleep -Seconds 2
-
-    $targetSsid = Get-TargetSsid
-    if ([string]::IsNullOrWhiteSpace($targetSsid)) {
-        Write-SimDebug 'Target SSID is empty.'
-        return $false
-    }
-
-    $currentSsid = Get-ConnectedSsid
-    if ($currentSsid -eq $targetSsid) {
-        Write-SimDebug "Already connected to $targetSsid — skipping"
-        return $true
-    }
-
-    if (-not (Wait-ForSsid -TargetSsid $targetSsid)) {
-        return $false
-    }
-
-    $profilePath = Join-Path $tempDir (('wifi-{0}.xml' -f ($targetSsid -replace '[^A-Za-z0-9._-]', '_')))
-    Set-Content -LiteralPath $profilePath -Value (New-WifiProfileXml -ssid $targetSsid -password $script:ssidpw) -Encoding ASCII
-
-    Write-SimDebug "Attempting to connect to $targetSsid"
-    netsh wlan add profile filename="$profilePath" user=all 2>&1 | Tee-Object -FilePath $debugPath -Append | Out-Null
-    netsh wlan connect name="$targetSsid" interface="$($adapter.Name)" 2>&1 | Tee-Object -FilePath $debugPath -Append | Out-Null
-    Remove-Item -LiteralPath $profilePath -Force -ErrorAction SilentlyContinue
-    Start-Sleep -Seconds 5
-
-    if ((Get-ConnectedSsid) -eq $targetSsid) {
-        Write-SimDebug "WiFi connected to $targetSsid"
-        return $true
-    }
-
-    Write-SimDebug "WiFi failed to connect to $targetSsid"
-    return $false
+    # Delegate to the shared connect library. Connect-WifiPsk (connect_psk.ps1)
+    # does the WPA2-PSK associate + reconnect-fail ramp AND dispatches to 802.1X
+    # (connect_1x.ps1) when the bucket SSID is "1X". Mirrors the Linux
+    # simulation.sh sourcing network_common.sh + connect_psk.sh + connect_1x.sh.
+    return [bool](Connect-WifiPsk)
 }
 
 function Manage-Connection {
@@ -369,10 +338,13 @@ function Apply-UserOverrides {
 while ($true) {
     $global:iniConfig = Parse-IniFile 'C:\Scripts\simulation.conf'
 
-    $script:username = ($env:COMPUTERNAME -split '-')[0]
+    $script:username = Get-SimUsername
     $hostname = $env:COMPUTERNAME
-    # Hash hostname to assign bucket — no VMID required.
-    $bucketNum = [System.Math]::Abs([System.BitConverter]::ToInt32([System.Security.Cryptography.SHA256]::Create().ComputeHash([System.Text.Encoding]::UTF8.GetBytes($hostname)), 0)) % 10
+    # Bucket via crc32(hostname) % 10 (common.ps1 Get-SimBucket) — MUST match the
+    # Linux client (common.sh derive_bucket) AND the spoke's sim_config.bucket_for().
+    # The old SHA256(host)%10 put the SAME host in a DIFFERENT bucket than
+    # Linux/the spoke, so a host's Windows and Linux sims diverged. crc32 aligns them.
+    $bucketNum = Get-SimBucket
     $script:simulation_id = "s$bucketNum"
     # Allow user-overrides.conf to pin a specific bucket.
     $userSimId = get_value $script:username 'simulation_id'
@@ -403,6 +375,8 @@ while ($true) {
     $script:download = get_value $script:simulation_id 'download'
     $script:iperf = get_value $script:simulation_id 'iperf'
     $script:www_traffic = get_value $script:simulation_id 'www_traffic'
+    $script:dns_latency = get_value $script:simulation_id 'dns_latency'
+    $script:collab = get_value $script:simulation_id 'collab'
 
     # ------------------------------------------------------------
     # Ambient random pool (see clients/linux/simulation.sh for the full story).
@@ -424,7 +398,7 @@ while ($true) {
         $randomBucket = 's' + (Get-Random -Minimum 0 -Maximum 10)
         Write-SimLog "Ambient random pool: rolling behaviour from bucket $randomBucket"
         $randomizableList = $randomizableSims -split '\s+' | Where-Object { $_ }
-        foreach ($sim in @('dhcp_fail','dns_fail','assoc_fail','port_flap','ssidpw_fail','auth_fail','ping_test','download','iperf','www_traffic')) {
+        foreach ($sim in @('dhcp_fail','dns_fail','dns_latency','collab','assoc_fail','port_flap','ssidpw_fail','auth_fail','ping_test','download','iperf','www_traffic')) {
             if ($randomizableList -contains $sim) {
                 Set-Variable -Name $sim -Scope Script -Value (get_value $randomBucket $sim)
             } else {
@@ -448,10 +422,11 @@ while ($true) {
 
     Apply-UserOverrides -Section $script:username -Names @(
         'kill_switch','sim_load','public_repo','repo_location','site_based_ssid','iperf_bw',
-        'wsite','sim_phy','ssid','ssidpw','dhcp_fail','dns_fail','assoc_fail','port_flap','ping_test',
+        'wsite','sim_phy','ssid','ssidpw','dhcp_fail','dns_fail','dns_latency','collab','assoc_fail','port_flap','ping_test',
         'download','iperf','www_traffic','ssidpw_fail','auth_fail','smb_address','ping_address',
         'dns_latency_1','dns_latency_2','dns_latency_3','dns_bad_ip_1','dns_bad_ip_2','dns_bad_ip_3',
-        'dns_bad_record_1','dns_bad_record_2','dns_bad_record_3','iperf_server'
+        'dns_bad_record_1','dns_bad_record_2','dns_bad_record_3','iperf_server',
+        'collab_app','collab_bw','collab_time','collab_server','dot1x_password','web_server'
     )
 
     if (Test-Path -LiteralPath $killSwitchPath) {
@@ -538,12 +513,14 @@ while ($true) {
             if ((($script:ssidpw_fail -eq 'on') -or ($script:auth_fail -eq 'on')) -and $null -ne $wladapter) {
                 $correctSsidpw = get_value $script:simulation_id 'ssidpw'
                 if ($script:ssidpw_fail -eq 'on') {
+                    # Fast wrong-password loop (<=~6s/attempt) so the "WPA Passphrase
+                    # Incorrect" insight fires >=10x/min — the full-connect loop
+                    # (radio cycle + scan-wait each) was far too slow to trip it.
+                    # PSK vs 1X per the bucket SSID. Mirrors Linux connect_wifi_fail.
+                    $script:ssidpw = "${correctSsidpw}_fail"
                     for ($i = 1; $i -le 100; $i++) {
-                        Write-SimDebug 'Running SSID Incorrect Password'
-                        $script:ssidpw = "${correctSsidpw}_fail"
-                        Write-SimDebug "Iteration $i of 100"
-                        Remove-WifiProfile -ProfileName (Get-TargetSsid)
-                        [void](Connect-Wifi)
+                        Write-SimDebug "Running SSID Incorrect Password — iteration $i of 100"
+                        if ($script:ssid -eq '1X') { [void](Connect-Wifi1xFail) } else { [void](Connect-WifiPskFail) }
                     }
                 }
                 if ($script:auth_fail -eq 'on') {
@@ -611,6 +588,18 @@ while ($true) {
                 if ($script:dns_fail -eq 'on' -and -not (Test-ScriptRunning -ScriptName 'dns_fail.ps1')) {
                     Run-Simulation -ScriptName 'dns_fail.ps1'
                     Write-SimDebug 'Running DNS Simulation'
+                }
+                if ($script:dns_latency -eq 'on' -and -not (Test-ScriptRunning -ScriptName 'dns_latency.ps1')) {
+                    Run-Simulation -ScriptName 'dns_latency.ps1'
+                    Write-SimDebug 'Running DNS Latency Simulation'
+                }
+                if ($script:dhcp_fail -eq 'on' -and -not (Test-ScriptRunning -ScriptName 'dhcp_fail.ps1')) {
+                    Run-Simulation -ScriptName 'dhcp_fail.ps1'
+                    Write-SimDebug 'Running DHCP Fail Simulation'
+                }
+                if ($script:collab -eq 'on' -and -not (Test-ScriptRunning -ScriptName 'collab.ps1')) {
+                    Run-Simulation -ScriptName 'collab.ps1'
+                    Write-SimDebug 'Running Collab Simulation'
                 }
 
                 Start-Sleep -Seconds 10

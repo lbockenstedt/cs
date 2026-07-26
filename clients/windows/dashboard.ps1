@@ -1,15 +1,17 @@
 . 'C:\Scripts\ini-parser.ps1'
+. 'C:\Scripts\common.ps1'
 
-$version = '.03'
+$version = '0.01'
 $logPath = 'C:\Scripts\sim.log'
 $refreshRate = 5
 $scriptRoot = 'C:\Scripts'
-$excludeScripts = @('dashboard.ps1','startup.ps1','simulation.ps1','ini-parser.ps1','sys_mon.ps1')
+$excludeScripts = @('dashboard.ps1','startup.ps1','simulation.ps1','ini-parser.ps1','sys_mon.ps1','common.ps1','network_common.ps1')
 
 function Get-SimulationId {
-    $hostname = $env:COMPUTERNAME
-    $bucketNum = [System.Math]::Abs([System.BitConverter]::ToInt32([System.Security.Cryptography.SHA256]::Create().ComputeHash([System.Text.Encoding]::UTF8.GetBytes($hostname)), 0)) % 10
-    $username = ($hostname -split '-')[0]
+    # Bucket via crc32(hostname) % 10 (common.ps1 Get-SimBucket) — MUST match the
+    # Linux client + the spoke (was SHA256%10, which diverged cross-platform).
+    $bucketNum = Get-SimBucket
+    $username = Get-SimUsername
     $userSimId = get_value $username 'simulation_id'
     if (-not [string]::IsNullOrWhiteSpace($userSimId)) { return $userSimId }
     return "s$bucketNum"

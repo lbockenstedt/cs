@@ -1,4 +1,4 @@
-$version = '.03'
+$version = '0.01'
 $logPath = 'C:\Scripts\sim.log'
 $debugPath = 'C:\Scripts\debug-startup.log'
 
@@ -21,12 +21,16 @@ powercfg /change standby-timeout-dc 0 | Out-Null
 powercfg /change monitor-timeout-ac 0 | Out-Null
 powercfg /change monitor-timeout-dc 0 | Out-Null
 
-$username = ($env:COMPUTERNAME -split '-')[0]
 . 'C:\Scripts\ini-parser.ps1'
+. 'C:\Scripts\common.ps1'
 $global:iniConfig = Parse-IniFile 'C:\Scripts\simulation.conf'
+Write-SimVersionsReport
 
+$username = Get-SimUsername
 $hostname = $env:COMPUTERNAME
-$bucketNum = [System.Math]::Abs([System.BitConverter]::ToInt32([System.Security.Cryptography.SHA256]::Create().ComputeHash([System.Text.Encoding]::UTF8.GetBytes($hostname)), 0)) % 10
+# Bucket via crc32(hostname) % 10 (common.ps1 Get-SimBucket) — MUST match the
+# Linux client + the spoke's sim_config.bucket_for() (was SHA256%10, which diverged).
+$bucketNum = Get-SimBucket
 $simulation_id = "s$bucketNum"
 $userSimId = get_value $username 'simulation_id'
 if (-not [string]::IsNullOrWhiteSpace($userSimId)) { $simulation_id = $userSimId }
