@@ -17,7 +17,7 @@
 #
 # Every helper here replaces copies that had drifted between simulation.sh,
 # dashboard.sh and startup.sh — edit HERE (clients/lib/), not per-script.
-version=0.01
+version=0.02
 
 # ── script version reporting ─────────────────────────────────────────────────
 # So an operator can tell FOR SURE which script + which deployment is running.
@@ -204,22 +204,30 @@ _DNS_UPPROBE_EVERY=5    # production AIMD: ~1 in N clean bursts, nudge the rate 
 # Default-gateway IP (the sim's real uplink), empty if there is no default route.
 dns_default_gw() { ip route 2>/dev/null | grep -oP 'default via \K\S+' | head -1; }
 
-# Return 0 iff the gateway answers a single ping (2s timeout — tolerant of a busy
-# small VM that can't service a 1s reply in time; a too-short timeout reads a slow
-# client as a dead gateway and false-ratchets the rate down).
-dns_gw_alive() { local gw="${1:-}"; [[ -n "$gw" ]] && ping -c1 -W2 "$gw" >/dev/null 2>&1; }
+# [simulation] gw_ping_timeout_s — per-ping ICMP timeout (seconds) for the gateway
+# liveness checks (default 4). Under heavy DNS-flood load the gateway RTT climbs
+# toward ~1.5s and beyond; a timeout at/under that reads a slow-but-ALIVE gateway
+# as dead and false-ratchets the DNS rate toward zero. Keep it comfortably above
+# the loaded RTT. Editable in the WebUI sim-config (sim-views.js).
+gw_ping_timeout_s() { local t; t=$(get_value 'simulation' 'gw_ping_timeout_s'); [[ "$t" =~ ^[0-9]+$ ]] || t=4; printf '%s' "$t"; }
 
-# "Is the gateway REALLY offline?" — 5 pings, and return 0 (offline) ONLY when
-# ALL 5 fail. `ping -c5` exits 0 if ANY of the 5 replies, so `! ping -c5` is true
-# only on a clean 5/5 loss = a real outage, not a WiFi/busy-VM blip. Used to
-# confirm before the sticky bail + rate throttle.
+# Gateway UP? Send 5 pings; UP if ANY of them replies (`ping -c5` exits 0 on any
+# reply). Five tries + a tolerant per-ping timeout mean one slow/dropped echo under
+# load never reads as down — so the flood KEEPS FIRING while the gateway is alive.
+dns_gw_alive() { local gw="${1:-}"; [[ -n "$gw" ]] && ping -c5 -i0.3 -W"$(gw_ping_timeout_s)" "$gw" >/dev/null 2>&1; }
+
+# "Is the gateway REALLY offline?" — a SECOND independent 5-ping round; returns 0
+# (offline) ONLY when all 5 miss. Paired with dns_gw_alive above (in the bail
+# condition), declaring the gateway down needs 10/10 loss across two rounds = a
+# real outage, not a WiFi/busy-VM/high-RTT blip.
 dns_gw_confirmed_down() {
   local gw="${1:-}"; [[ -n "$gw" ]] || return 1
-  ! ping -c5 -W2 -i0.3 "$gw" >/dev/null 2>&1
+  ! ping -c5 -i0.3 -W"$(gw_ping_timeout_s)" "$gw" >/dev/null 2>&1
 }
 
-# RECOVERY HOLD: gateway is STABLY up = $2 (default 4) consecutive single pings
-# ALL reply, ~2s apart. The pre-flood gate. These dongles hang off a USB PCI card
+# RECOVERY HOLD: gateway is STABLY up = $2 (default 4) consecutive dns_gw_alive
+# rounds all pass (each round = 5 pings, any reply), ~2s apart. The pre-flood gate.
+# These dongles hang off a USB PCI card
 # passed through to the guest; on bus contention the guest CANNOT reset the bus
 # (it doesn't own the PCI device), so the only recovery is to remove the load and
 # let the bus clear. Resuming the flood the instant the adapter blips back

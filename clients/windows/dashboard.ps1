@@ -57,7 +57,10 @@ function Get-GatewayStatus {
         return 'NOT FOUND'
     }
 
-    if (Test-Connection -ComputerName $gateway -Count 1 -Quiet -ErrorAction SilentlyContinue) {
+    # Shared 5-ping / tolerant-timeout probe (common.ps1) so the dashboard matches
+    # the sim's liveness logic — the old single Test-Connection read a slow-but-alive
+    # gateway (RTT >1s under load) as OFFLINE.
+    if (Test-DnsGatewayAlive $gateway) {
         return "ONLINE ($gateway)"
     }
 

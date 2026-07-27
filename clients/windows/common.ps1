@@ -218,17 +218,37 @@ function Get-DnsDefaultGateway {
          Sort-Object RouteMetric | Select-Object -First 1
     if ($r) { $r.NextHop } else { '' }
 }
-# 0/true iff the gateway answers a single ping.
+# [simulation] gw_ping_timeout_s — per-ping gateway ICMP timeout in seconds
+# (default 4). Mirror of common.sh gw_ping_timeout_s: under load the gateway RTT
+# climbs past ~1.5s, so a short timeout reads a slow-but-alive gateway as dead.
+function Get-GwPingTimeoutSec {
+    $t = get_value 'simulation' 'gw_ping_timeout_s'
+    if ($t -match '^[0-9]+$') { return [int]$t }
+    return 4
+}
+# Gateway UP? Send 5 pings; UP if ANY replies. Uses .NET Ping for a real per-ping
+# timeout (Test-Connection on PS 5.1 has no timeout knob). One slow/dropped echo
+# under load never reads as down — the flood keeps firing while the gateway is alive.
 function Test-DnsGatewayAlive {
     param([string]$Gw)
     if ([string]::IsNullOrEmpty($Gw)) { return $false }
-    try { return [bool](Test-Connection -ComputerName $Gw -Count 1 -Quiet -ErrorAction SilentlyContinue) } catch { return $false }
+    $timeoutMs = (Get-GwPingTimeoutSec) * 1000
+    try {
+        $p = New-Object System.Net.NetworkInformation.Ping
+        for ($i = 0; $i -lt 5; $i++) {
+            try { if ($p.Send($Gw, $timeoutMs).Status -eq 'Success') { return $true } } catch { }
+            Start-Sleep -Milliseconds 300
+        }
+        return $false
+    } catch { return $false }
 }
-# True (offline) ONLY when all 5 pings fail — a real outage, not a blip.
+# "Really offline?" — a SECOND independent 5-ping round; offline ONLY when all miss.
+# Paired with Test-DnsGatewayAlive in the bail condition, a down verdict needs
+# 10/10 loss across two rounds = a real outage, not a high-RTT blip.
 function Test-DnsGatewayConfirmedDown {
     param([string]$Gw)
-    if ([string]::IsNullOrEmpty($Gw)) { return $false }
-    try { return -not [bool](Test-Connection -ComputerName $Gw -Count 5 -Quiet -ErrorAction SilentlyContinue) } catch { return $true }
+    if ([string]::IsNullOrEmpty($Gw)) { return $true }
+    return -not (Test-DnsGatewayAlive $Gw)
 }
 # RECOVERY HOLD: gateway STABLY up = N consecutive single pings all reply, ~gap apart.
 function Test-DnsGatewayStable {

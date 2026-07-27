@@ -1,5 +1,5 @@
 #!/bin/bash
-version=0.01
+version=0.02
 # WHY: dashboard.sh is a read-only live monitor. It runs in its own terminal
 # window (launched by startup.desktop) so the operator can always see
 # what's happening without interrupting the simulation loop in the other pane.
@@ -152,7 +152,10 @@ run_cache_worker() {
     local gw
     gw=$(ip route | grep -oP 'default via \K\S+' | head -n1)
     echo "$gw" > "$CACHE_DIR/gateway"
-    if [[ -n "$gw" ]] && ping -c1 -W1 "$gw" >/dev/null 2>&1; then
+    # Use the shared 5-ping / tolerant-timeout probe (dns_gw_alive) so the dashboard
+    # matches the sim's own liveness logic — the old `ping -c1 -W1` read a slow-but-
+    # alive gateway (RTT >1s under load) as OFFLINE.
+    if [[ -n "$gw" ]] && dns_gw_alive "$gw"; then
       echo "up" > "$CACHE_DIR/gateway_ok"
     else
       echo "down" > "$CACHE_DIR/gateway_ok"
