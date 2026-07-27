@@ -16,7 +16,7 @@
 #   $LOG_FILE   — log path (set at the top of simulation.sh)
 #   $wladapter  — wifi adapter name (set by detect_wlan_adapter in common.sh)
 #   $eadapter   — wired adapter name (set by detect_eth_adapter in common.sh)
-version=0.01
+version=0.02
 
 # ----------------------------------------------------------------------------
 # Connection state — shared across all connect paths.
@@ -164,10 +164,17 @@ _wait_wlan_adapter() {
 # recovery) or waste time when it's already up. Returns 0 the instant it replies,
 # 1 after $2 sec (default 10). $1 = gateway IP, $2 = cap sec.
 _wait_gateway() {
-  local gw="$1" cap="${2:-10}" i
+  local gw="$1" cap="${2:-10}" tmo attempts=0
   [[ -z "$gw" ]] && return 1
-  for ((i=0; i<cap; i++)); do
-    ping -c1 -W1 "$gw" >/dev/null 2>&1 && return 0
+  # Per-ping timeout tolerant of a slow-but-alive gateway under load — the old
+  # fixed -W1 false-negated on any RTT >1s and triggered spurious recoveries.
+  tmo=$(gw_ping_timeout_s 2>/dev/null); [[ "$tmo" =~ ^[0-9]+$ ]] || tmo=4
+  local end=$(( $(date +%s) + cap ))
+  # Return the instant any ping replies. Poll until the cap elapses, but always
+  # try at least 5 times (any single reply = gateway up).
+  while (( attempts < 5 || $(date +%s) < end )); do
+    ping -c1 -W"$tmo" "$gw" >/dev/null 2>&1 && return 0
+    attempts=$((attempts + 1))
     sleep 1
   done
   return 1
