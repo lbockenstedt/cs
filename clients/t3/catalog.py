@@ -200,6 +200,78 @@ def emit_fingerprints(catalog: Dict[str, Any]) -> str:
     return "\n".join(lines) + "\n"
 
 
+def run_plan(catalog: Dict[str, Any], max_ifaces: int = 25) -> List[Dict[str, Any]]:
+    """The per-virtual-interface run plan the linux client's ``iot`` mode drives.
+
+    Expands each ``t3-vwlan`` device (surface == wireless IoT) with a non-null
+    OUI and ``count`` > 0 into that many interface slots, in catalog order, and
+    assigns them sequential ``vwlan`` indices starting at 1. Each slot carries
+    exactly what the bash engine needs to stand the interface up: the OUI (for
+    the deterministic vendor MAC), the simulated hostname, and the DHCP
+    fingerprint (opt60 vendor-class-id + opt55 param-request-list). ``vm-client``
+    devices are excluded — they are realized as full cs VM clients, not vwlans.
+
+    Capped at ``max_ifaces`` (the mac80211_hwsim / gen_macs 25-interface limit);
+    slots past the cap are dropped rather than silently wrapping the index."""
+    plan: List[Dict[str, Any]] = []
+    iface = 1
+    for d in devices(catalog):
+        if device_surface(d) != SURFACE_T3:
+            continue
+        oui = d.get("oui")
+        if not oui:
+            continue
+        cnt = int(d.get("count", 1) or 0)
+        dhcp = d.get("dhcp") or {}
+        prl = dhcp.get("param_request_list") or []
+        for _ in range(max(0, cnt)):
+            if iface > max_ifaces:
+                return plan
+            plan.append({
+                "iface": iface,
+                "id": d["id"],
+                "oui": str(oui).lower(),
+                "hostname": d["hostname"],
+                "opt60": str(dhcp.get("vendor_class_id") or ""),
+                "opt55": ",".join(str(x) for x in prl),
+            })
+            iface += 1
+    return plan
+
+
+def emit_run_plan(catalog: Dict[str, Any], max_ifaces: int = 25) -> str:
+    """TSV run plan (one row per vwlan interface): iface, id, oui, hostname,
+    opt60, opt55. Consumed by the linux client's iot_sim.sh — the single
+    data-driven source for interface setup + the DHCP fingerprint, replacing the
+    hardcoded per-device blocks in the legacy wireless.sh."""
+    lines = ["iface\tid\toui\thostname\topt60\topt55"]
+    for r in run_plan(catalog, max_ifaces):
+        lines.append("\t".join([
+            str(r["iface"]), r["id"], r["oui"], r["hostname"], r["opt60"], r["opt55"],
+        ]))
+    return "\n".join(lines) + "\n"
+
+
+def emit_traffic(catalog: Dict[str, Any], device_id: str) -> str:
+    """The traffic targets for one device, one ``kind<TAB>target`` line per entry
+    (kind ∈ dns/http/curl/wget), in catalog order. The iot engine calls this for
+    the device it is driving this cycle and dispatches each line through the
+    linux client's existing traffic helpers. Empty output for an unknown id or a
+    device with no traffic."""
+    did = str(device_id or "").strip().lower()
+    lines: List[str] = []
+    for d in devices(catalog):
+        if str(d.get("id", "")).strip().lower() != did:
+            continue
+        tr = d.get("traffic") or {}
+        for kind in ("dns", "http", "curl", "wget"):
+            for target in (tr.get(kind) or []):
+                if str(target).strip():
+                    lines.append(f"{kind}\t{target}")
+        break
+    return "\n".join(lines) + ("\n" if lines else "")
+
+
 def sim_quota_catalog(catalog: Dict[str, Any]) -> Dict[str, Any]:
     """The device menu the hub/UI renders for the ``device`` sim-quota kind.
     Each entry: id, vendor, model, category, surface, oui (or null), verified.
@@ -249,6 +321,16 @@ def _cmd_sim_quota_catalog(args) -> int:
     return 0
 
 
+def _cmd_emit_run_plan(args) -> int:
+    sys.stdout.write(emit_run_plan(load_catalog(), int(getattr(args, "max", 25) or 25)))
+    return 0
+
+
+def _cmd_emit_traffic(args) -> int:
+    sys.stdout.write(emit_traffic(load_catalog(), args.emit_traffic))
+    return 0
+
+
 def main(argv: Optional[List[str]] = None) -> int:
     p = argparse.ArgumentParser(description="IoT device catalog loader/emitter")
     grp = p.add_mutually_exclusive_group(required=True)
@@ -259,6 +341,12 @@ def main(argv: Optional[List[str]] = None) -> int:
                      help="emit the opt60/opt55/hostname fingerprint table")
     grp.add_argument("--sim-quota-catalog", action="store_true",
                      help="emit the device menu for the sim-quota 'device' kind")
+    grp.add_argument("--emit-run-plan", action="store_true",
+                     help="emit the per-vwlan-interface run plan (TSV) for the iot mode")
+    grp.add_argument("--emit-traffic", metavar="DEVICE_ID",
+                     help="emit the kind<TAB>target traffic lines for one device id")
+    p.add_argument("--max", type=int, default=25,
+                   help="max vwlan interfaces for --emit-run-plan (default 25)")
     args = p.parse_args(argv)
     if args.validate:
         return _cmd_validate(args)
@@ -268,6 +356,10 @@ def main(argv: Optional[List[str]] = None) -> int:
         return _cmd_emit_fingerprints(args)
     if args.sim_quota_catalog:
         return _cmd_sim_quota_catalog(args)
+    if args.emit_run_plan:
+        return _cmd_emit_run_plan(args)
+    if args.emit_traffic:
+        return _cmd_emit_traffic(args)
     return 2
 
 
