@@ -306,6 +306,57 @@ def detect_has_usb():
         return False
 
 
+def _conf_value(section, key):
+    """Minimal INI read of /usr/local/scripts/simulation.conf (the client uses a
+    custom parser, and python's strict configparser can choke on the file). First
+    matching key in the given section, or ''."""
+    try:
+        cur = None
+        with open("/usr/local/scripts/simulation.conf") as f:
+            for line in f:
+                s = line.strip()
+                if s.startswith("[") and s.endswith("]"):
+                    cur = s[1:-1].strip().lower()
+                elif cur == section and "=" in s and not s.startswith("#"):
+                    k, _, v = s.partition("=")
+                    if k.strip().lower() == key:
+                        return v.strip()
+    except Exception:
+        pass
+    return ""
+
+
+def detect_iot():
+    """T3 IoT host: this guest exposes a PCI device whose vid:pid is in the
+    cs-module ``t3_pci_vidpids`` list (the passed-through WiFi adapter) — mirror
+    of the client's detect_t3_pci. Advertised so the sim-quota engine can target
+    device quotas at this host. Returns ``(capable: bool, capacity: int)``."""
+    try:
+        import subprocess, re as _re
+        raw = _conf_value("simulation", "t3_pci_vidpids").lower()
+        want = {t for t in _re.split(r"[,\s]+", raw)
+                if _re.match(r"^[0-9a-f]{4}:[0-9a-f]{4}$", t)}
+        if not want:
+            return False, 0
+        out = subprocess.run(["lspci", "-Dn"], capture_output=True, text=True, timeout=10)
+        present = set(_re.findall(r"[0-9a-f]{4}:[0-9a-f]{4}", (out.stdout or "").lower()))
+        if not (want & present):
+            return False, 0
+        cap = _conf_value("simulation", "iot_max_ifaces")
+        try:
+            cap = max(1, min(25, int(cap)))
+        except Exception:
+            cap = 25
+        return True, cap
+    except Exception:
+        return False, 0
+
+
+def _iot_fields():
+    ok, cap = detect_iot()
+    return {"iot_capable": ok, "iot_capacity": cap}
+
+
 def fallback_status():
     return {
         "hostname": hostname,
@@ -318,6 +369,7 @@ def fallback_status():
         "errors": [],
         "config": {},
         "has_usb": detect_has_usb(),
+        **_iot_fields(),
     }
 
 
@@ -340,6 +392,9 @@ def load_status():
     # Live-detected each frame (hardware fact, not from the status file) so the
     # hub can classify this client T1 (no USB WiFi) vs T2 (USB WiFi dongle).
     payload["has_usb"] = detect_has_usb()
+    # T3 IoT capability + capacity (live) so the sim-quota engine can target
+    # device quotas at this host. See detect_iot / detect_t3_pci.
+    payload.update(_iot_fields())
     return payload
 
 

@@ -200,52 +200,85 @@ def emit_fingerprints(catalog: Dict[str, Any]) -> str:
     return "\n".join(lines) + "\n"
 
 
-def run_plan(catalog: Dict[str, Any], max_ifaces: int = 25) -> List[Dict[str, Any]]:
+def parse_compose(spec: Any) -> Dict[str, int]:
+    """Parse an engine-delivered device composition ``"id:count,id:count"`` (the
+    sim-quota ``iot_devices`` override) into ``{device_id: count}``. Tolerant:
+    skips malformed tokens, sums duplicates, ignores non-positive counts."""
+    out: Dict[str, int] = {}
+    for tok in re.split(r"[,\s]+", str(spec or "").strip()):
+        if not tok or ":" not in tok:
+            continue
+        did, _, cnt = tok.partition(":")
+        did = did.strip()
+        try:
+            n = int(cnt.strip())
+        except (TypeError, ValueError):
+            continue
+        if did and n > 0:
+            out[did] = out.get(did, 0) + n
+    return out
+
+
+def run_plan(catalog: Dict[str, Any], max_ifaces: int = 25,
+             compose: Any = None) -> List[Dict[str, Any]]:
     """The per-virtual-interface run plan the linux client's ``iot`` mode drives.
 
-    Expands each ``t3-vwlan`` device (surface == wireless IoT) with a non-null
-    OUI and ``count`` > 0 into that many interface slots, in catalog order, and
-    assigns them sequential ``vwlan`` indices starting at 1. Each slot carries
-    exactly what the bash engine needs to stand the interface up: the OUI (for
-    the deterministic vendor MAC), the simulated hostname, and the DHCP
-    fingerprint (opt60 vendor-class-id + opt55 param-request-list). ``vm-client``
-    devices are excluded — they are realized as full cs VM clients, not vwlans.
+    Default (``compose`` is None): expand each ``t3-vwlan`` device (surface ==
+    wireless IoT) with a non-null OUI and ``count`` > 0 into that many interface
+    slots, in catalog order — the whole fleet.
 
-    Capped at ``max_ifaces`` (the mac80211_hwsim / gen_macs 25-interface limit);
-    slots past the cap are dropped rather than silently wrapping the index."""
-    plan: List[Dict[str, Any]] = []
-    iface = 1
-    for d in devices(catalog):
-        if device_surface(d) != SURFACE_T3:
-            continue
-        oui = d.get("oui")
-        if not oui:
-            continue
-        cnt = int(d.get("count", 1) or 0)
+    Engine-driven (``compose`` = ``{device_id: count}`` or an ``"id:count,..."``
+    string): build the fleet from EXACTLY that composition (each device repeated
+    its count), so a device quota ("10 Teslas + 4 BarcoShare in MIA") stages just
+    those. Unknown ids, non-``t3-vwlan`` surfaces, and OUI-less devices are
+    skipped.
+
+    Either way each slot carries what the bash engine needs — OUI (for the
+    deterministic vendor MAC), hostname, and DHCP fingerprint (opt60 + opt55) —
+    numbered sequentially from vwlan1 and capped at ``max_ifaces`` (the
+    mac80211_hwsim / gen_macs 25-interface limit)."""
+    def _slot(iface: int, d: Dict[str, Any]) -> Dict[str, Any]:
         dhcp = d.get("dhcp") or {}
         prl = dhcp.get("param_request_list") or []
-        for _ in range(max(0, cnt)):
-            if iface > max_ifaces:
-                return plan
-            plan.append({
-                "iface": iface,
-                "id": d["id"],
-                "oui": str(oui).lower(),
+        return {"iface": iface, "id": d["id"], "oui": str(d.get("oui")).lower(),
                 "hostname": d["hostname"],
                 "opt60": str(dhcp.get("vendor_class_id") or ""),
-                "opt55": ",".join(str(x) for x in prl),
-            })
-            iface += 1
+                "opt55": ",".join(str(x) for x in prl)}
+
+    def _eligible(d: Dict[str, Any]) -> bool:
+        return device_surface(d) == SURFACE_T3 and bool(d.get("oui"))
+
+    # Build the ordered list of device instances to stage.
+    instances: List[Dict[str, Any]] = []
+    if compose is not None:
+        comp = compose if isinstance(compose, dict) else parse_compose(compose)
+        by_id = {str(d.get("id")): d for d in devices(catalog)}
+        for did, cnt in comp.items():
+            d = by_id.get(str(did))
+            if d and _eligible(d):
+                instances.extend([d] * max(0, int(cnt)))
+    else:
+        for d in devices(catalog):
+            if _eligible(d):
+                instances.extend([d] * max(0, int(d.get("count", 1) or 0)))
+
+    plan: List[Dict[str, Any]] = []
+    for iface, d in enumerate(instances, start=1):
+        if iface > max_ifaces:
+            break
+        plan.append(_slot(iface, d))
     return plan
 
 
-def emit_run_plan(catalog: Dict[str, Any], max_ifaces: int = 25) -> str:
+def emit_run_plan(catalog: Dict[str, Any], max_ifaces: int = 25,
+                  compose: Any = None) -> str:
     """TSV run plan (one row per vwlan interface): iface, id, oui, hostname,
     opt60, opt55. Consumed by the linux client's iot_sim.sh — the single
-    data-driven source for interface setup + the DHCP fingerprint, replacing the
-    hardcoded per-device blocks in the legacy wireless.sh."""
+    data-driven source for interface setup + the DHCP fingerprint. With
+    ``compose`` set it emits the engine-delivered device composition instead of
+    the whole catalog."""
     lines = ["iface\tid\toui\thostname\topt60\topt55"]
-    for r in run_plan(catalog, max_ifaces):
+    for r in run_plan(catalog, max_ifaces, compose):
         lines.append("\t".join([
             str(r["iface"]), r["id"], r["oui"], r["hostname"], r["opt60"], r["opt55"],
         ]))
@@ -322,7 +355,8 @@ def _cmd_sim_quota_catalog(args) -> int:
 
 
 def _cmd_emit_run_plan(args) -> int:
-    sys.stdout.write(emit_run_plan(load_catalog(), int(getattr(args, "max", 25) or 25)))
+    sys.stdout.write(emit_run_plan(load_catalog(), int(getattr(args, "max", 25) or 25),
+                                   compose=getattr(args, "compose", None) or None))
     return 0
 
 
@@ -347,6 +381,9 @@ def main(argv: Optional[List[str]] = None) -> int:
                      help="emit the kind<TAB>target traffic lines for one device id")
     p.add_argument("--max", type=int, default=25,
                    help="max vwlan interfaces for --emit-run-plan (default 25)")
+    p.add_argument("--compose", default=None,
+                   help="device composition 'id:count,id:count' for --emit-run-plan "
+                        "(the engine-delivered iot_devices quota); default = whole catalog")
     args = p.parse_args(argv)
     if args.validate:
         return _cmd_validate(args)

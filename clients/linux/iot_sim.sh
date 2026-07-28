@@ -75,10 +75,20 @@ iot_available() {
 
 # Emit the run plan TSV (iface id oui hostname opt60 opt55), honoring a
 # configurable interface cap (iot_max_ifaces, default 25 = the hwsim limit).
+# The sim-quota engine's device kind delivers a per-host composition as an
+# `iot_devices` [username] override ("id:count,id:count"); when present, stage
+# exactly that fleet — otherwise the whole catalog (the un-quota'd default).
 iot_run_plan() {
   local maxif; maxif=$(get_value 'simulation' 'iot_max_ifaces'); maxif="${maxif:-25}"
   [[ "$maxif" =~ ^[0-9]+$ ]] || maxif=25
-  python3 "$IOT_CATALOG_PY" --emit-run-plan --max "$maxif" 2>>"${LOG_FILE:-/dev/null}"
+  local compose; compose=$(get_value "${username:-}" 'iot_devices' 2>/dev/null)
+  if [[ -n "$compose" ]]; then
+    _iot_log "device quota composition: ${compose}"
+    python3 "$IOT_CATALOG_PY" --emit-run-plan --max "$maxif" --compose "$compose" \
+      2>>"${LOG_FILE:-/dev/null}"
+  else
+    python3 "$IOT_CATALOG_PY" --emit-run-plan --max "$maxif" 2>>"${LOG_FILE:-/dev/null}"
+  fi
 }
 
 # Deterministic host octet for the MAC (same formula as clients/t3/gen_macs.sh:
