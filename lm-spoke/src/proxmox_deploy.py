@@ -87,6 +87,8 @@ class ProxmoxDeploy:
     _SUMMARY_KEYS = (
         "connected", "last_seen", "node", "vm_count", "running_count", "vms",
         "usb_state", "present_usb", "unknown_usb", "usb_count", "agent_version",
+        # Present T1/T3 PCI devices (host lspci ∩ allow-lists) → WebUI PCI tab.
+        "t1_pci_devices", "t3_pci_devices",
         "pve_version", "provision_halt", "template_lock", "vmid_range",
         "vm_set_override", "effective_vm_set", "provision", "prov_run",
         # Quarantined dongles (dmesg kernel USB errors — bus-id + reason + when
@@ -244,6 +246,11 @@ class ProxmoxDeploy:
             "usb_state":        [_tag_usb(u, hostname) for u in usb_state],
             "present_usb":      [_tag_usb(u, hostname) for u in present_usb],
             "unknown_usb":      [_tag_usb(u, hostname) for u in unknown_usb],
+            # Present T1/T3 PCI devices (host lspci ∩ the allow-lists) for the
+            # WebUI PCI tab's "Present devices" section. Relayed as-is (each is
+            # {address, vidpid, name}); projected to the hub via _SUMMARY_KEYS.
+            "t1_pci_devices":   list(body.get("t1_pci_devices") or []),
+            "t3_pci_devices":   list(body.get("t3_pci_devices") or []),
             # Quarantined dongles (dmesg-only) for the WebUI QT badge — bus-id +
             # reason + recovers_in_s. Tagged with the source host like the other
             # USB lists so the hub-side per-host projection keeps them attributed.
