@@ -166,6 +166,11 @@ copy_local_files() {
     for _iot in "$src_dir/../t3/catalog.py" "$src_dir/../t3/iot_catalog.json"; do
         [[ -f "$_iot" ]] && cp --remove-destination "$_iot" /usr/local/scripts/
     done
+    # .json data files that arrive by NAME in src_dir (the API/content-hash tier
+    # downloads iot_catalog.json into tmp_web via /api/scripts/list). The local-
+    # install/GitHub tiers get it from the t3 sibling above instead.
+    local json_files=( "$src_dir"/*.json )
+    (( ${#json_files[@]} )) && cp --remove-destination "${json_files[@]}" /usr/local/scripts/
     # Never copy kill_switch.txt — gkill_switch is always fetched live at runtime
     local filtered_txt=()
     for _t in "${txt_files[@]}"; do
