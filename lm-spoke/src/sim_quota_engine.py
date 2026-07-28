@@ -1238,6 +1238,11 @@ class SimQuotaEngine:
         """One sweep: align the ledger + overrides with effective_sim_quotas."""
         async with self._reconcile_lock:
             quotas = self.spoke.local_store.get_effective_sim_quotas() or []
+            # Device-kind quotas (T3 IoT fleet) are realized by a SEPARATE pass —
+            # they target T3 hosts with a device composition, not harvested
+            # clients — so split them off before the sim/presence loop below.
+            device_quotas = [q for q in quotas if q.get("kind") == "device"]
+            quotas = [q for q in quotas if q.get("kind") != "device"]
             now = time.time()
             self._sweep_now = now          # for _assign / _diag_reason (no `now` arg)
             clients = self._all_clients()
@@ -1603,6 +1608,11 @@ class SimQuotaEngine:
             # placement just homed; stacked clients stay fully harvestable.
             await self._reconcile_stacked(clients, now, actions)
 
+            # Device-kind quotas (T3 IoT fleet): deliver each site's device
+            # composition to its T3 host(s). Self-contained — only touches
+            # iot_capable hosts via the iot_devices override (never the sim ledger).
+            await self._reconcile_device_quotas(device_quotas, clients)
+
             # Reconcile engine-owned override keys against the ledger: drop
             # orphaned engine-set sim flags (a transient _release failure left
             # sim_id=on after the ledger entry was dropped) and re-prune every
@@ -1678,6 +1688,85 @@ class SimQuotaEngine:
         return await self.reconcile()
 
     # ── override hygiene (provenance + bucket re-prune) ──────────────────────
+    @staticmethod
+    def _apportion_by_capacity(total: int, hosts: List[str],
+                               caps: Dict[str, int]) -> Dict[str, int]:
+        """Largest-remainder split of ``total`` across ``hosts`` proportional to
+        each host's capacity (even split when total capacity is 0). {host: share}."""
+        total = max(0, int(total))
+        if not hosts or total == 0:
+            return {h: 0 for h in hosts}
+        cap_sum = sum(max(0, caps.get(h, 0)) for h in hosts)
+        if cap_sum <= 0:
+            base, rem = divmod(total, len(hosts))
+            return {h: base + (1 if i < rem else 0) for i, h in enumerate(hosts)}
+        raw = {h: total * max(0, caps.get(h, 0)) / cap_sum for h in hosts}
+        floor = {h: int(raw[h]) for h in hosts}
+        leftover = total - sum(floor.values())
+        order = sorted(hosts, key=lambda h: raw[h] - floor[h], reverse=True)
+        for i in range(max(0, leftover)):
+            floor[order[i % len(order)]] += 1
+        return floor
+
+    async def _reconcile_device_quotas(self, device_quotas: List[Dict[str, Any]],
+                                       clients: Dict[str, Any]) -> None:
+        """Realize device-kind quotas (T3 IoT fleet).
+
+        Groups enabled device quotas by site into a ``{device_id: count}`` target,
+        finds the T3 hosts (``iot_capable``) serving each site, apportions each
+        device's count across them proportional to capacity, and delivers the
+        per-host composition as an ``iot_devices`` override (``id:count,id:count``)
+        — consumed by the client's iot_sim.sh. A T3 host previously targeted but
+        no longer is has its override cleared. Device quotas do NOT harvest normal
+        clients (the T3 host generates the whole fleet itself). Best-effort.
+
+        NOTE the ``iot_devices`` value is a CSV, not ``"on"``, so the engine-keys
+        hygiene pass (which only reverts orphaned ``"on"`` flags) never strips it."""
+        # site → {device_id: total count}
+        by_site: Dict[str, Dict[str, int]] = {}
+        for q in device_quotas:
+            if not q.get("enabled"):
+                continue
+            site = str(q.get("site") or "").strip()
+            did = str(q.get("device_id") or "").strip()
+            cnt = int(q.get("count") or 0)
+            if not site or not did or cnt <= 0:
+                continue
+            by_site.setdefault(site, {})[did] = by_site[site].get(did, 0) + cnt
+        # T3 hosts grouped by effective site.
+        t3_by_site: Dict[str, List[str]] = {}
+        for h, c in clients.items():
+            if not c.get("iot_capable"):
+                continue
+            t3_by_site.setdefault(self._effective_site(h, c), []).append(h)
+        # Compute the composition each targeted host should run.
+        desired: Dict[str, str] = {}
+        for site, comp in by_site.items():
+            hosts = sorted(t3_by_site.get(site, []))
+            if not hosts:
+                logger.info("SimQuotaEngine: device quota for site %s has no T3 host "
+                            "serving it — %d device profile(s) unplaced", site, len(comp))
+                continue
+            caps = {h: int((clients.get(h) or {}).get("iot_capacity") or 25) for h in hosts}
+            per_host: Dict[str, Dict[str, int]] = {h: {} for h in hosts}
+            for did, cnt in comp.items():
+                for h, share in self._apportion_by_capacity(cnt, hosts, caps).items():
+                    if share > 0:
+                        per_host[h][did] = share
+            for h in hosts:
+                if per_host[h]:
+                    desired[h] = ",".join(f"{d}:{n}" for d, n in sorted(per_host[h].items()))
+        # Deliver to targeted hosts; clear on hosts no longer targeted.
+        prev = set(getattr(self, "_iot_hosts", set()))
+        for h, comp_str in desired.items():
+            await self._engine_set(h, {"iot_devices": comp_str})
+        for h in prev - set(desired):
+            await self._engine_remove(h, ["iot_devices"])
+        self._iot_hosts = set(desired)
+        if desired or prev:
+            logger.info("SimQuotaEngine: device quotas → %d T3 host(s) staged (%s)",
+                        len(desired), ", ".join(f"{h}=[{c}]" for h, c in sorted(desired.items())) or "none")
+
     async def _reconcile_engine_keys(self, clients: Dict[str, Any]) -> None:
         """Remove engine-set sim_id overrides the ledger no longer claims.
 

@@ -196,7 +196,11 @@ class ClientRegistry:
             for key in ("simulation_id", "platform", "iteration",
                         "connected_ssid", "ip", "gateway_reachable",
                         "active_simulations", "config", "status", "has_usb",
-                        "dns_ceiling"):
+                        "dns_ceiling",
+                        # T3 IoT: the host advertises whether it can run the vwlan
+                        # fleet + how many interfaces, so the sim-quota engine's
+                        # device-quota pass can target it (see _reconcile_device_quotas).
+                        "iot_capable", "iot_capacity"):
                 if key in payload:
                     entry[key] = payload[key]
 
