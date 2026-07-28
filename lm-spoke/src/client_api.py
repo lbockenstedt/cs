@@ -98,6 +98,15 @@ CONFIGS_DIR = REPO / "configs"
 CLIENTS_DIR = REPO / "clients"
 _VALID_PLATFORMS = ("linux", "windows", "t3")
 
+# Files a platform serves from ANOTHER platform's dir, so a single canonical copy
+# reaches clients that need it without duplicating it in the repo. The linux
+# client's iot mode (iot_sim.sh) needs the T3 IoT catalog, which is canonical in
+# clients/t3 — expose it under the linux surface (list + manifest + get) so
+# update.sh mirrors it into /usr/local/scripts like any other linux file.
+_CROSS_PLATFORM_FILES: Dict[str, Dict[str, str]] = {
+    "linux": {"catalog.py": "t3", "iot_catalog.json": "t3"},
+}
+
 # hostname → WebSocket, for live command push to connected agents.
 client_ws_connections: Dict[str, WebSocket] = {}
 
@@ -169,7 +178,11 @@ def resolve_script_path(platform: str, filename: str) -> Path:
     """
     if platform not in _VALID_PLATFORMS:
         raise HTTPException(status_code=404, detail=f"unknown platform: {platform}")
-    sd = (CLIENTS_DIR / platform).resolve()
+    # A cross-platform file (e.g. the T3 IoT catalog served to linux) resolves
+    # from its SOURCE platform dir; the traversal guard below then checks against
+    # that source dir. filename is a bare name here, so it stays inside it.
+    src_platform = _CROSS_PLATFORM_FILES.get(platform, {}).get(filename, platform)
+    sd = (CLIENTS_DIR / src_platform).resolve()
     candidate = (sd / filename).resolve()
     try:
         candidate.relative_to(sd)
@@ -306,6 +319,8 @@ def build_client_api_app(spoke) -> FastAPI:
                 bool(ls.get_ambient_control()),
                 tuple(sorted((str(k), str(v)) for k, v in (ls.get_ambient_site_weights() or {}).items())),
                 tuple(sorted((str(k), str(v)) for k, v in (ls.get_ambient_weights() or {}).items())),
+                # T3 IoT detection list — re-render the served conf when it changes.
+                tuple(str(x) for x in (((ls.get_hub_config() or {}).get("hub_config") or {}).get("t3_pci_vidpids") or [])),
             )
         except Exception:  # noqa: BLE001
             return object()
@@ -430,6 +445,23 @@ def build_client_api_app(spoke) -> FastAPI:
                 sim_conf.set("simulation", "ambient_pct", str(base_pct))
         except Exception:  # noqa: BLE001
             pass
+        # T3 IoT-fleet detection list: deliver the hub-config t3_pci_vidpids into
+        # [simulation] so the linux client's iot_sim.sh detect_t3_pci matches this
+        # guest's passed-through WiFi adapter and enters iot mode. This is the SAME
+        # allow-list the pxmx agent provisions against — one source of truth.
+        # Space-joined "vid:pid" tokens (the guest parses a space/comma list).
+        try:
+            _hc = (spoke.local_store.get_hub_config() or {}).get("hub_config") or {}
+            _t3 = _hc.get("t3_pci_vidpids") or []
+            if isinstance(_t3, str):
+                _t3 = [_t3]
+            _t3_str = " ".join(str(x).strip() for x in _t3 if str(x).strip())
+            if _t3_str:
+                if not sim_conf.has_section("simulation"):
+                    sim_conf.add_section("simulation")
+                sim_conf.set("simulation", "t3_pci_vidpids", _t3_str)
+        except Exception:  # noqa: BLE001
+            pass
         # Deliver the engine/registry overrides into the client's [username]
         # section — the layer simulation.sh's apply_override() resolves LAST, so
         # it WINS over the client's bucket no matter which bucket the client is
@@ -504,7 +536,13 @@ def build_client_api_app(spoke) -> FastAPI:
         sd = _scripts_dir(platform)
         if not sd.is_dir():
             return []
-        return sorted(p.name for p in sd.iterdir() if p.is_file())
+        names = {p.name for p in sd.iterdir() if p.is_file()}
+        # Advertise cross-platform files (e.g. the T3 IoT catalog served to linux)
+        # so update.sh downloads them via /api/scripts/{platform}/{name} too.
+        for _fname, _src in _CROSS_PLATFORM_FILES.get(platform, {}).items():
+            if (CLIENTS_DIR / _src / _fname).is_file():
+                names.add(_fname)
+        return sorted(names)
 
     @app.get("/api/scripts/manifest")
     async def api_scripts_manifest(platform: str = Query(...)) -> Dict[str, str]:
@@ -530,6 +568,15 @@ def build_client_api_app(spoke) -> FastAPI:
                  if p.is_file()
                  and p.name != "kill_switch.txt"
                  and (p.suffix in (".sh", ".py", ".txt") or p.name == "VERSION")]
+        # Cross-platform files served under this platform (e.g. the T3 IoT catalog
+        # served to linux) — hash them from their SOURCE dir so the content-hash
+        # gate re-syncs when they change, even though they live elsewhere. .json
+        # is included here (the catalog data) even though it's not in the suffix
+        # scan above, since these are added by explicit name.
+        for _fname, _src in _CROSS_PLATFORM_FILES.get(platform, {}).items():
+            _p = CLIENTS_DIR / _src / _fname
+            if _p.is_file():
+                files.append(_p)
         try:
             newest = max((p.stat().st_mtime for p in files), default=0.0)
         except OSError:
