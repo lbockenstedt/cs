@@ -159,6 +159,18 @@ copy_local_files() {
     # Copy .py helpers (e.g. dhcp_fire.py used by dhcp_fail.sh). Invoked via
     # `python3 <path>` so they only need to be readable; chmod a+rw below.
     (( ${#py_files[@]} )) && cp --remove-destination "${py_files[@]}" /usr/local/scripts/
+    # T3 IoT-fleet data: catalog.py + iot_catalog.json are canonical in the
+    # sibling clients/t3 tree (single source of truth for the IoT device fleet);
+    # iot_sim.sh (a linux .sh, synced above) reads them from /usr/local/scripts.
+    # Guarded by -f so an API-cache src_dir without the t3 sibling just skips them.
+    for _iot in "$src_dir/../t3/catalog.py" "$src_dir/../t3/iot_catalog.json"; do
+        [[ -f "$_iot" ]] && cp --remove-destination "$_iot" /usr/local/scripts/
+    done
+    # .json data files that arrive by NAME in src_dir (the API/content-hash tier
+    # downloads iot_catalog.json into tmp_web via /api/scripts/list). The local-
+    # install/GitHub tiers get it from the t3 sibling above instead.
+    local json_files=( "$src_dir"/*.json )
+    (( ${#json_files[@]} )) && cp --remove-destination "${json_files[@]}" /usr/local/scripts/
     # Never copy kill_switch.txt — gkill_switch is always fetched live at runtime
     local filtered_txt=()
     for _t in "${txt_files[@]}"; do
@@ -635,6 +647,10 @@ if [[ "$source_found" == false && "$github_repo" == "on" ]]; then
                 (( ${#_filtered_txt[@]} )) && cp --remove-destination "${_filtered_txt[@]}" /usr/local/scripts/
                 [[ -f "VERSION" ]] && cp --remove-destination VERSION /usr/local/scripts/VERSION
                 cd ..
+                # T3 IoT-fleet data from the sibling t3 tree (single source of
+                # truth) — deployed alongside iot_sim.sh for the iot mode.
+                [[ -f "t3/catalog.py" ]]       && cp --remove-destination t3/catalog.py       /usr/local/scripts/
+                [[ -f "t3/iot_catalog.json" ]] && cp --remove-destination t3/iot_catalog.json /usr/local/scripts/
             else
                 echo "WARNING: linux directory not found" | tee -a "$debug"
             fi

@@ -21,6 +21,10 @@ source '/usr/local/scripts/network_common.sh'
 source '/usr/local/scripts/connect_psk.sh'
 source '/usr/local/scripts/connect_1x.sh'
 source '/usr/local/scripts/recovery.sh'
+# T3 IoT-fleet mode (vwlan multi-device) — detect_t3_pci + run_iot_simulation.
+# Guarded: a T1/T2 client that hasn't been shipped iot_sim.sh yet simply never
+# enters iot mode (the branch below type-checks detect_t3_pci first).
+[[ -f '/usr/local/scripts/iot_sim.sh' ]] && source '/usr/local/scripts/iot_sim.sh'
 
 #------------------------------------------------------------
 # Remote-control support — let agent.sh find and signal this loop.
@@ -586,6 +590,23 @@ run_simulation() {
 # client-id — see clients/linux/dhcp_fail.sh. The client's real lease and
 # NM profile (including cloned-mac-address) are left untouched here.
 #------------------------------------------------------------
+#------------------------------------------------------------
+# T3 IoT-fleet mode — skip the single-client path entirely.
+# If this guest has the passed-through T3 WiFi adapter (its PCI vid:pid is in the
+# cs-module t3_pci_vidpids list), it is an IoT host: run the vwlan IoT-fleet sim
+# (iot_sim.sh), heartbeat, take an inter-cycle sleep, and re-enter the outer loop
+# (which re-reads config each pass). type-guarded so a client without iot_sim.sh
+# deployed falls straight through to the normal T1/T2 path.
+#------------------------------------------------------------
+if type -t detect_t3_pci >/dev/null 2>&1 && detect_t3_pci; then
+  echo "T3 adapter detected — running IoT-fleet (vwlan) simulation" | tee -a ${LOG_FILE}
+  run_iot_simulation "$ssid" "$ssidpw"
+  z=$(( ${z:-0} + 1 ))
+  report_status "$z"
+  iot_cycle=$(get_value 'simulation' 'iot_cycle_sleep'); [[ "$iot_cycle" =~ ^[0-9]+$ ]] || iot_cycle=300
+  _isleep "$iot_cycle"
+  continue
+fi
 #------------------------------------------------------------
 #Attempting WiFi connection
 #------------------------------------------------------------
