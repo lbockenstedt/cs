@@ -147,6 +147,16 @@ web_server=on
     Write-Ok "simulation.conf already present — left as-is"
 }
 
+# ── 3b. Keep the VM awake (no sleep / no screen saver) ──────────────────────
+# Reuse the shared helper (just copied into InstallDir). It's also re-asserted on
+# every update.ps1 cycle + every logon (startup.ps1), so it self-heals.
+Write-Step "Disabling sleep, monitor timeout, hibernate, and the screen saver"
+try {
+    . (Join-Path $InstallDir 'common.ps1')
+    Set-NoSleepNoScreensaver
+    Write-Ok "power + screen-saver hardened (re-applied every update cycle + logon)"
+} catch { Write-Warn2 "hardening via common.ps1 failed ($_) — update.ps1/startup.ps1 will apply it" }
+
 # ── 4. First config + script sync from the spoke ────────────────────────────
 Write-Step "Running update.ps1 once to pull live config + latest scripts from the spoke"
 try {

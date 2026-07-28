@@ -367,3 +367,34 @@ function Select-DnsLatServer {
     Set-DnsLatSaved $best
     return $best
 }
+
+# ── Keep the sim VM awake + un-blanked ───────────────────────────────────────
+# Sleep / monitor-off / hibernate DISABLED (machine-wide, persistent via powercfg)
+# and the SCREEN SAVER off (per-user registry — powercfg does NOT control the
+# saver). Idempotent, so install.ps1 (once), update.ps1 (every cycle — self-heals
+# a GPO/user reset) and startup.ps1 (each logon) all call it. Windows-specific
+# (Linux does the equivalent via xset/desktop in its startup path).
+function Set-NoSleepNoScreensaver {
+    try {
+        powercfg /change standby-timeout-ac 0 2>$null | Out-Null
+        powercfg /change standby-timeout-dc 0 2>$null | Out-Null
+        powercfg /change monitor-timeout-ac 0 2>$null | Out-Null
+        powercfg /change monitor-timeout-dc 0 2>$null | Out-Null
+        powercfg /change disk-timeout-ac 0    2>$null | Out-Null
+        powercfg /change disk-timeout-dc 0    2>$null | Out-Null
+        powercfg /hibernate off               2>$null | Out-Null
+    } catch { }
+    # Screen saver off for the RUNNING user (HKCU) + the .DEFAULT hive (login
+    # screen + fresh profiles). ScreenSaveActive=0 disables it; clearing
+    # SCRNSAVE.EXE removes the configured saver so nothing can re-arm it.
+    foreach ($p in @('HKCU:\Control Panel\Desktop',
+                     'Registry::HKEY_USERS\.DEFAULT\Control Panel\Desktop')) {
+        try {
+            if (-not (Test-Path $p)) { New-Item -Path $p -Force | Out-Null }
+            Set-ItemProperty -Path $p -Name 'ScreenSaveActive'    -Value '0' -ErrorAction SilentlyContinue
+            Set-ItemProperty -Path $p -Name 'ScreenSaveTimeOut'   -Value '0' -ErrorAction SilentlyContinue
+            Set-ItemProperty -Path $p -Name 'ScreenSaverIsSecure' -Value '0' -ErrorAction SilentlyContinue
+            Remove-ItemProperty -Path $p -Name 'SCRNSAVE.EXE' -ErrorAction SilentlyContinue
+        } catch { }
+    }
+}

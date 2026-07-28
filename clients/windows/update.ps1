@@ -451,4 +451,9 @@ if (-not $sourceFound) {
     Write-UpdateLog 'ERROR: All update sources failed — no files updated'
 }
 
+# Re-assert no-sleep / no-screensaver every update cycle so a GPO refresh or a
+# user toggle can't leave a sim VM asleep or blanked (Set-NoSleepNoScreensaver
+# is idempotent). Best-effort — never fail the update over it.
+try { Set-NoSleepNoScreensaver } catch { Write-UpdateLog "no-sleep re-assert skipped: $($_.Exception.Message)" }
+
 Write-UpdateLog 'Update complete'

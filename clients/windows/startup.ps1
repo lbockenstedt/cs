@@ -15,14 +15,14 @@ Start-Job -ScriptBlock {
     & powershell -NoProfile -ExecutionPolicy Bypass -File 'C:\Scripts\sys_mon.ps1'
 } | Out-Null
 
-Write-StartupLog 'Disabling screen blanking and sleep timers'
-powercfg /change standby-timeout-ac 0 | Out-Null
-powercfg /change standby-timeout-dc 0 | Out-Null
-powercfg /change monitor-timeout-ac 0 | Out-Null
-powercfg /change monitor-timeout-dc 0 | Out-Null
-
 . 'C:\Scripts\ini-parser.ps1'
 . 'C:\Scripts\common.ps1'
+
+# Sleep / monitor-off / hibernate + SCREEN SAVER all disabled (shared helper in
+# common.ps1, sourced just above). Runs in the sim user's context at logon, so
+# the per-user screen-saver registry (HKCU) is the sim user's — the reliable spot.
+Write-StartupLog 'Disabling sleep, monitor timeout, hibernate, and screen saver'
+Set-NoSleepNoScreensaver
 $global:iniConfig = Parse-IniFile 'C:\Scripts\simulation.conf'
 Write-SimVersionsReport
 
