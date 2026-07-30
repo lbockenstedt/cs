@@ -15,6 +15,171 @@ This repo is the local execution plane. It can run standalone, or relay telemetr
 
 ---
 
+<!-- INSTALLERS:START -->
+## Installation
+
+Every installer in this repo, with every flag and environment variable it accepts.
+Installers are idempotent — re-running one updates code and preserves credentials.
+
+### CS spoke — `install_cs.sh`
+
+The canonical entrypoint. It is a thin wrapper: the real logic lives in
+`lm-spoke/install_cs.sh` (single source of truth) and the wrapper `exec`s it,
+fetching it from GitHub when there is no checkout beside it.
+
+```bash
+curl -sSL https://raw.githubusercontent.com/lbockenstedt/cs/main/install_cs.sh \
+  | sudo bash -s -- --hub lm-hub.lrbtechnologies.com
+```
+
+| Flag | Purpose |
+| :--- | :--- |
+| `--hub URL` | Hub WebSocket URL. A bare host is fine — `lm-hub.example.com` becomes `wss://lm-hub.example.com:443`, `host:port` gets a `wss://` prefix, `ws://`/`wss://` and the `auto` sentinel are left alone. Omit it to auto-discover (DNS `lm-hub.<suffix>`, then mDNS). |
+| `--id`, `--name` | Pin the spoke id. Omitted, the id derives from the hostname at startup, so a cloned and renamed container reconnects under its new name. |
+| `--secret` | Pre-shared spoke secret. |
+| `--hub-secret` | Hub PSK for auto-approval. Without it every clone waits for manual approval in the WebUI. |
+| `--dhcp-iface IFACE` | NIC for the sim-client DHCP scope. Auto-detected otherwise. |
+| `--no-dhcp` | Skip DHCP setup entirely. |
+| `--tls-verify` | Verify the hub certificate. **Requires `--tls-ca-cert`** — the installer refuses `--tls-verify` on its own, even against a publicly-trusted certificate. |
+| `--tls-ca-cert PATH` | CA certificate for that verification. |
+| `--agent-listener` | Enable the client API listener. Already the default; a harmless no-op. |
+| `--no-agent-listener` | Disable the client API listener. |
+| `--infra-only` | Host-level infrastructure only — no spoke runtime. Used when the box hosts the `simulation` role via the generic agent. |
+| `--purge-env`, `--reset-identity` | Delete the existing `.env` first, regenerating the secret and `INSTALL_UUID`. The spoke then re-registers and needs approval. |
+| `--clone`, `--prep-clone` | Golden-image prep: full install, no identity minted, unit enabled but not started. Ignores `--id` — each clone derives its own from its hostname. |
+| `--admin-token`, `--all-prereqs` | Deprecated, accepted and ignored. |
+
+**Environment overrides:** `HUB_URL`, `SPOKE_ID`, `DHCP_IFACE`, `DHCP_SUBNET`,
+`DHCP_PREFIX`, `DHCP_GATEWAY`, `DHCP_RANGE_START`, `DHCP_RANGE_END`,
+`DHCP_LEASE_TIME`, `DHCP_SKIP` (`1` to skip DHCP).
+
+Re-running preserves the spoke secret and `INSTALL_UUID`, so the spoke keeps its
+identity. DHCP is a **cs-owned Kea instance** (`kea-dhcp4-sim`) on a second NIC,
+separate from the `lm/dhcp` module's Kea so both coexist on an all-in-one box; it
+serves `169.253.1.0/24` with no router option. The client API listens on
+**8080** — the hub already owns `:8000`.
+
+### Proxmox host agent — `proxmox/install-proxmox-agent.sh`
+
+Runs **on the Proxmox host**. Omit `--server` and it finds LXC **1001**, resolves
+its IP and points itself at `http://<spoke-ip>:8000`.
+
+```bash
+curl -sSL https://raw.githubusercontent.com/lbockenstedt/cs/main/proxmox/install-proxmox-agent.sh | bash -s --
+```
+
+| Flag | Purpose |
+| :--- | :--- |
+| `--server URL` | Spoke API URL. Given explicitly, LXC-1001 auto-detection is never attempted, and it wins over the stored value on reinstall. |
+| `--key` | Agent API key. |
+| `--interval N` | Poll interval in seconds. Default `60`. |
+| `--branch` | Repo branch to self-update from. Default `main`. |
+| `--hub-url URL` | Hub URL, used to fetch the Azure SAS token for VM image pulls. |
+| `--installer-key` | Paired with `--hub-url`. Without it the SAS fetch is skipped and it falls back to direct Azure URLs. |
+| `--tenant-id UUID` | Tenant id. |
+| `--unattended` | Non-interactive. |
+
+**Environment overrides:** `CLIENT_SIM_AGENT_PORT` (listener, default `9105`),
+`CLIENT_SIM_INSTALLER_KEY`, `REPO_BRANCH`.
+
+Re-running reads `/etc/client-sim-proxmox-agent.env` and keeps the existing key,
+interval, branch and port unless you override them.
+
+> The auto-provisioning **brain** lives in the pxmx agent
+> (`pxmx/agent/install_agent.sh`), not here. This bundle is the legacy/Azure-backup
+> deployment.
+
+### Linux simulation client — `installers/install.sh`
+
+Run on the client VM. It reaches the spoke over the sim DHCP network
+(`169.253.1.1:8080`), so it needs no server argument.
+
+```bash
+sudo bash installers/install.sh
+```
+
+| Flag | Purpose |
+| :--- | :--- |
+| `--debug`, `-d` | Verbose install logging. |
+
+### Windows simulation client — `clients/windows/install.ps1`
+
+```powershell
+.\install.ps1 -SpokeIp 169.253.1.1
+```
+
+| Parameter | Default | Purpose |
+| :--- | :--- | :--- |
+| `-SpokeIp` | `169.253.1.1` | Spoke address. |
+| `-InstallDir` | `C:\Scripts` | Install location. |
+| `-Branch` | `main` | Repo branch. |
+| `-RepoUrl` | `https://github.com/lbockenstedt/cs.git` | Source repo. |
+| `-AutoLogonUser` | *(empty)* | Enable auto-logon as this user. |
+| `-AutoLogonPassword` | *(empty)* | Password for auto-logon. |
+| `-SkipDeps` | *(off)* | Skip dependency installation. |
+
+### T3 wireless client — `clients/t3/install.sh`
+
+Run as root on a fresh headless Debian/Ubuntu box. Installs into `/usr/scripts`,
+writes `/etc/udev/rules.d/90-Wireless.rules`, and optionally enables the
+`t3-simulation` service for headless autostart. No flags.
+
+```bash
+sudo bash clients/t3/install.sh
+```
+
+### Legacy standalone spoke — `installers/install-lxc.sh`
+
+The pre-LM `webui-spoke` deployment. Prefer `install_cs.sh` for anything new.
+
+| Flag | Purpose |
+| :--- | :--- |
+| `--reinstall`, `-r` | Full wipe and reinstall. |
+| `--force`, `-f` | Implies `--reinstall`. |
+| `--unattended` | Non-interactive. |
+| `--branch`, `-b` | Repo branch. |
+| `--port`, `-p` | Listener port. |
+| `--admin-password` | Local admin password. |
+| `--hub-url` | Legacy hub URL. |
+| `--hub-tenant` | Tenant name or UUID. A name is resolved via the hub API, which needs `--hub-url`, `--hub-user` and `--hub-password`. |
+| `--hub-user` | Hub username, for that lookup. |
+| `--hub-password` | Hub password. |
+| `--hub-psk` | Hub pre-shared key. |
+| `--lm-hub-url` | LM hub URL. |
+| `--lm-hub-secret` | LM hub secret. |
+| `--lm-core-path` | Path to the LM core checkout. |
+| `--help`, `-h` | Usage. |
+
+Every flag also accepts `--flag=value`.
+
+**Environment overrides:** `REPO_URL`, `REPO_BRANCH`, `INSTALL_DIR`, `REPO_CACHE`,
+`SERVICE_USER`, `PORT`, `OFFLINE_TIMEOUT`, `DHCP_IFACE`, `DHCP_SUBNET`,
+`DHCP_GATEWAY`, `DHCP_RANGE_START`, `DHCP_RANGE_END`, `DHCP_LEASE_TIME`.
+
+### Local WebUI hub — `webui-local/install.sh`
+
+```bash
+sudo bash webui-local/install.sh
+```
+
+No flags. **Environment overrides:** `INSTALL_DIR` (default `/opt/hub`),
+`DATA_DIR` (`/var/lib/hub`), `HUB_PORT` (`8443`), `ADMIN_PASSWORD` (`changeme`),
+`SECRET_KEY`, `WEBUI_SECRET_KEY`, `PYTHON`.
+
+### Uninstallers
+
+```bash
+sudo bash uninstall_cs.sh --yes
+sudo bash proxmox/uninstall-proxmox-agent.sh --yes
+```
+
+`uninstall_cs.sh` — `--yes`, `--purge-logs`, `--remove-dhcp`, `--hub-api URL`,
+`--spoke-id ID`. It never removes assets shared with other LM services: the
+`svc_lm` user, `/opt/lm/core`, `/var/log/lm`, or the `dhcp` module's own Kea.
+
+`proxmox/uninstall-proxmox-agent.sh` — `--yes`, `--purge-logs`, `--purge-pve-scripts`.
+<!-- INSTALLERS:END -->
+
 ## Operators
 
 ### What this repo provides
