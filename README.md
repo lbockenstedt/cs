@@ -45,7 +45,7 @@ curl -sSL https://raw.githubusercontent.com/lbockenstedt/cs/main/install_cs.sh \
 | `--agent-listener` | Enable the client API listener. Already the default; a harmless no-op. |
 | `--no-agent-listener` | Disable the client API listener. |
 | `--infra-only` | Host-level infrastructure only — no spoke runtime. Used when the box hosts the `simulation` role via the generic agent. |
-| `--purge-env`, `--reset-identity` | Delete the existing `.env` first, regenerating the secret and `INSTALL_UUID`. The spoke then re-registers and needs approval. |
+| `--purge-env`, `--reset-identity` | Full identity reset: deletes `.env` (regenerating the secret and `INSTALL_UUID`) **and regenerates `/etc/machine-id`**. The spoke re-registers and needs approval. The machine-id part matters — `INSTALL_UUID` is bound to a machine fingerprint whose first source is `/etc/machine-id`, and a Proxmox clone copies that file verbatim, so without it two clones share a fingerprint, keep the copied identity, and flap over one hub connection (hub logs `[identity] CLONE COLLISION`). Side effect: anything keyed to machine-id changes too, notably the systemd-networkd DHCP DUID, so the box may take a different lease. |
 | `--clone`, `--prep-clone` | Golden-image prep: full install, no identity minted, unit enabled but not started. Ignores `--id` — each clone derives its own from its hostname. |
 | `--admin-token`, `--all-prereqs` | Deprecated, accepted and ignored. |
 

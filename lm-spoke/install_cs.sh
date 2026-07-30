@@ -639,9 +639,44 @@ fi
 # spoke secret + INSTALL_UUID are regenerated fresh instead of being carried
 # forward. Done here (not at arg-parse) so $LM_DIR is set and it lands right
 # before the reads it must precede.
-if [ "$PURGE_ENV" = "1" ] && [ -f "$LM_DIR/cs/.env" ]; then
-    rm -f "$LM_DIR/cs/.env"
-    warn "--purge-env: removed $LM_DIR/cs/.env — secret + INSTALL_UUID will be regenerated (spoke re-registers on the hub → needs approval)."
+if [ "$PURGE_ENV" = "1" ]; then
+    if [ -f "$LM_DIR/cs/.env" ]; then
+        rm -f "$LM_DIR/cs/.env"
+        warn "--purge-env: removed $LM_DIR/cs/.env — secret + INSTALL_UUID will be regenerated (spoke re-registers on the hub → needs approval)."
+    fi
+
+    # A fresh .env alone does NOT make a clone distinct. core's
+    # _ensure_install_uuid() binds INSTALL_UUID to a machine fingerprint whose
+    # FIRST source is /etc/machine-id (control_plane.py:_machine_fingerprint),
+    # and a Proxmox clone copies that file byte-for-byte — cloud-init would
+    # regenerate it, a plain clone does not. Two clones therefore read the SAME
+    # fingerprint, the clone-detection concludes "same machine", the copied
+    # identity + HUB_SECRET are kept, and both boxes flap over one hub
+    # connection (hub logs "[identity] CLONE COLLISION"). Regenerating it here
+    # is what makes --purge-env a complete identity reset rather than a
+    # half one that silently re-collides on the next clone.
+    _old_mid="$(cat /etc/machine-id 2>/dev/null || true)"
+    : > /etc/machine-id 2>/dev/null || true
+    rm -f /var/lib/dbus/machine-id 2>/dev/null || true
+    if command -v systemd-machine-id-setup >/dev/null 2>&1; then
+        systemd-machine-id-setup >/dev/null 2>&1 || true
+    fi
+    # Fallback for a box whose systemd helper is absent or no-opped.
+    if [ ! -s /etc/machine-id ]; then
+        od -An -tx1 -N16 /dev/urandom 2>/dev/null | tr -d ' \n' > /etc/machine-id 2>/dev/null || true
+        echo >> /etc/machine-id 2>/dev/null || true
+    fi
+    # dbus keeps its own copy (usually a symlink to the same file); resync it so
+    # the fingerprint's 2nd source can't hand back the ORIGIN's stale id.
+    if [ -s /etc/machine-id ] && [ -d /var/lib/dbus ]; then
+        cp -f /etc/machine-id /var/lib/dbus/machine-id 2>/dev/null || true
+    fi
+    _new_mid="$(cat /etc/machine-id 2>/dev/null || true)"
+    if [ -n "$_new_mid" ] && [ "$_new_mid" != "$_old_mid" ]; then
+        warn "--purge-env: regenerated /etc/machine-id (${_old_mid:0:8}… → ${_new_mid:0:8}…) — this box can no longer share a clone fingerprint with its origin."
+    else
+        warn "--purge-env: could NOT regenerate /etc/machine-id — if this box was cloned it may still collide with its origin (hub: '[identity] CLONE COLLISION'). Fix by hand: truncate -s 0 /etc/machine-id && rm -f /var/lib/dbus/machine-id && systemd-machine-id-setup"
+    fi
 fi
 
 # ── Spoke secret (preserve on re-run) ────────────────────────────────────────
