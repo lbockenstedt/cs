@@ -583,6 +583,44 @@ EOF
         # socket and don't clash with the -sim instance's :8002 / -sim socket).
         systemctl enable --now kea-dhcp4-sim kea-ctrl-agent-sim >/dev/null 2>&1 || true
         systemctl restart kea-dhcp4-sim kea-ctrl-agent-sim >/dev/null 2>&1 || true
+
+        # ── Verify it actually SERVES, and fall back to complain mode ─────────
+        # The local-include grant above is not always sufficient: Debian's kea
+        # profile can carry an explicit `deny`, and in AppArmor an explicit deny
+        # beats any later allow and CANNOT be overridden from
+        # /etc/apparmor.d/local. The result is the worst kind of failure --
+        # correct-looking rules, a clean apparmor_parser reload, and a daemon
+        # that still cannot open its lease DB, with the denials often invisible
+        # because the kernel rate-limits audit messages when the ctrl-agent is
+        # also being denied several times a second. Proven on a live spoke: the
+        # unit only started once the profile was unloaded.
+        #
+        # So: don't trust the grant, TEST it. If kea-dhcp4-sim will not become
+        # active, drop the profile to complain (permits + logs, still confined
+        # for observability) rather than leaving a DHCP server that hands out
+        # nothing. Loud about it, because this is a policy relaxation.
+        _kea_ok=""
+        for _i in $(seq 1 12); do
+            if systemctl is-active --quiet kea-dhcp4-sim; then _kea_ok=1; break; fi
+            sleep 1
+        done
+        if [ -z "$_kea_ok" ] && command -v apparmor_parser >/dev/null 2>&1 \
+           && [ -f /etc/apparmor.d/usr.sbin.kea-dhcp4 ]; then
+            warn "kea-dhcp4-sim did not start with the AppArmor grant applied — falling back to complain mode for the kea profiles (permits + logs; the packaged profile likely carries a deny that a local include cannot override)."
+            apparmor_parser -C -r /etc/apparmor.d/usr.sbin.kea-dhcp4 2>/dev/null || true
+            [ -f /etc/apparmor.d/usr.sbin.kea-ctrl-agent ] && \
+                apparmor_parser -C -r /etc/apparmor.d/usr.sbin.kea-ctrl-agent 2>/dev/null || true
+            systemctl restart kea-dhcp4-sim kea-ctrl-agent-sim >/dev/null 2>&1 || true
+            for _i in $(seq 1 12); do
+                if systemctl is-active --quiet kea-dhcp4-sim; then _kea_ok=1; break; fi
+                sleep 1
+            done
+        fi
+        if [ -n "$_kea_ok" ]; then
+            ok "Sim DHCP serving: kea-dhcp4-sim active on ${DHCP_IFACE} (${DHCP_SUBNET}/${DHCP_PREFIX}, pool ${DHCP_RANGE_START}-${DHCP_RANGE_END})"
+        else
+            warn "Sim DHCP is NOT serving — kea-dhcp4-sim will not stay active. Clients on the sim network will get no address. Check: journalctl -u kea-dhcp4-sim -n 30; dmesg | grep -i 'apparmor.*kea'"
+        fi
         if systemctl is-active --quiet kea-dhcp4-sim; then
             ok "kea-dhcp4-sim running — DHCP active on ${DHCP_IFACE}"
         else
