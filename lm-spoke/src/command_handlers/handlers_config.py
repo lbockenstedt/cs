@@ -407,6 +407,158 @@ class ConfigCommandsMixin:
             actions = await eng.reset()
             return {"status": "SUCCESS", "actions": actions}
 
+        if cmd == "CS_GET_DHCP_HEALTH":
+            # Everything needed to answer "why is the sim network not handing
+            # out IPs" WITHOUT ssh. Built from a real incident: the config was
+            # valid and the NIC was correct, but AppArmor denied Kea its
+            # runtime files, so it crash-looped with no lease file. Diagnosing
+            # that took five round trips because each signal lived somewhere
+            # different (systemctl / journal / dmesg / the conf / ip addr).
+            # Collect them together and let the UI render the verdict.
+            import json as _json
+            import os as _os
+            import re as _re
+            import subprocess as _sp
+
+            def _run(argv, timeout=8):
+                try:
+                    r = _sp.run(argv, capture_output=True, text=True, timeout=timeout)
+                    return r.returncode, (r.stdout or "").strip(), (r.stderr or "").strip()
+                except Exception as exc:  # noqa: BLE001
+                    return -1, "", str(exc)
+
+            out: Dict[str, Any] = {"status": "SUCCESS", "units": {}, "notes": []}
+
+            # ── units ────────────────────────────────────────────────────────
+            for unit in ("kea-dhcp4-sim", "kea-ctrl-agent-sim"):
+                props = {}
+                rc, so, _ = _run(["systemctl", "show", unit, "--no-pager",
+                                  "-p", "LoadState,ActiveState,SubState,Result,"
+                                        "NRestarts,ExecMainStatus,UnitFileState"])
+                for line in so.splitlines():
+                    if "=" in line:
+                        k, v = line.split("=", 1)
+                        props[k] = v
+                out["units"][unit] = props
+
+            # ── the config Kea is actually running ───────────────────────────
+            conf = "/etc/kea/kea-dhcp4-sim.conf"
+            out["conf_path"] = conf
+            out["conf_exists"] = _os.path.isfile(conf)
+            want_ifaces, lease_path, subnet, pool = [], "", "", ""
+            if out["conf_exists"]:
+                try:
+                    with open(conf) as fh:
+                        raw = fh.read()
+                    cfg = _json.loads(_re.sub(r"^\s*//.*$", "", raw, flags=_re.M))
+                    d4 = (cfg or {}).get("Dhcp4", {}) or {}
+                    want_ifaces = ((d4.get("interfaces-config") or {}).get("interfaces") or [])
+                    lease_path = ((d4.get("lease-database") or {}).get("name") or "")
+                    subs = d4.get("subnet4") or []
+                    if subs:
+                        subnet = subs[0].get("subnet", "")
+                        pools = subs[0].get("pools") or []
+                        pool = (pools[0] or {}).get("pool", "") if pools else ""
+                except Exception as exc:  # noqa: BLE001
+                    out["notes"].append(f"could not parse {conf}: {exc}")
+            out.update({"interfaces_configured": want_ifaces, "subnet": subnet,
+                        "pool": pool, "lease_file": lease_path})
+
+            # ── does that interface exist, and does it hold the server IP? ───
+            rc, so, _ = _run(["ip", "-o", "-4", "addr", "show"])
+            present = {}
+            for line in so.splitlines():
+                parts = line.split()
+                if len(parts) >= 4:
+                    present.setdefault(parts[1], []).append(parts[3])
+            out["interfaces_present"] = present
+            out["interface_ok"] = bool(want_ifaces) and all(i in present for i in want_ifaces)
+            # A renamed NIC is the quiet killer: the conf still names ens19, the
+            # box now calls it ens20, Kea binds nothing and serves nobody with
+            # no error beyond "listening on interface ens19". Surface both the
+            # mismatch AND the likely replacement so the UI can name the fix.
+            # Deliberately NOT auto-rebound here — picking the wrong NIC would
+            # put a DHCP server on the production LAN.
+            out["interface_missing"] = [i for i in want_ifaces if i not in present]
+            gw = ""
+            for _sub in ([subnet] if subnet else []):
+                gw = _sub.split("/")[0].rsplit(".", 1)[0] + ".1" if "." in _sub else ""
+            out["sim_gateway"] = gw
+            holder = [i for i, addrs in present.items()
+                      if gw and any(a.startswith(gw + "/") for a in addrs)]
+            out["interface_holding_gateway"] = holder
+            # Same rule the installer uses at install time: first non-loopback
+            # NIC is the uplink, second is the sim network.
+            rc_l, so_l, _ = _run(["ip", "-o", "link", "show"])
+            order = []
+            for line in so_l.splitlines():
+                try:
+                    nm = line.split(":")[1].strip().split("@")[0]
+                except Exception:  # noqa: BLE001
+                    continue
+                if nm and nm != "lo" and nm not in order:
+                    order.append(nm)
+            out["nic_order"] = order
+            # Best signal for "which NIC is the sim network": the one with NO
+            # IPv4 address. The uplink always has one; the sim NIC only gets
+            # 169.253.1.1 from us, so before/without that it is bare. That is
+            # more reliable than "second by index", which depends on enumeration
+            # order surviving a rebuild. Preference order: the NIC already
+            # holding the sim gateway (definitive) -> the address-less NIC ->
+            # index 1 (what the installer used historically).
+            bare = [n for n in order if not present.get(n)]
+            out["interfaces_without_ip"] = bare
+            out["interface_suggested"] = (holder[0] if holder
+                                          else (bare[0] if bare
+                                                else (order[1] if len(order) > 1 else "")))
+
+            # ── lease DB: the thing that proves it is actually serving ───────
+            lease_info = {"exists": False, "leases": 0, "size": 0, "mtime": 0}
+            if lease_path:
+                try:
+                    st = _os.stat(lease_path)
+                    lease_info.update({"exists": True, "size": st.st_size,
+                                       "mtime": int(st.st_mtime)})
+                    with open(lease_path) as fh:
+                        # header + one row per lease
+                        lease_info["leases"] = max(0, sum(1 for _ in fh) - 1)
+                except FileNotFoundError:
+                    pass
+                except Exception as exc:  # noqa: BLE001
+                    out["notes"].append(f"lease file unreadable: {exc}")
+            out["lease_db"] = lease_info
+
+            # ── config test (catches a bad conf independent of the unit) ─────
+            rc, so, se = _run(["kea-dhcp4", "-t", conf], timeout=15)
+            out["config_test"] = {"ok": rc == 0, "detail": (se or so)[-1500:]}
+
+            # ── last fatal line + AppArmor denials ───────────────────────────
+            # Both need privilege the spoke user may not have; say so explicitly
+            # rather than render an empty panel that looks like "no problems".
+            rc, so, se = _run(["journalctl", "-u", "kea-dhcp4-sim", "--no-pager",
+                               "-n", "60", "-o", "cat"])
+            if rc == 0 and so:
+                fatal = [l for l in so.splitlines()
+                         if "ERROR" in l or "Fatal" in l or "DENIED" in l]
+                out["last_errors"] = fatal[-6:] or so.splitlines()[-3:]
+            else:
+                out["last_errors"] = []
+                out["notes"].append(
+                    "journal not readable by the spoke user — add it to the "
+                    "systemd-journal group to surface Kea's own errors here")
+
+            rc, so, se = _run(["dmesg"], timeout=10)
+            if rc == 0 and so:
+                den = [l for l in so.splitlines()
+                       if "apparmor" in l.lower() and "kea" in l.lower() and "DENIED" in l]
+                out["apparmor_denials"] = den[-6:]
+            else:
+                out["apparmor_denials"] = []
+                out["notes"].append(
+                    "dmesg not readable (kernel.dmesg_restrict) — AppArmor "
+                    "denials cannot be shown; run: dmesg | grep -i 'apparmor.*kea'")
+            return out
+
         if cmd == "CS_GET_PXMX_SITE_MAP":
             # Operator-assigned pxmx server → site map (Config → PXMX Sites). The
             # engine resolves a client's site via its hosting server's entry.
