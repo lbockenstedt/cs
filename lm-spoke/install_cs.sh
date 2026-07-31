@@ -328,6 +328,17 @@ if [[ "$DHCP_SKIP" != "1" ]]; then
   /var/lib/kea/ rw,
   /var/lib/kea/** rwk,
 AARULES
+            # kea-ctrl-agent resolves names at start-up (getaddrinfo for its
+            # listen address), which the stock profile does not permit: it is
+            # denied /etc/resolv.conf, /etc/hosts, /etc/nsswitch.conf and an
+            # inet dgram socket, and then cannot start. The nameservice
+            # abstraction is the canonical grant for exactly that set — cleaner
+            # and narrower than listing the files by hand. dhcp4 does not need
+            # it (it binds an interface, not a name).
+            if [ "$_p" = "usr.sbin.kea-ctrl-agent" ] \
+               && ! grep -qF 'abstractions/nameservice' "/etc/apparmor.d/local/$_p" 2>/dev/null; then
+                printf '  #include <abstractions/nameservice>\n' >> "/etc/apparmor.d/local/$_p"
+            fi
             if command -v apparmor_parser >/dev/null 2>&1; then
                 apparmor_parser -r "/etc/apparmor.d/$_p" 2>/dev/null && _aa_reloaded=1
             fi
