@@ -9235,20 +9235,6 @@ async function csRenderVmServerCentral() {
     </div>`);
 }
 
-async function csRenderVmServerApiServer() {
-    csSetToolbar('');
-    try { await csVmLoad(); } catch (e) { console.error('csRenderVmServerApiServer: vm load failed', e); csSet(csErrorBox('Could not load', e)); return; }
-    const h = csVmSelectedHost();
-    const api = (h && h.api_server) || {};
-    const health = api.health || {};
-    const rows = Object.entries(health).map(([k, v]) => `<tr><td class="px-3 py-2 font-mono text-xs text-slate-500">${csEscape(k)}</td><td class="px-3 py-2 text-sm">${csEscape(typeof v === 'object' ? JSON.stringify(v) : v)}</td></tr>`).join('');
-    csSet(`<div>${csVmHostBanner()}
-      <p class="text-[11px] font-bold text-slate-400 uppercase tracking-wider mb-2">API Server Health</p>
-      ${csTable(['Key', 'Value'], rows)}
-      <details class="mt-4 text-xs"><summary class="cursor-pointer text-slate-400">Raw payload</summary>${csJsonDump(api)}</details>
-    </div>`);
-}
-
 // ── Register all VM Server children ─────────────────────────────────────────
 window.CS_CHILD_RENDERERS['VM Server::Overview']     = csRenderVmServer;
 window.CS_CHILD_RENDERERS['VM Server::VMs']          = csRenderVmServerVms;
