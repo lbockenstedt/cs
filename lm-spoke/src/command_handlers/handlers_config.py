@@ -563,7 +563,28 @@ class ConfigCommandsMixin:
             if rc == 0 and so:
                 den = [l for l in so.splitlines()
                        if "apparmor" in l.lower() and "kea" in l.lower() and "DENIED" in l]
-                out["apparmor_denials"] = den[-6:]
+                # dmesg is a RING BUFFER: a denial from hours ago stays in it
+                # forever and reads as if it were happening now. That made a
+                # recovered spoke look broken. The leading "[   1105.38]" is
+                # seconds since boot, so age = uptime - that. Report the age and
+                # whether any denial is RECENT; the UI greys out old ones.
+                try:
+                    with open("/proc/uptime") as _u:
+                        _up = float(_u.read().split()[0])
+                except Exception:  # noqa: BLE001
+                    _up = 0.0
+                _rows, _recent = [], False
+                for _l in den[-8:]:
+                    _age = None
+                    _m = _re.match(r"^\[\s*(\d+)\.\d+\]", _l)
+                    if _m and _up:
+                        _age = max(0, int(_up - int(_m.group(1))))
+                        if _age <= 900:      # within 15 min = still happening
+                            _recent = True
+                    _rows.append({"line": _l, "age_s": _age})
+                out["apparmor_denials"] = [r["line"] for r in _rows]   # back-comn't
+                out["apparmor_denial_rows"] = _rows
+                out["apparmor_recent"] = _recent
             else:
                 out["apparmor_denials"] = []
                 out["notes"].append(
