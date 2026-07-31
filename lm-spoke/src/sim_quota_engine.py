@@ -791,12 +791,26 @@ class SimQuotaEngine:
             return {"t2": 0, "t1": 1}.get(t, 2)
         return {"t1": 0, "t2": 1}.get(t, 2)
 
-    def _in_harvest_cooldown(self, hostname: str, now: float) -> bool:
+    def _in_harvest_cooldown(self, hostname: str, now: float,
+                             c: Optional[Dict[str, Any]] = None) -> bool:
         """True while ``hostname`` is inside its post-harvest cooldown window
         (``harvest_cooldown_s``, default 4h; 0 disables). Caller must exempt a
-        client currently serving a quota."""
+        client currently serving a quota.
+
+        T1 clients are EXEMPT. The cooldown is an anti-flap rule for the drone
+        pool — rest a released client so Central data stays realistic — but T1s
+        are the dedicated PCI radios the quota sims are supposed to run on. A T1
+        released by a shrinking quota and needed again minutes later would
+        otherwise rest for hours while a less-reliable T2 took the slot, which
+        inverts the whole tier model. The stamp is still RECORDED for T1s (see
+        _assign) so flipping this policy back needs no state migration.
+
+        ``c`` is the client entry; omitted → no exemption (fail closed to the
+        historical behaviour rather than silently exempting an unknown tier)."""
         cd = float(getattr(self, "_harvest_cooldown_s", 0) or 0)
         if cd <= 0:
+            return False
+        if c is not None and self._tier_of(c) == "t1":
             return False
         return (now - float(self._last_harvest.get(hostname, 0.0))) < cd
 
@@ -835,7 +849,7 @@ class SimQuotaEngine:
         # CURRENTLY serving a quota is EXEMPT — it's being kept/packed, not freshly
         # picked — so only a released-and-resting free client is blocked.
         if (not self._engine_sims_for(hostname)
-                and self._in_harvest_cooldown(hostname, now)):
+                and self._in_harvest_cooldown(hostname, now, c)):
             return False
         if multi:
             # Preempt a drone's bucket-default exclusive; only ANOTHER quota's
@@ -862,7 +876,7 @@ class SimQuotaEngine:
         if sim_id and self._human_pinned_sim(hostname, sim_id):
             return "human_pin"
         if (not self._engine_sims_for(hostname)
-                and self._in_harvest_cooldown(hostname, getattr(self, "_sweep_now", 0.0))):
+                and self._in_harvest_cooldown(hostname, getattr(self, "_sweep_now", 0.0), c)):
             return "harvest_cooldown"
         if not self._tier_ok(c, req_tier):
             return "tier_mismatch"                # quota wants a tier this client isn't
@@ -907,7 +921,10 @@ class SimQuotaEngine:
             # Stamp the harvest time → this client now rests `harvest_cooldown_s`
             # before it can be re-harvested (see _in_harvest_cooldown). Only a real
             # SIM harvest counts; a PRESENCE quota (sim_id empty) homes but doesn't
-            # harvest, so it doesn't consume the cooldown.
+            # harvest, so it doesn't consume the cooldown. T1s are stamped too even
+            # though _in_harvest_cooldown exempts them — the stamp is the record,
+            # the exemption is the policy, so the policy can flip without a
+            # state migration.
             self._last_harvest[hostname] = float(getattr(self, "_sweep_now", 0.0)) or time.time()
             # Preempt a drone: turn OFF any EXCLUSIVE sim the client runs as a
             # BUCKET DEFAULT (not sim_id, not owned by another quota). Two

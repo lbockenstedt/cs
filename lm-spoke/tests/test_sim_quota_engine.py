@@ -1279,3 +1279,80 @@ def test_ambient_spread_does_not_reserve_t1_out_of_background_work(tmp_path):
         placed = {h for h, c in spoke.registry.clients.items()
                   if (c.get("overrides") or {}).get("ssid")}
         assert placed == {"c0", "c1"}, f"{pri}: every spare client placed, got {placed}"
+
+
+# ── T1 exemption from the harvest cooldown ────────────────────────────────────
+# The cooldown is an anti-flap rule for the DRONE pool: rest a released client so
+# Central data stays realistic. T1s are exempt — a T1 released by a disappearing
+# quota and needed again straight away must be re-harvestable, or it rests for
+# hours while a less-reliable T2 takes the slot, inverting the tier model.
+# NOTE: a count-0 quota does NOT release its clients (the ledger is left alone);
+# the real release path is the quota leaving the effective set entirely.
+def _cooldown_spoke(clients, tmp_path):
+    spoke = _FakeSpoke(clients, [_tq(1)], tmp_path)
+    spoke.registry = _ProvRegistry(clients)      # release reverts by DELETION, not "off"
+    spoke.local_store._harvest_cooldown_s = 3600  # 1h — the fake defaults it OFF
+    return spoke
+
+
+def test_t1_is_exempt_from_harvest_cooldown(tmp_path):
+    clients = {"c0": _tiered("c0", "MIA", "t1")}
+    spoke = _cooldown_spoke(clients, tmp_path)
+    eng = SimQuotaEngine(spoke)
+    _run(eng.reconcile())
+    assert set(eng._ledger["alert:A:MIA"]["clients"]) == {"c0"}
+    spoke.local_store._q = []                     # quota removed → released
+    _run(eng.reconcile())
+    assert "alert:A:MIA" not in eng._ledger
+    assert eng._last_harvest.get("c0"), \
+        "still STAMPED — the exemption is policy, not a missing record"
+    spoke.local_store._q = [_tq(1)]               # and comes straight back
+    _run(eng.reconcile())
+    assert set(eng._ledger["alert:A:MIA"]["clients"]) == {"c0"}, \
+        "T1 re-harvested inside its cooldown window"
+
+
+def test_t2_still_rests_in_harvest_cooldown(tmp_path):
+    # Same sequence, T2: the exemption must be tier-scoped, so the drone rests.
+    clients = {"c0": _tiered("c0", "MIA", "t2")}
+    spoke = _cooldown_spoke(clients, tmp_path)
+    eng = SimQuotaEngine(spoke)
+    _run(eng.reconcile())
+    assert set(eng._ledger["alert:A:MIA"]["clients"]) == {"c0"}
+    spoke.local_store._q = []
+    _run(eng.reconcile())
+    spoke.local_store._q = [_tq(1)]
+    _run(eng.reconcile())
+    assert not eng._ledger["alert:A:MIA"]["clients"], "a released T2 rests out its cooldown"
+
+
+def test_t1_preferred_over_a_resting_t2(tmp_path):
+    # The point of the exemption, end to end: both were released, the quota comes
+    # back needing one client. The T1 is available immediately; the T2 is resting.
+    clients = {"c0": _tiered("c0", "MIA", "t1"), "c1": _tiered("c1", "MIA", "t2")}
+    spoke = _cooldown_spoke(clients, tmp_path)
+    spoke.local_store._q = [_tq(2)]
+    eng = SimQuotaEngine(spoke)
+    _run(eng.reconcile())
+    assert set(eng._ledger["alert:A:MIA"]["clients"]) == {"c0", "c1"}
+    spoke.local_store._q = []
+    _run(eng.reconcile())
+    spoke.local_store._q = [_tq(2)]               # wants 2, only the T1 is free
+    _run(eng.reconcile())
+    assert set(eng._ledger["alert:A:MIA"]["clients"]) == {"c0"}
+
+
+def test_t1_cooldown_exemption_surfaces_in_diag(tmp_path):
+    # _diag_reason mirrors _pool_eligible; if it lagged behind, Engine State would
+    # report harvest_cooldown for a T1 the engine is happily harvesting.
+    clients = {"c0": _tiered("c0", "MIA", "t1"), "c1": _tiered("c1", "MIA", "t2")}
+    spoke = _cooldown_spoke(clients, tmp_path)
+    spoke.local_store._q = [_tq(2)]
+    eng = SimQuotaEngine(spoke)
+    _run(eng.reconcile())
+    spoke.local_store._q = []
+    _run(eng.reconcile())
+    spoke.local_store._q = [_tq(2)]
+    _run(eng.reconcile())
+    blocked = eng._quota_diag["alert:A:MIA"]["blocked"]
+    assert blocked.get("harvest_cooldown", 0) == 1, blocked   # the T2, never the T1
