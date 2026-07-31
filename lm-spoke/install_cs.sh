@@ -360,9 +360,21 @@ AARULES
             # reloading fine while kea-dhcp4 did not, so the installer claimed
             # success while the DHCP server -- the one that matters for leases --
             # was still denied its lease file and crash-looping.
+            # PRESERVE COMPLAIN MODE. A plain `apparmor_parser -r` forces the
+            # profile back to ENFORCE, which knocks over a spoke that was
+            # deliberately left in complain because the packaged profile's deny
+            # cannot be overridden from local/. Observed: re-running the
+            # installer on a healthy spoke took its DHCP down. Read the current
+            # mode from securityfs (aa-status is not installed on these boxes)
+            # and reload in the SAME mode.
+            _prof="${_p#usr.sbin.}"
+            _mode="$(sed -n "s/^${_prof} (\([a-z]*\)).*/\1/p" \
+                     /sys/kernel/security/apparmor/profiles 2>/dev/null | head -1)"
+            _aa_flag=""
+            [ "$_mode" = "complain" ] && _aa_flag="-C"
             if command -v apparmor_parser >/dev/null 2>&1; then
-                _aa_err="$(apparmor_parser -r "/etc/apparmor.d/$_p" 2>&1 >/dev/null)" && {
-                    ok "AppArmor: ${_p} reloaded"
+                _aa_err="$(apparmor_parser $_aa_flag -r "/etc/apparmor.d/$_p" 2>&1 >/dev/null)" && {
+                    ok "AppArmor: ${_p} reloaded${_mode:+ (kept in $_mode mode)}"
                     _aa_reloaded=1
                 } || warn "AppArmor: ${_p} FAILED to reload${_aa_err:+ — $_aa_err}. Kea will keep being denied; fix and run: apparmor_parser -r /etc/apparmor.d/${_p}"
             fi
