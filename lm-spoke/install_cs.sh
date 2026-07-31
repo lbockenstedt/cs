@@ -288,6 +288,37 @@ if [[ "$DHCP_SKIP" != "1" ]]; then
         fi
         ok "Kea (kea-dhcp4-server + kea-ctrl-agent) installed"
 
+        # ── AppArmor: allow the SIM instance's runtime files ──────────────────
+        # Kea derives its PID file name from the CONFIG file name, so our
+        # deliberately-renamed sim instance writes
+        #   /run/kea/kea-dhcp4-sim.kea-dhcp4.pid
+        #   /run/kea/kea-ctrl-agent-sim.kea-ctrl-agent.pid
+        # while Debian's stock profiles only permit the packaged
+        # kea-dhcp4.kea-dhcp4.pid names. The result is a DENIED on create — as
+        # ROOT, so it looks nothing like a permissions problem (ls shows
+        # /run/kea root-owned and writable) and the unit just crash-loops with
+        # "Unable to open PID file ... for write" plus a logger_lockfile denial.
+        # Only the sim instance is affected; the dhcp module's Kea keeps working,
+        # which makes it look like the sim config is at fault when it is valid.
+        # 'k' = lock permission, required for the interprocess logger_lockfile
+        # (denied separately from the PID file).
+        _aa_reloaded=0
+        for _p in usr.sbin.kea-dhcp4 usr.sbin.kea-ctrl-agent; do
+            [ -f "/etc/apparmor.d/$_p" ] || continue
+            mkdir -p /etc/apparmor.d/local
+            if ! grep -q '^\s*/run/kea/\*\* ' "/etc/apparmor.d/local/$_p" 2>/dev/null; then
+                printf '  /run/kea/ rw,\n  /run/kea/** rwk,\n' >> "/etc/apparmor.d/local/$_p"
+            fi
+            if command -v apparmor_parser >/dev/null 2>&1; then
+                apparmor_parser -r "/etc/apparmor.d/$_p" 2>/dev/null && _aa_reloaded=1
+            fi
+        done
+        if [ "$_aa_reloaded" = "1" ]; then
+            ok "AppArmor: granted the sim Kea instance its /run/kea runtime files"
+        elif [ -d /etc/apparmor.d ] && [ -f /etc/apparmor.d/usr.sbin.kea-dhcp4 ]; then
+            warn "AppArmor profiles present but apparmor_parser did not reload — if kea-dhcp4-sim crash-loops with \"Unable to open PID file\", run: apparmor_parser -r /etc/apparmor.d/usr.sbin.kea-dhcp4"
+        fi
+
         # ── Static IP on the internal interface ───────────────────────────────
         IFACE_CFG="/etc/network/interfaces.d/${DHCP_IFACE}.conf"
         mkdir -p /etc/network/interfaces.d
