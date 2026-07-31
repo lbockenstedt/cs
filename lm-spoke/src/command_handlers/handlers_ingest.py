@@ -172,7 +172,8 @@ class IngestCommandsMixin:
             # any host but poll_agent_inbox marks it delivered on the first poll,
             # so only one server would act. Enqueue one copy per connected agent
             # hostname (target=hostname) so all servers run it in parallel.
-            _FLEET = {"proxmox_reclone_all", "proxmox_reclone_stop"}
+            _FLEET = {"proxmox_reclone_all", "proxmox_reclone_stop",
+                      "proxmox_reclone_clear"}
             targets = [target]
             if target == "proxmox" and action in _FLEET and self.control_plane:
                 hns = [info.get("hostname") for info in
