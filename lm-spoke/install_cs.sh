@@ -306,9 +306,28 @@ if [[ "$DHCP_SKIP" != "1" ]]; then
         for _p in usr.sbin.kea-dhcp4 usr.sbin.kea-ctrl-agent; do
             [ -f "/etc/apparmor.d/$_p" ] || continue
             mkdir -p /etc/apparmor.d/local
-            if ! grep -q '^\s*/run/kea/\*\* ' "/etc/apparmor.d/local/$_p" 2>/dev/null; then
-                printf '  /run/kea/ rw,\n  /run/kea/** rwk,\n' >> "/etc/apparmor.d/local/$_p"
-            fi
+            # BOTH runtime dirs. /run/kea covers the PID + logger lockfile;
+            # /var/lib/kea covers the memfile LEASE DB. Kea derives both names
+            # from the config file name, so the sim instance wants
+            # kea-leases4-sim.csv where the stock profile only allows the
+            # packaged kea-leases4.csv. Granting only /run/kea gets the daemon
+            # past start-up and then it dies one step later on
+            # DHCPSRV_MEMFILE_FAILED_TO_OPEN -- looks like a different bug, same
+            # cause.
+            # Append only the rules that are missing, so a box already carrying
+            # an earlier partial grant is topped up instead of accumulating a
+            # duplicate copy of the rules it already had.
+            touch "/etc/apparmor.d/local/$_p"
+            while IFS= read -r _rule; do
+                [ -n "$_rule" ] || continue
+                grep -qxF "$_rule" "/etc/apparmor.d/local/$_p" 2>/dev/null \
+                    || printf '%s\n' "$_rule" >> "/etc/apparmor.d/local/$_p"
+            done <<'AARULES'
+  /run/kea/ rw,
+  /run/kea/** rwk,
+  /var/lib/kea/ rw,
+  /var/lib/kea/** rwk,
+AARULES
             if command -v apparmor_parser >/dev/null 2>&1; then
                 apparmor_parser -r "/etc/apparmor.d/$_p" 2>/dev/null && _aa_reloaded=1
             fi
