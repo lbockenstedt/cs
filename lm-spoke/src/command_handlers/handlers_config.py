@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import logging
 import asyncio
+import time
 from pathlib import Path
 
 import sim_config
@@ -406,6 +407,87 @@ class ConfigCommandsMixin:
                 return {"status": "ERROR", "message": "sim quota engine unavailable"}
             actions = await eng.reset()
             return {"status": "SUCCESS", "actions": actions}
+
+        if cmd == "CS_GET_SIM_TAG_HEALTH":
+            # Answers "why does this Proxmox server show no / stale sim- tags"
+            # WITHOUT ssh or log archaeology. Built from a real incident: three
+            # servers showed three different faults (no tags, stale tags,
+            # correct) and every one of them was invisible — the dispatch skipped
+            # unresolvable hosts silently, and a VM with no client match was
+            # simply absent from the map. Each host reports whether its agent
+            # resolved, and each VM reports DESIRED vs ACTUAL tags plus the
+            # reason it was excluded, so a mismatch names itself.
+            from token_store import (norm_hostname as _nh, sanitize_tag as _san,
+                                     _ONLINE_WINDOW_S as _TAG_LIVE_WINDOW_S)
+            spoke = self
+            reg = getattr(spoke, "registry", None)
+            deploy = getattr(spoke, "deploy", None)
+            states = (getattr(deploy, "proxmox_states", {}) or {}) if deploy else {}
+            skips = dict(getattr(spoke, "_sim_tag_skips", {}) or {})
+            cp = getattr(spoke, "control_plane", None)
+            agents = (getattr(cp, "connected_agents", {}) or {}) if cp else {}
+            conn_exact, conn_norm = set(), set()
+            for _info in agents.values():
+                _hn = str((_info or {}).get("hostname") or "").strip()
+                if _hn:
+                    conn_exact.add(_hn)
+                    conn_norm.add(_nh(_hn))
+            # client hostname -> (live?, its sims) from the SAME registry the
+            # tag map reads, so the panel can't disagree with the dispatcher.
+            clients: Dict[str, Any] = {}
+            try:
+                for _c in ((reg.get_all() if reg else {}) or {}).values():
+                    _h = str((_c or {}).get("hostname") or "").strip().lower()
+                    if not _h:
+                        continue
+                    _ls = (_c or {}).get("last_seen")
+                    _age = (time.time() - float(_ls)) if isinstance(_ls, (int, float)) else None
+                    clients[_h] = {
+                        "last_seen_age_s": round(_age, 1) if _age is not None else None,
+                        "sims": [t for t in (_san(x) for x in
+                                             ((_c or {}).get("active_simulations") or [])) if t],
+                    }
+            except Exception:  # noqa: BLE001
+                pass
+            hosts = []
+            for hn, st in states.items():
+                agent_ok = hn in conn_exact or _nh(hn) in conn_norm
+                vms = []
+                for vm in (st.get("vms") or []):
+                    if vm.get("is_template") or vm.get("type") == "lxc":
+                        continue
+                    name = str(vm.get("name") or "").strip().lower()
+                    actual = sorted(str(t) for t in (vm.get("tags") or [])
+                                    if str(t).startswith("sim-"))
+                    cl = clients.get(name)
+                    if cl is None:
+                        why, desired = "no_client_matches_vm_name", []
+                    elif cl["last_seen_age_s"] is None:
+                        why, desired = "client_never_reported", []
+                    elif cl["last_seen_age_s"] >= _TAG_LIVE_WINDOW_S:
+                        why, desired = "client_stale_tags_cleared", []
+                    else:
+                        why, desired = None, sorted(cl["sims"])
+                    row = {"vmid": vm.get("vmid"), "name": vm.get("name"),
+                           "desired": desired, "actual": actual,
+                           "in_sync": desired == actual}
+                    if why:
+                        row["excluded"] = why
+                    if cl:
+                        row["client_last_seen_age_s"] = cl["last_seen_age_s"]
+                    vms.append(row)
+                drift = [v for v in vms if not v["in_sync"]]
+                hosts.append({
+                    "hostname": hn,
+                    "agent_connected": agent_ok,
+                    "skip_reason": skips.get(hn) or (None if agent_ok else "agent_not_connected"),
+                    "vm_count": len(vms), "drift_count": len(drift),
+                    "vms": sorted(vms, key=lambda v: str(v.get("name") or "")),
+                })
+            return {"status": "SUCCESS",
+                    "connected_agents": sorted(conn_exact),
+                    "live_window_s": _TAG_LIVE_WINDOW_S,
+                    "hosts": sorted(hosts, key=lambda h: h["hostname"])}
 
         if cmd == "CS_GET_DHCP_HEALTH":
             # Everything needed to answer "why is the sim network not handing

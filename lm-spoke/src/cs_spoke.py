@@ -37,7 +37,7 @@ from simulation_engine import SimulationEngine
 import sim_config
 from proxmox_deploy import ProxmoxDeploy
 from command_queue import CommandQueue, CSSettings
-from token_store import TokenStore, compute_sim_tag_map
+from token_store import TokenStore, compute_sim_tag_map, norm_hostname as _norm_hostname
 from client_registry import ClientRegistry
 from demo_scenarios import DemoManager
 from local_store import LocalStore
@@ -110,6 +110,10 @@ class CSSpoke(AgentCommandsMixin, SimCommandsMixin, ConfigCommandsMixin,
         # Per-host signature of the last sim-tag map dispatched to each agent, so
         # an unchanged map is not re-sent every debounce ({hostname: sig-tuple}).
         self._sim_tag_cache: Dict[str, tuple] = {}
+        # {hostname: reason} for hosts the last sweep could NOT tag. Surfaced by
+        # CS_GET_SIM_TAG_HEALTH so "this server has no tags" is answerable
+        # without reading spoke logs.
+        self._sim_tag_skips: Dict[str, str] = {}
         self._sim_tag_sync_lock = asyncio.Lock()
         # Sim-tag sync is DEBOUNCED off the per-frame telemetry hot path: at most
         # once per _SIM_TAG_MIN_INTERVAL. It no longer PUTs to the Proxmox API from
@@ -375,17 +379,36 @@ class CSSpoke(AgentCommandsMixin, SimCommandsMixin, ConfigCommandsMixin,
                 tag_map = compute_sim_tag_map(self.deploy, self.registry)
                 if not tag_map:
                     return
-                # hostname -> currently-connected agent id
+                # hostname -> currently-connected agent id.
+                # Joined on a NORMALIZED key (lowercased, domain stripped): the
+                # telemetry hostname (proxmox_states key, from the agent's own
+                # CS_TELEMETRY frame) and connected_agents[aid]["hostname"] are
+                # two independently-reported strings. When they disagreed — FQDN
+                # vs short name, or a case difference after a host rebuild — the
+                # exact-match lookup below silently skipped that host on EVERY
+                # sweep, so its VMs were never tagged (or froze at whatever tags
+                # they had when the names last matched). Exact match still wins;
+                # the normalized form is only a fallback.
                 hn_to_aid: Dict[str, str] = {}
+                hn_to_aid_norm: Dict[str, str] = {}
                 for aid, info in (self.control_plane.connected_agents or {}).items():
                     hn = str((info or {}).get("hostname") or "").strip()
                     if hn:
                         hn_to_aid[hn] = aid
+                        hn_to_aid_norm.setdefault(_norm_hostname(hn), aid)
                 deploy_states = getattr(self.deploy, "proxmox_states", {}) or {}
+                skipped: Dict[str, str] = {}
                 for hostname, vmid_map in tag_map.items():
-                    aid = hn_to_aid.get(hostname)
+                    aid = (hn_to_aid.get(hostname)
+                           or hn_to_aid_norm.get(_norm_hostname(hostname)))
                     if not aid:
-                        continue  # that host's agent isn't connected right now
+                        # NOT silent: a host whose agent we can't resolve gets no
+                        # tags at all, which is indistinguishable from "no sims
+                        # running" when you look at Proxmox. Record it so
+                        # _sim_tag_skips can answer "why does this host have no
+                        # tags", and log the CHANGE (not every 60s sweep).
+                        skipped[hostname] = "agent_not_connected"
+                        continue
                     # Desired-vs-ACTUAL reconcile: fold each VM's LIVE sim- tags
                     # (reported in telemetry) into the signature. A VM that drifted
                     # — recloned, apply lost, or the tag never took — has the desired
@@ -426,7 +449,22 @@ class CSSpoke(AgentCommandsMixin, SimCommandsMixin, ConfigCommandsMixin,
                         logger.debug("sim-tags: dispatched %d VM(s) to agent %s (%s)",
                                      len(vmid_map), aid, hostname)
                     except Exception as exc:  # noqa: BLE001 - one host must not abort the rest
+                        skipped[hostname] = f"dispatch_failed: {exc}"
                         logger.debug("sim-tag dispatch to %s failed: %s", hostname, exc)
+                # Change-gated report. Logging every sweep would be 1440 lines a
+                # day of steady state; logging only transitions makes the event
+                # findable without drowning it.
+                if skipped != self._sim_tag_skips:
+                    for hn, why in skipped.items():
+                        if self._sim_tag_skips.get(hn) != why:
+                            logger.warning(
+                                "sim-tags: host %s NOT tagged (%s) — its VMs keep "
+                                "whatever tags they already have. Connected agents: %s",
+                                hn, why, sorted(hn_to_aid) or "none")
+                    for hn in self._sim_tag_skips:
+                        if hn not in skipped:
+                            logger.info("sim-tags: host %s tagging recovered", hn)
+                    self._sim_tag_skips = skipped
         except Exception as e:  # noqa: BLE001
             logger.debug("sim-tag sync skipped: %s", e)
 

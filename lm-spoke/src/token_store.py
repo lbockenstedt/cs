@@ -32,14 +32,36 @@ from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger("TokenStore")
 
-# A client seen within this window counts as ONLINE for sim-tag purposes —
-# mirrors client_rows.py ("online = last_seen within 300 s") and the quota
-# engine's QT_ONLINE_S. Online clients get their active_simulations as sim-
-# tags; a client that has aged out gets an empty set (its sim- tags are cleared,
-# manual tags preserved).
-_ONLINE_WINDOW_S = 300.0
+# A client seen within this window keeps its sim- tags. This MUST track the
+# quota engine's OFFLINE_TTL_S (3600s), NOT the 300s "online" window used by
+# client_rows / QT_ONLINE_S.
+#
+# The engine keeps an offline-but-alive runner ASSIGNED and PRODUCING for a full
+# hour — its VM is still running the sim; only the agent's heartbeat lapsed. At
+# 300s this map declared such a client offline and handed back an EMPTY tag set,
+# so apply_sim_tags STRIPPED the sim- tags off a VM that was still running the
+# simulation and still counted in the ledger. Result: a client quiet for 5-60
+# minutes showed `<no-tags>` in Proxmox while the Engine State page listed it as
+# a producing runner — the two views disagreed and the tags looked broken.
+#
+# Borrowing QT_ONLINE_S was the original mistake: that window governs DONGLE
+# QUARANTINE (is this dongle answering right now), a different question from
+# "is this client still running its assigned sim".
+_ONLINE_WINDOW_S = 3600.0
 
 _SIM_TAG_PREFIX = "sim-"
+
+
+def norm_hostname(h: Any) -> str:
+    """Normalize a host identity for JOINING two independently-reported names.
+
+    Telemetry (``proxmox_states`` keys) and the agent registration
+    (``connected_agents[aid]["hostname"]``) are reported separately, so one can
+    be an FQDN or differently-cased. Lowercase + strip the DNS domain so
+    ``PXMX-CS-SVR-03.example.com`` and ``pxmx-cs-svr-03`` join. Used only as a
+    FALLBACK after an exact match, so this can never merge two genuinely
+    different short names."""
+    return str(h or "").strip().lower().split(".")[0]
 
 
 def sanitize_tag(name: str) -> str:
@@ -119,8 +141,9 @@ def _client_sim_map(registry: Any) -> Dict[str, List[str]]:
     tags). Returns ``{}`` when no registry is wired.
 
     ClientRegistry exposes ``get_all()`` (a ``{hostname: entry}`` dict) and has
-    NO ``online`` field — so derive online from ``last_seen`` freshness here,
-    same 300 s window client_rows uses. (The prior code called a nonexistent
+    NO ``online`` field — so derive liveness from ``last_seen`` freshness here,
+    using the ENGINE's offline TTL (see _ONLINE_WINDOW_S) so a still-assigned
+    runner keeps its tags. (The prior code called a nonexistent
     ``registry.get_clients()`` behind a ``hasattr`` guard, so it always fell to
     ``[]`` and this map was permanently empty — sim-tag sync never fired.)"""
     if registry is None:
