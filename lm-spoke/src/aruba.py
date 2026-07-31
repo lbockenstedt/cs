@@ -129,6 +129,69 @@ class ArubaFinding:
     raw: dict[str, Any] = field(default_factory=dict)
 
 
+# Ordered candidate keys for a client's reported OS. Central spells this
+# differently across API generations and Mist differs again, and the WebUI showed
+# "Unknown" for every client because only two spellings were tried while the
+# Central UI clearly had the value. Model/manufacturer are LAST-RESORT: the UI
+# column reads "OS/Model", so a device that reports no OS but does report a model
+# is still more useful than "Unknown".
+_CLIENT_OS_KEYS = (
+    "osType", "os_type", "os",
+    "operatingSystem", "operating_system",
+    "osInfo", "os_info", "osName", "os_name",
+    "clientOs", "client_os",
+    "deviceType", "device_type",
+    "deviceModel", "device_model", "model",
+    "deviceFamily", "device_family",
+)
+
+
+_os_miss_logged: set = set()
+
+
+def _log_os_miss(tag: str, rows: list, raw: list) -> None:
+    """If EVERY client resolved to "—", log the raw field names once per source.
+
+    The first cut of this feature tried two spellings and every client rendered
+    "Unknown" while the Central UI plainly showed an OS — with nothing in the log
+    to say which key it should have read. This makes the next spelling mismatch
+    self-diagnosing instead of a guessing game."""
+    try:
+        if not rows or tag in _os_miss_logged:
+            return
+        if any(str(r.get("os") or "").strip() not in ("", "\u2014") for r in rows):
+            return
+        _os_miss_logged.add(tag)
+        sample = raw[0] if raw else {}
+        logger.warning(
+            "client OS unresolved for ALL %d client(s) [%s] — none of %s present. "
+            "Available fields on a sample record: %s",
+            len(rows), tag, list(_CLIENT_OS_KEYS),
+            sorted(sample.keys()) if isinstance(sample, dict) else type(sample).__name__)
+    except Exception:  # noqa: BLE001 — diagnostics must never break the pull
+        pass
+
+
+def _client_os(item: dict[str, Any]) -> str:
+    """First non-empty OS-ish field on a Central/Mist client record, else "—".
+
+    Values like "unknown"/"n/a" that a controller uses to mean "not reported" are
+    treated as absent so they don't outrank a later, real field."""
+    if not isinstance(item, dict):
+        return "\u2014"
+    for k in _CLIENT_OS_KEYS:
+        v = item.get(k)
+        if isinstance(v, dict):                       # e.g. {"name": "Windows"}
+            v = v.get("name") or v.get("type") or v.get("value")
+        if v is None:
+            continue
+        text = str(v).strip()
+        if not text or text.lower() in ("unknown", "n/a", "na", "none", "-", "\u2014"):
+            continue
+        return text
+    return "\u2014"
+
+
 class ArubaClient:
     """Aruba Central API client. One instance per tenant config."""
 
@@ -585,7 +648,8 @@ class ArubaClient:
             if self.api_version == "new_central":
                 try:
                     data = await self._get(client, "/network-monitoring/v1alpha1/clients", params={"limit": limit})
-                    return [
+                    _items = data.get("items") or []
+                    _rows = [
                         {
                             "mac": item.get("macAddress") or item.get("mac_address") or item.get("mac") or "—",
                             "ip": item.get("ipv4") or item.get("ipv4Address") or item.get("ip_address") or item.get("ip") or "—",
@@ -595,19 +659,22 @@ class ArubaClient:
                             "ap": item.get("associatedDeviceName") or item.get("associatedDevice") or item.get("ap_name") or "—",
                             "ssid": item.get("ssid") or item.get("essid") or "—",
                             "status": item.get("status") or "—",
-                            "os": item.get("osType") or item.get("os_type") or "—",
+                            "os": _client_os(item),
                             "vlan": str(item.get("vlan") or "—"),
                             "connection_type": item.get("clientConnectionType") or "",
                         }
-                        for item in (data.get("items") or [])
+                        for item in _items
                     ]
+                    _log_os_miss("new_central", _rows, _items)
+                    return _rows
                 except Exception as exc:
                     logger.warning("list_clients new_central failed [%s]: %s", self._config_hash, exc)
                     return []
             for path in ("/monitoring/v2/clients/wireless", "/monitoring/v1/clients/wireless"):
                 try:
                     data = await self._get(client, path, params={"limit": limit})
-                    return [
+                    _items = data.get("clients") or data.get("items") or []
+                    _rows = [
                         {
                             "mac": item.get("macaddr") or item.get("mac_address") or item.get("mac") or "—",
                             "ip": item.get("ip_address") or item.get("ip") or "—",
@@ -617,11 +684,13 @@ class ArubaClient:
                             "ap": item.get("associated_device_name") or item.get("ap_name") or "—",
                             "ssid": item.get("ssid") or "—",
                             "status": item.get("status") or "connected",
-                            "os": item.get("os_type") or "—",
+                            "os": _client_os(item),
                             "vlan": str(item.get("vlan_id") or item.get("vlan") or "—"),
                         }
-                        for item in (data.get("clients") or data.get("items") or [])
+                        for item in _items
                     ]
+                    _log_os_miss("classic:" + path, _rows, _items)
+                    return _rows
                 except httpx.HTTPStatusError as exc:
                     if exc.response.status_code == 404:
                         continue
@@ -1118,7 +1187,7 @@ class ArubaClient:
                     "ap": cli.get("associatedDeviceName") or cli.get("associatedDevice") or cli.get("ap_name") or "—",
                     "ssid": cli.get("ssid") or cli.get("essid") or "—",
                     "status": cli.get("status") or "—",
-                    "os": cli.get("osType") or cli.get("os_type") or "—",
+                    "os": _client_os(cli),
                     "vlan": str(cli.get("vlan") or "—"),
                     "connection_type": cli.get("clientConnectionType") or "",
                 })

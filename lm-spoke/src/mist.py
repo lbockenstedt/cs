@@ -122,6 +122,36 @@ def validate_mist_host(host: str) -> str:
     return h
 
 
+# Mist mirrors Central but must never import it (test_mist_tracker enforces the
+# split), so the OS-key resolver is duplicated here. Keep behaviour identical.
+_CLIENT_OS_KEYS = (
+    "osType", "os_type", "os",
+    "operatingSystem", "operating_system",
+    "osInfo", "os_info", "osName", "os_name",
+    "clientOs", "client_os",
+    "deviceType", "device_type",
+    "deviceModel", "device_model", "model",
+    "deviceFamily", "device_family",
+)
+
+
+def _client_os(item) -> str:
+    """First non-empty OS-ish field on a Mist client record, else "—"."""
+    if not isinstance(item, dict):
+        return "\u2014"
+    for k in _CLIENT_OS_KEYS:
+        v = item.get(k)
+        if isinstance(v, dict):
+            v = v.get("name") or v.get("type") or v.get("value")
+        if v is None:
+            continue
+        text = str(v).strip()
+        if not text or text.lower() in ("unknown", "n/a", "na", "none", "-", "\u2014"):
+            continue
+        return text
+    return "\u2014"
+
+
 class MistClient:
     """Juniper Mist API client. One instance per tenant config.
 
@@ -579,7 +609,7 @@ class MistClient:
                     "ap": cl.get("ap_name") or cl.get("ap_mac") or "—",
                     "ssid": cl.get("ssid") or cl.get("essid") or "—",
                     "status": "connected" if cl.get("connected") is not False else "—",
-                    "os": cl.get("os") or cl.get("device_type") or "—",
+                    "os": _client_os(cl),
                     "vlan": str(cl.get("vlan_id") or cl.get("vlan") or "—"),
                     "connection_type": "wireless" if self._client_is_wireless(cl) else "wired",
                 })
@@ -651,7 +681,7 @@ class MistClient:
                     "ap": cl.get("ap_name") or cl.get("ap_mac") or "—",
                     "ssid": cl.get("ssid") or "—",
                     "status": "connected" if cl.get("connected") is not False else "—",
-                    "os": cl.get("os") or "—",
+                    "os": _client_os(cl),
                     "vlan": str(cl.get("vlan_id") or "—"),
                     "connection_type": "wireless" if self._client_is_wireless(cl) else "wired",
                 })
