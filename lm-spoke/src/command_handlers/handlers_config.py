@@ -645,9 +645,46 @@ class ConfigCommandsMixin:
                     st = _os.stat(lease_path)
                     lease_info.update({"exists": True, "size": st.st_size,
                                        "mtime": int(st.st_mtime)})
+                    # Kea's memfile is APPEND-ONLY: every renew/release writes
+                    # a NEW row for the same address, and the file only shrinks
+                    # when Lease File Cleanup (kea-lfc) compacts it. Counting
+                    # lines therefore reports far more "leases" than the pool can
+                    # hold — 688 in a 244-address pool in the field — which makes
+                    # the panel look broken and hides the real signal.
+                    #
+                    # Count DISTINCT addresses instead, last row wins (that is
+                    # the current state of that address), and drop rows that are
+                    # not live: valid_lifetime 0 is a RELEASE, and an expire in
+                    # the past is a lapsed lease still sitting in the file.
+                    # Columns: address,hwaddr,client_id,valid_lifetime,expire,...
+                    _now = int(time.time())
+                    _state: Dict[str, tuple] = {}
+                    _rows = 0
                     with open(lease_path) as fh:
-                        # header + one row per lease
-                        lease_info["leases"] = max(0, sum(1 for _ in fh) - 1)
+                        for _i, _line in enumerate(fh):
+                            if _i == 0 or not _line.strip():
+                                continue          # header
+                            _rows += 1
+                            _c = _line.rstrip("\n").split(",")
+                            if len(_c) < 5 or not _c[0].strip():
+                                continue
+                            try:
+                                _state[_c[0].strip()] = (int(float(_c[3] or 0)),
+                                                         int(float(_c[4] or 0)))
+                            except (TypeError, ValueError):
+                                continue
+                    _live = [a for a, (lt, exp) in _state.items()
+                             if lt > 0 and exp > _now]
+                    lease_info["leases"] = len(_live)
+                    lease_info["addresses"] = len(_state)
+                    lease_info["rows"] = _rows
+                    # Surfacing the row/lease gap makes a broken LFC obvious: a
+                    # healthy file has rows ~= addresses, a file LFC has stopped
+                    # compacting grows without bound.
+                    if _rows > max(50, len(_state) * 3):
+                        out["notes"].append(
+                            f"lease file has {_rows} rows for {len(_state)} address(es) — "
+                            f"kea-lfc (Lease File Cleanup) is not compacting it")
                 except FileNotFoundError:
                     pass
                 except Exception as exc:  # noqa: BLE001

@@ -354,6 +354,23 @@ if [[ "$DHCP_SKIP" != "1" ]]; then
   /var/lib/kea/ rw,
   /var/lib/kea/** rwk,
 AARULES
+            # kea-lfc ALSO needs CAP_DAC_OVERRIDE. Our sim unit runs Kea as ROOT
+            # (no User=), and kea-lfc creates its pid file and RENAMES the lease
+            # DB (csv -> csv.1) across files whose ownership it does not match;
+            # the stock profile's capability set omits dac_override, so AppArmor
+            # denies it even though the process is root:
+            #   profile="kea-lfc" capability=1 capname="dac_override"
+            # The visible failures are LFC_FAIL_PID_CREATE and
+            # DHCPSRV_MEMFILE_LFC_LEASE_FILE_RENAME_FAIL "Permission denied",
+            # neither of which stops DHCP -- leases keep being served while
+            # cleanup silently fails and the memfile grows without bound. That
+            # is what made the health panel report more leases than the pool can
+            # hold (it counts file ROWS, and an uncompacted memfile keeps every
+            # renewal). Granted to kea-lfc ONLY, not the daemons.
+            if [ "$_p" = "usr.sbin.kea-lfc" ]; then
+                grep -qxF '  capability dac_override,' "/etc/apparmor.d/local/$_p" 2>/dev/null \
+                    || printf '%s\n' '  capability dac_override,' >> "/etc/apparmor.d/local/$_p"
+            fi
             # kea-ctrl-agent resolves names at start-up (getaddrinfo for its
             # listen address), which the stock profile does not permit: it is
             # denied /etc/resolv.conf, /etc/hosts, /etc/nsswitch.conf and an
