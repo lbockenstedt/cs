@@ -32,7 +32,8 @@ if ([string]::IsNullOrWhiteSpace($probeRecord)) { $probeRecord = 'example.com' }
 # ── slow-responder POOL ──────────────────────────────────────────────────────
 # Prefer the [address] `dns_latency` list (space/comma separated, UNLIMITED —
 # real DNS servers blacklist a flooding client over time, so keep a big pool and
-# rotate to a still-slow one). Fall back to the legacy dns_latency_1/2/3 keys.
+# rotate to a still-slow one). The legacy dns_latency_1/2/3 slots are retired —
+# this list is the only source.
 $overrides = Get-SimOverrides
 $dnsLatency = get_value 'address' 'dns_latency'
 if ($overrides.ContainsKey('dns_latency')) { $dnsLatency = $overrides['dns_latency'] }
@@ -40,15 +41,6 @@ if ($overrides.ContainsKey('dns_latency')) { $dnsLatency = $overrides['dns_laten
 $pool = @()
 if (-not [string]::IsNullOrWhiteSpace($dnsLatency)) {
     $pool = @(($dnsLatency -split '[,\s]+') | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
-}
-if ($pool.Count -eq 0) {
-    $l1 = get_value 'address' 'dns_latency_1'
-    $l2 = get_value 'address' 'dns_latency_2'
-    $l3 = get_value 'address' 'dns_latency_3'
-    if ($overrides.ContainsKey('dns_latency_1')) { $l1 = $overrides['dns_latency_1'] }
-    if ($overrides.ContainsKey('dns_latency_2')) { $l2 = $overrides['dns_latency_2'] }
-    if ($overrides.ContainsKey('dns_latency_3')) { $l3 = $overrides['dns_latency_3'] }
-    $pool = @(@($l1, $l2, $l3) | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
 }
 if ($pool.Count -eq 0) {
     Write-SimLog "dns_latency.ps1: no dns_latency servers configured — nothing to do"

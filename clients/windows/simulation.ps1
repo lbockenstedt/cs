@@ -409,9 +409,6 @@ while ($true) {
 
     $script:smb_address = get_value 'address' 'smb_address'
     $script:ping_address = get_value 'address' 'ping_address'
-    $script:dns_latency_1 = get_value 'address' 'dns_latency_1'
-    $script:dns_latency_2 = get_value 'address' 'dns_latency_2'
-    $script:dns_latency_3 = get_value 'address' 'dns_latency_3'
     $script:dns_bad_ip_1 = get_value 'address' 'dns_bad_ip_1'
     $script:dns_bad_ip_2 = get_value 'address' 'dns_bad_ip_2'
     $script:dns_bad_ip_3 = get_value 'address' 'dns_bad_ip_3'
@@ -424,7 +421,7 @@ while ($true) {
         'kill_switch','sim_load','public_repo','repo_location','site_based_ssid','iperf_bw',
         'wsite','sim_phy','ssid','ssidpw','dhcp_fail','dns_fail','dns_latency','collab','assoc_fail','port_flap','ping_test',
         'download','iperf','www_traffic','ssidpw_fail','auth_fail','smb_address','ping_address',
-        'dns_latency_1','dns_latency_2','dns_latency_3','dns_bad_ip_1','dns_bad_ip_2','dns_bad_ip_3',
+        'dns_bad_ip_1','dns_bad_ip_2','dns_bad_ip_3',
         'dns_bad_record_1','dns_bad_record_2','dns_bad_record_3','iperf_server',
         'collab_app','collab_bw','collab_time','collab_server','dot1x_password','web_server'
     )

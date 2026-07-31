@@ -284,9 +284,7 @@ repo_branch=main
 
 [address]
 # Use verified, secure DNS servers
-dns_latency_1=8.8.8.8           # Google DNS (verified)
-dns_latency_2=8.8.4.4           # Google DNS secondary
-dns_latency_3=1.1.1.1           # Cloudflare DNS
+dns_latency=8.8.8.8 8.8.4.4 1.1.1.1   # verified DNS servers (space-separated pool)
 
 # Use real server addresses, not test addresses
 ping_address=8.8.8.8

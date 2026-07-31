@@ -828,9 +828,6 @@ SERVER_SECTION_KEYS = {"server_url"}
 ADDRESS_SECTION_KEYS = {
     "smb_address",
     "ping_address",
-    "dns_latency_1",
-    "dns_latency_2",
-    "dns_latency_3",
     "dns_bad_ip_1",
     "dns_bad_ip_2",
     "dns_bad_ip_3",

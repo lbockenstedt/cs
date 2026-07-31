@@ -476,9 +476,6 @@ Resolution order on a client VM is:
 | `[server]` | `server_url` | `http://169.253.1.1:8080` | Spoke URL used by clients for health/config/scripts/status/inbox |
 | `[address]` | `smb_address` | `//nas/scripts` | SMB fallback path for updates |
 | `[address]` | `ping_address` | `172.31.201.3` | Ping target for traffic testing |
-| `[address]` | `dns_latency_1` | `13.239.88.95` | DNS latency target 1 |
-| `[address]` | `dns_latency_2` | `27.110.152.250` | DNS latency target 2 |
-| `[address]` | `dns_latency_3` | `165.246.10.2` | DNS latency target 3 |
 | `[address]` | `dns_bad_ip_1` | `10.0.0.1` | Bad DNS response IP 1 |
 | `[address]` | `dns_bad_ip_2` | `172.16.0.1` | Bad DNS response IP 2 |
 | `[address]` | `dns_bad_ip_3` | `192.168.0.1` | Bad DNS response IP 3 |
@@ -522,9 +519,6 @@ These keys are valid in `[s0]`-`[s9]` bucket sections and in `[username]` sectio
 | `iperf_bw` | `1k` in examples | User-specific iPerf target |
 | `smb_address` | `//nas/scripts` in examples | User-specific SMB fallback path override |
 | `ping_address` | `172.31.201.1` in examples | User-specific ping target override |
-| `dns_latency_1` | `13.239.88.95` in examples | User-specific DNS latency target 1 override |
-| `dns_latency_2` | `27.110.152.250` in examples | User-specific DNS latency target 2 override |
-| `dns_latency_3` | `165.246.10.2` in examples | User-specific DNS latency target 3 override |
 | `dns_bad_ip_1` | `10.0.0.2` in examples | User-specific bad DNS IP 1 override |
 | `dns_bad_ip_2` | `172.16.0.2` in examples | User-specific bad DNS IP 2 override |
 | `dns_bad_ip_3` | `192.168.0.2` in examples | User-specific bad DNS IP 3 override |

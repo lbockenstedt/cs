@@ -30,7 +30,8 @@ dnsfile=$(shuf /usr/local/scripts/dns_fail.txt 2>/dev/null)
 # The dns_latency server POOL (any number). Prefer the [address] `dns_latency`
 # list (space-separated, UNLIMITED — real DNS servers blacklist a flooding client
 # over time, so we keep a big pool and rotate to a still-slow one); fall back to
-# the legacy dns_latency_1/2/3 keys when the list key is absent.
+# nothing when the list key is absent — the legacy dns_latency_1/2/3 slots are
+# retired, this list is the only source.
 dns_latency=$(get_value 'address' 'dns_latency')
 #------------------------------------------------------------
 # Per-user overrides — mirror simulation.sh's apply_override so a
@@ -48,13 +49,6 @@ apply_override() {
 apply_override 'dns_latency'
 dns_latency="${dns_latency//,/ }"          # tolerate comma- OR space-separated lists
 latencies=($dns_latency)
-if (( ${#latencies[@]} == 0 )); then
-  dns_latency_1=$(get_value 'address' 'dns_latency_1')
-  dns_latency_2=$(get_value 'address' 'dns_latency_2')
-  dns_latency_3=$(get_value 'address' 'dns_latency_3')
-  for key in dns_latency_1 dns_latency_2 dns_latency_3; do apply_override "$key"; done
-  latencies=($dns_latency_1 $dns_latency_2 $dns_latency_3)
-fi
 # Self-healing pick: use ONE server whose lookups are actually SLOW (>= the
 # latency threshold), rotating away from any blacklisted one (now refuses fast).
 # Persisted so a good server sticks; re-probed periodically in the burst below.

@@ -97,9 +97,7 @@ Change these to match your lab network.
 [address]
 smb_address=//nas/scripts
 ping_address=172.31.201.3
-dns_latency_1=13.239.88.95    # External DNS servers used to generate latency
-dns_latency_2=27.110.152.250
-dns_latency_3=165.246.10.2
+dns_latency=208.67.220.220 13.239.88.95 27.110.152.250 165.246.10.2   # space-separated pool (unlimited)
 dns_bad_ip_1=10.0.0.1         # IPs that return bad DNS responses
 dns_bad_ip_2=172.16.0.1
 dns_bad_ip_3=192.168.0.1

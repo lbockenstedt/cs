@@ -165,8 +165,8 @@ function Get-WifiStandard {
 $script:CS_OVERRIDE_KEYS = @(
     'kill_switch','sim_load','github_repo','repo_location','site_based_ssid','iperf_bw',
     'wsite','sim_phy','ssid','ssidpw','dhcp_fail','dns_fail','dns_latency','assoc_fail','port_flap','ping_test','download','iperf',
-    'www_traffic','ssidpw_fail','auth_fail','smb_address','ping_address','dns_latency_1','dns_latency_2',
-    'dns_latency_3','dns_bad_ip_1','dns_bad_ip_2','dns_bad_ip_3','dns_bad_record_1','dns_bad_record_2',
+    'www_traffic','ssidpw_fail','auth_fail','smb_address','ping_address',
+    'dns_bad_ip_1','dns_bad_ip_2','dns_bad_ip_3','dns_bad_record_1','dns_bad_record_2',
     'dns_bad_record_3','iperf_server','dot1x_password',
     'collab','collab_app','collab_bw','collab_time','collab_server','web_server'
 )

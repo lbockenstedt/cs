@@ -52,7 +52,6 @@ SIM_FLAG_KEYS = (
     "wsite", "ssid", "ssidpw", "dhcp_fail", "dns_fail", "dns_latency", "assoc_fail",
     "port_flap", "ping_test", "download", "iperf", "www_traffic", "sim_phy",
     "l1", "smb_address", "ping_address", "iperf_server",
-    "dns_latency_1", "dns_latency_2", "dns_latency_3",
     "dns_bad_ip_1", "dns_bad_ip_2", "dns_bad_ip_3",
     "dns_bad_record_1", "dns_bad_record_2", "dns_bad_record_3",
     "central_check", "mutter_cpu_limit",
