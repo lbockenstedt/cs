@@ -513,7 +513,8 @@ class ConfigCommandsMixin:
                                                 else (order[1] if len(order) > 1 else "")))
 
             # ── lease DB: the thing that proves it is actually serving ───────
-            lease_info = {"exists": False, "leases": 0, "size": 0, "mtime": 0}
+            lease_info = {"exists": False, "leases": 0, "size": 0, "mtime": 0,
+                          "readable": True}
             if lease_path:
                 try:
                     st = _os.stat(lease_path)
@@ -525,7 +526,13 @@ class ConfigCommandsMixin:
                 except FileNotFoundError:
                     pass
                 except Exception as exc:  # noqa: BLE001
-                    out["notes"].append(f"lease file unreadable: {exc}")
+                    # The file is 0640 _kea:_kea, so the spoke user often cannot
+                    # read it. Say UNKNOWN — reporting 0 here reads as "running
+                    # but nobody has leased yet", which is a different (and
+                    # much less alarming) statement than "I cannot tell".
+                    lease_info["readable"] = False
+                    lease_info["leases"] = None
+                    out["notes"].append(f"lease count unavailable: {exc}")
             out["lease_db"] = lease_info
 
             # ── config test (catches a bad conf independent of the unit) ─────

@@ -596,6 +596,17 @@ EOF
         systemctl enable --now kea-dhcp4-sim kea-ctrl-agent-sim >/dev/null 2>&1 || true
         systemctl restart kea-dhcp4-sim kea-ctrl-agent-sim >/dev/null 2>&1 || true
 
+        # Let the spoke user READ diagnostics. The DHCP health panel runs as the
+        # spoke (svc_lm) and could report "NOT serving" without being able to say
+        # why: the journal needs the systemd-journal group, and the lease file is
+        # 0640 _kea:_kea. Read-only group membership only -- nothing here grants
+        # write access to Kea's data or lets the spoke change policy.
+        if id -u "$SVC_USER" >/dev/null 2>&1; then
+            usermod -aG systemd-journal "$SVC_USER" 2>/dev/null || true
+            getent group _kea >/dev/null 2>&1 && usermod -aG _kea "$SVC_USER" 2>/dev/null || true
+            ok "Diagnostics: ${SVC_USER} can read the Kea journal + lease file (health panel shows the real error)"
+        fi
+
         # ── Verify it actually SERVES, and fall back to complain mode ─────────
         # The local-include grant above is not always sufficient: Debian's kea
         # profile can carry an explicit `deny`, and in AppArmor an explicit deny
