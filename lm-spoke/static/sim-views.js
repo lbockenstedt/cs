@@ -8064,12 +8064,15 @@ window.csVmBulk = async function (action) {
     const byHost = {};
     items.forEach(v => { const hl = v._hostlabel || v._host || '?'; byHost[hl] = (byHost[hl] || 0) + 1; });
     const hostList = Object.keys(byHost);
-    // Destructive + cross-host → confirm with the per-host breakdown.
-    if (action === 'delete_vm') {
+    // No confirm dialog on delete (operator request): the toast below already
+    // names the count and the hosts, and the rows go into an in-flight state
+    // immediately, so the action is visible without a modal. The per-host
+    // breakdown that used to live in the dialog rides the toast instead, so a
+    // cross-host bulk still shows WHERE the VMs are going.
+    if (typeof showToast === 'function') {
         const bd = hostList.map(h => `${h} (${byHost[h]})`).join(', ');
-        if (!confirm(`Delete ${items.length} VM(s) across ${hostList.length} host(s)?\n\n${bd}`)) return;
+        showToast(`${csVmActionLabel(action)} ${items.length} VM(s) across ${hostList.length} host(s): ${bd}`, 'info');
     }
-    if (typeof showToast === 'function') showToast(`${csVmActionLabel(action)} ${items.length} VM(s) across ${hostList.length} host(s)…`, 'info');
     // Optimistic in-flight: mark every selected VM the moment we dispatch (before
     // awaiting) and re-render so their rows show the operation instantly.
     const _op = _CS_ACTION_OP[action];
@@ -8664,21 +8667,35 @@ window.csClearCommands = async function () {
 
 // Two dongle-release actions. Both force-unbind driver-bound dongles from the
 // host driver (agent side); they differ only in which state store they clear.
-async function _csUsbClearCmd(host, action, doneMsg) {
+// allSpokes: the USB quarantine / exclusion lists are PER-HOST state and each cs
+// spoke owns its own host(s), so clearing them is only meaningful fleet-wide.
+// Without the flag the hub enqueued to whichever spoke it happened to pick, which
+// cleared ONE host and left the rest quarantined while the toast still read as a
+// success.
+async function _csUsbClearCmd(host, action, doneMsg, allSpokes) {
     try {
+        const body = { action, target: host || 'proxmox', type: action, args: {} };
+        if (allSpokes) body.all_spokes = true;
         const r = await csFetch(`/${csTenant()}/proxmx/command?tenant_id=${csTenant()}`, {
-            method: 'POST', body: JSON.stringify({ action, target: host || 'proxmox', type: action, args: {} }) });
+            method: 'POST', body: JSON.stringify(body) });
+        if (r && Array.isArray(r.errors) && (r.errors.length || (r.refusals || []).length)) {
+            // Partial fan-out: name the spokes that did NOT clear rather than
+            // reporting a blanket success.
+            const bad = r.errors.concat(r.refusals || []).join('; ');
+            showToast(`${doneMsg}. Cleared ${r.pushed_to_spokes}/${r.spokes_total} spoke(s) — failed: ${bad}`, 'error');
+            return;
+        }
         if (typeof csPushToast === 'function') csPushToast(r, doneMsg);
         else if (typeof showToast === 'function') showToast(doneMsg, 'success');
     } catch (e) { console.error(action + ' failed', e); if (typeof showToast === 'function') showToast(action + ' failed: ' + (e.message || e), 'error'); }
 }
 window.csClearUsbQuarantine = async function (spokeId, host) {
-    if (!confirm(`Clear USB quarantine on ${host || 'this host'}?\n\nClears the dmesg quarantine list (incl. the 5-strike permanent flag) and force-unbinds any driver-bound dongle from the host driver. Leaves the exclusion list intact.`)) return;
-    _csUsbClearCmd(host, 'clear_usb_quarantine', 'Quarantine cleared + driver-bound dongles released — available on the next provision pass');
+    if (!confirm(`Clear USB quarantine across ALL spokes?\n\nClears the dmesg quarantine list (incl. the 5-strike permanent flag) and force-unbinds any driver-bound dongle from the host driver. Leaves the exclusion list intact.`)) return;
+    _csUsbClearCmd(host, 'clear_usb_quarantine', 'Quarantine cleared on all spokes + driver-bound dongles released — available on the next provision pass', true);
 };
 window.csClearUsbExclusions = async function (spokeId, host) {
-    if (!confirm(`Clear USB exclusion list on ${host || 'this host'}?\n\nClears the destroy-fail bus exclusions (what repeated spin-up/down trips) and force-unbinds any driver-bound dongle from the host driver. Leaves the quarantine list intact.`)) return;
-    _csUsbClearCmd(host, 'clear_usb_exclusions', 'Exclusion list cleared + driver-bound dongles released — available on the next provision pass');
+    if (!confirm(`Clear USB exclusion list across ALL spokes?\n\nClears the destroy-fail bus exclusions (what repeated spin-up/down trips) and force-unbinds any driver-bound dongle from the host driver. Leaves the quarantine list intact.`)) return;
+    _csUsbClearCmd(host, 'clear_usb_exclusions', 'Exclusion list cleared on all spokes + driver-bound dongles released — available on the next provision pass', true);
 };
 
 window.csCmdDelete = async function (btn) {
