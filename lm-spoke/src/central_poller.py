@@ -357,6 +357,28 @@ class CheckHealthHistory:
                 for b, v in sorted(buckets.items())]
 
 
+def client_os_counts(clients) -> Dict[str, int]:
+    """``{os_label: count}`` for a browse client list, biggest first.
+
+    The per-client ``os`` field is already normalized by ArubaClient/MistClient
+    (osType / os_type / device_type, "—" when the controller reported nothing).
+    Aggregated HERE rather than in the browser so every consumer of the browse
+    payload — WebUI tabs, the dashboard, and any API caller — sees the same
+    numbers. Unreported values collapse into "Unknown" instead of "—" so the
+    label reads sensibly in a count ("12 Unknown").
+    """
+    counts: Dict[str, int] = {}
+    for c in (clients or []):
+        try:
+            raw = str((c or {}).get("os") or "").strip()
+        except Exception:  # noqa: BLE001
+            raw = ""
+        label = raw if raw and raw != "\u2014" else "Unknown"
+        counts[label] = counts.get(label, 0) + 1
+    # biggest first, then alphabetical so equal counts render deterministically
+    return dict(sorted(counts.items(), key=lambda kv: (-kv[1], kv[0].lower())))
+
+
 class CentralPoller:
     """Drives ``ArubaClient`` on a 5-minute loop, writing
     ``spoke.central_status`` in the shape ``sim-views.js``'s Checks/Hardware/
@@ -648,15 +670,17 @@ class CentralPoller:
         if not self._client or not self._client.is_configured():
             return {"status": "SUCCESS", "sites": [], "alerts": [], "insights": [],
                     "clients": [], "devices_by_site": {}, "clients_by_site": {},
-                    "warning": "Central not configured."}
+                    "os_counts": {}, "warning": "Central not configured."}
         try:
             data = await self._client.browse_all()
-            return {"status": "SUCCESS", **data}
+            return {"status": "SUCCESS", **data,
+                    "os_counts": client_os_counts(data.get("clients"))}
         except Exception as exc:  # noqa: BLE001
             logger.warning("Central browse failed [%s]: %s",
                            self.spoke.spoke_id, exc)
             return {"status": "ERROR", "message": str(exc),
-                    "sites": [], "alerts": [], "insights": [], "clients": []}
+                    "sites": [], "alerts": [], "insights": [], "clients": [],
+                    "os_counts": {}}
 
     async def test_connection(self) -> Dict[str, Any]:
         """Best-effort connectivity check for the Setup → Central API tab's

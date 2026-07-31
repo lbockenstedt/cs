@@ -57,6 +57,23 @@ def _build_mist_config(mist_config: Dict[str, Any]) -> Dict[str, Any]:
     return dict(mist_config)
 
 
+def client_os_counts(clients) -> Dict[str, int]:
+    """``{os_label: count}`` for a browse client list, biggest first.
+
+    DUPLICATED from central_poller on purpose: Mist mirrors Central but must
+    never import it (test_mist_tracker enforces this — the two data sources stay
+    independently evolvable). Keep the two copies behaviourally identical."""
+    counts: Dict[str, int] = {}
+    for c in (clients or []):
+        try:
+            raw = str((c or {}).get("os") or "").strip()
+        except Exception:  # noqa: BLE001
+            raw = ""
+        label = raw if raw and raw != "\u2014" else "Unknown"
+        counts[label] = counts.get(label, 0) + 1
+    return dict(sorted(counts.items(), key=lambda kv: (-kv[1], kv[0].lower())))
+
+
 class MistPoller:
     """Drives ``MistClient`` on a 5-minute loop, writing ``spoke.mist_status`` in
     the shape ``sim-views.js``'s Checks/Hardware/Client-Count tabs expect. No-op
@@ -256,14 +273,16 @@ class MistPoller:
         if not self._client or not self._client.is_configured():
             return {"status": "SUCCESS", "sites": [], "alerts": [], "insights": [],
                     "clients": [], "devices_by_site": {}, "clients_by_site": {},
-                    "warning": "Mist not configured."}
+                    "os_counts": {}, "warning": "Mist not configured."}
         try:
             data = await self._client.browse_all()
-            return {"status": "SUCCESS", **data}
+            return {"status": "SUCCESS", **data,
+                    "os_counts": client_os_counts(data.get("clients"))}
         except Exception as exc:  # noqa: BLE001
             logger.warning("Mist browse failed [%s]: %s", self.spoke.spoke_id, exc)
             return {"status": "ERROR", "message": str(exc),
-                    "sites": [], "alerts": [], "insights": [], "clients": []}
+                    "sites": [], "alerts": [], "insights": [], "clients": [],
+                    "os_counts": {}}
 
     async def test_connection(self) -> Dict[str, Any]:
         """Best-effort connectivity check for the Setup → Mist API "Test" button.
