@@ -296,7 +296,9 @@ if [[ "$DHCP_SKIP" != "1" ]]; then
         # Sim DHCP is OPTIONAL (single-NIC hosts skip it). A kea apt failure must
         # NOT abort the whole cs spoke install under `set -e` — bail the DHCP
         # branch and continue so the spoke unit still gets written/started.
-        if ! DEBIAN_FRONTEND=noninteractive apt-get install -y -q kea-dhcp4-server kea-ctrl-agent \
+        # 'acl' ships setfacl, used below to give the spoke a durable read on the
+        # sim lease DB (which Kea owns as root and recreates periodically).
+        if ! DEBIAN_FRONTEND=noninteractive apt-get install -y -q kea-dhcp4-server kea-ctrl-agent acl \
                 -o Dpkg::Options::="--force-confdef" \
                 -o Dpkg::Options::="--force-confold"; then
             warn "kea install failed — skipping sim DHCP (cs spoke will still install)"
@@ -611,8 +613,35 @@ EOF
         # write access to Kea's data or lets the spoke change policy.
         if id -u "$SVC_USER" >/dev/null 2>&1; then
             usermod -aG systemd-journal "$SVC_USER" 2>/dev/null || true
+            # NOTE: the _kea group does NOT get you the sim lease file. Our
+            # kea-dhcp4-sim unit runs as ROOT (no User=), so Kea creates
+            # kea-leases4-sim.csv as root:root 0640 — group _kea is irrelevant
+            # to it. Only the PACKAGED instance's files are _kea:_kea. Kept
+            # anyway so the packaged files are readable too, but the sim file
+            # needs the explicit grant below.
             getent group _kea >/dev/null 2>&1 && usermod -aG _kea "$SVC_USER" 2>/dev/null || true
-            ok "Diagnostics: ${SVC_USER} can read the Kea journal + lease file (health panel shows the real error)"
+
+            # Durable read access to the SIM lease file for the health panel.
+            # A one-off chgrp is not enough: Kea and the hourly LFC recreate the
+            # file, and a fresh root:root 0640 drops any ownership we set. A
+            # DEFAULT ACL on the directory is inherited by every file created in
+            # it afterwards, so the grant survives recreation. Read-only, and
+            # scoped to this one user.
+            if command -v setfacl >/dev/null 2>&1; then
+                setfacl -m   "u:${SVC_USER}:rx" /var/lib/kea 2>/dev/null || true
+                setfacl -d -m "u:${SVC_USER}:r"  /var/lib/kea 2>/dev/null || true
+                [ -f /var/lib/kea/kea-leases4-sim.csv ] && \
+                    setfacl -m "u:${SVC_USER}:r" /var/lib/kea/kea-leases4-sim.csv 2>/dev/null || true
+                ok "Diagnostics: ${SVC_USER} granted read on the sim lease DB (default ACL survives Kea recreating it)"
+            else
+                # No acl tooling: fall back to a group-readable file. This is
+                # undone whenever Kea recreates the file, so say so rather than
+                # implying it is permanent.
+                [ -f /var/lib/kea/kea-leases4-sim.csv ] && \
+                    chgrp _kea /var/lib/kea/kea-leases4-sim.csv 2>/dev/null && \
+                    chmod 0640 /var/lib/kea/kea-leases4-sim.csv 2>/dev/null || true
+                warn "Diagnostics: setfacl not installed — granted lease-DB read via group only; it reverts when Kea recreates the file. Install 'acl' for a durable grant."
+            fi
         fi
 
         # ── Verify it actually SERVES, and fall back to complain mode ─────────
@@ -1282,7 +1311,7 @@ else
         if runuser -u "$SVC_USER" -- test -r "$_lease" 2>/dev/null; then
             ok "Diagnostics: spoke can read the lease DB (health panel will show real lease counts)"
         else
-            warn "Diagnostics: ${SVC_USER} still cannot read $_lease — the health panel will show 'count unreadable'. Fix: usermod -aG _kea ${SVC_USER} && systemctl restart lm-cs"
+            warn "Diagnostics: ${SVC_USER} still cannot read $_lease — the health panel will show 'count unreadable'. The sim lease file is root:root (our Kea unit runs as root), so the _kea group does NOT cover it. Fix: setfacl -m u:${SVC_USER}:r $_lease && setfacl -d -m u:${SVC_USER}:r /var/lib/kea"
         fi
     fi
     ok "Generic Agent service started"
