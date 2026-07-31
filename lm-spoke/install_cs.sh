@@ -339,12 +339,20 @@ AARULES
                && ! grep -qF 'abstractions/nameservice' "/etc/apparmor.d/local/$_p" 2>/dev/null; then
                 printf '  #include <abstractions/nameservice>\n' >> "/etc/apparmor.d/local/$_p"
             fi
+            # Report the reload PER PROFILE and surface the parser's own error.
+            # A single shared flag hid the case that actually bit: ctrl-agent
+            # reloading fine while kea-dhcp4 did not, so the installer claimed
+            # success while the DHCP server -- the one that matters for leases --
+            # was still denied its lease file and crash-looping.
             if command -v apparmor_parser >/dev/null 2>&1; then
-                apparmor_parser -r "/etc/apparmor.d/$_p" 2>/dev/null && _aa_reloaded=1
+                _aa_err="$(apparmor_parser -r "/etc/apparmor.d/$_p" 2>&1 >/dev/null)" && {
+                    ok "AppArmor: ${_p} reloaded"
+                    _aa_reloaded=1
+                } || warn "AppArmor: ${_p} FAILED to reload${_aa_err:+ — $_aa_err}. Kea will keep being denied; fix and run: apparmor_parser -r /etc/apparmor.d/${_p}"
             fi
         done
         if [ "$_aa_reloaded" = "1" ]; then
-            ok "AppArmor: granted the sim Kea instance its /run/kea runtime files"
+            ok "AppArmor: granted the sim Kea instance its /run/kea + /var/lib/kea runtime files (see per-profile reload lines above)"
         elif [ -d /etc/apparmor.d ] && [ -f /etc/apparmor.d/usr.sbin.kea-dhcp4 ]; then
             warn "AppArmor profiles present but apparmor_parser did not reload — if kea-dhcp4-sim crash-loops with \"Unable to open PID file\", run: apparmor_parser -r /etc/apparmor.d/usr.sbin.kea-dhcp4"
         fi
