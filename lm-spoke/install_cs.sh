@@ -319,7 +319,15 @@ if [[ "$DHCP_SKIP" != "1" ]]; then
         # 'k' = lock permission, required for the interprocess logger_lockfile
         # (denied separately from the PID file).
         _aa_reloaded=0
-        for _p in usr.sbin.kea-dhcp4 usr.sbin.kea-ctrl-agent; do
+        # kea-lfc too: the Lease File Cleanup helper runs hourly against the
+        # SAME renamed lease DB, so it hits the identical denial --
+        #   profile="kea-lfc" name="/var/lib/kea/kea-leases4-sim.csv"     (w)
+        #   profile="kea-lfc" name="/var/lib/kea/kea-leases4-sim.csv.pid" (c)
+        # It does not stop DHCP, which is why it went unnoticed: leases keep
+        # being handed out while cleanup silently fails and the CSV grows
+        # without bound. Same rule set covers it (the .pid lives under
+        # /var/lib/kea/**).
+        for _p in usr.sbin.kea-dhcp4 usr.sbin.kea-ctrl-agent usr.sbin.kea-lfc; do
             [ -f "/etc/apparmor.d/$_p" ] || continue
             mkdir -p /etc/apparmor.d/local
             # BOTH runtime dirs. /run/kea covers the PID + logger lockfile;

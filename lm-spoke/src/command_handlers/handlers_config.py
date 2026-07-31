@@ -547,7 +547,12 @@ class ConfigCommandsMixin:
             if rc == 0 and so:
                 fatal = [l for l in so.splitlines()
                          if "ERROR" in l or "Fatal" in l or "DENIED" in l]
+                # Distinguish real errors from tail-context. Without this the UI
+                # renders DHCP4_LEASE_ALLOC / DHCPACK success lines under a
+                # heading that says "Last errors", which reads as a fault on a
+                # spoke that is working perfectly.
                 out["last_errors"] = fatal[-6:] or so.splitlines()[-3:]
+                out["last_errors_are_fatal"] = bool(fatal)
             else:
                 out["last_errors"] = []
                 out["notes"].append(
