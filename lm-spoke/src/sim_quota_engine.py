@@ -101,6 +101,11 @@ def _quota_key(q: Dict[str, Any]) -> str:
     return f"{q.get('alert_type', 'alert')}:{q.get('alert_id', '')}:{q.get('site', '')}"
 
 
+# Tier UPGRADE swaps per quota per sweep. A swap tears down a running sim on the
+# outgoing client and starts it on the incoming one, so the churn is paid a client
+# at a time rather than re-shuffling a whole quota in one sweep. At the 60s
+# reconcile interval a 10-client quota fully upgrades in ~5 min.
+TIER_UPGRADE_PER_SWEEP = 2
 PLACEMENT_PREFIX = "placement:"   # ledger key prefix for SSID placement quotas
 # pxmx_site_map value marking a server whose clients are NOT physically site-bound
 # (site-based SSID) — they join this tenant's assignable pool and placement gives
@@ -732,20 +737,59 @@ class SimQuotaEngine:
         # onto the registry client (record_tiers_batch) — t1/t2/t3 or "".
         return str((c or {}).get("tier") or "").lower()
 
+    # Tenant-wide default applied when a quota does not pin its own tier
+    # ("best"). The intended model is T1 = dedicated PCI radios reserved for
+    # SPECIFIC simulations, T2 = USB dongles carrying background noise — but that
+    # is a policy choice, so it is configurable rather than baked in.
+    _TIER_PRIORITY_VALUES = ("t1_first", "t2_first", "t1_only", "t2_only")
+
+    def _tier_priority(self) -> str:
+        """Tenant tier priority for quotas that did not pin a tier. Default
+        't1_first' — use every available T1, fall back to T2 — which is the
+        historical 'best' behaviour, so an unconfigured tenant is unchanged."""
+        try:
+            csc = self.spoke.local_store.get_central_sites_config() or {}
+        except Exception:  # noqa: BLE001
+            return "t1_first"
+        v = str(csc.get("tier_priority") or "").strip().lower()
+        return v if v in self._TIER_PRIORITY_VALUES else "t1_first"
+
+    def _effective_tier(self, req_tier: str) -> str:
+        """Resolve a quota's own tier against the tenant default.
+
+        A quota that PINS t1/t2 always wins — the per-quota setting is an
+        explicit operator decision and the tenant default must not override it.
+        Only 'best' (unset) consults the default."""
+        rt = (req_tier or "best").strip().lower()
+        if rt in ("t1", "t2"):
+            return rt
+        pri = self._tier_priority()
+        if pri == "t1_only":
+            return "t1"
+        if pri == "t2_only":
+            return "t2"
+        return "best_t2" if pri == "t2_first" else "best"
+
     def _tier_ok(self, c: Dict[str, Any], req_tier: str) -> bool:
         """Hard tier gate: a 't1'/'t2' quota admits ONLY that tier (underfill
-        rather than degrade); 'best' (default) admits all — ordering prefers T1."""
-        if req_tier in ("t1", "t2"):
-            return self._tier_of(c) == req_tier
+        rather than degrade); 'best' admits all — ordering decides preference.
+        t1_only/t2_only from the tenant default gate the same way."""
+        eff = self._effective_tier(req_tier)
+        if eff in ("t1", "t2"):
+            return self._tier_of(c) == eff
         return True
 
     def _tier_rank(self, c: Dict[str, Any], req_tier: str) -> int:
-        """Ordering rank under ``req_tier``. 'best' → prefer T1 (0) then T2 (1)
-        then other/unknown (2) — 'use all the T1 available, fall back to T2'. Hard
-        t1/t2 already filtered → uniform rank."""
-        if req_tier != "best":
+        """Ordering rank. 'best' → T1 first then T2; 'best_t2' (tenant
+        t2_first) → T2 first then T1 — for a fleet that wants its T1 radios kept
+        free for pinned quotas. Hard t1/t2 already filtered → uniform rank."""
+        eff = self._effective_tier(req_tier)
+        if eff not in ("best", "best_t2"):
             return 0
-        return {"t1": 0, "t2": 1}.get(self._tier_of(c), 2)
+        t = self._tier_of(c)
+        if eff == "best_t2":
+            return {"t2": 0, "t1": 1}.get(t, 2)
+        return {"t1": 0, "t2": 1}.get(t, 2)
 
     def _in_harvest_cooldown(self, hostname: str, now: float) -> bool:
         """True while ``hostname`` is inside its post-harvest cooldown window
@@ -1041,6 +1085,27 @@ class SimQuotaEngine:
             return
         cells = getattr(self, "_cells_by_name", {})
         online = {h for h, c in clients.items() if self._is_harvestable(c, now)}
+        # Tier RESERVATION for the ambient pool. Quotas already pick T1 first
+        # (_tier_rank, and harvest runs before this), but that is a preference,
+        # not a reservation: a T1 no quota claimed this sweep would otherwise be
+        # spent on background noise and be unavailable the moment a quota grows.
+        # 't1_first' (default) holds T1s BACK from ambient so they stay free for
+        # specific simulations; 't2_first' does the mirror; the *_only modes pin
+        # ambient to that tier outright. If the reservation would leave ambient
+        # with NO clients at all, it is dropped for this sweep — an idle fleet is
+        # worse than an unreserved one, and *_only is an explicit operator pin so
+        # it is honoured even when it empties the pool.
+        pri = self._tier_priority()
+        hold = {"t1_first": "t1", "t2_first": "t2",
+                "t1_only": "t2", "t2_only": "t1"}.get(pri)
+        if hold:
+            kept = {h for h in online if self._tier_of(clients.get(h) or {}) != hold}
+            if kept or pri in ("t1_only", "t2_only"):
+                if len(kept) != len(online):
+                    logger.debug(
+                        "SimQuotaEngine: tier_priority=%s reserving %d %s client(s) out of ambient",
+                        pri, len(online) - len(kept), hold.upper())
+                online = kept
         # Group rules by the cell's physical site.
         by_site: Dict[str, List[Dict[str, Any]]] = {}
         for r in rules:
@@ -1466,31 +1531,37 @@ class SimQuotaEngine:
                 # ``from_site`` so a later release reverts it AND a packed fellow
                 # quota is recognized as a re-homer (no cross-quota wsite
                 # stomp).
+                # Clients the engine has ALREADY homed to this site under any
+                # other quota (typically a presence quota — "Clients Associated")
+                # count as in-site here, so a sim quota's tests stack onto
+                # presence-homed clients immediately instead of waiting for the
+                # next sweep's snapshot to reflect the wsite re-home (get_all() is
+                # a stale per-sweep copy).
+                # Share by CELL, not site: only clients already homed to THIS cell
+                # (same claim) count as homed_here — so dns_fail on MIA-PSK stacks
+                # onto MIA-PSK's Clients Associated, but NOT onto MIA-ACD.
+                # Computed OUTSIDE the top-up branch: the tier-upgrade pass below
+                # runs when the quota is FULL (top-up skipped) and needs the same
+                # in-site test.
+                homed_here = set()
+                if claim_key:
+                    for e in self._ledger.values():
+                        if (e.get("claim") or e.get("site") or "") == claim_key:
+                            homed_here.update((e.get("clients") or {}).keys())
+                # Per-quota tier policy: t1/t2 admit ONLY that tier; "best"
+                # (unset) admits all and defers to the tenant tier_priority — the
+                # sort below then prefers that tier. Hoisted with homed_here: the
+                # tier-upgrade pass runs on a FULL quota, where the top-up that
+                # used to define this is skipped.
+                req_tier = str(q.get("tier") or "best").strip().lower()
                 if len(producing) < target:
                     need = target - len(producing)
-                    # Clients the engine has ALREADY homed to this site under any
-                    # other quota (typically a presence quota — "Clients
-                    # Associated") count as in-site here, so a sim quota's tests
-                    # stack onto presence-homed clients immediately instead of
-                    # waiting for the next sweep's snapshot to reflect the wsite
-                    # re-home (get_all() is a stale per-sweep copy).
-                    # Share by CELL, not site: only clients already homed to THIS
-                    # cell (same claim) count as homed_here — so dns_fail on MIA-PSK
-                    # stacks onto MIA-PSK's Clients Associated, but NOT onto MIA-ACD.
-                    homed_here = set()
-                    if claim_key:
-                        for e in self._ledger.values():
-                            if (e.get("claim") or e.get("site") or "") == claim_key:
-                                homed_here.update((e.get("clients") or {}).keys())
                     # A tenant-pool client (server not site-pinned) is assignable
                     # to any site, so it counts as in-site for a site-scoped
                     # harvest (assign sets its wsite=site). Physically-bound
                     # clients at OTHER sites are still excluded (RF isolation).
                     # _cell_ok_for excludes a client already claimed for a DIFFERENT
                     # cell this sweep (one SSID per client).
-                    # Per-quota tier policy: t1/t2 admit ONLY that tier; "best"
-                    # (default) admits all but the sort below prefers T1 → T2.
-                    req_tier = str(q.get("tier") or "best").strip().lower()
                     in_site = [h for h, c in clients.items()
                                if self._pool_eligible(h, c, sim_id, multi, now, assigned)
                                and self._tier_ok(c, req_tier)
@@ -1552,6 +1623,70 @@ class SimQuotaEngine:
                         from_site = assigned.pop(h, "")
                         await self._release(h, sim_id, from_site, key)
                         actions["released"] += 1
+
+                # TIER UPGRADE. A quota at full strength never re-picks (the
+                # top-up above is gated on len(producing) < target), so a quota
+                # that filled with T2 dongles while every T1 radio was busy would
+                # hold those T2s forever — even after a T1 freed up. Walk the
+                # ledger and swap the worst-ranked holder for a better-ranked free
+                # candidate, so a specific simulation moves onto a T1 as soon as
+                # one is available and the displaced T2 falls back to the ambient
+                # pool (background noise) on the next weighted pass.
+                #
+                # Only for rank-PREFERENCE modes (best / best_t2): a hard t1/t2
+                # quota already admits one tier, so every holder ranks the same and
+                # there is nothing to upgrade. In-site candidates only — an upgrade
+                # is an optimization, and re-homing a client across sites to gain a
+                # tier is not worth the disruption.
+                if (self._effective_tier(req_tier) in ("best", "best_t2")
+                        and target > 0 and len(assigned) >= target):
+                    for _ in range(TIER_UPGRADE_PER_SWEEP):
+                        held = [h for h in producing if h in assigned]
+                        if not held:
+                            break
+                        worst = max(held, key=lambda h: self._tier_rank(
+                            clients.get(h) or {}, req_tier))
+                        worst_rank = self._tier_rank(clients.get(worst) or {}, req_tier)
+                        if worst_rank <= 0:
+                            break   # already on the preferred tier — nothing to gain
+                        # Same eligibility filter as the in-site top-up pick, plus a
+                        # STRICTLY better tier rank (no lateral swaps → no churn for
+                        # churn's sake, and the loop always terminates).
+                        cands = [h for h, c in clients.items()
+                                 if h not in assigned
+                                 and self._tier_rank(c, req_tier) < worst_rank
+                                 and self._pool_eligible(h, c, sim_id, multi, now, assigned)
+                                 and self._tier_ok(c, req_tier)
+                                 and self._cell_ok_for(h, claim_key)
+                                 and (not scope_site or self._effective_site(h, c) == scope_site
+                                      or h in homed_here
+                                      or (self._is_tenant_pool_client(h)
+                                          and self._site_ok_for(h, scope_site)))]
+                        if not cands:
+                            break
+                        best_h = min(cands, key=lambda h: self._tier_rank(
+                            clients.get(h) or {}, req_tier))
+                        # Release the outgoing holder FIRST so the swap can never
+                        # push the ledger over N (the trim above already ran).
+                        from_site = assigned.pop(worst, "")
+                        await self._release(worst, sim_id, from_site, key)
+                        producing.remove(worst)
+                        self._claimed_site.pop(worst, None)
+                        self._claimed_cell.pop(worst, None)
+                        await self._assign(best_h, sim_id, scope_site, cell=cell)
+                        c_new = clients.get(best_h) or {}
+                        assigned[best_h] = self._natural_site(best_h, c_new)
+                        if scope_site:
+                            self._claimed_site[best_h] = scope_site
+                        if claim_key:
+                            self._claimed_cell[best_h] = claim_key
+                        producing.append(best_h)
+                        actions["upgraded"] = actions.get("upgraded", 0) + 1
+                        logger.info(
+                            "SimQuotaEngine: tier upgrade %s -> %s for quota %s (%s -> %s)",
+                            worst, best_h, key,
+                            (self._tier_of(clients.get(worst) or {}) or "?"),
+                            (self._tier_of(c_new) or "?"))
 
                 # Capture WHY this quota is (or isn't) filled — a read-only pass
                 # over the harvestable pool attributing each not-assigned client's

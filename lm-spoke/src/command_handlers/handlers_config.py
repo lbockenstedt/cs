@@ -929,6 +929,20 @@ class ConfigCommandsMixin:
                 csc["qt_exclude_sims"] = [str(s) for s in qt if str(s).strip()]
                 self.local_store.set_central_sites_config(csc)
                 applied.append("qt_exclude_sims")
+        # Quota tier priority (T1 = dedicated PCI radios, T2 = USB dongles).
+        # Controls BOTH halves of tier selection: the default a quota gets when
+        # it does not pin its own tier, and whether the ambient/background spread
+        # is allowed to consume the other tier. Merged into csc the same way as
+        # qt_exclude_sims so SimQuotaEngine reads it from one place. Unknown
+        # values are dropped rather than stored so the engine's 't1_first'
+        # default (historical behaviour) stands.
+        if "tier_priority" in patch:
+            tp = str(patch.get("tier_priority") or "").strip().lower()
+            if tp in ("t1_first", "t2_first", "t1_only", "t2_only"):
+                csc = self.local_store.get_central_sites_config() or {}
+                csc["tier_priority"] = tp
+                self.local_store.set_central_sites_config(csc)
+                applied.append("tier_priority")
         if "ignored_hostnames" in patch:
             ih = patch.get("ignored_hostnames")
             if isinstance(ih, list):
@@ -1127,6 +1141,7 @@ class ConfigCommandsMixin:
             "effective_sim_quotas", "central_sites_config",
             "mist_sites_config",
             "sim_conf_override", "user_conf_override", "qt_exclude_sims",
+            "tier_priority",
         )
         if any(k in a for a in applied for k in _reconcile_keys):
             self._trigger_sim_quota_reconcile()

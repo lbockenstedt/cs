@@ -18,7 +18,8 @@ SRC = HERE.parent / "src"
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
-from sim_quota_engine import SimQuotaEngine, OFFLINE_TTL_S  # noqa: E402
+from sim_quota_engine import (  # noqa: E402
+    SimQuotaEngine, OFFLINE_TTL_S, TIER_UPGRADE_PER_SWEEP)
 
 
 class _FakeRegistry:
@@ -83,6 +84,7 @@ class _FakeLocalStore:
     def __init__(self, quotas, pxmx_site_map=None):
         self._q = quotas
         self._map = pxmx_site_map or {}
+        self._csc = {}          # central_sites_config (tier_priority lives here)
         self._matrix = []          # ssid_matrix (cell defs)
         self._weights = []         # ssid_weights (per-cell spread rules)
         self._site_w = {}          # ambient_site_weights (cross-site spread)
@@ -127,6 +129,9 @@ class _FakeLocalStore:
 
     def get_ambient_site_weights(self):
         return dict(self._site_w)
+
+    def get_central_sites_config(self):
+        return dict(self._csc)
 
 
 class _FakeDeploy:
@@ -1094,3 +1099,117 @@ def test_quota_tier_best_prefers_t1_then_falls_back(tmp_path):
     _run(eng.reconcile())
     got = set(eng._ledger["alert:A:MIA"]["clients"].keys())
     assert {"c0", "c1"} <= got and len(got) == 3 and (got & {"c2", "c3"})
+
+
+# ── tenant tier priority + tier upgrade ───────────────────────────────────────
+# tier_priority sets the DEFAULT tier for quotas that don't pin one, and reserves
+# the other tier out of the ambient spread. The upgrade pass then swaps a held T2
+# for a T1 the moment one frees up, so a specific simulation doesn't stay stuck on
+# a dongle just because it filled while every radio was busy.
+def _tq(count, tier=None):
+    q = {"alert_id": "A", "sim_id": "dns_fail", "count": count,
+         "site": "MIA", "enabled": True}
+    if tier:
+        q["tier"] = tier
+    return q
+
+
+def test_tier_priority_defaults_to_t1_first(tmp_path):
+    # Unconfigured tenant == historical 'best' behaviour: T1 first.
+    clients = {"c0": _tiered("c0", "MIA", "t2"), "c1": _tiered("c1", "MIA", "t1")}
+    spoke = _FakeSpoke(clients, [_tq(1)], tmp_path)
+    eng = SimQuotaEngine(spoke)
+    _run(eng.reconcile())
+    assert set(eng._ledger["alert:A:MIA"]["clients"]) == {"c1"}
+
+
+def test_tier_priority_t2_first_inverts_the_preference(tmp_path):
+    clients = {"c0": _tiered("c0", "MIA", "t2"), "c1": _tiered("c1", "MIA", "t1")}
+    spoke = _FakeSpoke(clients, [_tq(1)], tmp_path)
+    spoke.local_store._csc = {"tier_priority": "t2_first"}
+    eng = SimQuotaEngine(spoke)
+    _run(eng.reconcile())
+    assert set(eng._ledger["alert:A:MIA"]["clients"]) == {"c0"}
+
+
+def test_tier_priority_t1_only_gates_an_unpinned_quota(tmp_path):
+    # t1_only makes an unpinned ('best') quota behave like tier='t1': underfill
+    # rather than take a dongle.
+    clients = {"c0": _tiered("c0", "MIA", "t1"), "c1": _tiered("c1", "MIA", "t2"),
+               "c2": _tiered("c2", "MIA", "t2")}
+    spoke = _FakeSpoke(clients, [_tq(3)], tmp_path)
+    spoke.local_store._csc = {"tier_priority": "t1_only"}
+    eng = SimQuotaEngine(spoke)
+    _run(eng.reconcile())
+    assert set(eng._ledger["alert:A:MIA"]["clients"]) == {"c0"}
+
+
+def test_quota_pinned_tier_beats_the_tenant_default(tmp_path):
+    # An explicit per-quota tier is an operator decision — the tenant-wide
+    # default must not override it.
+    clients = {"c0": _tiered("c0", "MIA", "t1"), "c1": _tiered("c1", "MIA", "t2")}
+    spoke = _FakeSpoke(clients, [_tq(1, tier="t2")], tmp_path)
+    spoke.local_store._csc = {"tier_priority": "t1_only"}
+    eng = SimQuotaEngine(spoke)
+    _run(eng.reconcile())
+    assert set(eng._ledger["alert:A:MIA"]["clients"]) == {"c1"}
+
+
+def test_unknown_tier_priority_falls_back_to_default(tmp_path):
+    clients = {"c0": _tiered("c0", "MIA", "t2"), "c1": _tiered("c1", "MIA", "t1")}
+    spoke = _FakeSpoke(clients, [_tq(1)], tmp_path)
+    spoke.local_store._csc = {"tier_priority": "nonsense"}
+    eng = SimQuotaEngine(spoke)
+    _run(eng.reconcile())
+    assert set(eng._ledger["alert:A:MIA"]["clients"]) == {"c1"}
+
+
+def test_tier_upgrade_swaps_a_held_t2_for_a_freed_t1(tmp_path):
+    # THE regression this pass exists for: the quota fills with a T2 because no
+    # T1 is online, then a T1 appears. Before the upgrade pass the quota was full
+    # (need == 0), never re-picked, and held the dongle indefinitely.
+    clients = {"c0": _tiered("c0", "MIA", "t2"),
+               "c1": _tiered("c1", "MIA", "t1")}
+    clients["c1"]["last_seen"] = 0     # T1 present but OFFLINE
+    spoke = _FakeSpoke(clients, [_tq(1)], tmp_path)
+    eng = SimQuotaEngine(spoke)
+    _run(eng.reconcile())
+    assert set(eng._ledger["alert:A:MIA"]["clients"]) == {"c0"}, "fills with the T2"
+    # T1 comes online.
+    spoke.registry.clients["c1"]["last_seen"] = time.time()
+    actions = _run(eng.reconcile())
+    assert set(eng._ledger["alert:A:MIA"]["clients"]) == {"c1"}, "upgraded onto the T1"
+    assert actions.get("upgraded") == 1
+
+
+def test_tier_upgrade_is_capped_per_sweep(tmp_path):
+    # 3 T2s holding, 3 T1s free → at most TIER_UPGRADE_PER_SWEEP swap per sweep,
+    # so a large quota migrates gradually instead of tearing down all at once.
+    clients = {f"t2_{i}": _tiered(f"t2_{i}", "MIA", "t2") for i in range(3)}
+    spoke = _FakeSpoke(clients, [_tq(3)], tmp_path)
+    eng = SimQuotaEngine(spoke)
+    _run(eng.reconcile())
+    assert len(eng._ledger["alert:A:MIA"]["clients"]) == 3
+    for i in range(3):
+        spoke.registry.clients[f"t1_{i}"] = _tiered(f"t1_{i}", "MIA", "t1")
+    actions = _run(eng.reconcile())
+    assert actions.get("upgraded") == TIER_UPGRADE_PER_SWEEP
+    held = eng._ledger["alert:A:MIA"]["clients"]
+    assert len(held) == 3, "ledger never exceeds N during a swap"
+    assert sum(1 for h in held if h.startswith("t1_")) == TIER_UPGRADE_PER_SWEEP
+    # Subsequent sweeps finish the migration, then stop (no lateral churn).
+    _run(eng.reconcile())
+    assert set(eng._ledger["alert:A:MIA"]["clients"]) == {"t1_0", "t1_1", "t1_2"}
+    assert _run(eng.reconcile()).get("upgraded", 0) == 0, "converged — no churn"
+
+
+def test_tier_upgrade_skipped_for_a_hard_pinned_quota(tmp_path):
+    # tier='t2' admits only T2 — every holder ranks the same, so a free T1 must
+    # NOT trigger a swap.
+    clients = {"c0": _tiered("c0", "MIA", "t2"), "c1": _tiered("c1", "MIA", "t1")}
+    spoke = _FakeSpoke(clients, [_tq(1, tier="t2")], tmp_path)
+    eng = SimQuotaEngine(spoke)
+    _run(eng.reconcile())
+    actions = _run(eng.reconcile())
+    assert set(eng._ledger["alert:A:MIA"]["clients"]) == {"c0"}
+    assert actions.get("upgraded", 0) == 0
