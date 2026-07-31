@@ -267,7 +267,23 @@ if [[ "$DHCP_SKIP" != "1" ]]; then
 
     # Honour an explicit DHCP_IFACE; otherwise use the 2nd NIC, or skip.
     if [[ -z "$DHCP_IFACE" ]]; then
-        if (( NIC_COUNT >= 2 )); then
+        # Prefer the NIC with NO IPv4 address: the uplink always has one, the
+        # sim NIC only gets 169.253.1.1 from us, so before that it is bare.
+        # Index-based detection ("the second one") depends on enumeration order
+        # surviving a rebuild -- a renamed/reordered NIC silently points Kea at
+        # an interface that no longer exists and it serves nobody. Fall back to
+        # index 1 (the historical rule) when every NIC already has an address,
+        # which is the case on a re-run where we assigned the sim IP earlier.
+        _bare=""
+        for _n in "${IFACES[@]}"; do
+            if ! ip -o -4 addr show dev "$_n" 2>/dev/null | grep -q .; then
+                _bare="$_n"; break
+            fi
+        done
+        if [[ -n "$_bare" ]]; then
+            DHCP_IFACE="$_bare"
+            ok "Sim NIC detected (no IPv4 address): ${DHCP_IFACE} — DHCP will be configured"
+        elif (( NIC_COUNT >= 2 )); then
             DHCP_IFACE="${IFACES[1]}"
             ok "Second NIC detected: ${DHCP_IFACE} — DHCP will be configured"
         else
