@@ -930,12 +930,13 @@ class ConfigCommandsMixin:
                 self.local_store.set_central_sites_config(csc)
                 applied.append("qt_exclude_sims")
         # Quota tier priority (T1 = dedicated PCI radios, T2 = USB dongles).
-        # Controls BOTH halves of tier selection: the default a quota gets when
-        # it does not pin its own tier, and whether the ambient/background spread
-        # is allowed to consume the other tier. Merged into csc the same way as
-        # qt_exclude_sims so SimQuotaEngine reads it from one place. Unknown
-        # values are dropped rather than stored so the engine's 't1_first'
-        # default (historical behaviour) stands.
+        # Sets the default tier a quota gets when it does not pin its own —
+        # T1s are the reliable clients and should run the issue-generating quota
+        # sims. It does NOT gate the ambient spread: every spare client does
+        # background work, and a quota preempts a background T1 when it needs
+        # one. Merged into csc the same way as qt_exclude_sims so SimQuotaEngine
+        # reads it from one place. Unknown values are dropped rather than stored
+        # so the engine's 't1_first' default (historical behaviour) stands.
         if "tier_priority" in patch:
             tp = str(patch.get("tier_priority") or "").strip().lower()
             if tp in ("t1_first", "t2_first", "t1_only", "t2_only"):

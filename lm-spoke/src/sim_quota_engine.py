@@ -1085,27 +1085,15 @@ class SimQuotaEngine:
             return
         cells = getattr(self, "_cells_by_name", {})
         online = {h for h, c in clients.items() if self._is_harvestable(c, now)}
-        # Tier RESERVATION for the ambient pool. Quotas already pick T1 first
-        # (_tier_rank, and harvest runs before this), but that is a preference,
-        # not a reservation: a T1 no quota claimed this sweep would otherwise be
-        # spent on background noise and be unavailable the moment a quota grows.
-        # 't1_first' (default) holds T1s BACK from ambient so they stay free for
-        # specific simulations; 't2_first' does the mirror; the *_only modes pin
-        # ambient to that tier outright. If the reservation would leave ambient
-        # with NO clients at all, it is dropped for this sweep — an idle fleet is
-        # worse than an unreserved one, and *_only is an explicit operator pin so
-        # it is honoured even when it empties the pool.
-        pri = self._tier_priority()
-        hold = {"t1_first": "t1", "t2_first": "t2",
-                "t1_only": "t2", "t2_only": "t1"}.get(pri)
-        if hold:
-            kept = {h for h in online if self._tier_of(clients.get(h) or {}) != hold}
-            if kept or pri in ("t1_only", "t2_only"):
-                if len(kept) != len(online):
-                    logger.debug(
-                        "SimQuotaEngine: tier_priority=%s reserving %d %s client(s) out of ambient",
-                        pri, len(online) - len(kept), hold.upper())
-                online = kept
+        # NO tier filtering here, deliberately: EVERY spare client does background
+        # work, T1 included. Reserving T1s out of the ambient spread would leave a
+        # T1 no quota happens to need with no SSID/site placement — idle — and an
+        # idle T1 is worse than a busy one, because nothing is lost by loading it:
+        # harvest runs BEFORE this pass and preempts ambient (stacked/ambient sims
+        # live outside the ledger, so _engine_sims_for is empty for a background
+        # client and _pool_eligible admits it). A T1 doing background work is
+        # therefore reclaimed into a quota the moment one needs it — see the tier
+        # upgrade pass, which will displace a T2 to make room for it.
         # Group rules by the cell's physical site.
         by_site: Dict[str, List[Dict[str, Any]]] = {}
         for r in rules:

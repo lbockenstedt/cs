@@ -1213,3 +1213,69 @@ def test_tier_upgrade_skipped_for_a_hard_pinned_quota(tmp_path):
     actions = _run(eng.reconcile())
     assert set(eng._ledger["alert:A:MIA"]["clients"]) == {"c0"}
     assert actions.get("upgraded", 0) == 0
+
+
+def test_tier_upgrade_harvests_a_t1_busy_with_background_work(tmp_path):
+    # The operating model: T1s are the reliable clients and should be running the
+    # issue-generating quota sims; T2s are the less-reliable background noise. A
+    # T1 that no quota needs still does background work (nothing is idle) — but
+    # the moment a quota needs it, it must be harvested OUT of that background
+    # work and INTO the quota, displacing a T2 to make room.
+    #
+    # Background work is representable as a bucket-default sim: stacked/ambient
+    # sims live OUTSIDE the ledger, so _engine_sims_for is empty for a background
+    # client and _pool_eligible treats it as a preemptible drone.
+    clients = {"c0": _tiered("c0", "MIA", "t2"),
+               "c1": _tiered("c1", "MIA", "t1")}
+    clients["c1"]["config"]["ping_test"] = "on"       # T1 busy with background work
+    spoke = _FakeSpoke(clients, [_tq(1)], tmp_path)
+    spoke.registry = _ProvRegistry(clients)
+    eng = SimQuotaEngine(spoke)
+    _run(eng.reconcile())
+    assert set(eng._ledger["alert:A:MIA"]["clients"]) == {"c1"}, \
+        "a T1 doing background work is harvestable, not blocked"
+
+
+def test_t1_in_background_is_harvested_over_a_held_t2(tmp_path):
+    # Same rule from the UPGRADE side: the quota is already full of T2 (the T1
+    # was absent when it filled). The T1 returns and goes to background work.
+    # It must still be pulled into the quota, disrupting the T2.
+    clients = {"c0": _tiered("c0", "MIA", "t2")}
+    spoke = _FakeSpoke(clients, [_tq(1)], tmp_path)
+    spoke.registry = _ProvRegistry(clients)
+    eng = SimQuotaEngine(spoke)
+    _run(eng.reconcile())
+    assert set(eng._ledger["alert:A:MIA"]["clients"]) == {"c0"}, "filled with the T2"
+    # T1 appears, already loaded with background work.
+    t1 = _tiered("c1", "MIA", "t1")
+    t1["config"]["ping_test"] = "on"
+    spoke.registry.clients["c1"] = t1
+    actions = _run(eng.reconcile())
+    assert set(eng._ledger["alert:A:MIA"]["clients"]) == {"c1"}, \
+        "T1 harvested out of background work, T2 disrupted"
+    assert actions.get("upgraded") == 1
+    # And the displaced T2 is free to go back to background noise.
+    assert "c0" not in eng._ledger["alert:A:MIA"]["clients"]
+
+
+def eng_reset(spoke):
+    return SimQuotaEngine(spoke)
+
+
+def test_ambient_spread_does_not_reserve_t1_out_of_background_work(tmp_path):
+    # "All clients should be doing something": the weighted ambient spread must
+    # place EVERY spare client, T1 included. A T1 held back would sit with no
+    # SSID/site placement, which is worse than loading it — harvest preempts
+    # ambient anyway, so nothing is lost by keeping it busy.
+    clients = {"c0": _tiered("c0", "MIA", "t1"), "c1": _tiered("c1", "MIA", "t2")}
+    spoke = _FakeSpoke(clients, [], tmp_path)          # no quotas → all spare
+    spoke.local_store._matrix = [{"name": "MIA-PSK", "site": "MIA",
+                                  "ssid": "PSK", "ssidpw": "pw"}]
+    spoke.local_store._weights = [{"site": "MIA", "ssid": "MIA-PSK",
+                                   "weight": 1, "all": True}]
+    for pri in ("t1_first", "t2_first"):
+        spoke.local_store._csc = {"tier_priority": pri}
+        _run(eng_reset(spoke).reconcile())
+        placed = {h for h, c in spoke.registry.clients.items()
+                  if (c.get("overrides") or {}).get("ssid")}
+        assert placed == {"c0", "c1"}, f"{pri}: every spare client placed, got {placed}"
