@@ -640,9 +640,59 @@ fi
 # forward. Done here (not at arg-parse) so $LM_DIR is set and it lands right
 # before the reads it must precede.
 if [ "$PURGE_ENV" = "1" ]; then
+    # Capture the id this box has been registering under BEFORE .env goes, so
+    # the per-identity state dir below can be found. SPOKE_ID is only baked into
+    # .env when it was explicitly pinned; otherwise the spoke derives the bare
+    # hostname at startup (lm-spoke/src/control_plane.py), which is what we fall
+    # back to.
+    _old_id=""
+    if [ -f "$LM_DIR/cs/.env" ] && grep -q '^SPOKE_ID=' "$LM_DIR/cs/.env" 2>/dev/null; then
+        _old_id="$(grep '^SPOKE_ID=' "$LM_DIR/cs/.env" | head -1 | cut -d= -f2-)"
+    fi
+    [ -n "$_old_id" ] || _old_id="$(hostname)"
+
     if [ -f "$LM_DIR/cs/.env" ]; then
         rm -f "$LM_DIR/cs/.env"
         warn "--purge-env: removed $LM_DIR/cs/.env — secret + INSTALL_UUID will be regenerated (spoke re-registers on the hub → needs approval)."
+    fi
+
+    # mTLS CLIENT identity. A clone carries the ORIGIN's client cert and
+    # presents it to the hub ("wss: presenting hub-CA mTLS client cert"), so a
+    # reset that leaves it behind hands the new box the old box's credential.
+    # Same file set core clears in its own reset path (control_plane.py:2014):
+    # the current mtls-hub-client.* plus the legacy mtls-client.* names. The CA
+    # and the agent-listener server cert (hub.crt) are deliberately NOT touched
+    # — the CA is shared trust, not identity, and both are re-pushed by the hub.
+    _mtls_cleared=0
+    for _f in mtls-hub-client.crt mtls-hub-client.key mtls-client.crt mtls-client.key; do
+        if [ -f "$LM_DIR/cs/certs/$_f" ]; then
+            rm -f "$LM_DIR/cs/certs/$_f" && _mtls_cleared=1
+        fi
+    done
+    [ "$_mtls_cleared" = "1" ] && \
+        warn "--purge-env: cleared the mTLS client cert/key — the hub re-provisions one for the new identity."
+
+    # Per-identity runtime/recovery state (update snapshots, rollback markers).
+    # Keyed by the OLD spoke id, so it is orphaned the moment the id changes and
+    # accumulates one directory per rebuild.
+    if [ -n "$_old_id" ] && [ -d "/var/lib/lm/$_old_id" ]; then
+        rm -rf "/var/lib/lm/$_old_id"
+        warn "--purge-env: removed /var/lib/lm/$_old_id (recovery state for the discarded identity)."
+    fi
+
+    # SSH host keys — the same clone problem as machine-id: a Proxmox clone
+    # copies /etc/ssh/ssh_host_* verbatim, so every clone presents an identical
+    # SSH identity and any one of them can impersonate its siblings.
+    if [ -d /etc/ssh ] && ls /etc/ssh/ssh_host_* >/dev/null 2>&1; then
+        rm -f /etc/ssh/ssh_host_*
+        if command -v ssh-keygen >/dev/null 2>&1 && ssh-keygen -A >/dev/null 2>&1; then
+            # try-restart: a no-op when sshd isn't running, and it does NOT drop
+            # established sessions (existing connections are separate processes).
+            systemctl try-restart ssh 2>/dev/null || systemctl try-restart sshd 2>/dev/null || true
+            warn "--purge-env: regenerated SSH host keys — clients that connected before will report REMOTE HOST IDENTIFICATION HAS CHANGED. Clear the old entry with: ssh-keygen -R <this-host>"
+        else
+            warn "--purge-env: removed SSH host keys but could NOT regenerate them (no ssh-keygen) — run 'ssh-keygen -A' before relying on SSH to this box."
+        fi
     fi
 
     # A fresh .env alone does NOT make a clone distinct. core's
@@ -676,6 +726,34 @@ if [ "$PURGE_ENV" = "1" ]; then
         warn "--purge-env: regenerated /etc/machine-id (${_old_mid:0:8}… → ${_new_mid:0:8}…) — this box can no longer share a clone fingerprint with its origin."
     else
         warn "--purge-env: could NOT regenerate /etc/machine-id — if this box was cloned it may still collide with its origin (hub: '[identity] CLONE COLLISION'). Fix by hand: truncate -s 0 /etc/machine-id && rm -f /var/lib/dbus/machine-id && systemd-machine-id-setup"
+    fi
+
+    # A clean identity does NOT help if this box runs the spoke TWICE. Both
+    # processes derive the same id, so they take turns evicting each other on
+    # the hub and rotate each other's secret (symptom: connect → clean close →
+    # reconnect every ~60-130s, alternating secret=yes/secret=no). A purge
+    # cannot detect that from .env, so look for the second unit directly.
+    _dupes=""
+    for _u in lm-cs lm-agent lm-generic-agent; do
+        systemctl is-enabled "$_u" >/dev/null 2>&1 && _dupes="$_dupes $_u"
+    done
+    _nproc="$(pgrep -fc 'control_plane' 2>/dev/null || echo 0)"
+    case "$_dupes" in
+        *lm-cs*lm-agent*|*lm-agent*lm-cs*)
+            warn "--purge-env: BOTH${_dupes} are enabled on this box. If the agent hosts the 'simulation' role you now have TWO cs spokes sharing one id — they will flap against each other regardless of identity. Keep ONE: 'systemctl disable --now lm-generic-agent' for the legacy agent, or drop the simulation role from lm-agent." ;;
+    esac
+    if [ "${_nproc:-0}" -gt 1 ] 2>/dev/null; then
+        warn "--purge-env: ${_nproc} control_plane processes are running — expected 1. Check 'pgrep -af control_plane'; a duplicate will flap against this spoke on the hub."
+    fi
+
+    # Say what this box will register AS. "I replaced a server with the same
+    # name" is invisible until two boxes collide on the hub hours later; print
+    # the derived id here so a reused hostname is obvious at install time.
+    if [ "$SPOKE_ID_PINNED" = "1" ] && [ -n "${SPOKE_ID:-}" ]; then
+        echo "   Identity reset. This spoke will register as: $SPOKE_ID (pinned via --id)"
+    else
+        echo "   Identity reset. This spoke will register as: $(hostname) (derived from the hostname)"
+        echo "   If another live box already uses that hostname, the two WILL collide on the hub — rename one first."
     fi
 fi
 
