@@ -409,6 +409,7 @@ class ConfigCommandsMixin:
             return {"status": "SUCCESS", "actions": actions}
 
         if cmd == "CS_GET_SIM_TAG_HEALTH":
+            _STALE_HOST_S = 900.0     # 15 min without telemetry = not a live host
             # Answers "why does this Proxmox server show no / stale sim- tags"
             # WITHOUT ssh or log archaeology. Built from a real incident: three
             # servers showed three different faults (no tags, stale tags,
@@ -417,6 +418,7 @@ class ConfigCommandsMixin:
             # simply absent from the map. Each host reports whether its agent
             # resolved, and each VM reports DESIRED vs ACTUAL tags plus the
             # reason it was excluded, so a mismatch names itself.
+            import socket as _sock
             from token_store import (norm_hostname as _nh, sanitize_tag as _san,
                                      _ONLINE_WINDOW_S as _TAG_LIVE_WINDOW_S)
             spoke = self
@@ -449,6 +451,27 @@ class ConfigCommandsMixin:
                     }
             except Exception:  # noqa: BLE001
                 pass
+            # Ask every CONNECTED agent where it is pointed. Each pxmx host is
+            # meant to dial its OWN cs spoke; when telemetry lands on the wrong
+            # spoke (or nowhere), the agent's pinned URL is what settles it. Only
+            # reachable from the spoke the agent is talking to, so the fleet
+            # picture comes from asking every spoke — a host that appears under
+            # none has an agent connected nowhere.
+            pointing: Dict[str, str] = {}
+            for _aid, _info in agents.items():
+                _hn = str((_info or {}).get("hostname") or "").strip()
+                if not _hn:
+                    continue
+                try:
+                    _r = await spoke.control_plane.send_to_agent(
+                        "PXMX_GET_IDENTITY", {}, agent_id=_aid, timeout=10.0)
+                    _d = (_r or {}).get("payload", {}).get("data", _r) if isinstance(_r, dict) else {}
+                    if isinstance(_d, dict):
+                        pointing[_nh(_hn)] = (str(_d.get("spoke_url") or "").strip()
+                                              or str(_d.get("spoke_ip") or "").strip()
+                                              or "(auto-discovery)")
+                except Exception as exc:  # noqa: BLE001 — diagnostics only
+                    pointing[_nh(_hn)] = f"(unknown: {exc})"
             hosts = []
             for hn, st in states.items():
                 agent_ok = hn in conn_exact or _nh(hn) in conn_norm
@@ -477,16 +500,36 @@ class ConfigCommandsMixin:
                         row["client_last_seen_age_s"] = cl["last_seen_age_s"]
                     vms.append(row)
                 drift = [v for v in vms if not v["in_sync"]]
+                # Telemetry age. proxmox_states retains a host FOREVER once seen
+                # (deliberate: a briefly-offline server keeps its identity), so a
+                # host that was rebuilt/renamed leaves a permanent entry whose VM
+                # list is whatever it last reported. Those ghosts still enter the
+                # tag map, so the panel must show WHEN a host last reported —
+                # otherwise a stale entry is indistinguishable from a live one.
+                try:
+                    _ls = float((st or {}).get("last_seen") or 0)
+                except (TypeError, ValueError):
+                    _ls = 0.0
+                _age = (time.time() - _ls) if _ls else None
                 hosts.append({
                     "hostname": hn,
                     "agent_connected": agent_ok,
                     "skip_reason": skips.get(hn) or (None if agent_ok else "agent_not_connected"),
                     "vm_count": len(vms), "drift_count": len(drift),
+                    "telemetry_age_s": round(_age, 1) if _age is not None else None,
+                    "agent_points_at": pointing.get(_nh(hn)),
+                    "stale": bool(_age is not None and _age > _STALE_HOST_S),
                     "vms": sorted(vms, key=lambda v: str(v.get("name") or "")),
                 })
             return {"status": "SUCCESS",
                     "connected_agents": sorted(conn_exact),
                     "live_window_s": _TAG_LIVE_WINDOW_S,
+                    "spoke_self": {
+                        "spoke_id": getattr(spoke, "spoke_id", "") or "",
+                        "hostname": _sock.gethostname(),
+                        "hub_url": str(getattr(getattr(spoke, "settings", None), "hub_url", "")
+                                       or getattr(spoke, "hub_url", "") or ""),
+                    },
                     "hosts": sorted(hosts, key=lambda h: h["hostname"])}
 
         if cmd == "CS_GET_DHCP_HEALTH":
@@ -704,8 +747,14 @@ class ConfigCommandsMixin:
                     hosts_err[hn] = str((d or {}).get("message") or "error")
                     continue
                 hosts_ok.append(hn)
-                for pid in (d.get("pools") or []):
-                    by_pool.setdefault(str(pid), []).append(hn)
+                # The agent's PXMX_LIST_POOLS returns [{poolid, comment}, ...]
+                # (vm_inventory.list_pools, via the Proxmox API). Tolerate a bare
+                # string too so an older agent build still populates the dropdown.
+                for p in (d.get("pools") or []):
+                    pid = (str(p.get("poolid") or "").strip()
+                           if isinstance(p, dict) else str(p or "").strip())
+                    if pid:
+                        by_pool.setdefault(pid, []).append(hn)
             return {"status": "SUCCESS",
                     "pools": sorted(by_pool),
                     "by_pool": {k: sorted(v) for k, v in by_pool.items()},
