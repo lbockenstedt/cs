@@ -51,6 +51,34 @@ def build_local_ui_router(spoke) -> APIRouter:
     async def _cmd(cmd: str, data: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         return await spoke.handle_command(cmd, data or {})
 
+    # ── Proxmox pools (sim-client Pool dropdown) ─────────────────────────────
+    # Twin of the hub's /sim/api/{tenant}/pools so the SAME sim-views.js code
+    # works when served by the spoke directly (standalone mode). The hub route
+    # unions across spokes; here there is exactly one, so the spoke's own answer
+    # is the whole picture.
+
+    @router.get("/{tenant}/pools")
+    async def list_pools(tenant: str):
+        d = await _cmd("CS_GET_POOLS", {})
+        return {"pools": d.get("pools") or [],
+                "by_pool": d.get("by_pool") or {},
+                "hosts": d.get("hosts") or [],
+                "errors": d.get("errors") or {},
+                "selected": d.get("selected") or "",
+                "spokes": 1}
+
+    @router.post("/{tenant}/pools/add-existing")
+    async def pool_add_existing(tenant: str, request: Request):
+        try:
+            body = await request.json()
+        except Exception:  # noqa: BLE001
+            body = {}
+        d = await _cmd("CS_POOL_ADD_EXISTING",
+                       {"pool": str((body or {}).get("pool") or "").strip()})
+        return {"status": d.get("status") or "SUCCESS",
+                "added": d.get("added") or 0,
+                "errors": d.get("errors") or {}}
+
     # ── Clients tab ──────────────────────────────────────────────────────────
 
     @router.get("/aggregate/clients")

@@ -674,6 +674,77 @@ class ConfigCommandsMixin:
                     "denials cannot be shown; run: dmesg | grep -i 'apparmor.*kea'")
             return out
 
+        if cmd == "CS_GET_POOLS":
+            # Proxmox resource pools available across this spoke's pxmx agents,
+            # for the sim-client Pool dropdown. Unioned across agents: pools are
+            # cluster-wide, but a fleet of STANDALONE nodes each has its own set,
+            # and an operator picking a pool that only exists on some hosts would
+            # get clone failures on the rest — so the response also reports WHICH
+            # hosts have each pool, and the UI can flag a partial one.
+            by_pool: Dict[str, list] = {}
+            hosts_ok, hosts_err = [], {}
+            try:
+                agents = self._get_agents().get("agents", [])
+            except Exception as exc:  # noqa: BLE001
+                return {"status": "ERROR", "message": f"agent list failed: {exc}",
+                        "pools": [], "by_pool": {}}
+            for a in agents:
+                aid = a.get("agent_id")
+                hn = str(a.get("hostname") or aid or "?")
+                if not aid:
+                    continue
+                try:
+                    r = await self.control_plane.send_to_agent(
+                        "PXMX_LIST_POOLS", {}, agent_id=aid, timeout=15.0)
+                except Exception as exc:  # noqa: BLE001 — one agent must not blank the list
+                    hosts_err[hn] = str(exc)
+                    continue
+                d = (r or {}).get("payload", {}).get("data", r) if isinstance(r, dict) else {}
+                if not isinstance(d, dict) or d.get("status") == "ERROR":
+                    hosts_err[hn] = str((d or {}).get("message") or "error")
+                    continue
+                hosts_ok.append(hn)
+                for pid in (d.get("pools") or []):
+                    by_pool.setdefault(str(pid), []).append(hn)
+            return {"status": "SUCCESS",
+                    "pools": sorted(by_pool),
+                    "by_pool": {k: sorted(v) for k, v in by_pool.items()},
+                    "hosts": sorted(hosts_ok), "errors": hosts_err,
+                    "selected": str(self.settings.get("sim_pool", "") or "").strip()}
+
+        if cmd == "CS_POOL_ADD_EXISTING":
+            # Retrofit: put already-provisioned sim VMs into the configured pool
+            # (new clones get it via qm clone --pool). Fans out to every agent;
+            # the agent guards to the sim VMID range so this can never sweep a
+            # non-sim VM into the pool.
+            pool = str((data or {}).get("pool")
+                       or self.settings.get("sim_pool", "") or "").strip()
+            if not pool:
+                return {"status": "ERROR", "message": "no pool configured"}
+            added, errors = 0, {}
+            try:
+                agents = self._get_agents().get("agents", [])
+            except Exception as exc:  # noqa: BLE001
+                return {"status": "ERROR", "message": f"agent list failed: {exc}"}
+            for a in agents:
+                aid = a.get("agent_id")
+                hn = str(a.get("hostname") or aid or "?")
+                if not aid:
+                    continue
+                try:
+                    r = await self.control_plane.send_to_agent(
+                        "PXMX_POOL_ADD_VMS", {"pool": pool}, agent_id=aid, timeout=60.0)
+                except Exception as exc:  # noqa: BLE001
+                    errors[hn] = str(exc)
+                    continue
+                d = (r or {}).get("payload", {}).get("data", r) if isinstance(r, dict) else {}
+                if isinstance(d, dict) and d.get("status") == "SUCCESS":
+                    added += int(d.get("added") or 0)
+                else:
+                    errors[hn] = str((d or {}).get("message") or "error")
+            return {"status": "SUCCESS" if not errors else "PARTIAL",
+                    "pool": pool, "added": added, "errors": errors}
+
         if cmd == "CS_GET_PXMX_SITE_MAP":
             # Operator-assigned pxmx server → site map (Config → PXMX Sites). The
             # engine resolves a client's site via its hosting server's entry.
@@ -757,7 +828,7 @@ class ConfigCommandsMixin:
     _HUB_DIRECT_KEYS = (
         "usb_vidpids", "usb_ignored_vidpids",
         "t1_pci_vidpids", "t3_pci_vidpids", "usb_auto_provision",
-        "usb_missing_timeout", "usb_max_slots", "vm_image_1_pct",
+        "usb_missing_timeout", "usb_max_slots", "vm_image_1_pct", "sim_pool",
         "reclone_concurrency", "l1_vlan_start", "l1_vlan_end",
         "vmid_start", "vmid_end", "vm_set_override", "use_all_dongles",
         "guest_agent_watchdog_enabled", "guest_agent_grace_minutes",
