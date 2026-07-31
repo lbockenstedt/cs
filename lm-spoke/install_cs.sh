@@ -1201,10 +1201,18 @@ HUB_SECRET_ARG=""
 # CAP_NET_BIND_SERVICE lets svc_lm (non-root) bind :443 for the agent listener.
 # Only granted when --agent-listener is on; a relay-only cs spoke needs no
 # extra capability.
+# CAP_SYSLOG additionally lets the spoke READ the kernel ring buffer, which is
+# what the Sim DHCP health panel needs to show AppArmor denials. Without it the
+# panel can only say "NOT serving" and the operator is back to ssh + dmesg — the
+# exact loop this panel exists to remove. Read-only: CAP_SYSLOG grants klogctl
+# reads, not writes, and does not bypass file permissions.
 CAP_LINES=""
 if [ "$CS_AGENT_LISTENER" = "1" ]; then
-    CAP_LINES="AmbientCapabilities=CAP_NET_BIND_SERVICE
-CapabilityBoundingSet=CAP_NET_BIND_SERVICE"
+    CAP_LINES="AmbientCapabilities=CAP_NET_BIND_SERVICE CAP_SYSLOG
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE CAP_SYSLOG"
+else
+    CAP_LINES="AmbientCapabilities=CAP_SYSLOG
+CapabilityBoundingSet=CAP_SYSLOG"
 fi
 
 cat > /etc/systemd/system/lm-cs.service <<SYSD
@@ -1253,6 +1261,22 @@ if [ "$CLONE_MODE" = "1" ]; then
     ok "Clone template prepped — lm-cs enabled (starts on next boot), identity NOT minted"
 else
     systemctl restart lm-cs
+
+    # Verify the DIAGNOSTICS actually work, not just the service. The health
+    # panel runs AS the spoke; if it cannot read the lease file or the kernel
+    # log it degrades to "NOT serving" with no reason, and the operator is back
+    # to ssh — which is precisely what this panel replaces. Group membership
+    # only applies to processes started AFTER usermod, hence checking here,
+    # after the restart, rather than assuming.
+    sleep 2
+    _lease="/var/lib/kea/kea-leases4-sim.csv"
+    if [ -f "$_lease" ]; then
+        if runuser -u "$SVC_USER" -- test -r "$_lease" 2>/dev/null; then
+            ok "Diagnostics: spoke can read the lease DB (health panel will show real lease counts)"
+        else
+            warn "Diagnostics: ${SVC_USER} still cannot read $_lease — the health panel will show 'count unreadable'. Fix: usermod -aG _kea ${SVC_USER} && systemctl restart lm-cs"
+        fi
+    fi
     ok "Generic Agent service started"
 fi
 
