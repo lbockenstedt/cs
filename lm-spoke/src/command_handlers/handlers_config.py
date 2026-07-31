@@ -417,6 +417,33 @@ class ConfigCommandsMixin:
                 agents = self._get_agents().get("agents", [])
             except Exception as exc:  # noqa: BLE001
                 logger.warning("CS_GET_PXMX_SITE_MAP: agents list failed: %s", exc)
+            # _get_agents() lists only CONNECTED (+ pending) agents, so a server
+            # whose agent is down and which has never been assigned had no row
+            # in the editor at all — it could not be given a site until it came
+            # back. Site assignment is operator intent about where a box
+            # physically IS; it does not need the agent online, and the engine
+            # reads the map (not the agent) when placing clients. So union in
+            # every host the spoke still knows from telemetry: deploy
+            # .proxmox_states retains stale hosts deliberately (see
+            # proxmox_deploy.relay_payload) precisely so a briefly-offline
+            # server keeps its identity. Marked status=offline so the editor can
+            # flag them rather than imply they are live.
+            try:
+                _seen = {a.get("agent_id") or a.get("hostname") for a in agents}
+                _states = getattr(getattr(self, "deploy", None), "proxmox_states", {}) or {}
+                for _hn, _st in _states.items():
+                    if not _hn or _hn in _seen:
+                        continue
+                    _seen.add(_hn)
+                    agents.append({
+                        "agent_id":  _hn,
+                        "hostname":  _hn,
+                        "last_seen": (_st or {}).get("last_seen", 0),
+                        "version":   (_st or {}).get("version", "unknown"),
+                        "status":    "offline",
+                    })
+            except Exception as exc:  # noqa: BLE001 — never fail the map read
+                logger.warning("CS_GET_PXMX_SITE_MAP: offline-host merge failed: %s", exc)
             return {"status": "SUCCESS",
                     "pxmx_site_map": self.local_store.get_pxmx_site_map(),
                     "agents": agents}
