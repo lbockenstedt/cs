@@ -684,14 +684,56 @@ EOF
         if [ -z "$_kea_ok" ] && command -v apparmor_parser >/dev/null 2>&1 \
            && [ -f /etc/apparmor.d/usr.sbin.kea-dhcp4 ]; then
             warn "kea-dhcp4-sim did not start with the AppArmor grant applied — falling back to complain mode for the kea profiles (permits + logs; the packaged profile likely carries a deny that a local include cannot override)."
+            # PERSIST the complain mode. `apparmor_parser -C -r` changes only the
+            # RUNNING profile: on the next boot AppArmor reloads every profile
+            # from /etc/apparmor.d/ in ENFORCE, the grant is denied again, and
+            # kea-dhcp4 crash-loops with "Unable to open database: unable to open
+            # /var/lib/kea/kea-leases4-sim.csv". That is exactly what happened —
+            # a whole fleet ran fine for days on runtime-only complain mode and
+            # every spoke lost DHCP simultaneously at the first reboot, ~4300
+            # restarts each, with a valid config and a perfectly readable lease
+            # file. A fallback that silently expires at reboot is worse than no
+            # fallback, because nothing reports it until the clients are dark.
+            #
+            # /etc/apparmor.d/force-complain/<profile> is the supported way to
+            # make it stick: the AppArmor init unit honours these symlinks when
+            # it loads policy at boot. Remove the symlink + `apparmor_parser -r`
+            # to go back to enforce once the profile is fixed properly.
+            mkdir -p /etc/apparmor.d/force-complain
+            for _cp in usr.sbin.kea-dhcp4 usr.sbin.kea-ctrl-agent usr.sbin.kea-lfc; do
+                [ -f "/etc/apparmor.d/$_cp" ] || continue
+                ln -sf "/etc/apparmor.d/$_cp" "/etc/apparmor.d/force-complain/$_cp" 2>/dev/null || true
+            done
             apparmor_parser -C -r /etc/apparmor.d/usr.sbin.kea-dhcp4 2>/dev/null || true
             [ -f /etc/apparmor.d/usr.sbin.kea-ctrl-agent ] && \
                 apparmor_parser -C -r /etc/apparmor.d/usr.sbin.kea-ctrl-agent 2>/dev/null || true
+            [ -f /etc/apparmor.d/usr.sbin.kea-lfc ] && \
+                apparmor_parser -C -r /etc/apparmor.d/usr.sbin.kea-lfc 2>/dev/null || true
             systemctl restart kea-dhcp4-sim kea-ctrl-agent-sim >/dev/null 2>&1 || true
             for _i in $(seq 1 12); do
                 if systemctl is-active --quiet kea-dhcp4-sim; then _kea_ok=1; break; fi
                 sleep 1
             done
+        fi
+        # Reboot-survival check, independent of how we got here: if any kea
+        # profile is complain ONLY at runtime, say so loudly — that box is one
+        # reboot away from losing DHCP.
+        _aa_transient=""
+        for _cp in usr.sbin.kea-dhcp4 usr.sbin.kea-ctrl-agent usr.sbin.kea-lfc; do
+            [ -f "/etc/apparmor.d/$_cp" ] || continue
+            _m="$(sed -n "s/^[[:space:]]*profile[[:space:]].*flags=(\(.*\)).*/\1/p" \
+                    "/etc/apparmor.d/$_cp" 2>/dev/null | head -1)"
+            if aa-status 2>/dev/null | grep -q "^ *${_cp##usr.sbin.} (complain)" \
+               || echo "$_m" | grep -q complain; then
+                [ -L "/etc/apparmor.d/force-complain/$_cp" ] || _aa_transient="${_aa_transient} $_cp"
+            fi
+        done
+        if [ -n "$_aa_transient" ]; then
+            mkdir -p /etc/apparmor.d/force-complain
+            for _cp in $_aa_transient; do
+                ln -sf "/etc/apparmor.d/$_cp" "/etc/apparmor.d/force-complain/$_cp" 2>/dev/null || true
+            done
+            warn "AppArmor: made complain mode PERSISTENT for:${_aa_transient} (was runtime-only — it would have reverted to enforce at the next reboot and taken sim DHCP down)."
         fi
         if [ -n "$_kea_ok" ]; then
             ok "Sim DHCP serving: kea-dhcp4-sim active on ${DHCP_IFACE} (${DHCP_SUBNET}/${DHCP_PREFIX}, pool ${DHCP_RANGE_START}-${DHCP_RANGE_END})"
