@@ -12,9 +12,17 @@
 #   sudo bash install_wifi_drivers.sh              # firmware + all USB drivers
 #   sudo bash install_wifi_drivers.sh --firmware-only
 #   sudo bash install_wifi_drivers.sh --drivers-only
+#   sudo bash install_wifi_drivers.sh --repair          # un-wedge broken DKMS/apt
 #
 # SCOPE: USB only. These clients are VMs fed by USB passthrough and never see a
 # PCIe/M.2 adapter, so no PCIe-only driver is built here.
+#
+# TARGETS Debian 12 (bookworm, 6.1) AND 13 (trixie, 6.12). Nothing here is
+# version-pinned: the mainline-vs-out-of-tree decision is made by probing
+# `modinfo` on the RUNNING kernel, so on bookworm this builds 8821cu (rtw88's
+# USB support for it did not land until 6.2) and on trixie it skips it. Both
+# apt sources formats are handled — bookworm's one-line sources.list and
+# trixie's deb822 .sources.
 #
 # Callers may pre-set LOG and DRIVER_STATE to fold this into their own logging
 # (install.sh does); otherwise sane defaults are used.
@@ -23,11 +31,12 @@ set -uo pipefail        # NOT -e: every step is best-effort and reported
 
 export PATH="/usr/sbin:/sbin:/usr/bin:/bin:$PATH"
 
-DO_FIRMWARE=1; DO_DRIVERS=1
+DO_FIRMWARE=1; DO_DRIVERS=1; DO_REPAIR=0
 for a in "$@"; do
   case "$a" in
     --firmware-only) DO_DRIVERS=0 ;;
     --drivers-only)  DO_FIRMWARE=0 ;;
+    --repair)        DO_REPAIR=1 ;;
   esac
 done
 
@@ -44,6 +53,36 @@ command -v warn >/dev/null 2>&1 || warn() { echo "  WARN $*" | tee -a "$LOG"; }
 
 [[ $EUID -eq 0 ]] || { echo "FATAL: must run as root"; exit 1; }
 echo "=== install_wifi_drivers.sh $(date -Is) ===" >>"$LOG"
+
+###############################################################################
+# 0. REPAIR (--repair)
+#
+# Un-wedge a box where a broken DKMS module is failing the linux-headers
+# postinst. Symptom, and it names the wrong package:
+#   "errors were encountered while processing: linux-headers-6.1.0-51-amd64"
+# apt is then stuck for EVERY subsequent operation until the module is removed.
+###############################################################################
+if [[ $DO_REPAIR -eq 1 ]]; then
+  info "Repair: looking for DKMS modules that fail to build"
+  _removed=0
+  while read -r _line; do
+    _m="$(echo "$_line" | awk -F'[,/:]' '{print $1}' | tr -d ' ')"
+    _v="$(echo "$_line" | awk -F'[,/:]' '{print $2}' | tr -d ' ')"
+    [[ -z "$_m" || -z "$_v" ]] && continue
+    if echo "$_line" | grep -qiE "broken|failed|error"; then
+      warn "removing broken DKMS module $_m/$_v"
+      dkms remove -m "$_m" -v "$_v" --all >>"$LOG" 2>&1 || true
+      rm -rf "/usr/src/${_m}-${_v}"
+      _removed=$(( _removed + 1 ))
+    fi
+  done < <(dkms status 2>/dev/null)
+  info "Repair: removed $_removed broken module(s); running apt-get -f install"
+  DEBIAN_FRONTEND=noninteractive apt-get -f install -y >>"$LOG" 2>&1 \
+    && ok "apt dependency state repaired" \
+    || warn "apt-get -f install still failing — see $LOG"
+  info "Re-run without --repair to reinstall drivers."
+  exit 0
+fi
 
 ###############################################################################
 # 1. FIRMWARE + MODE-SWITCH + REGULATORY
@@ -112,8 +151,22 @@ else
 fi
 info "Installing build prerequisites ($KERNEL_HEADERS)"
 DEBIAN_FRONTEND=noninteractive apt-get install -y -q \
-  dkms build-essential bc libelf-dev git "$KERNEL_HEADERS" linux-headers-amd64 \
-  >>"$LOG" 2>&1 || warn "some build prerequisites failed — driver builds may fail"
+  dkms build-essential bc libelf-dev git linux-headers-amd64 \
+  >>"$LOG" 2>&1 || warn "some build prerequisites failed"
+DEBIAN_FRONTEND=noninteractive apt-get install -y -q "$KERNEL_HEADERS" \
+  >>"$LOG" 2>&1 || warn "$KERNEL_HEADERS failed to install"
+
+# Headers for the RUNNING kernel are a hard gate: without them EVERY DKMS build
+# below fails identically with "kernel source not found", producing a wall of
+# failures whose real cause is one missing package. Say so once and stop, rather
+# than emitting 13 misleading build errors.
+if [[ ! -d "/lib/modules/$(uname -r)/build" ]]; then
+  warn "No kernel headers for $(uname -r) (/lib/modules/$(uname -r)/build missing)."
+  warn "Every DKMS driver build would fail. Install headers, then re-run:"
+  warn "  apt-get install -y $KERNEL_HEADERS   # or reboot into the kernel the headers match"
+  echo "kernel-headers:MISSING" >>"$DRIVER_STATE"
+  exit 1
+fi
 
 ###############################################################################
 # 3. OUT-OF-TREE USB DRIVERS — cloned LIVE from GitHub and built
@@ -213,9 +266,22 @@ for entry in "${DRIVERS[@]}"; do
         SRC_DEST="/usr/src/${MOD}-${DKMS_VER}"
         rm -rf "$SRC_DEST"; cp -r "$(pwd)" "$SRC_DEST"
         dkms add -m "$MOD" -v "$DKMS_VER" >>"$LOG" 2>&1 || true
-        dkms build -m "$MOD" -v "$DKMS_VER" >>"$LOG" 2>&1 \
-          && dkms install -m "$MOD" -v "$DKMS_VER" >>"$LOG" 2>&1 \
-          || INSTALL_OK=false
+        if dkms build -m "$MOD" -v "$DKMS_VER" >>"$LOG" 2>&1 \
+           && dkms install -m "$MOD" -v "$DKMS_VER" >>"$LOG" 2>&1; then
+          :
+        else
+          INSTALL_OK=false
+          # UNREGISTER a module that failed to build. Leaving it registered
+          # poisons EVERY future kernel/header operation: the linux-headers
+          # postinst rebuilds all registered DKMS modules, one failure aborts
+          # the postinst, and dpkg then reports
+          #   "errors were encountered while processing: linux-headers-<ver>"
+          # — which points at the kernel package and gives no hint that a wifi
+          # driver is the cause. Observed in the field on 6.1.0-51-amd64.
+          warn "$NAME: build failed — unregistering from DKMS so it cannot break kernel upgrades"
+          dkms remove -m "$MOD" -v "$DKMS_VER" --all >>"$LOG" 2>&1 || true
+          rm -rf "$SRC_DEST"
+        fi
       fi
       ;;
   esac

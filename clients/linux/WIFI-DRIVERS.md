@@ -1,4 +1,39 @@
-# WiFi driver matrix — Debian 13 (trixie), kernel 6.12
+# WiFi driver matrix — Debian 12 (bookworm, 6.1) and 13 (trixie, 6.12)
+
+**Target is trixie / kernel 6.12.** Bookworm is documented because it is the
+mandatory intermediate step on a Debian release upgrade (you cannot skip a
+release), so a half-upgraded image will transit 6.1. The difference is not
+cosmetic — several chips that are mainline on 6.12 are NOT on
+6.1, so the same dongle needs an out-of-tree driver on bookworm and none on
+trixie:
+
+| Chip / driver | bookworm 6.1 | trixie 6.12 |
+|---|---|---|
+| `rtw88_8822bu` (RTL8822BU) | landed **in** 6.1 — usually present | mainline |
+| `rtw88_8821cu` (RTL8821CU/8811CU) | **NOT present** (6.2) → needs out-of-tree `8821cu` | mainline |
+| `mt7921u` (MT7921AU, Wi-Fi 6 USB) | mainline (5.16) | mainline |
+| `ath12k` (Wi-Fi 7) | **NOT present** (6.3) | mainline |
+| `mt7925` (Wi-Fi 7) | **NOT present** (6.7) | mainline |
+| `iwlwifi` BE200 (Wi-Fi 7) | **NOT present** (6.6) | mainline |
+| `rtw89_8922ae` (Wi-Fi 7) | **NOT present** (6.9) | mainline |
+
+`install_wifi_drivers.sh` does not hard-code any of this: it probes with
+`modinfo` and only skips an out-of-tree build when the mainline module actually
+exists on the running kernel. So the same script does the right thing on both
+releases — on 6.1 it builds `8821cu`, on 6.12 it skips it.
+
+**Practical bookworm consequence:** no Wi-Fi 7 at all, and 6E only via
+`ath11k`/`mt7922` (M.2, so not reachable by USB passthrough anyway). On bookworm
+the USB ceiling is **Wi-Fi 6** via `mt7921u` or the `rtl8852au/bu/cu` DKMS
+drivers — same as trixie in practice.
+
+Firmware package names also differ slightly: bookworm ships most mt76 firmware in
+`firmware-misc-nonfree`, while trixie splits some into `firmware-mediatek`. The
+installer attempts both and reports whichever is unavailable, so no action is
+needed either way.
+
+---
+
 
 Reference for `install_wifi_drivers.sh`. Every driver the sim-client image can
 need, what it covers, and what it requires to build or run.
