@@ -86,15 +86,6 @@ derive_username
 #Setting config file location
 #------------------------------------------------------------
 process_ini_file '/usr/local/scripts/simulation.conf'
-
-#------------------------------------------------------------
-# Cap the dongle's USB link at 2.0 BEFORE the sim starts generating traffic.
-# Needs the config parsed above (reads [simulation] force_usb2), and must run
-# before connect/simulation so the interface is not renamed underneath a live
-# association — the device re-enumerates on the companion bus, which changes its
-# bus id and can change the interface name.
-#------------------------------------------------------------
-usb_force_usb2
 #------------------------------------------------------------
 echo ------------------------------| tee -a /usr/local/scripts/sim.log
 echo Parsing Config File | tee -a /usr/local/scripts/sim.log
