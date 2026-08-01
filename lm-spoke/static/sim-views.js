@@ -76,6 +76,24 @@ const pollManager = window.pollManager || (() => {
 
 function csEl(id) { return document.getElementById(id); }
 
+// Stable DOM id for a per-client control. Hostnames can contain characters that
+// are not valid in an id (and would break querySelector), so they are collapsed
+// to underscores. Restored after a dead-code sweep removed it while callers
+// remained -- the result was `ReferenceError: Can't find variable: csCtlId`,
+// which aborted rendering of the whole Clients view.
+function csCtlId(host, flag) {
+    const h = String(host || '').replace(/[^a-zA-Z0-9_-]/g, '_');
+    return `cs-ctl-${h}-${flag}`;
+}
+
+// Status line under a client's control panel. Same story as csCtlId: still
+// called from the sim-toggle, debug-toggle and clear-override paths.
+function csCtlMsg(hostname, text, ok) {
+    const m = csEl(csCtlId(hostname, 'msg'));
+    if (m) { m.textContent = text; m.className = 'text-xs ' + (ok ? 'text-green-600' : 'text-red-500'); }
+}
+
+
 // Debounce a keystroke-driven filter so a fast typist doesn't re-render the
 // whole list (csRenderClientRows / cs-sim-checks table) on every keypress.
 // The select-driven filters (onchange) keep calling the immediate function —
