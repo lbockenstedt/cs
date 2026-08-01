@@ -1015,18 +1015,33 @@ KEAWDS
 [Unit]
 Description=Lab Manager - sim Kea self-heal (boot + every 5 min)
 [Timer]
-# Boot is the window that took the whole fleet down: AppArmor reloads every
-# profile in ENFORCE, and a runtime-only complain relaxation is gone.
-OnBootSec=90s
+# Boot is the window that takes the fleet down: nothing written under
+# /etc/apparmor.d survives apparmor.service's blanket reload, so the profiles
+# always come up ENFORCE and kea crash-loops until something acts AFTER that
+# service has finished. 30s keeps the post-reboot DHCP gap short; the units
+# themselves keep restarting in the meantime, so a client that asks early just
+# retries.
+OnBootSec=30s
 OnUnitActiveSec=5min
-AccuracySec=30s
+AccuracySec=15s
 [Install]
 WantedBy=timers.target
 KEAWDT
         systemctl daemon-reload >/dev/null 2>&1 || true
         systemctl enable --now lm-kea-watchdog.timer >/dev/null 2>&1 \
-            && ok "Sim DHCP watchdog installed (lm-kea-watchdog.timer — boot + every 5 min; re-applies complain mode and restarts Kea if it drifts back to enforce)" \
+            && ok "Sim DHCP watchdog installed (lm-kea-watchdog.timer — 30s after boot, then every 5 min)" \
             || warn "Sim DHCP watchdog could not be enabled — sim DHCP will NOT self-heal after a reboot"
+        # Run it ONCE now. A fresh install whose Kea is being denied should come
+        # up serving before the installer exits, rather than looking broken for
+        # the first timer interval — and this exercises the exact code path a
+        # reboot will take, so a failure is visible here instead of at 3am.
+        if ! systemctl is-active --quiet kea-dhcp4-sim; then
+            /usr/local/sbin/lm-kea-watchdog >/dev/null 2>&1 || true
+            sleep 2
+            if systemctl is-active --quiet kea-dhcp4-sim; then
+                ok "Sim DHCP recovered by the watchdog (see: journalctl -t lm-kea-watchdog)"
+            fi
+        fi
     fi
 fi
 }
