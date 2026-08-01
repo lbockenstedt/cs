@@ -284,6 +284,28 @@ elif [[ "$SIM_USER_IS_NEW" == "1" ]]; then
   warn "  sudo passwd $SIM_USER"
 fi
 
+# ── Group membership ─────────────────────────────────────────────────────────
+# `sudo` is the ask: the sudoers.d fragments below grant the rights, but only
+# group membership survives those files being removed or superseded, and it is
+# what most tooling actually tests for.
+#
+# The rest are what this workload needs on a desktop session and are silently
+# painful without: netdev for NetworkManager connection control, plugdev for the
+# USB WiFi dongles these clients exist to drive. Missing either shows up as
+# permission-denied deep inside nmcli/driver operations rather than as an obvious
+# account problem.
+for _grp in sudo netdev plugdev; do
+  if getent group "$_grp" >/dev/null 2>&1; then
+    if id -nG "$SIM_USER" 2>/dev/null | tr ' ' '\n' | grep -qx "$_grp"; then
+      ok "'$SIM_USER' already in group '$_grp'"
+    else
+      usermod -aG "$_grp" "$SIM_USER" >>"$LOG" 2>&1 \
+        && ok "Added '$SIM_USER' to group '$_grp'" \
+        || warn "Could not add '$SIM_USER' to group '$_grp'"
+    fi
+  fi
+done
+
 info "Configuring sudoers"
 
 # Scoped passwordless sudo for simulation operations.
