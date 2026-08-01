@@ -835,6 +835,128 @@ EOF
             journalctl -u kea-dhcp4-sim -n 20 --no-pager 2>/dev/null | sed 's/^/      /' || true
             warn "diagnose: systemctl status kea-dhcp4-sim ; ${KEA_DHCP4_BIN} -t ${KEA_DHCP4_CONF} ; ip -br link"
         fi
+
+        # ── Self-healing watchdog (root) ─────────────────────────────────────
+        # Install-time checks only cover install time. This fleet lost sim DHCP
+        # on ALL FOUR spokes at once after a reboot, because complain mode had
+        # been applied at runtime but never written to the policy text — and it
+        # stayed down until a human noticed. AppArmor state can drift back to
+        # enforce on a package upgrade, a profile reload, or a restored image,
+        # and each time the symptom is a silent crash-loop with a valid config.
+        #
+        # The spoke itself runs as ${SVC_USER} and CANNOT fix this: editing
+        # /etc/apparmor.d and running apparmor_parser need root. So this is a
+        # small root-run oneshot on a timer, deliberately narrow in scope: it
+        # only ever touches the three kea profiles and the two sim units.
+        #
+        # OnBootSec is the important trigger — post-reboot is exactly the window
+        # that took the fleet down.
+        cat > /usr/local/sbin/lm-kea-watchdog <<'KEAWD'
+#!/usr/bin/env bash
+# Self-heal the cs sim Kea instance. Installed by install_cs.sh.
+#
+# The packaged AppArmor profile carries an explicit deny that a local include
+# cannot override, so the sim instance (whose runtime filenames derive from its
+# renamed config) can only run with the profile in COMPLAIN. If that relaxation
+# is lost - reboot into enforce, package upgrade, profile reload - kea-dhcp4
+# crash-loops on "Unable to open database" with a perfectly valid config.
+set -uo pipefail
+export PATH="/usr/sbin:/sbin:/usr/bin:/bin:$PATH"
+PROFILES="usr.sbin.kea-dhcp4 usr.sbin.kea-ctrl-agent usr.sbin.kea-lfc"
+log() { logger -t lm-kea-watchdog -- "$*"; echo "lm-kea-watchdog: $*"; }
+
+AA=""
+for c in /sbin/apparmor_parser /usr/sbin/apparmor_parser "$(command -v apparmor_parser 2>/dev/null)"; do
+    [ -n "$c" ] && [ -x "$c" ] && { AA="$c"; break; }
+done
+
+# Is the complain flag in the POLICY TEXT (survives a reboot) rather than only
+# in the running profile?
+persisted() {
+    grep -m1 -E "^[^#].*\{[[:space:]]*$" "/etc/apparmor.d/$1" 2>/dev/null | grep -q complain
+}
+set_complain() {
+    [ -f "/etc/apparmor.d/$1" ] || return 1
+    [ -f "/etc/apparmor.d/$1.lm-bak" ] || cp -a "/etc/apparmor.d/$1" "/etc/apparmor.d/$1.lm-bak" 2>/dev/null
+    python3 - "/etc/apparmor.d/$1" <<'PYW'
+import re, sys
+p = sys.argv[1]
+s = open(p).read()
+out, done = [], False
+for line in s.splitlines(True):
+    if not done:
+        t = line.strip()
+        if t and not t.startswith(('#', 'include', 'abi')) and t.endswith('{'):
+            if 'complain' in line:
+                done = True
+            elif 'flags=(' in line:
+                line = re.sub(r'flags=\(([^)]*)\)',
+                              lambda m: 'flags=(%s,complain)' % m.group(1).strip(),
+                              line, count=1); done = True
+            else:
+                line = line.rstrip()[:-1].rstrip() + ' flags=(complain) {\n'; done = True
+    out.append(line)
+if done:
+    open(p, 'w').write(''.join(out))
+sys.exit(0 if done else 1)
+PYW
+}
+
+# 1. Persistence drift: complain now, but nothing in the file -> next boot dies.
+#    Fix quietly-but-logged; no restart needed, the box is working.
+for p in $PROFILES; do
+    [ -f "/etc/apparmor.d/$p" ] || continue
+    rt="$(sed -n "s/^${p#usr.sbin.} (\([a-z]*\)).*/\1/p" \
+          /sys/kernel/security/apparmor/profiles 2>/dev/null | head -1)"
+    if [ "$rt" = "complain" ] && ! persisted "$p"; then
+        set_complain "$p" && log "persisted complain flag for $p (was runtime-only; would have reverted to enforce at the next boot)"
+    fi
+done
+
+# 2. The actual outage: sim DHCP is down. Re-apply and restart.
+systemctl is-active --quiet kea-dhcp4-sim && exit 0
+log "kea-dhcp4-sim is NOT active - attempting self-heal"
+changed=""
+for p in $PROFILES; do
+    [ -f "/etc/apparmor.d/$p" ] || continue
+    if ! persisted "$p"; then set_complain "$p" && changed=1 && log "set complain flag in $p"; fi
+    [ -n "$AA" ] && "$AA" -r "/etc/apparmor.d/$p" 2>/dev/null
+done
+[ -z "$AA" ] && log "WARNING apparmor_parser not found - cannot reload profiles"
+systemctl restart kea-ctrl-agent-sim 2>/dev/null
+systemctl restart kea-dhcp4-sim 2>/dev/null
+sleep 3
+if systemctl is-active --quiet kea-dhcp4-sim; then
+    log "recovered: kea-dhcp4-sim is active again${changed:+ (complain flag persisted)}"
+else
+    log "STILL DOWN after self-heal - clients will get no address. Check: journalctl -u kea-dhcp4-sim -n 40"
+fi
+KEAWD
+        chmod 0755 /usr/local/sbin/lm-kea-watchdog
+        cat > /etc/systemd/system/lm-kea-watchdog.service <<'KEAWDS'
+[Unit]
+Description=Lab Manager - sim Kea (DHCP) self-heal
+After=apparmor.service kea-dhcp4-sim.service
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/lm-kea-watchdog
+KEAWDS
+        cat > /etc/systemd/system/lm-kea-watchdog.timer <<'KEAWDT'
+[Unit]
+Description=Lab Manager - sim Kea self-heal (boot + every 5 min)
+[Timer]
+# Boot is the window that took the whole fleet down: AppArmor reloads every
+# profile in ENFORCE, and a runtime-only complain relaxation is gone.
+OnBootSec=90s
+OnUnitActiveSec=5min
+AccuracySec=30s
+[Install]
+WantedBy=timers.target
+KEAWDT
+        systemctl daemon-reload >/dev/null 2>&1 || true
+        systemctl enable --now lm-kea-watchdog.timer >/dev/null 2>&1 \
+            && ok "Sim DHCP watchdog installed (lm-kea-watchdog.timer — boot + every 5 min; re-applies complain mode and restarts Kea if it drifts back to enforce)" \
+            || warn "Sim DHCP watchdog could not be enabled — sim DHCP will NOT self-heal after a reboot"
     fi
 fi
 }
