@@ -167,6 +167,50 @@ fi
 [[ $DO_DRIVERS -eq 0 ]] && { info "--firmware-only: skipping driver builds"; exit 0; }
 
 ###############################################################################
+# 1b. PURGE RETIRED DRIVERS
+#
+# Removing an entry from the DRIVERS table stops it being INSTALLED again — it
+# does NOT uninstall what is already on the box. A superseded module stays
+# DKMS-registered and keeps claiming its USB IDs forever, so two drivers race
+# for the same dongle and which one binds varies per boot. Observed after
+# lwfinger/rtl8852au was replaced by morrownr/rtw89:
+#   0b05:1a62  rtw89_8852bu_git  8852au
+#   2357:0141  8852au            rtw89_8852au_git
+# Nothing reports this: both modules build cleanly and dkms status looks healthy.
+RETIRED_MODULES=(
+  # module   why it was retired
+  "8852au"   # superseded by rtw89 (morrownr consolidated the Wi-Fi 6/7 USB parts)
+  "8852bu"   # superseded by rtw89; its repo no longer exists upstream
+  "8852cu"   # superseded by rtw89; its repo no longer exists upstream
+  "8710bu"   # mainline rtl8xxxu has claimed RTL8710BU since 6.4
+  "8723du"   # obsolete upstream; mainline rtw88_8723du replaced it
+)
+
+info "Checking for retired drivers that would race the current set"
+_purged=0
+for _rm in "${RETIRED_MODULES[@]}"; do
+  while read -r _line; do
+    [[ -z "$_line" ]] && continue
+    _m="$(echo "$_line" | awk -F'[,/:]' '{print $1}' | tr -d ' ')"
+    _v="$(echo "$_line" | awk -F'[,/:]' '{print $2}' | tr -d ' ')"
+    [[ "$_m" == "$_rm" ]] || continue
+    [[ -z "$_v" ]] && continue
+    warn "removing retired driver $_m/$_v — it races the current driver for the same USB IDs"
+    dkms remove -m "$_m" -v "$_v" --all >>"$LOG" 2>&1 || true
+    rm -rf "/usr/src/${_m}-${_v}"
+    rm -f "/etc/modprobe.d/${_m}.conf"
+    echo "$_m:PURGED_RETIRED" >>"$DRIVER_STATE"
+    _purged=$(( _purged + 1 ))
+  done < <(dkms status 2>/dev/null)
+done
+if [[ $_purged -gt 0 ]]; then
+  depmod -a >>"$LOG" 2>&1 || true
+  ok "Purged $_purged retired driver(s)"
+else
+  ok "No retired drivers present"
+fi
+
+###############################################################################
 # 2. BUILD PREREQUISITES
 #
 # Headers MUST match the RUNNING kernel or every build fails with a misleading
@@ -375,6 +419,16 @@ for entry in "${DRIVERS[@]}"; do
     8723du) modinfo rtw88_8723du >/dev/null 2>&1 && {
               info "skip $NAME — rtw88_8723du is mainline on $(uname -r)"
               echo "$NAME:SKIPPED_IN_TREE" >>"$DRIVER_STATE"; continue; } ;;
+    # RTL8188EUS: checked by ID rather than by module name. `modinfo rtl8xxxu`
+    # always succeeds on a modern kernel (it is a generic driver covering many
+    # chips), so a name test would skip this unconditionally and be wrong on a
+    # kernel where rtl8xxxu does not actually claim 8179. Asking the alias table
+    # whether rtl8xxxu claims THIS ID is the precise question. Observed racing:
+    #   0bda:8179  rtl8xxxu 8188eu
+    8188eu) grep -i "v0BDAp8179" "/lib/modules/$(uname -r)/modules.alias" 2>/dev/null \
+              | grep -qw rtl8xxxu && {
+              info "skip $NAME — in-tree rtl8xxxu already claims 0bda:8179"
+              echo "$NAME:SKIPPED_IN_TREE" >>"$DRIVER_STATE"; continue; } ;;
   esac
 
   rm -rf "$NAME"
@@ -550,6 +604,43 @@ stuck_dongles() {
     [[ "$WIFI_VENDORS" == *" $_v "* ]] && echo "$_v:$_p"
   done | sort -u
 }
+
+###############################################################################
+# CONTESTED USB IDs — two drivers claiming one dongle.
+#
+# The worst failure this script can leave behind, because everything looks fine:
+# both modules build, dkms status is clean, and the dongle usually works. Which
+# driver wins is decided at bind time, so identical VMs behave differently across
+# reboots and one of them intermittently has no interface — unbuggable remotely.
+###############################################################################
+echo ""
+echo "=== contested USB IDs (more than one driver claims the same dongle) ==="
+_ma="/lib/modules/$(uname -r)/modules.alias"
+if [[ -r "$_ma" ]]; then
+  _contested=0
+  # Collapse each usb alias to "vVVVVpPPPP <module>", then report any ID with >1
+  # distinct module. Only wildcard-suffixed usb aliases are real device claims.
+  while read -r _id _mods; do
+    _n=$(echo "$_mods" | tr " " "\n" | sort -u | grep -c .)
+    if [[ "$_n" -gt 1 ]]; then
+      _contested=$(( _contested + 1 ))
+      warn "$_id claimed by:$(echo "$_mods" | tr " " "\n" | sort -u | tr "\n" " ")"
+    fi
+  done < <(
+    grep -oiE "^alias usb:v[0-9A-F]{4}p[0-9A-F]{4}[^ ]* +[^ ]+$" "$_ma" 2>/dev/null \
+      | sed -E "s/^alias usb:(v[0-9A-Fa-f]{4}p[0-9A-Fa-f]{4})[^ ]* +(.*)$/\1 \2/" \
+      | awk "{ m[\$1] = m[\$1] \" \" \$2 } END { for (k in m) print k, m[k] }"
+  )
+  if [[ "$_contested" -eq 0 ]]; then
+    echo "  none — every dongle ID is claimed by exactly one driver"
+  else
+    echo ""
+    echo "  A contested ID binds non-deterministically. Remove whichever driver"
+    echo "  you do not want, then run: depmod -a"
+  fi
+else
+  echo "  (modules.alias not readable — skipped)"
+fi
 
 echo ""
 echo "=== CD-ROM / mass-storage mode check ==="
