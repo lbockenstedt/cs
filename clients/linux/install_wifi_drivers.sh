@@ -277,11 +277,37 @@ DRIVERS=(
   "aic8800|script-yes|https://github.com/kilam994/aic8800d80-linux-driver.git|aic8800|HEAD|-"
 )
 
+###############################################################################
+# FETCH EVERYTHING FIRST, THEN BUILD.
+#
+# These two phases used to be interleaved: clone a driver, install it, clone the
+# next. That makes the run depend on the network still being up AFTER a driver
+# has been installed — and installing a Wi-Fi driver is precisely the thing that
+# can take the network down. Observed on the trixie image: drivers 1 and 2 cloned
+# and installed (the first one unloading a module that was ACTIVE), and every
+# clone from driver 5 on died with "Could not resolve host: github.com". Seven of
+# eleven drivers were lost to one transient, including rtw89 and aic8800, and
+# each was reported as an ordinary per-driver failure so nothing pointed at the
+# real cause.
+#
+# Cloning everything up front means a build that kills connectivity can only
+# affect builds, never fetches. It also fails fast and honestly: if the network
+# is down at the start, every clone fails together and the report says so.
+###############################################################################
+have_net() {
+  # DNS specifically — the observed failure was resolution, not routing.
+  getent hosts github.com >/dev/null 2>&1
+}
+
 TOTAL="${#DRIVERS[@]}"; N=0
+FETCHED=()
+
+info "Fetching $TOTAL driver sources before building any of them"
+have_net || warn "github.com does not resolve right now — clones will fail"
+
 for entry in "${DRIVERS[@]}"; do
   SAVED_IFS="$IFS"; IFS='|' read -r NAME TYPE REPO MOD PIN MODPROBE <<<"$entry"; IFS="$SAVED_IFS"
   N=$(( N + 1 ))
-  info "Driver $N/$TOTAL: $NAME"
 
   # Skip a chip the running kernel already handles. Building an out-of-tree
   # driver alongside a mainline one means BOTH claim the USB ID and which binds
@@ -299,9 +325,49 @@ for entry in "${DRIVERS[@]}"; do
   rm -rf "$NAME"
   CLONE_ARGS=(--depth=1)
   [[ "$PIN" != "HEAD" ]] && CLONE_ARGS+=(--branch "$PIN")
-  if ! git clone "${CLONE_ARGS[@]}" "$REPO" "$NAME" >>"$LOG" 2>&1; then
-    echo "$NAME:CLONE_FAILED" >>"$DRIVER_STATE"; warn "✗ clone failed: $NAME"; continue
+
+  # Retry: the failure mode here is a transient loss of DNS, which a second
+  # attempt a few seconds later often rides out.
+  CLONE_OK=false
+  for _try in 1 2 3; do
+    if git clone "${CLONE_ARGS[@]}" "$REPO" "$NAME" >>"$LOG" 2>&1; then
+      CLONE_OK=true; break
+    fi
+    rm -rf "$NAME"
+    [[ $_try -lt 3 ]] && { info "clone $NAME failed (attempt $_try/3) — retrying"; sleep 5; }
+  done
+
+  if ! $CLONE_OK; then
+    if have_net; then
+      echo "$NAME:CLONE_FAILED" >>"$DRIVER_STATE"; warn "✗ clone failed: $NAME"
+    else
+      # Distinguish "this repo is bad" from "this machine lost the network".
+      # Reporting both as CLONE_FAILED is what hid the real fault last time.
+      echo "$NAME:NO_NETWORK" >>"$DRIVER_STATE"
+      warn "✗ $NAME — no network (github.com does not resolve), not a repo problem"
+    fi
+    continue
   fi
+  FETCHED+=("$entry")
+done
+
+ok "Fetched ${#FETCHED[@]}/$TOTAL driver sources"
+if [[ ${#FETCHED[@]} -eq 0 ]]; then
+  warn "No driver sources fetched — nothing to build. Check DNS/network and re-run."
+fi
+
+###############################################################################
+# BUILD PHASE — network is no longer required past this point.
+###############################################################################
+# Guarded: `set -u` is in force and expanding an EMPTY array is an unbound
+# variable error on bash < 4.4. Trixie's 5.2 tolerates it, but the failure would
+# abort the whole script right where it should be reporting why nothing built.
+TOTAL="${#FETCHED[@]}"; N=0
+for entry in ${FETCHED[@]+"${FETCHED[@]}"}; do
+  SAVED_IFS="$IFS"; IFS='|' read -r NAME TYPE REPO MOD PIN MODPROBE <<<"$entry"; IFS="$SAVED_IFS"
+  N=$(( N + 1 ))
+  info "Driver $N/$TOTAL: $NAME"
+
   cd "$NAME" || continue
   INSTALL_OK=true
 
