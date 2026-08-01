@@ -173,6 +173,21 @@ if [[ $OUT_OF_TREE -eq 1 ]]; then
     # (MT7921AU is the other Wi-Fi 6 USB option and needs NOTHING — mt7921u has
     # been mainline since 5.16.)
     _dkms_git rtl8852au 1.15.0.1 https://github.com/morrownr/rtl8852au.git
+    _dkms_git rtl8852bu 1.15.0.1 https://github.com/morrownr/rtl8852bu.git
+
+    #--------------------------------------------------------
+    # Realtek USB parts with no mainline driver at all. Not in the current
+    # fleet's usb_config, but these are the cheap dongles you actually end up
+    # buying, and a driver already in the image costs nothing while a missing
+    # one costs a rebuild. All are USB — no PCIe/M.2 drivers are built here,
+    # since these VMs only ever see USB passthrough.
+    #--------------------------------------------------------
+    # RTL8723DU  0bda:d723  (wifi + bluetooth combo)
+    _dkms_git rtl8723du 5.9.5   https://github.com/lwfinger/rtl8723du.git
+    # RTL8192FU / RTL8188FU  0bda:f179 0bda:f192
+    _dkms_git rtl8192fu 1.0     https://github.com/kelebek333/rtl8192fu-dkms.git
+    # RTL8710BU / RTL8188GU  0bda:b711
+    _dkms_git rtl8710bu 1.0     https://github.com/morrownr/rtl8710bu.git
     # RTL8192EU  0bda:818b — rtl8xxxu claims it but is unstable on many units
     _dkms_git rtl8192eu 1.0      https://github.com/Mange/rtl8192eu-linux-driver.git
 

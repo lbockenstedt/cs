@@ -3,6 +3,12 @@
 Reference for `install_wifi_drivers.sh`. Every driver the sim-client image can
 need, what it covers, and what it requires to build or run.
 
+**SCOPE: USB dongles.** These sim clients are VMs fed by USB passthrough — they
+never see a PCIe or M.2 adapter. PCIe/M.2 rows below are kept for reference only
+and are marked; nothing in `install_wifi_drivers.sh` builds a PCIe-only driver.
+The practical consequence is that **Wi-Fi 6 is the ceiling** (mt7921u mainline,
+or rtl8852au/bu out-of-tree) — 6E and Wi-Fi 7 silicon is M.2 except MT7925.
+
 Trixie ships **kernel 6.12**, which is late enough that several chips that
 historically needed an out-of-tree DKMS driver are now **mainline**. Installing
 a DKMS driver for a chip the kernel already handles is not neutral — both
@@ -72,6 +78,58 @@ Needed only for chips with no usable mainline driver on 6.12.
 | `88x2bu` | RTL8812BU, RTL8822BU | `0bda:b812`, `0bda:b820`, `2357:012d` | `morrownr/88x2bu-20210702` | **No — `rtw88_8822bu` is mainline since 6.1.** Only use if the mainline driver misbehaves, and blacklist one of the two. |
 | `8821cu` | RTL8811CU, RTL8821CU | `0bda:c811`, `0bda:c820` | `morrownr/8821cu-20210916` | **No — `rtw88_8821cu` is mainline since 6.2.** Same caveat. |
 | `broadcom-sta` (`wl`) | Legacy Broadcom PCIe (BCM4311–4360) | — | Debian `broadcom-sta-dkms` | Only for old laptop chips; conflicts with `b43`/`brcmsmac`. |
+
+---
+
+## 1a. Realtek — full coverage
+
+Realtek is the bulk of this fleet's dongles, and its driver story is the messiest
+in Linux: three separate mainline families plus a long tail of USB parts that
+have never been upstreamed. Which family claims a chip is not obvious from the
+model number.
+
+### Mainline Realtek families
+
+| Driver family | Chips | Bus | Mainline since | Firmware |
+|---|---|---|---|---|
+| `rtl818x` (`rtl8180`, `rtl8187`) | RTL8180, RTL8185, RTL8187/B | PCI, USB | 2.6.23 | none |
+| `rtlwifi` (`rtl8192ce`, `rtl8192cu`, `rtl8192de`, `rtl8192se`, `rtl8188ee`, `rtl8723ae`, `rtl8723be`, `rtl8821ae`) | RTL8188CE/EE, 8192CE/CU/DE/SE, 8723AE/BE, 8812AE, 8821AE | PCIe + **8192cu is USB** | 2.6.38–3.10 | `firmware-realtek` |
+| `rtl8xxxu` | RTL8188CU/CUS, 8192CU, 8723AU, 8192EU *(partial)* | USB | 4.4 | `firmware-realtek` |
+| `rtw88` | RTL8822BE/CE, 8821CE, 8723DE, **8822BU, 8821CU, 8811CU** | PCIe + **USB since 6.1** | 4.20 / 6.1 (USB) | `firmware-realtek` |
+| `rtw89` | RTL8852AE/BE (6), 8852CE (6E), **8922AE (Wi-Fi 7)** | PCIe / M.2 | 5.16 / 6.9 | `firmware-realtek` |
+| `rtl8723bs` | RTL8723BS | **SDIO** | 4.12 | `firmware-realtek` |
+
+**`rtl8xxxu` vs `rtlwifi` overlap:** both claim RTL8192CU/8188CU. `rtl8xxxu` is
+the newer rewrite and is usually preferred; if a dongle misbehaves, blacklisting
+one and forcing the other is a legitimate first move:
+
+```
+echo 'blacklist rtl8192cu' > /etc/modprobe.d/prefer-rtl8xxxu.conf
+```
+
+### Out-of-tree Realtek USB (no mainline driver)
+
+These are the ones to add as the fleet grows — all common, all cheap, none
+upstreamed.
+
+| Driver | Chips | Typical VID:PID | Source | Gen |
+|---|---|---|---|---|
+| `8812au` | RTL8812AU, RTL8821AU | `0bda:8812`, `2357:011e`, `2001:331e` | `morrownr/8812au-20210629` | ac |
+| `8814au` | RTL8814AU | `0bda:8813` | `morrownr/8814au-20210629` | ac |
+| `88x2bu` | RTL8812BU, RTL8822BU | `0bda:b812`, `2357:012d` | `morrownr/88x2bu-20210702` | ac *(mainline `rtw88` on 6.12)* |
+| `8821cu` | RTL8811CU, RTL8821CU | `0bda:c811`, `0bda:c820` | `morrownr/8821cu-20210916` | ac *(mainline `rtw88` on 6.12)* |
+| `8188eu` | RTL8188EUS | `0bda:8179` | `morrownr/8188eu-20210902` | n |
+| `rtl8192eu` | RTL8192EU | `0bda:818b` | `Mange/rtl8192eu-linux-driver` | n |
+| **`rtl8723du`** | RTL8723DU | `0bda:d723` | `lwfinger/rtl8723du` | n + BT |
+| **`rtl8192fu`** | RTL8192FU, RTL8188FU | `0bda:f179`, `0bda:f192` | `kelebek333/rtl8192fu-dkms` | n |
+| **`rtl8710bu`** | RTL8710BU, RTL8188GU | `0bda:b711` | `morrownr/rtl8710bu` | n |
+| **`rtl8852au`** | RTL8852AU, RTL8832AU | — | `morrownr/rtl8852au` | **Wi-Fi 6** |
+| **`rtl8852bu`** | RTL8852BU | — | `morrownr/rtl8852bu` | **Wi-Fi 6** |
+
+Bold = added for future dongles; not currently in the fleet's `usb_config`.
+
+**Realtek SDIO** (`rtl8189fs`, `rtl88x2cs`) is omitted deliberately — SDIO parts
+appear on SBCs, never on a USB-passthrough VM.
 
 ---
 
