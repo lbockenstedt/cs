@@ -377,10 +377,25 @@ PACKAGES=(
   "network-manager-gnome"
 )
 
-# Pi already has a desktop environment (PIXEL/LXDE) — don't replace it
-# On Debian x86/x64 VMs install PIXEL (from Pi repo) + lightdm/xorg
+# Pi hardware already has a desktop environment (PIXEL/LXDE) — don't replace it.
+# On plain Debian x86/x64 VMs install the SAME machinery Pi OS uses — lightdm +
+# LXDE (Openbox WM) + xorg — all from Debian main, on both amd64 and arm64.
+#
+# Deliberately NOT installed: raspberrypi-ui-mods / raspberrypi-artwork. Those are
+# theme-only (+rpt, from the Pi Foundation repo) and they are what makes a Debian
+# box un-upgradeable — every release upgrade then dies package-by-package on the
+# +rpt set (dphys-swapfile, raspberrypi-ui-mods, ...). Dropping them costs the Pi
+# LOOK and nothing else: the window manager, display manager, autologin and window
+# positioning are all identical, so there is ONE package set to test across plain
+# Debian and real Pi hardware instead of two.
 if ! $IS_PI; then
-  PACKAGES+=("raspberrypi-ui-mods" "raspberrypi-artwork" "lightdm" "lxde-core" "xorg")
+  PACKAGES+=("lightdm" "lxde-core" "xorg")
+  # Escape hatch: --pixel-desktop (which also added the Pi repo above) layers the
+  # Pi look back on top. Same machinery either way — this only adds the theme, and
+  # it re-introduces the +rpt upgrade problem, so it stays opt-in.
+  if [[ "${PIXEL_DESKTOP:-0}" == "1" ]]; then
+    PACKAGES+=("raspberrypi-ui-mods" "raspberrypi-artwork")
+  fi
 fi
 TOTAL_PKGS="${#PACKAGES[@]}"
 INSTALLED_COUNT=0
@@ -472,16 +487,27 @@ begin_phase
 # On Pi hardware/VMs, Pi OS manages its own display manager — skip this.
 if ! $IS_PI; then
   info "Configuring LightDM autologin for $SIM_USER"
+
+  # Pick the session by what is actually installed rather than hard-coding it.
+  # `LXDE-pi` is provided by raspberrypi-ui-mods; plain Debian's lxde-core
+  # provides `LXDE`. Naming a session that has no .desktop file does NOT fail
+  # loudly — LightDM just falls back to the greeter, so autologin quietly stops
+  # working and the three autostart windows never appear. Probing keeps Pi OS
+  # boxes on the exact session they already used while letting straight Debian
+  # work with no second code path.
+  LXSESSION="LXDE"
+  [[ -f /usr/share/xsessions/LXDE-pi.desktop ]] && LXSESSION="LXDE-pi"
+
   mkdir -p /etc/lightdm/lightdm.conf.d
   cat >/etc/lightdm/lightdm.conf.d/50-autologin.conf <<LIGHTDM_EOF
 [Seat:*]
 autologin-user=$SIM_USER
 autologin-user-timeout=0
-autologin-session=LXDE-pi
-user-session=LXDE-pi
+autologin-session=$LXSESSION
+user-session=$LXSESSION
 greeter-session=lightdm-greeter
 LIGHTDM_EOF
-  ok "LightDM autologin → $SIM_USER (session: LXDE-pi)"
+  ok "LightDM autologin → $SIM_USER (session: $LXSESSION)"
 else
   ok "Pi platform — keeping native Pi OS desktop and display manager"
 fi
