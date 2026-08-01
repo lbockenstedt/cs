@@ -135,9 +135,16 @@ if (( ! VERBOSE )) && [[ -n "$_dfgw" ]] && ! dns_gw_stable "$_dfgw"; then
   echo "$(date) default gateway $_dfgw not stably up (USB bus still clearing?) — holding the flood OFF this burst so the adapter can recover" | tee -a "$debug"
   exit 0
 fi
+# Background gateway prober — see dns_fail.sh / common.sh. Reading a state file
+# replaces the ~1.2s inline ping that froze the loop every 2s.
+dns_gw_probe_start "$_dfgw" 2 || echo "$(date) gateway prober failed to start — running without pause/resume" | tee -a "$debug"
+trap 'dns_gw_probe_stop' EXIT
+
 _gw_next_check=$((SECONDS + 2))
 _lat_next_check=$((SECONDS + _lat_recheck_s))
 _bailed=0
+_pauses=0
+_stop_at_max=$(( stop_at + burst_seconds ))
 while (( SECONDS < stop_at )); do
   for record in $dnsfile; do
 
@@ -146,14 +153,34 @@ while (( SECONDS < stop_at )); do
 
     # Gateway check (~every 2s): single ping, then CONFIRM with 5 pings — OFFLINE
     # only if ALL 5 fail. Offline → bail + drop the OPERATING rate 20%.
+    # PAUSE / settle / RESUME (shared model with dns_fail.sh): stopping the load
+    # is what lets the gateway recover; the rate only drops when the client
+    # trips repeatedly inside the window.
     if (( ! VERBOSE )) && [[ -n "$_dfgw" ]] && (( SECONDS >= _gw_next_check )); then
       _gw_next_check=$((SECONDS + 2))
-      if ! dns_gw_alive "$_dfgw" && dns_gw_confirmed_down "$_dfgw"; then
-        _newrate=$(dns_ceiling_penalize "$rate_per_minute")
-        echo "$(date) default gateway $_dfgw OFFLINE (5/5 pings failed) after ${fired} digs at ${rate_per_minute}/min — BAILING; throttling to ${_newrate}/min next burst" | tee -a "$debug"
+      if [[ "$(dns_gw_probe_state)" == "down" ]]; then
         kill $(jobs -p) 2>/dev/null
-        _bailed=1
-        break 2
+        _pauses=$(( _pauses + 1 ))
+        dns_pause_record
+        echo "$(date) gateway $_dfgw DOWN after ${fired} digs at ${rate_per_minute}/min — PAUSING (pause ${_pauses}, ${_dns_pause_recent} in the last ${_DNS_PAUSE_WINDOW_S}s)" | tee -a "$debug"
+        _waited=$(dns_gw_wait_settled "$_stop_at_max")
+        if [[ "$(dns_gw_probe_state)" == "up" ]]; then
+          echo "$(date) gateway $_dfgw back and settled after ${_waited}s — RESUMING at ${rate_per_minute}/min" | tee -a "$debug"
+        else
+          echo "$(date) gateway $_dfgw still down after ${_waited}s — ending burst" | tee -a "$debug"
+          _bailed=1
+          break 2
+        fi
+        stop_at=$(( stop_at + _waited ))
+        (( stop_at > _stop_at_max )) && stop_at=$_stop_at_max
+        if dns_pause_over_budget; then
+          _newrate=$(dns_ceiling_penalize "$rate_per_minute")
+          echo "$(date) ${_dns_pause_recent} pauses in ${_DNS_PAUSE_WINDOW_S}s (> ${_DNS_PAUSE_MAX}) — ratcheting ${rate_per_minute} -> ${_newrate}/min" | tee -a "$debug"
+          rate_per_minute=$_newrate
+          (( rate_per_minute <= 0 )) && { echo "$(date) rate floored to 0 — ending burst" | tee -a "$debug"; _bailed=1; break 2; }
+          pause_between=$(awk "BEGIN { printf \"%.3f\", 60 / $rate_per_minute }")
+        fi
+        _gw_next_check=$((SECONDS + 2))
       fi
     fi
 
@@ -195,7 +222,10 @@ done
 # Let any lookups still in flight finish, then record how many we fired.
 (( VERBOSE )) || wait 2>/dev/null
 if (( _bailed )); then
-  echo "$(date) DNS latency lookups fired: ${fired} (BAILED on gateway loss — self-throttling next burst)" | tee -a "$debug"
+  echo "$(date) DNS latency lookups fired: ${fired} (ended early — gateway did not come back; ${_pauses} pause(s) this burst)" | tee -a "$debug"
+elif (( _pauses > 0 )); then
+  # Paused => not clean => no up-probe, but no ratchet either (see dns_fail.sh).
+  echo "$(date) DNS latency lookups fired: ${fired} at ${rate_per_minute}/min (${_pauses} pause(s) — holding rate, no up-probe)" | tee -a "$debug"
 elif (( ! VERBOSE )) && (( rate_per_minute > 0 && rate_per_minute < _configured_rate )) && (( RANDOM % _DNS_UPPROBE_EVERY == 0 )); then
   # Production AIMD up-probe (see dns_fail): throttled + clean → occasionally nudge
   # UP to re-test capacity; a DOS falls back 20%. Rides varying capacity (50→80).

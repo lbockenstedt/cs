@@ -207,10 +207,17 @@ json_escape() {
 # so the sim can write it without root.
 _DNS_CEILING_FILE="/dev/shm/dns_ceiling.state"                  # self-throttle rate (failures/min), cleared at boot
 _DNS_CEILING_FILE_LEGACY="/usr/local/scripts/dns_ceiling.state"  # pre-tmpfs location; removed on first use
-_DNS_RATE_FLOOR=0       # 0 = a client that can't sustain ANY flood ratchets fully
-                        # OFF (sidelines itself) — a bad USB/hub client vs a
-                        # dedicated channel that sustains a firehose. rate 0 =
-                        # "don't flood this burst" (handled in the sim scripts).
+# [simulation] dns_rate_floor — the lowest rate the ratchet may fall to.
+# It used to be a hard 0, which let a client that kept tripping ratchet itself
+# all the way to ZERO and then generate no DNS traffic at all -- silently, since
+# a sidelined client still looks healthy. Several clients reached near-0 that way
+# and the fleet stopped producing alerts. A floor still self-throttles a
+# struggling client without ever removing it from the fleet.
+dns_rate_floor() {
+  local t; t=$(get_value 'simulation' 'dns_rate_floor' 2>/dev/null)
+  [[ "$t" =~ ^[0-9]+$ ]] || t=100
+  printf '%s' "$t"
+}
 _DNS_UPPROBE_EVERY=5    # production AIMD: ~1 in N clean bursts, nudge the rate UP to re-test capacity
 
 # Default-gateway IP (the sim's real uplink), empty if there is no default route.
@@ -236,6 +243,146 @@ dns_gw_confirmed_down() {
   local gw="${1:-}"; [[ -n "$gw" ]] || return 1
   ! ping -c5 -i0.3 -W"$(gw_ping_timeout_s)" "$gw" >/dev/null 2>&1
 }
+
+# ── gateway probe: BACKGROUND, non-blocking ─────────────────────────────────
+# The probe used to run INLINE in the dig loop: `ping -c5 -i0.3 -W4` blocks for
+# ~1.2s even when the gateway answers instantly, and it fired every 2s. The
+# flood therefore ran ~2s, froze ~1.2s, repeated -- roughly a 38% duty-cycle
+# loss on a HEALTHY client, so a configured 750/min actually delivered ~465.
+#
+# Worse, an inline probe competes with the very load it is measuring: under a
+# heavy burst the ping process can simply fail to be scheduled, and 5 missed
+# replies then look identical to a real outage. Running it in a separate process
+# that only writes a state file means the dig loop's cost to check the gateway
+# is one file read, and the probe keeps its own timing regardless of how busy
+# the flood is.
+_DNS_GW_STATE_FILE=""        # set by dns_gw_probe_start (PID-suffixed)
+_DNS_GW_PROBE_PID=""
+
+# Start the background prober. Per-PID state file so dns_fail and dns_latency
+# running concurrently never share (or double-write) one file.
+dns_gw_probe_start() {
+  local gw="$1" interval="${2:-2}"
+  [[ -n "$gw" ]] || return 1
+  # tmpfs preferred (never touches the SD card / disk on a client that writes
+  # this every 2s), but fall back to /tmp rather than failing: a start failure
+  # means the burst runs with NO gateway protection at all, which is far worse
+  # than writing the state a little slower.
+  local _d
+  for _d in /dev/shm /tmp; do
+    [[ -d "$_d" && -w "$_d" ]] || continue
+    _DNS_GW_STATE_FILE="$_d/dns_gw_state.$$"
+    printf 'unknown' > "$_DNS_GW_STATE_FILE" 2>/dev/null && break
+    _DNS_GW_STATE_FILE=""
+  done
+  [[ -n "$_DNS_GW_STATE_FILE" ]] || return 1
+  chmod 0666 "$_DNS_GW_STATE_FILE" 2>/dev/null || true
+  (
+    while :; do
+      if dns_gw_alive "$gw"; then printf 'up' > "$_DNS_GW_STATE_FILE" 2>/dev/null
+      else                        printf 'down' > "$_DNS_GW_STATE_FILE" 2>/dev/null; fi
+      sleep "$interval"
+    done
+  ) &
+  _DNS_GW_PROBE_PID=$!
+  # Detach from job control so stopping it does not print "Terminated" into
+  # sim.log — the prober is stopped on EVERY burst, so that message would appear
+  # constantly and read like an error.
+  disown "$_DNS_GW_PROBE_PID" 2>/dev/null || true
+  return 0
+}
+
+# Always call from an EXIT trap: a leaked prober keeps pinging forever after the
+# burst ends, and a fleet of them would be a real load of its own.
+dns_gw_probe_stop() {
+  [[ -n "$_DNS_GW_PROBE_PID" ]] && kill "$_DNS_GW_PROBE_PID" 2>/dev/null
+  [[ -n "$_DNS_GW_STATE_FILE" ]] && rm -f "$_DNS_GW_STATE_FILE" 2>/dev/null
+  _DNS_GW_PROBE_PID=""; _DNS_GW_STATE_FILE=""
+}
+
+# up | down | unknown. 'unknown' before the first round completes — callers must
+# treat it as "do not act", never as down, or every burst would pause on startup.
+dns_gw_probe_state() {
+  local s=""
+  [[ -n "$_DNS_GW_STATE_FILE" && -f "$_DNS_GW_STATE_FILE" ]] && s=$(< "$_DNS_GW_STATE_FILE")
+  printf '%s' "${s:-unknown}"
+}
+
+# Seconds the gateway must read 'up' CONTINUOUSLY before the flood resumes.
+# Resuming the instant the gateway answers one ping re-loads a link that has not
+# finished clearing, which just trips the next pause immediately.
+dns_gw_settle_s() {
+  local t; t=$(get_value 'simulation' 'dns_gw_settle_s' 2>/dev/null)
+  [[ "$t" =~ ^[0-9]+$ ]] || t=10
+  printf '%s' "$t"
+}
+
+# Block until the gateway has been continuously up for the settle window, or
+# until $1 (an absolute SECONDS deadline) passes. Echoes the seconds waited.
+dns_gw_wait_settled() {
+  local deadline="$1" settle start=$SECONDS ok=0
+  settle=$(dns_gw_settle_s)
+  while (( SECONDS < deadline )); do
+    if [[ "$(dns_gw_probe_state)" == "up" ]]; then
+      ok=$(( ok + 1 ))
+      (( ok >= settle )) && break
+    else
+      ok=0            # any miss restarts the settle window
+    fi
+    sleep 1
+  done
+  printf '%s' "$(( SECONDS - start ))"
+}
+
+# ── pause accounting (sliding window) ───────────────────────────────────────
+# "More than N pauses in W seconds" is the signal that the client genuinely
+# cannot sustain the rate -- as opposed to one transient, which pausing alone
+# recovers from. A TRUE sliding window, not a per-burst counter: a per-burst
+# count resets at the boundary, so 5 pauses at the end of one burst plus 5 at
+# the start of the next would never trip.
+# [simulation] dns_pause_window_s / dns_pause_max — "more than MAX pauses inside
+# WINDOW seconds means the rate itself is too high". Knobs because the right
+# values depend on how twitchy a given fleet's gateway is, and getting them wrong
+# in either direction is costly: too strict ratchets a healthy client, too loose
+# lets a struggling one pause forever without ever slowing down.
+dns_pause_window_s() {
+  local t; t=$(get_value 'simulation' 'dns_pause_window_s' 2>/dev/null)
+  [[ "$t" =~ ^[0-9]+$ ]] || t=300
+  printf '%s' "$t"
+}
+dns_pause_max() {
+  local t; t=$(get_value 'simulation' 'dns_pause_max' 2>/dev/null)
+  [[ "$t" =~ ^[0-9]+$ ]] || t=5
+  printf '%s' "$t"
+}
+# Resolved LAZILY on first use, never at source time: common.sh is sourced
+# BEFORE process_ini_file runs, so reading the config here would silently pin
+# both to their defaults and the knobs would appear to do nothing.
+_DNS_PAUSE_WINDOW_S=""
+_DNS_PAUSE_MAX=""
+_dns_pause_init() {
+  [[ -n "$_DNS_PAUSE_WINDOW_S" ]] || _DNS_PAUSE_WINDOW_S=$(dns_pause_window_s)
+  [[ -n "$_DNS_PAUSE_MAX" ]]      || _DNS_PAUSE_MAX=$(dns_pause_max)
+}
+_dns_pause_times=()
+_dns_pause_recent=0
+
+# Record a pause and refresh _dns_pause_recent. Call DIRECTLY (not in $( )) —
+# it prunes the array in place, which a subshell would discard.
+dns_pause_record() {
+  local now cutoff t keep=()
+  _dns_pause_init
+  now=$(date +%s); cutoff=$(( now - _DNS_PAUSE_WINDOW_S ))
+  _dns_pause_times+=("$now")
+  for t in ${_dns_pause_times[@]+"${_dns_pause_times[@]}"}; do
+    (( t >= cutoff )) && keep+=("$t")
+  done
+  _dns_pause_times=(${keep[@]+"${keep[@]}"})
+  _dns_pause_recent=${#_dns_pause_times[@]}
+}
+
+# Has the client paused too often to be believed at this rate?
+dns_pause_over_budget() { _dns_pause_init; (( _dns_pause_recent > _DNS_PAUSE_MAX )); }
 
 # RECOVERY HOLD: gateway is STABLY up = $2 (default 4) consecutive dns_gw_alive
 # rounds all pass (each round = 5 pings, any reply), ~2s apart. The pre-flood gate.
@@ -290,10 +437,19 @@ _dns_ceiling_write() {
 
 # Gateway offline (we overloaded it) → AIMD multiplicative DECREASE: persist a new
 # ceiling of (rate * 0.8), floored, and echo it.
+# Multiplicative decrease. Gentle (x0.95) BY DESIGN: the ratchet no longer fires
+# on a single transient -- the flood now PAUSES and resumes for those, and this
+# only runs when the client has paused more than _DNS_PAUSE_MAX times inside
+# _DNS_PAUSE_WINDOW_S. A rare, well-evidenced signal deserves a small nudge, not
+# the old x0.8 cliff that took ~15 clean bursts to climb back from.
+_DNS_RATE_PENALTY=0.95
 dns_ceiling_penalize() {
-  local achieved=$1 next
-  next=$(awk -v a="$achieved" 'BEGIN { printf "%d", a * 0.8 }')
-  (( next < _DNS_RATE_FLOOR )) && next=$_DNS_RATE_FLOOR
+  local achieved=$1 next _floor
+  next=$(awk -v a="$achieved" -v f="$_DNS_RATE_PENALTY" 'BEGIN { printf "%d", a * f }')
+  # x0.95 of a small number can floor to itself and never move; force progress.
+  (( next >= achieved )) && next=$(( achieved - 1 ))
+  _floor=$(dns_rate_floor)
+  (( next < _floor )) && next=$_floor
   _dns_ceiling_write "$next"
   echo "$next"
 }

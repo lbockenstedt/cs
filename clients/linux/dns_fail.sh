@@ -149,8 +149,22 @@ if (( ! VERBOSE )) && [[ -n "$_dfgw" ]] && ! dns_gw_stable "$_dfgw"; then
   echo "$(date) default gateway $_dfgw not stably up (USB bus still clearing?) — holding the flood OFF this burst so the adapter can recover" | tee -a "$debug"
   exit 0
 fi
+# Background gateway prober. The dig loop below only READS its state file, so
+# checking the gateway costs one file read instead of the ~1.2s inline ping that
+# used to freeze the flood every 2 seconds (~38% of every burst on a HEALTHY
+# client). It also keeps its own timing, so it cannot be starved by the very
+# load it is measuring — the failure mode that made "gateway down" and "ping did
+# not get scheduled" indistinguishable.
+dns_gw_probe_start "$_dfgw" 2 || echo "$(date) gateway prober failed to start — running without pause/resume" | tee -a "$debug"
+trap 'dns_gw_probe_stop' EXIT
+
 _gw_next_check=$((SECONDS + 2))
 _bailed=0
+_pauses=0
+# Pauses EXTEND the burst so a recovery does not cost output: the burst still
+# delivers its intended firing time. Capped at 2x nominal so a flapping gateway
+# cannot make one burst run forever.
+_stop_at_max=$(( stop_at + burst_seconds ))
 while (( SECONDS < stop_at )); do
   for record in $dnsfile; do
     for server in "${bad_records[@]}" "${bad_ips[@]}"; do
@@ -164,14 +178,40 @@ while (( SECONDS < stop_at )); do
       # the OPERATING rate 20%.
       if (( ! VERBOSE )) && [[ -n "$_dfgw" ]] && (( SECONDS >= _gw_next_check )); then
         _gw_next_check=$((SECONDS + 2))
-        if ! dns_gw_alive "$_dfgw" && dns_gw_confirmed_down "$_dfgw"; then
-          # -20% of the OPERATING rate (not the noisy measured 'achieved', which
-          # came out ≈ the rate and barely moved the ceiling → a ~1 decrement).
-          _newrate=$(dns_ceiling_penalize "$rate_per_minute")
-          echo "$(date) default gateway $_dfgw OFFLINE (5/5 pings failed) after ${fired} digs at ${rate_per_minute}/min — BAILING; throttling to ${_newrate}/min next burst" | tee -a "$debug"
+        # 'unknown' means the prober has not completed a round yet — never treat
+        # that as down, or every burst would pause on startup.
+        if [[ "$(dns_gw_probe_state)" == "down" ]]; then
+          # PAUSE, do not abort. Stopping the load is what actually lets the
+          # gateway recover; dropping the rate was treating a transient as a
+          # permanent capacity problem. Kill the in-flight digs so the link is
+          # genuinely idle while it settles.
           kill $(jobs -p) 2>/dev/null
-          _bailed=1
-          break 2
+          _pause_start=$SECONDS
+          _pauses=$(( _pauses + 1 ))
+          dns_pause_record
+          echo "$(date) gateway $_dfgw DOWN after ${fired} digs at ${rate_per_minute}/min — PAUSING (pause ${_pauses}, ${_dns_pause_recent} in the last ${_DNS_PAUSE_WINDOW_S}s)" | tee -a "$debug"
+
+          _waited=$(dns_gw_wait_settled "$_stop_at_max")
+          if [[ "$(dns_gw_probe_state)" == "up" ]]; then
+            echo "$(date) gateway $_dfgw back and settled after ${_waited}s — RESUMING at ${rate_per_minute}/min" | tee -a "$debug"
+          else
+            echo "$(date) gateway $_dfgw still down after ${_waited}s — ending burst" | tee -a "$debug"
+            _bailed=1
+            break 2
+          fi
+          # Give the burst back the time it spent paused, up to the cap.
+          stop_at=$(( stop_at + _waited ))
+          (( stop_at > _stop_at_max )) && stop_at=$_stop_at_max
+
+          # Only NOW does repeated tripping mean the rate itself is too high.
+          if dns_pause_over_budget; then
+            _newrate=$(dns_ceiling_penalize "$rate_per_minute")
+            echo "$(date) ${_dns_pause_recent} pauses in ${_DNS_PAUSE_WINDOW_S}s (> ${_DNS_PAUSE_MAX}) — ratcheting ${rate_per_minute} -> ${_newrate}/min" | tee -a "$debug"
+            rate_per_minute=$_newrate
+            (( rate_per_minute <= 0 )) && { echo "$(date) rate floored to 0 — ending burst" | tee -a "$debug"; _bailed=1; break 2; }
+            pause_between=$(awk "BEGIN { printf \"%.3f\", 60 / $rate_per_minute }")
+          fi
+          _gw_next_check=$((SECONDS + 2))
         fi
       fi
 
@@ -207,7 +247,14 @@ done
 # (Verbose mode runs foreground — no background jobs to wait on.)
 (( VERBOSE )) || wait 2>/dev/null
 if (( _bailed )); then
-  echo "$(date) DNS failures fired: ${fired} (BAILED on gateway loss — self-throttling next burst)" | tee -a "$debug"
+  echo "$(date) DNS failures fired: ${fired} (ended early — gateway did not come back; ${_pauses} pause(s) this burst)" | tee -a "$debug"
+elif (( _pauses > 0 )); then
+  # A burst that had to pause is NOT clean: the client hit its limit at least
+  # once, so do not up-probe. It is not a ratchet either (that needs
+  # > _DNS_PAUSE_MAX pauses in the window) — deliberately a neutral middle
+  # state, so a client that pauses occasionally holds its rate instead of
+  # oscillating up and down around it.
+  echo "$(date) DNS failures fired: ${fired} at ${rate_per_minute}/min (${_pauses} pause(s) — holding rate, no up-probe)" | tee -a "$debug"
 elif (( ! VERBOSE )) && (( rate_per_minute > 0 && rate_per_minute < _configured_rate )) && (( RANDOM % _DNS_UPPROBE_EVERY == 0 )); then
   # Production AIMD up-probe: throttled below target + clean → occasionally nudge
   # the rate UP to re-test capacity (dongle recovered / shared bus freed as other
