@@ -13,12 +13,15 @@ DEBUG=0
 PIXEL_DESKTOP=0
 
 # Desktop account the client runs as, and which LightDM autologs in.
-# Password sources, in precedence order:
-#   1. --password <pw>      convenient, but VISIBLE in `ps` and shell history
-#   2. SIM_PASSWORD env var preferred for unattended installs
-#   3. interactive prompt   used when a TTY is available and neither is set
+#
+# The password defaults to "password" so an install is fully unattended and every
+# sim client is predictable to get into. These are disposable lab VMs on an
+# isolated sim network, so a well-known credential is the intended trade — do NOT
+# reuse this image anywhere reachable from a real network without overriding it.
+# Override with --password <pw> (visible in `ps` and shell history) or, better,
+# SIM_PASSWORD=... in the environment.
 SIM_USER="${SIM_USER:-sim-user}"
-SIM_PASSWORD="${SIM_PASSWORD:-}"
+SIM_PASSWORD="${SIM_PASSWORD:-password}"
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -37,10 +40,9 @@ Client Simulator Installer
   sudo bash install.sh [options]
 
   --user <name>       desktop account to create and autologin (default: sim-user)
-  --password <pw>     password for that account
+  --password <pw>     password for that account (default: "password")
                       NOTE: visible in `ps` and shell history. Prefer
-                      SIM_PASSWORD=... in the environment, or omit both and be
-                      prompted.
+                      SIM_PASSWORD=... in the environment.
   --pixel-desktop     also install the Raspberry Pi PIXEL theme. Pulls +rpt
                       packages that block future Debian release upgrades.
   --debug, -d         verbose output
@@ -262,13 +264,9 @@ fi
 # greeter, cannot unlock the screen after a blank/lock, and cannot authenticate
 # for anything outside the scoped sudoers rules below. Autologin papers over it
 # until the first lock, then the box is unreachable from the console.
-if [[ -z "$SIM_PASSWORD" ]] && [[ -t 0 ]]; then
-  # Interactive run and nothing supplied — ask rather than silently leaving the
-  # account locked. Never echoed, never written to $LOG.
-  read -r -s -p "Password for '$SIM_USER' (blank to skip): " SIM_PASSWORD </dev/tty || true
-  echo
-fi
-
+# Defaults to "password" (see the top of this script), so this branch is taken on
+# every normal install and the account is never left locked. It is only skipped
+# if someone explicitly passes an empty --password.
 if [[ -n "$SIM_PASSWORD" ]]; then
   # chpasswd reads stdin, so the password never appears in the process table the
   # way `passwd`/`usermod -p` arguments would. Deliberately not logged.
