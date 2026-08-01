@@ -20,7 +20,7 @@ PIXEL_DESKTOP=0
 # reuse this image anywhere reachable from a real network without overriding it.
 # Override with --password <pw> (visible in `ps` and shell history) or, better,
 # SIM_PASSWORD=... in the environment.
-SIM_USER="${SIM_USER:-sim-user}"
+SIM_USER="${SIM_USER:-user}"
 SIM_PASSWORD="${SIM_PASSWORD:-password}"
 
 while [[ $# -gt 0 ]]; do
@@ -39,7 +39,7 @@ Client Simulator Installer
 
   sudo bash install.sh [options]
 
-  --user <name>       desktop account to create and autologin (default: sim-user)
+  --user <name>       desktop account to create and autologin (default: user)
   --password <pw>     password for that account (default: "password")
                       NOTE: visible in `ps` and shell history. Prefer
                       SIM_PASSWORD=... in the environment.
@@ -56,7 +56,7 @@ done
 # A username lands in useradd, sudoers and lightdm config — keep it to something
 # that cannot break those files or smuggle in extra directives.
 if [[ ! "$SIM_USER" =~ ^[a-z_][a-z0-9_-]*$ ]]; then
-  echo "ERROR: invalid --user '$SIM_USER' (expected lowercase name, e.g. sim-user)" >&2
+  echo "ERROR: invalid --user '$SIM_USER' (expected lowercase name, e.g. user)" >&2
   exit 1
 fi
 
@@ -286,7 +286,11 @@ fi
 
 info "Configuring sudoers"
 
-# sim-user: scoped passwordless sudo for simulation operations
+# Scoped passwordless sudo for simulation operations.
+# When SIM_USER is the default `user`, the full-sudo fragment below also matches
+# this account. sudo reads /etc/sudoers.d in lexical order and 99-simuser sorts
+# before 99-user, so the broader rule wins and this fragment is redundant rather
+# than restrictive — it is kept so a custom --user still gets the scoped grant.
 cat >/etc/sudoers.d/99-simuser-nopasswd <<EOF
 # Managed by client-sim-install.sh — do not edit manually
 $SIM_USER ALL=(ALL) NOPASSWD: /usr/bin/apt-get, /usr/sbin/dpkg, /bin/systemctl, /sbin/depmod, /usr/sbin/dkms
