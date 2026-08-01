@@ -367,6 +367,14 @@ for entry in "${DRIVERS[@]}"; do
     8821cu) modinfo rtw88_8821cu >/dev/null 2>&1 && {
               info "skip $NAME — rtw88_8821cu is mainline on $(uname -r)"
               echo "$NAME:SKIPPED_IN_TREE" >>"$DRIVER_STATE"; continue; } ;;
+    # lwfinger/rtl8723du is declared OBSOLETE by its own Makefile and CANNOT
+    # build on 6.12: struct usb_driver lost its `drvwrap` member, so
+    # os_dep/usb_intf.c fails with "no member named drvwrap". Mainline
+    # rtw88_8723du replaced it. Skip when the in-tree driver exists; on an older
+    # kernel that lacks it the out-of-tree build still works.
+    8723du) modinfo rtw88_8723du >/dev/null 2>&1 && {
+              info "skip $NAME — rtw88_8723du is mainline on $(uname -r)"
+              echo "$NAME:SKIPPED_IN_TREE" >>"$DRIVER_STATE"; continue; } ;;
   esac
 
   rm -rf "$NAME"
@@ -449,6 +457,13 @@ for entry in ${FETCHED[@]+"${FETCHED[@]}"}; do
         DKMS_VER="0.0"
         [[ -f dkms.conf ]] && DKMS_VER="$(grep 'PACKAGE_VERSION=' dkms.conf | cut -d'"' -f2 || echo 0.0)"
         SRC_DEST="/usr/src/${MOD}-${DKMS_VER}"
+        # Deregister any previous build of this exact module/version FIRST.
+        # Wiping /usr/src alone leaves the DKMS registration behind, so `dkms add`
+        # returns "Error! DKMS tree already contains: <mod>/<ver>" and both build
+        # and install then report "already installed, skip" — the script called
+        # that success while silently KEEPING THE OLD BINARY. A driver update
+        # would never actually take effect, and the log looked clean.
+        dkms remove -m "$MOD" -v "$DKMS_VER" --all >>"$LOG" 2>&1 || true
         rm -rf "$SRC_DEST"; cp -r "$(pwd)" "$SRC_DEST"
         dkms add -m "$MOD" -v "$DKMS_VER" >>"$LOG" 2>&1 || true
         if dkms build -m "$MOD" -v "$DKMS_VER" >>"$LOG" 2>&1 \
