@@ -113,8 +113,14 @@ _scripts_sync_decision() {
 # This function only needs to handle the lxsession side (@nm-applet in autostart).
 #------------------------------------------------------------
 suppress_nm_applet() {
-    local _lxsession_sys="/etc/xdg/lxsession/LXDE-pi/autostart"
-    local _lxsession_user="$HOME/.config/lxsession/LXDE-pi/autostart"
+    # The lxsession profile is LXDE-pi only where raspberrypi-ui-mods is
+    # installed; plain Debian's lxde-core calls it LXDE. Hard-coding LXDE-pi made
+    # this silently no-op on a straight-Debian client — the `[ -f ]` below just
+    # failed, so the duplicate tray icon came back with nothing logged.
+    local _profile="LXDE"
+    [ -f "/etc/xdg/lxsession/LXDE-pi/autostart" ] && _profile="LXDE-pi"
+    local _lxsession_sys="/etc/xdg/lxsession/$_profile/autostart"
+    local _lxsession_user="$HOME/.config/lxsession/$_profile/autostart"
     if [ -f "$_lxsession_sys" ]; then
         mkdir -p "$(dirname "$_lxsession_user")"
         if [ ! -f "$_lxsession_user" ]; then
@@ -123,6 +129,59 @@ suppress_nm_applet() {
             sed -i '/nm-applet/d' "$_lxsession_user"
         fi
     fi
+}
+
+#------------------------------------------------------------
+# Remove .desktop autostart entries we used to ship but no longer do.
+#
+# Deployment was copy-only, so dropping a .desktop from the payload removed it
+# from the repo and NOWHERE ELSE — every existing client kept launching it
+# forever, and the only fix was touching each box by hand.
+#
+# Pruning an autostart dir is destructive: it also holds the user's own entries
+# and other packages'. So we never delete on "not in payload" alone — a file must
+# also be provably OURS:
+#   * X-LM-Sim=1  — the marker every .desktop we ship now carries, or
+#   * one of LEGACY_OWNED — the names we shipped BEFORE the marker existed, which
+#     is what is sitting on the current fleet. Without this, already-deployed
+#     files would be unprunable (no marker) and the fix would only work for
+#     clients installed after today.
+#
+#   prune_stale_desktops <dir> <payload_basename>...
+#------------------------------------------------------------
+LEGACY_OWNED=("journalctl.desktop" "logview.desktop" "startup.desktop" "nm-applet.desktop")
+
+prune_stale_desktops() {
+    local _dir="$1"; shift
+    local _payload=("$@")
+    [ -d "$_dir" ] || return 0
+
+    local _f _base _keep _owned _l
+    for _f in "$_dir"/*.desktop; do
+        [ -e "$_f" ] || continue
+        _base=$(basename "$_f")
+
+        # Still shipped? leave it alone.
+        _keep=0
+        for _p in "${_payload[@]}"; do
+            [ "$_base" = "$_p" ] && { _keep=1; break; }
+        done
+        [ "$_keep" = "1" ] && continue
+
+        # Not shipped — only remove it if it is ours.
+        _owned=0
+        grep -q '^X-LM-Sim=1[[:space:]]*$' "$_f" 2>/dev/null && _owned=1
+        if [ "$_owned" = "0" ]; then
+            for _l in "${LEGACY_OWNED[@]}"; do
+                [ "$_base" = "$_l" ] && { _owned=1; break; }
+            done
+        fi
+        [ "$_owned" = "0" ] && continue
+
+        rm -f "$_f" \
+            && echo "Removed stale autostart entry $_base (no longer in payload)" | tee -a "$debug" \
+            || echo "WARNING: could not remove stale $_base" | tee -a "$debug"
+    done
 }
 
 #------------------------------------------------------------
@@ -184,12 +243,24 @@ copy_local_files() {
     # so updates land here without requiring sudo cp to the system dir.
     _user_autostart="$HOME/.config/autostart"
     mkdir -p "$_user_autostart"
+    _payload_names=()
     for _d in "${desktop_files[@]}"; do
         _dname=$(basename "$_d")
+        _payload_names+=("$_dname")
         cp -f "$_d" "$_user_autostart/$_dname" \
             && echo "Updated $_dname" | tee -a "$debug" \
             || echo "WARNING: could not update $_dname" | tee -a "$debug"
     done
+    # Only prune when the payload actually carried .desktop files. An empty list
+    # means a truncated or failed sync, not "we removed them all" — pruning on
+    # that would strip every autostart window off the client on a transient
+    # fetch failure, and nothing would put them back until the next good sync.
+    if (( ${#_payload_names[@]} )); then
+        prune_stale_desktops "$_user_autostart" "${_payload_names[@]}"
+        # Installs before the user-dir switch dropped copies in the system dir;
+        # a stale entry there still autostarts even once the user copy is gone.
+        [ -w /etc/xdg/autostart ] && prune_stale_desktops /etc/xdg/autostart "${_payload_names[@]}"
+    fi
     suppress_nm_applet
     (( ${#conf_files[@]} )) && cp --remove-destination "${conf_files[@]}" /usr/local/scripts/
 
@@ -633,6 +704,13 @@ if [[ "$source_found" == false && "$github_repo" == "on" ]]; then
                         && echo "Updated $_d" | tee -a "$debug" \
                         || echo "WARNING: could not deploy $_d to autostart" | tee -a "$debug"
                 done
+                # Same prune as the web path — this dir glob is already relative,
+                # so the names ARE the payload basenames. Skip on an empty list
+                # (failed sync), never strip the client's windows on a bad fetch.
+                if (( ${#desktop_files[@]} )); then
+                    prune_stale_desktops "$_user_autostart" "${desktop_files[@]}"
+                    [ -w /etc/xdg/autostart ] && prune_stale_desktops /etc/xdg/autostart "${desktop_files[@]}"
+                fi
                 # Copy all .sh except update.sh first; update.sh copied last
                 for _f in "${sh_files[@]}"; do
                     [[ "$_f" == "update.sh" ]] && continue
