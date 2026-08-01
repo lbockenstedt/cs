@@ -11,12 +11,52 @@ export PATH="/usr/sbin:/sbin:/usr/bin:/bin:$PATH"
 ###############################################################################
 DEBUG=0
 PIXEL_DESKTOP=0
-for arg in "$@"; do
-  [[ "$arg" == "--debug" || "$arg" == "-d" ]] && DEBUG=1
-  # Opt in to the Pi PIXEL desktop on plain Debian. OFF by default: it pulls
-  # +rpt packages that block every future release upgrade.
-  [[ "$arg" == "--pixel-desktop" ]] && PIXEL_DESKTOP=1
+
+# Desktop account the client runs as, and which LightDM autologs in.
+# Password sources, in precedence order:
+#   1. --password <pw>      convenient, but VISIBLE in `ps` and shell history
+#   2. SIM_PASSWORD env var preferred for unattended installs
+#   3. interactive prompt   used when a TTY is available and neither is set
+SIM_USER="${SIM_USER:-sim-user}"
+SIM_PASSWORD="${SIM_PASSWORD:-}"
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --debug|-d)       DEBUG=1 ;;
+    # Opt in to the Pi PIXEL desktop on plain Debian. OFF by default: it pulls
+    # +rpt packages that block every future release upgrade.
+    --pixel-desktop)  PIXEL_DESKTOP=1 ;;
+    --user)           SIM_USER="${2:?--user requires a value}"; shift ;;
+    --user=*)         SIM_USER="${1#*=}" ;;
+    --password)       SIM_PASSWORD="${2:?--password requires a value}"; shift ;;
+    --password=*)     SIM_PASSWORD="${1#*=}" ;;
+    -h|--help)
+      cat <<'USAGE'
+Client Simulator Installer
+
+  sudo bash install.sh [options]
+
+  --user <name>       desktop account to create and autologin (default: sim-user)
+  --password <pw>     password for that account
+                      NOTE: visible in `ps` and shell history. Prefer
+                      SIM_PASSWORD=... in the environment, or omit both and be
+                      prompted.
+  --pixel-desktop     also install the Raspberry Pi PIXEL theme. Pulls +rpt
+                      packages that block future Debian release upgrades.
+  --debug, -d         verbose output
+USAGE
+      exit 0 ;;
+    *) echo "WARNING: ignoring unknown argument '$1'" >&2 ;;
+  esac
+  shift
 done
+
+# A username lands in useradd, sudoers and lightdm config — keep it to something
+# that cannot break those files or smuggle in extra directives.
+if [[ ! "$SIM_USER" =~ ^[a-z_][a-z0-9_-]*$ ]]; then
+  echo "ERROR: invalid --user '$SIM_USER' (expected lowercase name, e.g. sim-user)" >&2
+  exit 1
+fi
 
 ###############################################################################
 # Root check
@@ -204,14 +244,46 @@ apt_run() {
 # PHASE 1 — USER PROVISIONING + SCOPED SUDO
 ###############################################################################
 begin_phase
-SIM_USER="sim-user"
+# SIM_USER / SIM_PASSWORD are parsed at the top of this script.
 
 info "Checking user '$SIM_USER'"
 if ! id "$SIM_USER" &>/dev/null; then
   useradd -m -s /bin/bash "$SIM_USER" >>"$LOG" 2>&1
   ok "Created user '$SIM_USER'"
+  SIM_USER_IS_NEW=1
 else
   ok "User '$SIM_USER' already exists"
+  SIM_USER_IS_NEW=0
+fi
+
+# ── Account password ─────────────────────────────────────────────────────────
+# `useradd -m` leaves the account with NO password, which shadow records as a
+# LOCKED account (`!`). That is not a cosmetic gap: the user cannot log in at the
+# greeter, cannot unlock the screen after a blank/lock, and cannot authenticate
+# for anything outside the scoped sudoers rules below. Autologin papers over it
+# until the first lock, then the box is unreachable from the console.
+if [[ -z "$SIM_PASSWORD" ]] && [[ -t 0 ]]; then
+  # Interactive run and nothing supplied — ask rather than silently leaving the
+  # account locked. Never echoed, never written to $LOG.
+  read -r -s -p "Password for '$SIM_USER' (blank to skip): " SIM_PASSWORD </dev/tty || true
+  echo
+fi
+
+if [[ -n "$SIM_PASSWORD" ]]; then
+  # chpasswd reads stdin, so the password never appears in the process table the
+  # way `passwd`/`usermod -p` arguments would. Deliberately not logged.
+  if printf '%s:%s\n' "$SIM_USER" "$SIM_PASSWORD" | chpasswd 2>>"$LOG"; then
+    ok "Password set for '$SIM_USER'"
+  else
+    err "Failed to set password for '$SIM_USER'"
+  fi
+  # Clear it from the environment as soon as it has been consumed.
+  SIM_PASSWORD=""
+  unset SIM_PASSWORD
+elif [[ "$SIM_USER_IS_NEW" == "1" ]]; then
+  warn "No password set for '$SIM_USER' — account is LOCKED: console login and"
+  warn "  screen unlock will both fail. Re-run with --password or set one with:"
+  warn "  sudo passwd $SIM_USER"
 fi
 
 info "Configuring sudoers"
