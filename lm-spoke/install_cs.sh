@@ -73,6 +73,10 @@ CS_API_HOST="${CS_API_HOST:-0.0.0.0}"
 # skips entirely. Same subnet/pool/lease behaviour the prior dnsmasq scope had.
 DHCP_IFACE="${DHCP_IFACE:-}"
 DHCP_SKIP="${DHCP_SKIP:-0}"
+# AppArmor is DISABLED on cs spokes by default. See disable_apparmor() for the
+# evidence; --keep-apparmor opts back in for anyone who wants the confinement
+# and is willing to intervene manually when sim DHCP will not start.
+KEEP_APPARMOR="${KEEP_APPARMOR:-0}"
 DHCP_SUBNET="${DHCP_SUBNET:-169.253.1.0}"
 DHCP_PREFIX="${DHCP_PREFIX:-24}"
 DHCP_GATEWAY="${DHCP_GATEWAY:-169.253.1.1}"
@@ -131,6 +135,7 @@ while [[ "$#" -gt 0 ]]; do
         --agent-listener)     CS_AGENT_LISTENER=1 ;;  # default already; kept as a harmless no-op
         --no-agent-listener)  CS_AGENT_LISTENER=0 ;;
         --infra-only)         INFRA_ONLY=1 ;;
+        --keep-apparmor)      KEEP_APPARMOR=1 ;;
         --purge-env|--reset-identity) PURGE_ENV=1 ;;
         --clone|--prep-clone) CLONE_MODE=1 ;;
         --admin-token) ;; # deprecated
@@ -248,8 +253,73 @@ step() { echo -e "\n${GRN}━━  $*  ━━${NC}"; }
 #   units   kea-dhcp4-sim.service + kea-ctrl-agent-sim.service
 #   socket  /run/kea/kea4-ctrl-socket-sim   ctrl-agent http-port 8002 (dhcp=8001)
 #   leases  /var/lib/kea/kea-leases4-sim.csv
+disable_apparmor() {
+    # Turn AppArmor OFF on this spoke.
+    #
+    # WHY, and it is not a shortcut. Kea derives its runtime filenames from the
+    # config filename, so the renamed sim instance wants kea-leases4-sim.csv and
+    # kea-dhcp4-sim.kea-dhcp4.pid — paths outside Debian's packaged profile. The
+    # packaged profile also carries an explicit deny, and in AppArmor an explicit
+    # deny beats any later allow and cannot be overridden from
+    # /etc/apparmor.d/local. Every documented way of relaxing it was tried on a
+    # live spoke and verified across real reboots:
+    #
+    #   local include granting /run/kea + /var/lib/kea      -> still denied
+    #   flags=(complain) written into the policy text       -> came up ENFORCE
+    #   /etc/apparmor.d/force-complain/<profile> symlink    -> came up ENFORCE
+    #   /etc/apparmor.d/disable/<profile> + apparmor_parser -R -> came up ENFORCE
+    #
+    # The boot log shows apparmor.systemd announcing "forcing complain mode" and
+    # the profile still ending up enforce: its per-profile pass is followed by a
+    # blanket reload that re-enforces everything. Nothing written under
+    # /etc/apparmor.d wins that race, so the whole fleet lost sim DHCP on every
+    # reboot — four spokes, thousands of restarts, valid config, readable lease
+    # file, no dmesg denials (audit rate-limiting hid them).
+    #
+    # These are single-purpose spokes on an isolated simulation network. A DHCP
+    # server that actually serves is worth more here than MAC confinement on a
+    # box that runs nothing else exposed. Operator decision; --keep-apparmor
+    # reverses it.
+    if [ "$KEEP_APPARMOR" = "1" ]; then
+        ok "AppArmor left enabled (--keep-apparmor). If sim DHCP will not start, the kea profiles are why — see journalctl -t lm-kea-watchdog."
+        return 0
+    fi
+    command -v systemctl >/dev/null 2>&1 || return 0
+    [ -d /sys/kernel/security/apparmor ] || { ok "AppArmor not active on this host — nothing to disable"; return 0; }
+    step "Disabling AppArmor (see install_cs.sh disable_apparmor for why)"
+    # Unload every currently-loaded profile so this takes effect NOW, not only
+    # after a reboot. securityfs .remove is used directly because apparmor-utils
+    # (aa-teardown) is not installed on these spokes.
+    local _aap=""
+    for _c in /sbin/apparmor_parser /usr/sbin/apparmor_parser; do
+        [ -x "$_c" ] && { _aap="$_c"; break; }
+    done
+    if [ -n "$_aap" ] && [ -r /sys/kernel/security/apparmor/profiles ]; then
+        while read -r _pn _rest; do
+            [ -n "$_pn" ] || continue
+            echo -n "$_pn" > /sys/kernel/security/apparmor/.remove 2>/dev/null || true
+        done < /sys/kernel/security/apparmor/profiles
+    fi
+    # Stop it loading again at boot. Masking (not just disabling) so a package
+    # upgrade's postinst cannot quietly re-enable it.
+    systemctl disable --now apparmor.service >/dev/null 2>&1 || true
+    systemctl mask apparmor.service >/dev/null 2>&1 || true
+    local _left
+    _left="$(grep -c . /sys/kernel/security/apparmor/profiles 2>/dev/null || echo 0)"
+    if [ "${_left:-0}" = "0" ]; then
+        ok "AppArmor disabled and all profiles unloaded (apparmor.service masked). Re-enable: systemctl unmask --now apparmor.service && reboot"
+    else
+        warn "AppArmor service masked but ${_left} profile(s) still loaded — they clear on the next reboot"
+    fi
+}
+
 setup_sim_dhcp() {
 if [[ "$DHCP_SKIP" != "1" ]]; then
+    # BEFORE anything Kea-related: with AppArmor off, the sim instance starts
+    # clean on the first try and none of the profile-grant machinery below has
+    # to run at all. Called from here so both the full install and --infra-only
+    # get it, and so a --no-dhcp install leaves the host's confinement alone.
+    disable_apparmor
     step "Detecting DHCP interface (sim-client network)"
 
     # Build the list of ethernet interfaces excluding loopback. Strip the "@…"
