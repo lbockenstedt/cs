@@ -10,8 +10,12 @@ export PATH="/usr/sbin:/sbin:/usr/bin:/bin:$PATH"
 # Debug flag  (sudo bash install.sh --debug)
 ###############################################################################
 DEBUG=0
+PIXEL_DESKTOP=0
 for arg in "$@"; do
   [[ "$arg" == "--debug" || "$arg" == "-d" ]] && DEBUG=1
+  # Opt in to the Pi PIXEL desktop on plain Debian. OFF by default: it pulls
+  # +rpt packages that block every future release upgrade.
+  [[ "$arg" == "--pixel-desktop" ]] && PIXEL_DESKTOP=1
 done
 
 ###############################################################################
@@ -41,23 +45,44 @@ PHASE_START=0
 ###############################################################################
 # Platform detection
 ###############################################################################
-IS_PI=false
+# HARDWARE and OS are detected SEPARATELY, because they drive different
+# decisions and conflating them is a real bug:
+#
+#   * which kernel-headers package exists depends on the KERNEL (only actual Pi
+#     hardware runs an rpi kernel with raspberrypi-kernel-headers);
+#   * whether Pi repos/desktop apply depends on the OS.
+#
+# "Raspberry Pi Desktop for PC" is the case that breaks a single flag: it is Pi
+# OS branding on x86 hardware with a STOCK Debian kernel. The old single IS_PI
+# saw /etc/rpi-issue, chose raspberrypi-kernel-headers, and that package does
+# not exist for an x86 kernel — so headers never installed and every DKMS driver
+# build failed with "kernel source not found". Observed in the field as
+#   "errors were encountered while processing: linux-headers-6.1.0-51-amd64"
+IS_PI_HW=false        # real Raspberry Pi hardware (=> rpi kernel)
+IS_PI_OS=false        # Raspberry Pi OS / Raspberry Pi Desktop userland
+
 if grep -q "Raspberry Pi" /proc/device-tree/model 2>/dev/null; then
-  IS_PI=true
+  IS_PI_HW=true
 fi
-# Also catch Pi via cpuinfo (older firmware / no device-tree)
-if ! $IS_PI && grep -q "Raspberry Pi" /proc/cpuinfo 2>/dev/null; then
-  IS_PI=true
+# Older firmware with no device-tree still names the board in cpuinfo.
+if ! $IS_PI_HW && grep -q "Raspberry Pi" /proc/cpuinfo 2>/dev/null; then
+  IS_PI_HW=true
 fi
-# Also catch Pi VMs and Raspberry Pi Desktop for x86/x64 — these may not
-# have Pi hardware signatures but do have /etc/rpi-issue (all Pi OS variants)
-# or identify as raspbian/raspberry-pi-os in /etc/os-release
-if ! $IS_PI && [[ -f /etc/rpi-issue ]]; then
-  IS_PI=true
+# /etc/rpi-issue is present on EVERY Pi OS variant, including the x86 desktop.
+if [[ -f /etc/rpi-issue ]]; then
+  IS_PI_OS=true
 fi
-if ! $IS_PI && grep -qiE "raspbian|raspberry pi os" /etc/os-release 2>/dev/null; then
-  IS_PI=true
+if ! $IS_PI_OS && grep -qiE "raspbian|raspberry pi os" /etc/os-release 2>/dev/null; then
+  IS_PI_OS=true
 fi
+# Pi-repo packages carry a +rpt version suffix. Their presence means Pi repos are
+# (or were) configured even when the branding files are gone.
+if ! $IS_PI_OS && dpkg -l 2>/dev/null | grep -q '+rpt'; then
+  IS_PI_OS=true
+fi
+
+# Backwards compatibility for any later reference: IS_PI now means HARDWARE.
+IS_PI=$IS_PI_HW
 
 ###############################################################################
 # Logging
@@ -135,8 +160,10 @@ echo
 
 # ── Pre-flight summary ───────────────────────────────────────────────────────
 printf "${COL_DIM}  Log    : %s${COL_RESET}\n" "$LOG"
-if $IS_PI; then
-  printf "${COL_DIM}  Platform: Raspberry Pi (raspberrypi-kernel-headers)${COL_RESET}\n"
+if $IS_PI_HW; then
+  printf "${COL_DIM}  Platform: Raspberry Pi hardware (raspberrypi-kernel-headers)${COL_RESET}\n"
+elif $IS_PI_OS; then
+  printf "${COL_DIM}  Platform: Raspberry Pi OS on non-Pi hardware — using stock Debian headers${COL_RESET}\n"
 else
   printf "${COL_DIM}  Platform: Debian x86/VM (linux-headers-$(uname -r))${COL_RESET}\n"
 fi
@@ -253,13 +280,21 @@ ok "Package lists updated"
 # Adds the Pi Foundation's repo so we can install the PIXEL desktop theme
 # (raspberrypi-ui-mods, raspberrypi-artwork) on plain Debian x86/x64 VMs,
 # giving them the same look as Pi OS hardware.
-if ! $IS_PI; then
-  info "Adding Raspberry Pi apt repository for PIXEL desktop packages"
+# OPT-IN ONLY (--pixel-desktop). Adding the Pi repo to plain Debian is what
+# installs +rpt packages, and those have NO upgrade path: Raspberry Pi Desktop
+# for PC was never released past bookworm, so a bullseye->bookworm->trixie
+# upgrade dies on each +rpt package in turn (dphys-swapfile, raspberrypi-ui-mods,
+# ...). An image that will be release-upgraded must not have this repo.
+if [[ "${PIXEL_DESKTOP:-0}" == "1" ]] && ! $IS_PI_OS; then
+  info "Adding Raspberry Pi apt repository for PIXEL desktop packages (--pixel-desktop)"
   curl -fsSL https://archive.raspberrypi.org/debian/raspberrypi.gpg.key \
     | gpg --dearmor -o /usr/share/keyrings/raspberrypi-archive-keyring.gpg \
     >>"$LOG" 2>&1
+  # Use the RUNNING release codename. Hard-coding bookworm pulled bookworm
+  # packages onto a bullseye or trixie system — a silent cross-release mix.
+  _rel="$(. /etc/os-release 2>/dev/null && echo "${VERSION_CODENAME:-bookworm}")"
   echo "deb [signed-by=/usr/share/keyrings/raspberrypi-archive-keyring.gpg] \
-http://archive.raspberrypi.org/debian/ bookworm main" \
+http://archive.raspberrypi.org/debian/ ${_rel} main" \
     > /etc/apt/sources.list.d/raspberrypi.list
   # Lower priority so Pi repo never overrides standard Debian packages
   cat >/etc/apt/preferences.d/raspberrypi <<'PINEOF'
@@ -295,11 +330,27 @@ retry apt_run upgrade -y --quiet \
   -o Dpkg::Options::="--force-confold"
 ok "System packages upgraded"
 
-# Kernel headers package name differs between Debian x86 and Raspberry Pi OS
-if $IS_PI; then
+# Kernel headers: chosen by HARDWARE (which kernel is running), not by OS
+# branding. raspberrypi-kernel-headers exists only for the rpi kernel — on
+# "Raspberry Pi Desktop for PC" the branding says Pi while the kernel is stock
+# Debian, and asking for the Pi package there fails, taking every DKMS driver
+# build down with it.
+if $IS_PI_HW; then
   KERNEL_HEADERS="raspberrypi-kernel-headers"
 else
   KERNEL_HEADERS="linux-headers-$(uname -r)"
+fi
+# Verify rather than assume: if the chosen package is not installable, fall back
+# to the other. Getting this wrong produces a wall of identical "kernel source
+# not found" build failures whose real cause is one wrong package name.
+if ! apt-cache show "$KERNEL_HEADERS" >/dev/null 2>&1; then
+  if $IS_PI_HW; then
+    warn "raspberrypi-kernel-headers unavailable — falling back to linux-headers-$(uname -r)"
+    KERNEL_HEADERS="linux-headers-$(uname -r)"
+  else
+    warn "linux-headers-$(uname -r) unavailable — falling back to linux-headers-amd64"
+    KERNEL_HEADERS="linux-headers-amd64"
+  fi
 fi
 
 PACKAGES=(
