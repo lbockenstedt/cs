@@ -194,7 +194,19 @@ json_escape() {
 # value is a rate in failures/min — the currency the quota engine will consume
 # once learning-mode reporting lands (Phase 2). Down-only in Phase 1: the upward
 # re-probe is a learning-mode behavior (Phase 2); clear the state file to reset.
-_DNS_CEILING_FILE="/usr/local/scripts/dns_ceiling.state"        # persisted self-throttle rate (failures/min)
+# BOOT-VOLATILE ON PURPOSE. This lives on tmpfs (/dev/shm), so every reboot
+# restores the CONFIGURED rate. It used to sit in /usr/local/scripts and survive
+# reboots, which meant the ratchet was effectively one-way: a bail multiplies the
+# rate by 0.8 EVERY time, while the up-probe only fires on ~1 in 5 clean bursts,
+# so a client that had a bad period never climbed back and the whole fleet's DNS
+# output drifted toward the floor with nothing reporting it. With the floor at 0
+# a client could even pin itself at "generate nothing" permanently.
+#
+# /dev/shm rather than /tmp: it is tmpfs on every target (so it is genuinely
+# cleared at boot, which /tmp is not guaranteed to be on Debian) and it is 1777,
+# so the sim can write it without root.
+_DNS_CEILING_FILE="/dev/shm/dns_ceiling.state"                  # self-throttle rate (failures/min), cleared at boot
+_DNS_CEILING_FILE_LEGACY="/usr/local/scripts/dns_ceiling.state"  # pre-tmpfs location; removed on first use
 _DNS_RATE_FLOOR=0       # 0 = a client that can't sustain ANY flood ratchets fully
                         # OFF (sidelines itself) — a bad USB/hub client vs a
                         # dedicated channel that sustains a firehose. rate 0 =
@@ -249,6 +261,12 @@ dns_gw_stable() {
 # reading a missing file leaks a "No such file" error — so guard on -f.
 _dns_ceiling_saved() {
   local saved=""
+  # Drop any pre-tmpfs ceiling left on disk. It is NOT migrated: its whole
+  # problem was surviving reboots, and a client carrying a ratcheted-down value
+  # from a bad period would keep it forever. Deleting it is the reset. Left in
+  # place it would also mislead anyone inspecting /usr/local/scripts, since the
+  # file would still be there but no longer read.
+  [[ -f "$_DNS_CEILING_FILE_LEGACY" ]] && rm -f "$_DNS_CEILING_FILE_LEGACY" 2>/dev/null
   [[ -f "$_DNS_CEILING_FILE" ]] && saved=$(< "$_DNS_CEILING_FILE")
   [[ "$saved" =~ ^[0-9]+$ ]] && echo "$saved"
 }

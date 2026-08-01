@@ -208,9 +208,48 @@ function ConvertTo-SimJsonString {
 # Faithful port of common.sh dns_ceiling_* + gateway helpers. ONE shared ceiling
 # for both DNS sims. Down-only in Phase 1 (up-probe is Phase-2 learning-mode).
 # See common.sh:184-296 for the full rationale (AIMD, "I've DOSed myself" bail).
-$script:DNS_CEILING_FILE = Join-Path $script:ScriptsRoot 'dns_ceiling.state'
+# BOOT-VOLATILE ON PURPOSE (mirrors the Linux move to /dev/shm). Kept in TEMP
+# rather than C:\Scripts so it no longer survives reboots: a bail multiplies the
+# rate by 0.8 EVERY time while the up-probe fires on only ~1 in 5 clean bursts,
+# so a persisted ceiling made the ratchet effectively one-way and a client that
+# had a bad period never returned to the configured rate.
+#
+# Windows does NOT clear TEMP at boot the way tmpfs does, so volatility is not
+# free here -- Reset-DnsCeilingOnBoot below does it explicitly, comparing against
+# last boot time. The legacy C:\Scripts copy is removed rather than migrated:
+# carrying its value forward would preserve exactly the state we are discarding.
+$script:DNS_CEILING_FILE = Join-Path $env:TEMP 'dns_ceiling.state'
+$script:DNS_CEILING_FILE_LEGACY = Join-Path $script:ScriptsRoot 'dns_ceiling.state'
+$script:DNS_CEILING_BOOT_MARK   = Join-Path $env:TEMP 'dns_ceiling.boot'
 $script:DNS_RATE_FLOOR   = 0
 $script:DNS_UPPROBE_EVERY = 5
+
+function Reset-DnsCeilingOnBoot {
+    # Clear the ceiling once per boot. A marker holding the last-seen boot time
+    # is compared with the current one; when they differ this is a new boot and
+    # the ceiling is discarded, so the client starts every boot at its CONFIGURED
+    # rate. Cheap enough to call from any entry point, and idempotent within a
+    # boot (the marker is only rewritten when the boot time actually changes).
+    try {
+        # Drop the pre-TEMP copy wherever we find it — never migrated.
+        if (Test-Path -LiteralPath $script:DNS_CEILING_FILE_LEGACY) {
+            Remove-Item -LiteralPath $script:DNS_CEILING_FILE_LEGACY -Force -ErrorAction SilentlyContinue
+        }
+        $boot = (Get-CimInstance Win32_OperatingSystem -ErrorAction Stop).LastBootUpTime.ToString('o')
+        $seen = $null
+        if (Test-Path -LiteralPath $script:DNS_CEILING_BOOT_MARK) {
+            $seen = (Get-Content -LiteralPath $script:DNS_CEILING_BOOT_MARK -ErrorAction SilentlyContinue |
+                     Select-Object -First 1)
+        }
+        if ($seen -ne $boot) {
+            Remove-Item -LiteralPath $script:DNS_CEILING_FILE -Force -ErrorAction SilentlyContinue
+            Set-Content -LiteralPath $script:DNS_CEILING_BOOT_MARK -Value $boot -ErrorAction SilentlyContinue
+        }
+    } catch {
+        # Never fatal: a client that cannot determine boot time keeps whatever
+        # ceiling it has rather than losing the throttle entirely.
+    }
+}
 
 function Get-DnsDefaultGateway {
     $r = Get-NetRoute -DestinationPrefix '0.0.0.0/0' -ErrorAction SilentlyContinue |
@@ -271,6 +310,11 @@ function Get-DnsCeilingSaved {
 # >= 0 so a persisted ceiling of 0 (sidelined client) is HONORED.
 function Get-DnsCeilingRate {
     param([int]$Configured)
+    # Discard a ceiling left over from a previous boot before reading it, so the
+    # first burst after a reboot runs at the CONFIGURED rate. Done here rather
+    # than in each sim script so every caller gets it (matches Linux, where the
+    # legacy cleanup lives in _dns_ceiling_saved).
+    Reset-DnsCeilingOnBoot
     $saved = Get-DnsCeilingSaved
     if ($null -ne $saved -and $saved -ge 0 -and $saved -lt $Configured) { return $saved }
     return $Configured
