@@ -157,23 +157,53 @@ if [[ $OUT_OF_TREE -eq 1 ]]; then
             echo "  MISS $name — build failed; see /var/lib/dkms/$name/$ver/build/make.log"
         fi
     }
-    # chip                     name              ver        repo
+    # Chips with NO mainline driver on 6.12 — always build these.
     # RTL8812AU/8821AU  0bda:8812 2001:331e 2357:011e 0b05:1a62
     _dkms_git 8812au   20210629 https://github.com/morrownr/8812au-20210629.git
-    # RTL8812BU/8822BU  0bda:b812 0bda:b820 2357:012d
-    _dkms_git 88x2bu   20210702 https://github.com/morrownr/88x2bu-20210702.git
-    # RTL8811CU/8821CU  0bda:c811 0bda:c820
-    _dkms_git 8821cu   20210916 https://github.com/morrownr/8821cu-20210916.git
-    # RTL8188EU(S)      0bda:8179 0846:9020   (r8188eu left mainline after 6.6)
+    # RTL8188EU(S)      0bda:8179 0846:9020   (staging r8188eu removed after 6.6)
     _dkms_git 8188eu   20210902 https://github.com/morrownr/8188eu-20210902.git
-    # RTL8192EU         0bda:818b
+    # RTL8814AU — not in the current fleet, harmless if unused
+    _dkms_git 8814au   20210629 https://github.com/morrownr/8814au-20210629.git
+    # RTL8192EU  0bda:818b — rtl8xxxu claims it but is unstable on many units
     _dkms_git rtl8192eu 1.0      https://github.com/Mange/rtl8192eu-linux-driver.git
+
+    #--------------------------------------------------------
+    # RTL8822BU / RTL8821CU are MAINLINE on this kernel (rtw88_8822bu since 6.1,
+    # rtw88_8821cu since 6.2). Building the out-of-tree driver too means BOTH
+    # claim the same USB ID and which one binds is a race — behaviour then
+    # differs across reboots on identical VMs, which is exactly the kind of
+    # fault this fleet cannot debug remotely.
+    #
+    # So: only build them if the mainline module is genuinely absent. Opt in with
+    # LM_FORCE_RTW_OOT=1 if the mainline driver misbehaves on your dongles, and
+    # blacklist the mainline module if you do.
+    #--------------------------------------------------------
+    _mainline_has() { modinfo "$1" >/dev/null 2>&1; }
+    if [[ "${LM_FORCE_RTW_OOT:-0}" == "1" ]]; then
+        echo "  LM_FORCE_RTW_OOT=1 — building rtw88-overlapping drivers anyway"
+        echo "  REMEMBER to blacklist the mainline module, e.g.:"
+        echo "    echo 'blacklist rtw88_8822bu' > /etc/modprobe.d/blacklist-rtw88-usb.conf"
+        _dkms_git 88x2bu 20210702 https://github.com/morrownr/88x2bu-20210702.git
+        _dkms_git 8821cu 20210916 https://github.com/morrownr/8821cu-20210916.git
+    else
+        for _m in rtw88_8822bu rtw88_8821cu; do
+            if _mainline_has "$_m"; then
+                OK_LIST+=("$_m (mainline — no DKMS needed)"); echo "  ok   $_m (mainline, skipping out-of-tree)"
+            else
+                echo "  note $_m not found in this kernel — building out-of-tree instead"
+                case "$_m" in
+                    rtw88_8822bu) _dkms_git 88x2bu 20210702 https://github.com/morrownr/88x2bu-20210702.git ;;
+                    rtw88_8821cu) _dkms_git 8821cu 20210916 https://github.com/morrownr/8821cu-20210916.git ;;
+                esac
+            fi
+        done
+    fi
 else
     echo "-- out-of-tree DKMS builds SKIPPED (pass --out-of-tree to build them)"
     echo "   Without these, these fleet dongles have no driver:"
-    echo "     0bda:8812 0bda:b812 0bda:b820 0bda:c811 0bda:c820 0bda:818b 0bda:8179"
-    echo "     2001:331e 2357:011e 2357:012d 0b05:1a62 0846:9020"
-fi
+    echo "     0bda:8812 0bda:818b 0bda:8179 2001:331e 2357:011e 0b05:1a62 0846:9020"
+    echo "   (0bda:b812/b820/c811/c820 are covered by mainline rtw88 on kernel 6.12)"
+    fi
 
 #------------------------------------------------------------
 # 7. Make sure the radio is not soft-blocked, and refresh module deps so a
@@ -222,6 +252,7 @@ else
     ip -br link 2>/dev/null | grep -iE "wl" || echo "  (no wl* interface)"
 fi
 echo ""
+echo "Driver matrix + system requirements: cs/clients/linux/WIFI-DRIVERS.md (repo)"
 echo "Full log: $LOG"
 echo "If a dongle shows in lsusb but has no wl* interface, try:"
 echo "  usb_modeswitch -v <vid> -p <pid> -J     # CD-ROM-mode Realtek"
