@@ -968,8 +968,38 @@ systemctl restart kea-dhcp4-sim 2>/dev/null
 sleep 3
 if systemctl is-active --quiet kea-dhcp4-sim; then
     log "recovered: kea-dhcp4-sim is active again${changed:+ (complain flag persisted)}"
+    exit 0
+fi
+
+# LAST RESORT: unload the profiles entirely.
+#
+# Proven on this fleet: NO static mechanism survives boot. The complain flag in
+# the policy text, an /etc/apparmor.d/force-complain symlink and an
+# /etc/apparmor.d/disable symlink were each verified present across a reboot and
+# the profiles still came up ENFORCE - the boot log even shows apparmor.systemd
+# announcing "forcing complain mode" and the result being enforce anyway,
+# because its per-profile pass is followed by a blanket reload that re-enforces.
+#
+# What DOES work is acting AFTER apparmor.service has finished, which is the
+# whole reason this runs on a timer at OnBootSec rather than as a file on disk.
+# `apparmor_parser -R` (unload) was the one intervention that made kea-dhcp4-sim
+# start every single time it was tried.
+#
+# This drops confinement for the three kea binaries on this spoke. That is a
+# real reduction and it is deliberate: an unconfined DHCP server on the isolated
+# sim network beats a confined one that serves no addresses.
+if [ -n "$AA" ]; then
+    for p in $PROFILES; do
+        [ -f "/etc/apparmor.d/$p" ] && "$AA" -R "/etc/apparmor.d/$p" 2>/dev/null
+    done
+    systemctl restart kea-ctrl-agent-sim 2>/dev/null
+    systemctl restart kea-dhcp4-sim 2>/dev/null
+    sleep 3
+fi
+if systemctl is-active --quiet kea-dhcp4-sim; then
+    log "recovered by UNLOADING the kea AppArmor profiles (complain mode did not survive boot; the binaries now run unconfined on this spoke)"
 else
-    log "STILL DOWN after self-heal - clients will get no address. Check: journalctl -u kea-dhcp4-sim -n 40"
+    log "STILL DOWN after self-heal including profile unload - clients will get no address. Check: journalctl -u kea-dhcp4-sim -n 40"
 fi
 KEAWD
         chmod 0755 /usr/local/sbin/lm-kea-watchdog
