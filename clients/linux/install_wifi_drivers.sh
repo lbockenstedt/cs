@@ -132,6 +132,36 @@ if [[ $DO_FIRMWARE -eq 1 ]]; then
       echo "$p:UNAVAILABLE" >>"$DRIVER_STATE"; info "skip $p (not on this release)"
     fi
   done
+
+  # ── AIC8800 fake-CD-ROM mode switch ────────────────────────────────────────
+  # AIC8800 dongles boot as USB MASS STORAGE and only become a NIC after being
+  # flipped. usb-modeswitch-data does not carry the a69c IDs, and the upstream
+  # aic8800 installer only ships rules for the 1111:1111 clones — so on these
+  # units the flip never happens and the adapter shows up in lsusb forever
+  # while never producing a wlan interface. That is not an obvious driver
+  # symptom, which is why it is handled here rather than left to the driver.
+  info "Installing usb_modeswitch rule for AIC8800 (a69c:5721/5723)"
+  mkdir -p /etc/udev/rules.d
+  cat >/etc/udev/rules.d/40-aic8800-modeswitch.rules <<'AICRULES'
+# Managed by install_wifi_drivers.sh — do not edit manually
+# Flip AIC8800 dongles out of their fake CD-ROM (mass storage) identity so the
+# Wi-Fi function appears. Post-flip they re-enumerate as a69c:8d80.
+ACTION=="add", SUBSYSTEM=="usb", ATTR{idVendor}=="a69c", ATTR{idProduct}=="5721", RUN+="/usr/sbin/usb_modeswitch -v a69c -p 5721 -KQ"
+ACTION=="add", SUBSYSTEM=="usb", ATTR{idVendor}=="a69c", ATTR{idProduct}=="5723", RUN+="/usr/sbin/usb_modeswitch -v a69c -p 5723 -KQ"
+AICRULES
+  chmod 644 /etc/udev/rules.d/40-aic8800-modeswitch.rules
+  udevadm control --reload-rules >>"$LOG" 2>&1 || true
+  # Flip anything already plugged in — the rule alone only fires on a NEW add
+  # event, so without this the dongles sitting in the box stay mass-storage
+  # until physically re-seated.
+  for _pid in 5721 5723; do
+    if lsusb -d "a69c:$_pid" >/dev/null 2>&1; then
+      usb_modeswitch -v a69c -p "$_pid" -KQ >>"$LOG" 2>&1 \
+        && ok "AIC8800 a69c:$_pid flipped to Wi-Fi mode" \
+        || info "AIC8800 a69c:$_pid flip returned non-zero (may already be flipped)"
+    fi
+  done
+  echo "aic8800-modeswitch:INSTALLED" >>"$DRIVER_STATE"
 fi
 
 [[ $DO_DRIVERS -eq 0 ]] && { info "--firmware-only: skipping driver builds"; exit 0; }
@@ -191,9 +221,11 @@ OLD_PATH="$PATH"; export PATH="$SUPPRESS:$PATH"
 
 DRIVERS=(
   # ── chips in the fleet's usb_config today ─────────────────────────────────
-  # RTL8812AU/8821AU  0bda:8812 2001:331e 2357:011e 2357:012e
+  # RTL8812AU  0bda:8812 2001:331e 2357:012e
   "8812au-20210820|morrownr|https://github.com/morrownr/8812au-20210820.git|8812au|HEAD|-"
-  # RTL8821AU  0b05:1a62
+  # RTL8811AU/8821AU  2357:011e (TP-Link Archer T2U Nano)
+  # Mainline rtw88 gained these only in 6.13, so on trixie's 6.12 the
+  # out-of-tree build is the ONLY thing that binds them.
   "8821au-20210708|morrownr|https://github.com/morrownr/8821au-20210708.git|8821au|HEAD|-"
   # RTL8811CU/8821CU  0bda:c811 0bda:c820   (mainline rtw88 on 6.12 — see skip below)
   "8821cu-20210916|morrownr|https://github.com/morrownr/8821cu-20210916.git|8821cu|HEAD|-"
@@ -209,14 +241,40 @@ DRIVERS=(
   "8814au|morrownr|https://github.com/morrownr/8814au.git|8814au|HEAD|-"
   "rtl8723au|lwfinger|https://github.com/lwfinger/rtl8723au.git|8723au|HEAD|8723au"
   "rtl8723du|lwfinger|https://github.com/lwfinger/rtl8723du.git|8723du|HEAD|-"
-  "rtl8710bu|morrownr|https://github.com/morrownr/rtl8710bu.git|8710bu|HEAD|-"
+  # RTL8710BU/RTL8188GU (0bda:b711) intentionally has NO entry: morrownr/rtl8710bu
+  # no longer exists upstream (it was failing CLONE_FAILED on every run) and
+  # mainline rtl8xxxu has claimed this chip since 6.4, so trixie's 6.12 handles
+  # it in-tree. Adding an out-of-tree build back would just race the in-tree one.
 
-  # ── Wi-Fi 6 over USB — the practical ceiling for a passthrough VM ─────────
-  # (6E / Wi-Fi 7 silicon is M.2 except MT7925; MT7921AU needs nothing, mt7921u
-  #  has been mainline since 5.16.)
-  "rtl8852au|lwfinger|https://github.com/lwfinger/rtl8852au.git|8852au|HEAD|-"
-  "rtl8852bu-20240418|morrownr|https://github.com/morrownr/rtl8852bu-20240418.git|8852bu|HEAD|-"
-  "rtl8852cu-20240510|morrownr|https://github.com/morrownr/rtl8852cu-20240510.git|8852cu|HEAD|-"
+  # ── Wi-Fi 6 / 6E / Wi-Fi 7 over USB ──────────────────────────────────────
+  # ONE repo now covers the whole Realtek rtw89 USB family, replacing the three
+  # per-chip entries that used to live here. Two of those (rtl8852bu-20240418,
+  # rtl8852cu-20240510) NO LONGER EXIST upstream — morrownr consolidated them —
+  # so they had been failing CLONE_FAILED on every run, which is precisely why
+  # 0b05:1a62 and 0bda:c832 came up with no wlan interface. lwfinger/rtl8852au
+  # is dropped too: it claims the same USB IDs as this driver and two drivers
+  # racing for one device is the non-deterministic fault this fleet cannot debug
+  # remotely.
+  #
+  # Covers RTL8831BU 8851BU 8832AU 8852AU 8832BU 8852BU 8832CU 8852CU
+  #        8912AU 8922AU. In the fleet today:
+  #   0b05:1a62 8852BU (ASUS USB-AX55 Nano)   0bda:c832 8852CU
+  #   35bc:0108 8832BU (Archer TX20U Nano)    2357:0141 8832AU (Archer TX20UH)
+  #   0bda:8912 8912AU/8922AU (Wi-Fi 7)
+  # Its dkms.conf declares BUILD_EXCLUSIVE_KERNEL ^(6.[6-9]|6.1[0-9]|7.) so
+  # trixie's 6.12 qualifies, and its modules carry a _git suffix so they cannot
+  # collide with the in-tree rtw89 names when mainline catches up.
+  "rtw89|dkms-only|https://github.com/morrownr/rtw89.git|rtw89|HEAD|-"
+
+  # ── AIC8800D80  a69c:8d80 ────────────────────────────────────────────────
+  # No mainline support at ANY kernel version. Uses the repo's own installer
+  # because DKMS alone is not enough here: without its firmware blobs the module
+  # loads and the radio is deaf, and the dongle does not present as a NIC at all
+  # until usb_modeswitch flips it out of the fake CD-ROM identity it boots into
+  # (that is what a69c:5721 / a69c:5723 are — the SAME dongles pre-flip, not
+  # separate models). The installer ships the firmware, udev rules and
+  # usb_modeswitch config together.
+  "aic8800|script-yes|https://github.com/kilam994/aic8800d80-linux-driver.git|aic8800|HEAD|-"
 )
 
 TOTAL="${#DRIVERS[@]}"; N=0
@@ -253,6 +311,20 @@ for entry in "${DRIVERS[@]}"; do
         ./install-driver.sh NoPrompt >>"$LOG" 2>&1 || INSTALL_OK=false
       else
         warn "$NAME: install-driver.sh missing"; INSTALL_OK=false
+      fi
+      ;;
+    script-yes)
+      # Repo ships its own installer that does more than a module build —
+      # firmware, udev rules and usb_modeswitch config — so running DKMS by hand
+      # would produce a driver that loads and still cannot see a network.
+      # --yes keeps it non-interactive (it also auto-assumes yes when stdin is
+      # not a TTY, but be explicit rather than relying on how we are invoked).
+      if [[ -x ./install.sh ]]; then
+        ./install.sh --yes >>"$LOG" 2>&1 || INSTALL_OK=false
+      elif [[ -f ./install.sh ]]; then
+        bash ./install.sh --yes >>"$LOG" 2>&1 || INSTALL_OK=false
+      else
+        warn "$NAME: install.sh missing"; INSTALL_OK=false
       fi
       ;;
     lwfinger|dkms-only)
