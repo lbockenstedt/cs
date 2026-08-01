@@ -718,189 +718,36 @@ end_phase
 ###############################################################################
 begin_phase
 
-WIFI_SRC="/usr/src/wifi-drivers"
-mkdir -p "$WIFI_SRC"
-cd "$WIFI_SRC"
-
-# ── Reboot suppression shim ──────────────────────────────────────────────────
-SUPPRESS="$(mktemp -d)"
-for c in reboot shutdown poweroff halt; do
-  printf '#!/bin/sh\necho "[SUPPRESSED] %s called — ignored during driver install"\nexit 0\n' "$c" \
-    >"$SUPPRESS/$c"
-  chmod +x "$SUPPRESS/$c"
-done
-cat >"$SUPPRESS/systemctl" <<'SHIM'
-#!/bin/sh
-case "${1:-}" in
-  reboot|shutdown|poweroff|halt)
-    echo "[SUPPRESSED] systemctl $* ignored during driver install"
-    exit 0 ;;
-  *) exec /bin/systemctl "$@" ;;
-esac
-SHIM
-chmod +x "$SUPPRESS/systemctl"
-OLD_PATH="$PATH"
-export PATH="$SUPPRESS:$PATH"
-# ────────────────────────────────────────────────────────────────────────────
-
-# Format: "dir-name|type|repo-url|dkms-module|pinned-tag|modprobe-module"
-# Types:
-#   morrownr  — uses install-driver.sh NoPrompt
-#   aircrack  — uses install-driver.sh (with stdin echo)
-#   lwfinger  — bare Makefile; source copied to /usr/src then registered with DKMS
-#   dkms-only — bare Makefile + dkms.conf; DKMS-managed, no install-driver.sh
-# modprobe-module: use "-" if no explicit modprobe needed after install
+# The driver set lives in clients/linux/install_wifi_drivers.sh so it is
+# maintained in ONE place and can be re-run on a live client when a new dongle
+# shows up, without re-running this whole installer. It uses the same
+# clone-live-from-GitHub + morrownr/lwfinger/dkms-only build model this phase
+# used to carry inline, and additionally installs the firmware / usb_modeswitch
+# / wireless-regdb layer that was missing here entirely:
 #
-# Bug fixes applied:
-#   - rtl8812au (aircrack-ng) removed — duplicate of 8812au-20210820 (same chipset, conflict)
-#   - rtw89 changed from type morrownr→dkms-only (repo has no install-driver.sh)
-#   - rtw89 skipped at runtime if kernel ≥ 5.16 (driver is in-tree on modern kernels)
-DRIVERS=(
-  "8821au-20210708|morrownr|https://github.com/morrownr/8821au-20210708.git|8821au|HEAD|-"
-  "8821cu-20210916|morrownr|https://github.com/morrownr/8821cu-20210916.git|8821cu|HEAD|-"
-  "8814au|morrownr|https://github.com/morrownr/8814au.git|8814au|HEAD|-"
-  "8812au-20210820|morrownr|https://github.com/morrownr/8812au-20210820.git|8812au|HEAD|-"
-  "rtl8852bu-20240418|morrownr|https://github.com/morrownr/rtl8852bu-20240418.git|8852bu|HEAD|-"
-  "rtl8852cu-20240510|morrownr|https://github.com/morrownr/rtl8852cu-20240510.git|8852cu|HEAD|-"
-  "88x2bu-20210702|morrownr|https://github.com/morrownr/88x2bu-20210702.git|88x2bu|HEAD|-"
-  "rtw89|dkms-only|https://github.com/morrownr/rtw89.git|rtw89|HEAD|-"
-  "rtl8188eu|lwfinger|https://github.com/lwfinger/rtl8188eu.git|8188eu|HEAD|-"
-  "rtl8723au|lwfinger|https://github.com/lwfinger/rtl8723au.git|8723au|HEAD|8723au"
-  "rtl8852au|lwfinger|https://github.com/lwfinger/rtl8852au.git|8852au|HEAD|-"
-)
-
-TOTAL_DRIVERS="${#DRIVERS[@]}"
-DRIVER_NUM=0
-
-for entry in "${DRIVERS[@]}"; do
-  SAVED_IFS="$IFS"
-  IFS='|' read -r NAME TYPE REPO MOD PIN MODPROBE <<<"$entry"
-  IFS="$SAVED_IFS"
-
-  DRIVER_NUM=$(( DRIVER_NUM + 1 ))
-
-  phase_step "$DRIVER_NUM" "$TOTAL_DRIVERS"
-  info "Driver $DRIVER_NUM/$TOTAL_DRIVERS: $NAME"
-
-  rm -rf "$NAME"
-  CLONE_ARGS=(--depth=1)
-  [[ "$PIN" != "HEAD" ]] && CLONE_ARGS+=(--branch "$PIN")
-
-  info "Cloning $NAME [$DRIVER_NUM/$TOTAL_DRIVERS]"
-  if git clone "${CLONE_ARGS[@]}" "$REPO" "$NAME" >>"$LOG" 2>&1; then
-    cd "$NAME"
-
-  INSTALL_OK=true
-    case "$TYPE" in
-      morrownr)
-        if [[ -x ./install-driver.sh ]]; then
-          info "Building $NAME (morrownr)"
-          ./install-driver.sh NoPrompt >>"$LOG" 2>&1 || INSTALL_OK=false
-        else
-          warn "$NAME: install-driver.sh not found or not executable"
-          INSTALL_OK=false
-        fi
-        ;;
-
-      aircrack)
-        if [[ -x ./install-driver.sh ]]; then
-          info "Building $NAME (aircrack-ng)"
-          echo "" | ./install-driver.sh >>"$LOG" 2>&1 || INSTALL_OK=false
-        else
-          warn "$NAME: install-driver.sh not found or not executable"
-          INSTALL_OK=false
-        fi
-        ;;
-
-      dkms-only)
-        # Repos that have dkms.conf + Makefile but no install-driver.sh (e.g. morrownr/rtw89).
-        # Also skips rtw89 entirely on kernels >= 5.16 where it is already in-tree.
-        if [[ "$MOD" == "rtw89" ]]; then
-          KVER_MAJOR=$(uname -r | cut -d. -f1)
-          KVER_MINOR=$(uname -r | cut -d. -f2)
-          if (( KVER_MAJOR > 5 || ( KVER_MAJOR == 5 && KVER_MINOR >= 16 ) )); then
-            info "Skipping $NAME — rtw89 is built-in to kernel $(uname -r) (>= 5.16)"
-            echo "$NAME:SKIPPED_IN_TREE" >>"$DRIVER_STATE"
-            cd "$WIFI_SRC"; continue
-          fi
-        fi
-
-        DKMS_VER="0.0"
-        [[ -f dkms.conf ]] && DKMS_VER="$(grep 'PACKAGE_VERSION=' dkms.conf | cut -d'"' -f2 || echo "0.0")"
-
-        SRC_DEST="/usr/src/${MOD}-${DKMS_VER}"
-        info "Installing $NAME via DKMS ($MOD/$DKMS_VER)"
-
-        # Copy source into /usr/src where dkms expects it
-        rm -rf "$SRC_DEST"
-        cp -r "$(pwd)" "$SRC_DEST"
-
-        dkms add    -m "$MOD" -v "$DKMS_VER" >>"$LOG" 2>&1 || true
-        dkms build  -m "$MOD" -v "$DKMS_VER" >>"$LOG" 2>&1 \
-          && dkms install -m "$MOD" -v "$DKMS_VER" >>"$LOG" 2>&1 \
-          || { INSTALL_OK=false; }
-
-        if [[ "$MODPROBE" != "-" && -n "$MODPROBE" ]]; then
-          info "Loading module: $MODPROBE"
-          modprobe "$MODPROBE" >>"$LOG" 2>&1 \
-            || warn "modprobe $MODPROBE failed (may need reboot)"
-          ok "Module $MODPROBE loaded"
-        fi
-        ;;
-
-      lwfinger)
-        # Build only (no make install) — DKMS manages the module lifecycle.
-        # Source must be copied to /usr/src/MOD-VER/ before dkms add.
-        info "Building $NAME (lwfinger)"
-        if make all >>"$LOG" 2>&1; then
-
-          DKMS_VER="0.0"
-          [[ -f dkms.conf ]] && DKMS_VER="$(grep 'PACKAGE_VERSION=' dkms.conf | cut -d'"' -f2 || echo "0.0")"
-
-          SRC_DEST="/usr/src/${MOD}-${DKMS_VER}"
-          info "Registering $NAME with DKMS ($MOD/$DKMS_VER)"
-
-          # Copy source into /usr/src where dkms expects it, then register
-          rm -rf "$SRC_DEST"
-          cp -r "$(pwd)" "$SRC_DEST"
-
-          dkms add    -m "$MOD" -v "$DKMS_VER" >>"$LOG" 2>&1 || true
-          dkms build  -m "$MOD" -v "$DKMS_VER" >>"$LOG" 2>&1 \
-            && dkms install -m "$MOD" -v "$DKMS_VER" >>"$LOG" 2>&1 \
-            || { warn "$NAME: dkms build/install failed"; INSTALL_OK=false; }
-
-          if $INSTALL_OK && [[ "$MODPROBE" != "-" && -n "$MODPROBE" ]]; then
-            info "Loading module: $MODPROBE"
-            modprobe "$MODPROBE" >>"$LOG" 2>&1 \
-              || warn "modprobe $MODPROBE failed (may need reboot)"
-            ok "Module $MODPROBE loaded"
-          fi
-        else
-          INSTALL_OK=false
-        fi
-        ;;
-    esac
-
-    cd "$WIFI_SRC"
-
-    if $INSTALL_OK; then
-      echo "$NAME:INSTALLED" >>"$DRIVER_STATE"
-      ok "✓ $NAME installed [$DRIVER_NUM/$TOTAL_DRIVERS]"
-    else
-      echo "$NAME:FAILED" >>"$DRIVER_STATE"
-      warn "✗ $NAME build/install failed [$DRIVER_NUM/$TOTAL_DRIVERS]"
-    fi
-  else
-    echo "$NAME:CLONE_FAILED" >>"$DRIVER_STATE"
-    warn "✗ Failed to clone $NAME [$DRIVER_NUM/$TOTAL_DRIVERS]"
-  fi
+#   * MediaTek dongles in the fleet (0846:9041, 0e8d:c616, 2357:0105) run on
+#     MAINLINE mt76 drivers — the module loads and the device is dead without
+#     firmware-mediatek / firmware-misc-nonfree.
+#   * 0bda:1a2b is not a NIC until usb_modeswitch flips it out of CD-ROM mode.
+#   * RTL8192EU (0bda:818b) is in the fleet and had no out-of-tree driver here.
+#
+# LOG and DRIVER_STATE are exported so its output folds into this installer's
+# log and the PHASE 10 health summary keeps working unchanged.
+WIFI_DRIVER_PKG=""
+for _c in "$(dirname "$0")/../clients/linux/install_wifi_drivers.sh" \
+          /usr/local/scripts/install_wifi_drivers.sh \
+          "$(dirname "$0")/install_wifi_drivers.sh"; do
+    [[ -f "$_c" ]] && { WIFI_DRIVER_PKG="$_c"; break; }
 done
 
-info "Running depmod -a"
-depmod -a >>"$LOG" 2>&1
-
-export PATH="$OLD_PATH"
-rm -rf "$SUPPRESS"
+if [[ -n "$WIFI_DRIVER_PKG" ]]; then
+    info "WLAN drivers: $WIFI_DRIVER_PKG"
+    LOG="$LOG" DRIVER_STATE="$DRIVER_STATE" bash "$WIFI_DRIVER_PKG" \
+        || warn "driver package returned non-zero — see $LOG"
+else
+    warn "install_wifi_drivers.sh not found — NO wifi drivers or firmware installed."
+    warn "Fetch it with: curl -fsSL https://raw.githubusercontent.com/lbockenstedt/cs/main/clients/linux/install_wifi_drivers.sh -o /usr/local/scripts/install_wifi_drivers.sh"
+fi
 ok "WLAN driver installation complete"
 end_phase
 

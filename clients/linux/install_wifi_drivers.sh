@@ -1,284 +1,261 @@
-#!/bin/bash
-#------------------------------------------------------------
-# install_wifi_drivers.sh — every known WiFi driver for Debian 13 (trixie)
+#!/usr/bin/env bash
+###############################################################################
+# install_wifi_drivers.sh — USB WiFi driver package for the sim-client image
 #
-# Built for the sim-client image: these VMs get an arbitrary USB WiFi dongle
-# passed through, so the image must already carry a driver for ANY dongle in the
-# fleet rather than being fixed up per-VM after the fact.
+# Pulls every out-of-tree USB WiFi driver LIVE from GitHub and builds it, plus
+# the firmware / mode-switch / regulatory layer the DKMS drivers do not cover.
 #
-# Run ONCE while building the golden image (or on a live client when a new
-# dongle type shows up):
+# Extracted from installers/install.sh so the driver set is maintained in ONE
+# place and can be re-run on a live client when a new dongle appears, without
+# re-running the whole client installer. install.sh calls this at the end.
 #
-#     sudo bash /usr/local/scripts/install_wifi_drivers.sh            # firmware + packaged drivers
-#     sudo bash /usr/local/scripts/install_wifi_drivers.sh --out-of-tree   # + DKMS builds from source
+#   sudo bash install_wifi_drivers.sh              # firmware + all USB drivers
+#   sudo bash install_wifi_drivers.sh --firmware-only
+#   sudo bash install_wifi_drivers.sh --drivers-only
 #
-# DESIGN: every install is BEST EFFORT and independently reported. A package
-# that does not exist on this release, or a DKMS build that fails against this
-# kernel, must not abort the run — a partial driver set is useful, a script that
-# dies on the first missing package is not. The summary at the end is the real
-# output: it says which chips are covered and which are not.
+# SCOPE: USB only. These clients are VMs fed by USB passthrough and never see a
+# PCIe/M.2 adapter, so no PCIe-only driver is built here.
 #
-# Deliberately NOT idempotency-hostile: re-running is safe and is the intended
-# way to pick up new drivers after a kernel upgrade.
-#------------------------------------------------------------
-set -uo pipefail        # NOT -e: see the best-effort note above
+# Callers may pre-set LOG and DRIVER_STATE to fold this into their own logging
+# (install.sh does); otherwise sane defaults are used.
+###############################################################################
+set -uo pipefail        # NOT -e: every step is best-effort and reported
 
-OUT_OF_TREE=0
-[[ "${1:-}" == "--out-of-tree" ]] && OUT_OF_TREE=1
+export PATH="/usr/sbin:/sbin:/usr/bin:/bin:$PATH"
 
-LOG=/var/log/install_wifi_drivers.log
-exec > >(tee -a "$LOG") 2>&1
-echo "=== install_wifi_drivers.sh $(date -Is) (out-of-tree=$OUT_OF_TREE) ==="
+DO_FIRMWARE=1; DO_DRIVERS=1
+for a in "$@"; do
+  case "$a" in
+    --firmware-only) DO_DRIVERS=0 ;;
+    --drivers-only)  DO_FIRMWARE=0 ;;
+  esac
+done
 
-[[ $EUID -eq 0 ]] || { echo "FATAL: must run as root (sudo)"; exit 1; }
+LOG="${LOG:-/var/log/install_wifi_drivers.log}"
+DRIVER_STATE="${DRIVER_STATE:-/var/lib/lm-client/wlan-drivers.state}"
+mkdir -p "$(dirname "$DRIVER_STATE")" 2>/dev/null || DRIVER_STATE=/tmp/wlan-drivers.state
+: >"$DRIVER_STATE" 2>/dev/null || DRIVER_STATE=/tmp/wlan-drivers.state
+touch "$LOG" 2>/dev/null || LOG=/tmp/install_wifi_drivers.log
 
-OK_LIST=(); FAIL_LIST=()
-_try() {  # _try <label> <cmd...>
-    local label="$1"; shift
-    if "$@" >/dev/null 2>&1; then OK_LIST+=("$label"); echo "  ok   $label"
-    else FAIL_LIST+=("$label"); echo "  MISS $label"; fi
-}
+# Use the caller's helpers when invoked from install.sh; otherwise define ours.
+command -v info >/dev/null 2>&1 || info() { echo "  $*" | tee -a "$LOG"; }
+command -v ok   >/dev/null 2>&1 || ok()   { echo "  ok   $*" | tee -a "$LOG"; }
+command -v warn >/dev/null 2>&1 || warn() { echo "  WARN $*" | tee -a "$LOG"; }
 
-#------------------------------------------------------------
-# 1. Non-free firmware components.
+[[ $EUID -eq 0 ]] || { echo "FATAL: must run as root"; exit 1; }
+echo "=== install_wifi_drivers.sh $(date -Is) ===" >>"$LOG"
+
+###############################################################################
+# 1. FIRMWARE + MODE-SWITCH + REGULATORY
 #
-# Debian 12 split firmware out of `non-free` into its own `non-free-firmware`
-# component, and trixie ships the deb822 format (/etc/apt/sources.list.d/
-# debian.sources) rather than the one-line sources.list. Handle BOTH: an image
-# built from a netinst has the .sources file, an upgraded box may still have the
-# old list. Without this every firmware-* package below is simply "not found".
-#------------------------------------------------------------
-echo "-- enabling contrib / non-free / non-free-firmware"
-_src=/etc/apt/sources.list.d/debian.sources
-if [[ -f "$_src" ]]; then
-    if ! grep -q 'non-free-firmware' "$_src"; then
-        cp -n "$_src" "$_src.bak-wifi"
-        # Append the missing components to every Components: line.
-        sed -i 's/^\(Components:.*\)$/\1 contrib non-free non-free-firmware/' "$_src"
-        # Collapse any duplicates a re-run would introduce.
-        sed -i 's/\(Components:[^\n]*\)/\1/' "$_src"
-        echo "  updated $_src"
+# This layer is what the DKMS drivers do NOT give you, and its absence is the
+# hardest class of failure to diagnose because nothing errors:
+#   * MediaTek dongles in this fleet (0846:9041 MT7612U, 0e8d:c616, 2357:0105
+#     MT7610U) use MAINLINE mt76 drivers — the module loads and the device is
+#     dead without firmware-* installed.
+#   * 0bda:1a2b is not a NIC at all until usb_modeswitch flips it out of
+#     CD-ROM mode. It shows in lsusb with no wl* interface and no dmesg error.
+#   * Without wireless-regdb the kernel world-roams and every 6 GHz channel is
+#     silently unavailable while 2.4/5 GHz work fine.
+###############################################################################
+if [[ $DO_FIRMWARE -eq 1 ]]; then
+  info "Enabling contrib / non-free / non-free-firmware"
+  # Debian 12+ moved firmware into its own non-free-firmware component, and
+  # trixie ships deb822 (.sources). Handle both or every firmware-* below is
+  # simply "not found".
+  _src=/etc/apt/sources.list.d/debian.sources
+  if [[ -f "$_src" ]] && ! grep -q 'non-free-firmware' "$_src"; then
+    cp -n "$_src" "$_src.bak-wifi" 2>/dev/null
+    sed -i 's/^\(Components:.*\)$/\1 contrib non-free non-free-firmware/' "$_src"
+    info "updated $_src"
+  fi
+  if [[ -f /etc/apt/sources.list ]] && grep -qE '^deb ' /etc/apt/sources.list \
+     && ! grep -qE '^deb .*non-free-firmware' /etc/apt/sources.list; then
+    cp -n /etc/apt/sources.list /etc/apt/sources.list.bak-wifi 2>/dev/null
+    sed -i -E 's/^(deb .*debian\.org[^ ]* [a-z-]+ main.*)$/\1 contrib non-free non-free-firmware/' \
+      /etc/apt/sources.list
+    info "updated /etc/apt/sources.list"
+  fi
+  apt-get update -qq >>"$LOG" 2>&1 || warn "apt-get update failed — package list may be stale"
+
+  info "Installing firmware + support packages"
+  for p in \
+      firmware-linux-free firmware-linux-nonfree firmware-misc-nonfree \
+      firmware-realtek firmware-atheros firmware-iwlwifi firmware-brcm80211 \
+      firmware-mediatek firmware-ath9k-htc firmware-libertas firmware-zd1211 \
+      firmware-ti-connectivity \
+      usb-modeswitch usb-modeswitch-data wireless-regdb \
+      iw wireless-tools rfkill usbutils
+  do
+    if DEBIAN_FRONTEND=noninteractive apt-get install -y -q "$p" >>"$LOG" 2>&1; then
+      echo "$p:INSTALLED" >>"$DRIVER_STATE"; ok "$p"
     else
-        echo "  $_src already has non-free-firmware"
+      echo "$p:UNAVAILABLE" >>"$DRIVER_STATE"; info "skip $p (not on this release)"
     fi
+  done
 fi
-if [[ -f /etc/apt/sources.list ]] && grep -qE '^deb ' /etc/apt/sources.list; then
-    if ! grep -qE '^deb .*non-free-firmware' /etc/apt/sources.list; then
-        cp -n /etc/apt/sources.list /etc/apt/sources.list.bak-wifi
-        sed -i -E 's/^(deb .*debian\.org[^ ]* [a-z-]+ main.*)$/\1 contrib non-free non-free-firmware/' \
-            /etc/apt/sources.list
-        echo "  updated /etc/apt/sources.list"
-    fi
-fi
-apt-get update -qq || echo "  WARNING: apt-get update failed — package list may be stale"
 
-#------------------------------------------------------------
-# 2. Firmware blobs. Covers the in-kernel drivers (mt76, ath9k/10k, iwlwifi,
-#    brcmfmac, rtw88/rtw89, r8152 USB-ethernet) which load but do NOTHING
-#    without their firmware — the classic "device appears, never associates".
-#------------------------------------------------------------
-echo "-- firmware packages"
-for p in \
-    firmware-linux-free firmware-linux-nonfree firmware-misc-nonfree \
-    firmware-realtek firmware-atheros firmware-iwlwifi firmware-brcm80211 \
-    firmware-libertas firmware-ti-connectivity firmware-zd1211 \
-    firmware-mediatek firmware-ath9k-htc firmware-intel-sof \
-    firmware-realtek-rtl8723cs-bt
-do
-    _try "$p" env DEBIAN_FRONTEND=noninteractive apt-get install -y -q "$p"
-done
+[[ $DO_DRIVERS -eq 0 ]] && { info "--firmware-only: skipping driver builds"; exit 0; }
 
-#------------------------------------------------------------
-# 3. Build prerequisites for every DKMS driver below. Headers MUST match the
-#    running kernel or every DKMS build fails with a confusing "kernel source
-#    not found" — install both the exact and the meta package.
-#------------------------------------------------------------
-echo "-- build prerequisites"
-# wireless-regdb + iw are what make 6 GHz usable at all: without a regulatory
-# database the kernel falls back to world-roaming, and every 6E/Wi-Fi 7 channel
-# is silently unavailable. The adapter associates fine on 2.4/5 GHz, so this
-# looks like a hardware limitation rather than a missing package.
-for p in dkms build-essential bc "linux-headers-$(uname -r)" linux-headers-amd64 \
-         git iw wireless-tools wireless-regdb rfkill usbutils libelf-dev
-do
-    _try "$p" env DEBIAN_FRONTEND=noninteractive apt-get install -y -q "$p"
-done
-
-#------------------------------------------------------------
-# 4. usb_modeswitch — REQUIRED, not optional, for this fleet.
-#    Several Realtek dongles enumerate first as a CD-ROM holding a Windows
-#    driver (0bda:1a2b is exactly that mode) and only become a WiFi NIC after
-#    being switched. Without this the dongle looks present in lsusb and never
-#    appears as a netdev — which reads like a driver problem and is not one.
-#------------------------------------------------------------
-echo "-- usb_modeswitch (CD-ROM-mode dongles, e.g. 0bda:1a2b)"
-for p in usb-modeswitch usb-modeswitch-data; do
-    _try "$p" env DEBIAN_FRONTEND=noninteractive apt-get install -y -q "$p"
-done
-
-#------------------------------------------------------------
-# 5. Packaged DKMS drivers. These are the out-of-tree chips Debian happens to
-#    package; anything not here needs section 6.
-#------------------------------------------------------------
-echo "-- packaged DKMS drivers"
-for p in realtek-rtl88xxau-dkms rtl8821ce-dkms rtl8812au-dkms \
-         rtl8189es-dkms rtl8723bu-dkms broadcom-sta-dkms
-do
-    _try "$p" env DEBIAN_FRONTEND=noninteractive apt-get install -y -q "$p"
-done
-
-#------------------------------------------------------------
-# 6. Out-of-tree DKMS builds (--out-of-tree). Needs network + several minutes.
+###############################################################################
+# 2. BUILD PREREQUISITES
 #
-#    These are the chips with NO usable mainline driver, mapped from the fleet's
-#    configured dongle VID:PIDs. Each is cloned to /usr/src/<name> and registered
-#    with dkms so it REBUILDS AUTOMATICALLY on a kernel upgrade — a plain `make
-#    install` would silently stop working at the next kernel bump, which on a
-#    fleet this size is a slow-motion outage.
-#------------------------------------------------------------
-if [[ $OUT_OF_TREE -eq 1 ]]; then
-    echo "-- out-of-tree DKMS builds"
-    _dkms_git() {  # _dkms_git <name> <version> <git-url>
-        local name="$1" ver="$2" url="$3" dir="/usr/src/${1}-${2}"
-        if dkms status 2>/dev/null | grep -q "^${name}"; then
-            OK_LIST+=("$name (already installed)"); echo "  ok   $name (already installed)"; return
-        fi
-        rm -rf "$dir"
-        if ! git clone --depth 1 "$url" "$dir" >/dev/null 2>&1; then
-            FAIL_LIST+=("$name (clone failed)"); echo "  MISS $name (clone failed: $url)"; return
-        fi
-        # Most of these ship a dkms.conf; if not, the build is not DKMS-ready and
-        # we skip rather than hand-rolling one that will rot.
-        if [[ ! -f "$dir/dkms.conf" ]]; then
-            FAIL_LIST+=("$name (no dkms.conf)"); echo "  MISS $name (no dkms.conf)"; rm -rf "$dir"; return
-        fi
-        if dkms add -m "$name" -v "$ver" >/dev/null 2>&1 \
-           && dkms build -m "$name" -v "$ver" >/dev/null 2>&1 \
-           && dkms install -m "$name" -v "$ver" >/dev/null 2>&1; then
-            OK_LIST+=("$name (dkms)"); echo "  ok   $name (dkms built + installed)"
-        else
-            FAIL_LIST+=("$name (dkms build failed)")
-            echo "  MISS $name — build failed; see /var/lib/dkms/$name/$ver/build/make.log"
-        fi
-    }
-    # Chips with NO mainline driver on 6.12 — always build these.
-    # RTL8812AU/8821AU  0bda:8812 2001:331e 2357:011e 0b05:1a62
-    _dkms_git 8812au   20210629 https://github.com/morrownr/8812au-20210629.git
-    # RTL8188EU(S)      0bda:8179 0846:9020   (staging r8188eu removed after 6.6)
-    _dkms_git 8188eu   20210902 https://github.com/morrownr/8188eu-20210902.git
-    # RTL8814AU — not in the current fleet, harmless if unused
-    _dkms_git 8814au   20210629 https://github.com/morrownr/8814au-20210629.git
-    # RTL8852AU/8832AU — Wi-Fi 6 over USB. No mainline USB driver exists for
-    # these, so this is the only way to get Wi-Fi 6 on a Realtek dongle.
-    # (MT7921AU is the other Wi-Fi 6 USB option and needs NOTHING — mt7921u has
-    # been mainline since 5.16.)
-    _dkms_git rtl8852au 1.15.0.1 https://github.com/morrownr/rtl8852au.git
-    _dkms_git rtl8852bu 1.15.0.1 https://github.com/morrownr/rtl8852bu.git
-
-    #--------------------------------------------------------
-    # Realtek USB parts with no mainline driver at all. Not in the current
-    # fleet's usb_config, but these are the cheap dongles you actually end up
-    # buying, and a driver already in the image costs nothing while a missing
-    # one costs a rebuild. All are USB — no PCIe/M.2 drivers are built here,
-    # since these VMs only ever see USB passthrough.
-    #--------------------------------------------------------
-    # RTL8723DU  0bda:d723  (wifi + bluetooth combo)
-    _dkms_git rtl8723du 5.9.5   https://github.com/lwfinger/rtl8723du.git
-    # RTL8192FU / RTL8188FU  0bda:f179 0bda:f192
-    _dkms_git rtl8192fu 1.0     https://github.com/kelebek333/rtl8192fu-dkms.git
-    # RTL8710BU / RTL8188GU  0bda:b711
-    _dkms_git rtl8710bu 1.0     https://github.com/morrownr/rtl8710bu.git
-    # RTL8192EU  0bda:818b — rtl8xxxu claims it but is unstable on many units
-    _dkms_git rtl8192eu 1.0      https://github.com/Mange/rtl8192eu-linux-driver.git
-
-    #--------------------------------------------------------
-    # RTL8822BU / RTL8821CU are MAINLINE on this kernel (rtw88_8822bu since 6.1,
-    # rtw88_8821cu since 6.2). Building the out-of-tree driver too means BOTH
-    # claim the same USB ID and which one binds is a race — behaviour then
-    # differs across reboots on identical VMs, which is exactly the kind of
-    # fault this fleet cannot debug remotely.
-    #
-    # So: only build them if the mainline module is genuinely absent. Opt in with
-    # LM_FORCE_RTW_OOT=1 if the mainline driver misbehaves on your dongles, and
-    # blacklist the mainline module if you do.
-    #--------------------------------------------------------
-    _mainline_has() { modinfo "$1" >/dev/null 2>&1; }
-    if [[ "${LM_FORCE_RTW_OOT:-0}" == "1" ]]; then
-        echo "  LM_FORCE_RTW_OOT=1 — building rtw88-overlapping drivers anyway"
-        echo "  REMEMBER to blacklist the mainline module, e.g.:"
-        echo "    echo 'blacklist rtw88_8822bu' > /etc/modprobe.d/blacklist-rtw88-usb.conf"
-        _dkms_git 88x2bu 20210702 https://github.com/morrownr/88x2bu-20210702.git
-        _dkms_git 8821cu 20210916 https://github.com/morrownr/8821cu-20210916.git
-    else
-        for _m in rtw88_8822bu rtw88_8821cu; do
-            if _mainline_has "$_m"; then
-                OK_LIST+=("$_m (mainline — no DKMS needed)"); echo "  ok   $_m (mainline, skipping out-of-tree)"
-            else
-                echo "  note $_m not found in this kernel — building out-of-tree instead"
-                case "$_m" in
-                    rtw88_8822bu) _dkms_git 88x2bu 20210702 https://github.com/morrownr/88x2bu-20210702.git ;;
-                    rtw88_8821cu) _dkms_git 8821cu 20210916 https://github.com/morrownr/8821cu-20210916.git ;;
-                esac
-            fi
-        done
-    fi
+# Headers MUST match the RUNNING kernel or every build fails with a misleading
+# "kernel source not found". linux-headers-amd64 is separate and load-bearing:
+# without it DKMS silently skips the rebuild on a kernel upgrade and the driver
+# disappears at the next boot — a slow-motion fleet outage.
+###############################################################################
+if grep -qiE "raspberry|BCM2" /proc/cpuinfo 2>/dev/null; then
+  KERNEL_HEADERS="raspberrypi-kernel-headers"
 else
-    echo "-- out-of-tree DKMS builds SKIPPED (pass --out-of-tree to build them)"
-    echo "   Without these, these fleet dongles have no driver:"
-    echo "     0bda:8812 0bda:818b 0bda:8179 2001:331e 2357:011e 0b05:1a62 0846:9020"
-    echo "   (0bda:b812/b820/c811/c820 are covered by mainline rtw88 on kernel 6.12)"
-    fi
+  KERNEL_HEADERS="linux-headers-$(uname -r)"
+fi
+info "Installing build prerequisites ($KERNEL_HEADERS)"
+DEBIAN_FRONTEND=noninteractive apt-get install -y -q \
+  dkms build-essential bc libelf-dev git "$KERNEL_HEADERS" linux-headers-amd64 \
+  >>"$LOG" 2>&1 || warn "some build prerequisites failed — driver builds may fail"
 
-#------------------------------------------------------------
-# 7. Make sure the radio is not soft-blocked, and refresh module deps so a
-#    freshly-installed driver is loadable without a reboot.
-#------------------------------------------------------------
-depmod -a >/dev/null 2>&1 || true
+###############################################################################
+# 3. OUT-OF-TREE USB DRIVERS — cloned LIVE from GitHub and built
+#
+# Format: "dir-name|type|repo-url|dkms-module|pinned-tag|modprobe-module"
+# Types:
+#   morrownr  — repo ships install-driver.sh; run it NoPrompt
+#   lwfinger  — bare Makefile; build, copy to /usr/src, register with DKMS
+#   dkms-only — dkms.conf + Makefile, no install-driver.sh
+# modprobe-module: "-" when no explicit modprobe is needed.
+###############################################################################
+WIFI_SRC="/usr/src/wifi-drivers"
+mkdir -p "$WIFI_SRC"; cd "$WIFI_SRC" || exit 1
+
+# systemctl shim: several install-driver.sh scripts call systemctl, which is
+# meaningless (and noisy) mid-install. Suppressed for the duration only.
+SUPPRESS="$(mktemp -d)"
+printf '#!/bin/sh\necho "[SUPPRESSED] systemctl $* ignored during driver install"\nexit 0\n' \
+  > "$SUPPRESS/systemctl"
+chmod +x "$SUPPRESS/systemctl"
+OLD_PATH="$PATH"; export PATH="$SUPPRESS:$PATH"
+
+DRIVERS=(
+  # ── chips in the fleet's usb_config today ─────────────────────────────────
+  # RTL8812AU/8821AU  0bda:8812 2001:331e 2357:011e 2357:012e
+  "8812au-20210820|morrownr|https://github.com/morrownr/8812au-20210820.git|8812au|HEAD|-"
+  # RTL8821AU  0b05:1a62
+  "8821au-20210708|morrownr|https://github.com/morrownr/8821au-20210708.git|8821au|HEAD|-"
+  # RTL8811CU/8821CU  0bda:c811 0bda:c820   (mainline rtw88 on 6.12 — see skip below)
+  "8821cu-20210916|morrownr|https://github.com/morrownr/8821cu-20210916.git|8821cu|HEAD|-"
+  # RTL8812BU/8822BU  0bda:b812 0bda:b820 2357:012d   (mainline rtw88 on 6.12)
+  "88x2bu-20210702|morrownr|https://github.com/morrownr/88x2bu-20210702.git|88x2bu|HEAD|-"
+  # RTL8188EUS  0bda:8179 0846:9020
+  "rtl8188eu|lwfinger|https://github.com/lwfinger/rtl8188eu.git|8188eu|HEAD|-"
+  # RTL8192EU  0bda:818b — IS in the fleet but had NO out-of-tree driver in the
+  # installer. Mainline rtl8xxxu claims it and is unstable on many units.
+  "rtl8192eu|dkms-only|https://github.com/Mange/rtl8192eu-linux-driver.git|rtl8192eu|HEAD|-"
+
+  # ── not in the fleet yet; cheap parts you plausibly buy next ──────────────
+  "8814au|morrownr|https://github.com/morrownr/8814au.git|8814au|HEAD|-"
+  "rtl8723au|lwfinger|https://github.com/lwfinger/rtl8723au.git|8723au|HEAD|8723au"
+  "rtl8723du|lwfinger|https://github.com/lwfinger/rtl8723du.git|8723du|HEAD|-"
+  "rtl8710bu|morrownr|https://github.com/morrownr/rtl8710bu.git|8710bu|HEAD|-"
+
+  # ── Wi-Fi 6 over USB — the practical ceiling for a passthrough VM ─────────
+  # (6E / Wi-Fi 7 silicon is M.2 except MT7925; MT7921AU needs nothing, mt7921u
+  #  has been mainline since 5.16.)
+  "rtl8852au|lwfinger|https://github.com/lwfinger/rtl8852au.git|8852au|HEAD|-"
+  "rtl8852bu-20240418|morrownr|https://github.com/morrownr/rtl8852bu-20240418.git|8852bu|HEAD|-"
+  "rtl8852cu-20240510|morrownr|https://github.com/morrownr/rtl8852cu-20240510.git|8852cu|HEAD|-"
+)
+
+TOTAL="${#DRIVERS[@]}"; N=0
+for entry in "${DRIVERS[@]}"; do
+  SAVED_IFS="$IFS"; IFS='|' read -r NAME TYPE REPO MOD PIN MODPROBE <<<"$entry"; IFS="$SAVED_IFS"
+  N=$(( N + 1 ))
+  info "Driver $N/$TOTAL: $NAME"
+
+  # Skip a chip the running kernel already handles. Building an out-of-tree
+  # driver alongside a mainline one means BOTH claim the USB ID and which binds
+  # is a race — identical VMs then behave differently across reboots, which is
+  # exactly the fault this fleet cannot debug remotely.
+  case "$MOD" in
+    88x2bu) modinfo rtw88_8822bu >/dev/null 2>&1 && {
+              info "skip $NAME — rtw88_8822bu is mainline on $(uname -r)"
+              echo "$NAME:SKIPPED_IN_TREE" >>"$DRIVER_STATE"; continue; } ;;
+    8821cu) modinfo rtw88_8821cu >/dev/null 2>&1 && {
+              info "skip $NAME — rtw88_8821cu is mainline on $(uname -r)"
+              echo "$NAME:SKIPPED_IN_TREE" >>"$DRIVER_STATE"; continue; } ;;
+  esac
+
+  rm -rf "$NAME"
+  CLONE_ARGS=(--depth=1)
+  [[ "$PIN" != "HEAD" ]] && CLONE_ARGS+=(--branch "$PIN")
+  if ! git clone "${CLONE_ARGS[@]}" "$REPO" "$NAME" >>"$LOG" 2>&1; then
+    echo "$NAME:CLONE_FAILED" >>"$DRIVER_STATE"; warn "✗ clone failed: $NAME"; continue
+  fi
+  cd "$NAME" || continue
+  INSTALL_OK=true
+
+  case "$TYPE" in
+    morrownr)
+      if [[ -x ./install-driver.sh ]]; then
+        ./install-driver.sh NoPrompt >>"$LOG" 2>&1 || INSTALL_OK=false
+      else
+        warn "$NAME: install-driver.sh missing"; INSTALL_OK=false
+      fi
+      ;;
+    lwfinger|dkms-only)
+      # lwfinger repos build first; dkms-only go straight to DKMS.
+      if [[ "$TYPE" == "lwfinger" ]]; then
+        make all >>"$LOG" 2>&1 || INSTALL_OK=false
+      fi
+      if $INSTALL_OK; then
+        DKMS_VER="0.0"
+        [[ -f dkms.conf ]] && DKMS_VER="$(grep 'PACKAGE_VERSION=' dkms.conf | cut -d'"' -f2 || echo 0.0)"
+        SRC_DEST="/usr/src/${MOD}-${DKMS_VER}"
+        rm -rf "$SRC_DEST"; cp -r "$(pwd)" "$SRC_DEST"
+        dkms add -m "$MOD" -v "$DKMS_VER" >>"$LOG" 2>&1 || true
+        dkms build -m "$MOD" -v "$DKMS_VER" >>"$LOG" 2>&1 \
+          && dkms install -m "$MOD" -v "$DKMS_VER" >>"$LOG" 2>&1 \
+          || INSTALL_OK=false
+      fi
+      ;;
+  esac
+
+  if $INSTALL_OK && [[ "$MODPROBE" != "-" && -n "$MODPROBE" ]]; then
+    modprobe "$MODPROBE" >>"$LOG" 2>&1 || warn "modprobe $MODPROBE failed (may need reboot)"
+  fi
+
+  cd "$WIFI_SRC"
+  if $INSTALL_OK; then
+    echo "$NAME:INSTALLED" >>"$DRIVER_STATE"; ok "✓ $NAME [$N/$TOTAL]"
+  else
+    echo "$NAME:FAILED" >>"$DRIVER_STATE"; warn "✗ $NAME build failed [$N/$TOTAL]"
+  fi
+done
+
+export PATH="$OLD_PATH"; rm -rf "$SUPPRESS"
+depmod -a >>"$LOG" 2>&1 || true
 rfkill unblock all >/dev/null 2>&1 || true
 
-#------------------------------------------------------------
-# 8. Report. This is the point of the script — a bare exit code cannot tell you
-#    whether the image can actually drive the dongles you own.
-#------------------------------------------------------------
+###############################################################################
+# 4. REPORT — the point of the script. An exit code cannot tell you whether the
+#    image can actually drive the dongles you own.
+###############################################################################
 echo ""
-echo "=== SUMMARY ==="
-echo "installed/present : ${#OK_LIST[@]}"
-# Guarded: on bash < 4.4 an empty array under `set -u` expands to an UNBOUND
-# VARIABLE error, so the summary would die exactly when nothing installed —
-# the one run where you most need to read it.
-((${#OK_LIST[@]})) && printf '    %s\n' "${OK_LIST[@]}"
-if ((${#FAIL_LIST[@]})); then
-    echo "unavailable/failed: ${#FAIL_LIST[@]}"
-    printf '    %s\n' "${FAIL_LIST[@]}"
-    echo ""
-    echo "NOTE: 'unavailable' is often correct — several of the packages probed"
-    echo "above do not exist on every Debian release, and a chip covered by a"
-    echo "mainline driver needs no DKMS package at all. Judge by section 9, not"
-    echo "by this count."
-fi
-
-#------------------------------------------------------------
-# 9. Coverage against the dongles ACTUALLY plugged in right now.
-#------------------------------------------------------------
-echo ""
-echo "=== DONGLES PRESENT ON THIS HOST ==="
-if command -v lsusb >/dev/null 2>&1; then
-    lsusb | grep -iE "wireless|wlan|802\.11|realtek|ralink|mediatek|atheros|broadcom" \
-        || echo "  (no obvious wifi dongle in lsusb — plug one in and re-check)"
-else
-    echo "  lsusb unavailable (usbutils not installed)"
+echo "=== WiFi driver summary ==="
+if [[ -s "$DRIVER_STATE" ]]; then
+  printf '  %-34s %s\n' "ITEM" "RESULT"
+  while IFS=: read -r k v; do
+    [[ -n "${k:-}" ]] && printf '  %-34s %s\n' "$k" "${v:-?}"
+  done < "$DRIVER_STATE"
 fi
 echo ""
-echo "=== WIRELESS INTERFACES ==="
-if command -v iw >/dev/null 2>&1; then
-    iw dev 2>/dev/null | grep -E "Interface|type" || echo "  (none — driver missing, or dongle still in CD-ROM mode)"
-else
-    ip -br link 2>/dev/null | grep -iE "wl" || echo "  (no wl* interface)"
-fi
+echo "=== dongles present ==="
+lsusb 2>/dev/null | grep -iE "wireless|wlan|802\.11|realtek|ralink|mediatek|atheros" \
+  || echo "  (none detected — plug one in and re-check)"
+echo "=== wireless interfaces ==="
+iw dev 2>/dev/null | grep -E "Interface" || echo "  (none — driver missing, or dongle still in CD-ROM mode)"
 echo ""
-echo "Driver matrix + system requirements: cs/clients/linux/WIFI-DRIVERS.md (repo)"
-echo "Full log: $LOG"
-echo "If a dongle shows in lsusb but has no wl* interface, try:"
-echo "  usb_modeswitch -v <vid> -p <pid> -J     # CD-ROM-mode Realtek"
-echo "  dmesg | tail -40                        # driver bind errors"
-echo "=== done $(date -Is) ==="
+echo "State: $DRIVER_STATE   Log: $LOG"
+echo "Driver matrix: cs/clients/linux/WIFI-DRIVERS.md (repo)"
+echo "In lsusb but no wl* and no dmesg error => CD-ROM mode:"
+echo "  usb_modeswitch -v <vid> -p <pid> -J"
