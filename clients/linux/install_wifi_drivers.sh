@@ -299,6 +299,53 @@ have_net() {
   getent hosts github.com >/dev/null 2>&1
 }
 
+###############################################################################
+# PAUSE THE SIMULATION WHILE WE WORK.
+#
+# The client simulation deliberately downs and resets network interfaces —
+# that is its job (assoc_fail, dhcp_fail, adapter resets). Running it against a
+# long network-dependent install is a guaranteed fight, and it is the reason a
+# previous run lost seven of eleven drivers to "Could not resolve host": the sim
+# took the interface out from under the clones mid-run.
+#
+# Nothing in the failure output pointed at the simulation, so this pauses it
+# explicitly and restores EXACTLY what was running — a unit that was already
+# stopped stays stopped.
+###############################################################################
+SIM_UNITS_STOPPED=()
+
+pause_simulation() {
+  local _u
+  for _u in client-sim-agent.service client-sim-watchdog.timer client-sim-watchdog.service; do
+    if systemctl is-active --quiet "$_u" 2>/dev/null; then
+      systemctl stop "$_u" >>"$LOG" 2>&1 \
+        && { SIM_UNITS_STOPPED+=("$_u"); info "paused $_u for the duration of the install"; } \
+        || warn "could not stop $_u — it may disrupt the network during this run"
+    fi
+  done
+  # simulation.sh is launched from the desktop session, not only by a unit, so
+  # stopping the units alone can leave it running and still cycling interfaces.
+  if pgrep -f '/usr/local/scripts/simulation.sh' >/dev/null 2>&1; then
+    pkill -f '/usr/local/scripts/simulation.sh' >/dev/null 2>&1 || true
+    info "stopped a running simulation.sh"
+  fi
+}
+
+resume_simulation() {
+  local _u
+  for _u in ${SIM_UNITS_STOPPED[@]+"${SIM_UNITS_STOPPED[@]}"}; do
+    systemctl start "$_u" >>"$LOG" 2>&1 \
+      && info "resumed $_u" \
+      || warn "could not resume $_u — start it manually: systemctl start $_u"
+  done
+}
+
+# Resume even if the script exits early, otherwise a failed driver run leaves the
+# client permanently out of the simulation with nothing reporting it.
+trap resume_simulation EXIT
+
+pause_simulation
+
 TOTAL="${#DRIVERS[@]}"; N=0
 FETCHED=()
 
