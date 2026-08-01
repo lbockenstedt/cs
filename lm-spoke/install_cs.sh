@@ -398,11 +398,28 @@ if done:
 sys.exit(0 if done else 1)
 PYFLAG
             done
-            # Reload PLAINLY now: the flag lives in the file, so no -C needed and
-            # the running mode matches what the next boot will produce.
+            # Reload with the CACHE INVALIDATED. This is the step whose absence
+            # made every previous fix in this series look like it worked and
+            # then die at the next boot:
+            #
+            #   file:    profile kea-dhcp4 ... flags=(complain) {
+            #   runtime: kea-dhcp4 (enforce)
+            #
+            # AppArmor compiles profiles to a binary policy cache and the boot
+            # loader PREFERS the cache. Editing the profile text does not
+            # invalidate it, so boot kept loading a policy compiled from the
+            # pre-edit (enforce) source while the file on disk plainly said
+            # complain. -T (--skip-read-cache) forces a recompile from source
+            # and -W (--write-cache) replaces the cached copy, so the NEXT BOOT
+            # reads a complain-flagged policy. Stale cache files are removed too,
+            # for loaders that key the cache differently across versions.
+            for _cd in /var/cache/apparmor /etc/apparmor.d/cache; do
+                [ -d "$_cd" ] || continue
+                find "$_cd" -name 'usr.sbin.kea-*' -delete 2>/dev/null || true
+            done
             for _cp in usr.sbin.kea-dhcp4 usr.sbin.kea-ctrl-agent usr.sbin.kea-lfc; do
                 [ -f "/etc/apparmor.d/$_cp" ] || continue
-                [ -n "$AA_PARSER" ] && "$AA_PARSER" -r "/etc/apparmor.d/$_cp" 2>/dev/null || true
+                [ -n "$AA_PARSER" ] && "$AA_PARSER" -T -W -r "/etc/apparmor.d/$_cp" 2>/dev/null || true
             done
             systemctl restart kea-dhcp4-sim kea-ctrl-agent-sim >/dev/null 2>&1 || true
         }
@@ -815,7 +832,12 @@ EOF
             _persisted=""
             if grep -m1 -E "^[^#].*\{[[:space:]]*$" "/etc/apparmor.d/$_cp" 2>/dev/null \
                | grep -q complain; then _persisted=1; fi
-            if [ "$_rt" = "complain" ] && [ -z "$_persisted" ]; then
+            # Two drift shapes, both fatal at the next boot:
+            #   complain at runtime, no flag in the file -> reverts at boot
+            #   flag in the file, ENFORCE at runtime     -> stale compiled cache
+            # The second is what actually took this fleet down repeatedly.
+            if { [ "$_rt" = "complain" ] && [ -z "$_persisted" ]; } \
+               || { [ "$_rt" = "enforce" ] && [ -n "$_persisted" ]; }; then
                 _aa_transient="${_aa_transient} $_cp"
             fi
         done
@@ -911,6 +933,19 @@ for p in $PROFILES; do
     if [ "$rt" = "complain" ] && ! persisted "$p"; then
         set_complain "$p" && log "persisted complain flag for $p (was runtime-only; would have reverted to enforce at the next boot)"
     fi
+    # STALE COMPILED CACHE: the file says complain but the kernel loaded
+    # ENFORCE. AppArmor's boot loader prefers the cached binary policy, and
+    # editing the profile TEXT does not invalidate it - so the box comes back up
+    # confined and kea crash-loops even though the profile plainly says complain.
+    # This is what defeated every earlier fix. Repair it here rather than waiting
+    # for kea to fall over.
+    if [ "$rt" = "enforce" ] && persisted "$p" && [ -n "$AA" ]; then
+        for cd in /var/cache/apparmor /etc/apparmor.d/cache; do
+            [ -d "$cd" ] && find "$cd" -name "${p}*" -delete 2>/dev/null
+        done
+        "$AA" -T -W -r "/etc/apparmor.d/$p" 2>/dev/null \
+            && log "repaired stale AppArmor cache for $p (file said complain, kernel had loaded enforce)"
+    fi
 done
 
 # 2. The actual outage: sim DHCP is down. Re-apply and restart.
@@ -920,7 +955,12 @@ changed=""
 for p in $PROFILES; do
     [ -f "/etc/apparmor.d/$p" ] || continue
     if ! persisted "$p"; then set_complain "$p" && changed=1 && log "set complain flag in $p"; fi
-    [ -n "$AA" ] && "$AA" -r "/etc/apparmor.d/$p" 2>/dev/null
+    # -T/-W: recompile from source and refresh the cache, so the NEXT BOOT loads
+    # a complain-flagged policy instead of the stale enforce one.
+    for cd in /var/cache/apparmor /etc/apparmor.d/cache; do
+        [ -d "$cd" ] && find "$cd" -name "${p}*" -delete 2>/dev/null
+    done
+    [ -n "$AA" ] && "$AA" -T -W -r "/etc/apparmor.d/$p" 2>/dev/null
 done
 [ -z "$AA" ] && log "WARNING apparmor_parser not found - cannot reload profiles"
 systemctl restart kea-ctrl-agent-sim 2>/dev/null
