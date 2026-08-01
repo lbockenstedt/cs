@@ -562,7 +562,16 @@ rm -rf "$CLIENT_SIM_DIR"
 if retry git clone --depth=1 "$CLIENT_SIM_REPO" "$CLIENT_SIM_DIR" >>"$LOG" 2>&1; then
   ok "client-sim repo cloned"
 
-  LINUX_DIR="$CLIENT_SIM_DIR/linux"
+  # The client scripts live in clients/linux/. The old flat layout kept them at
+  # linux/, and this resolved only that path — so against the current repo the
+  # `-d` test below failed and the installer skipped EVERY file deployment
+  # (scripts, units, .desktop, configs) while still reporting a successful run.
+  # Probe both so either layout works.
+  if [[ -d "$CLIENT_SIM_DIR/clients/linux" ]]; then
+    LINUX_DIR="$CLIENT_SIM_DIR/clients/linux"
+  else
+    LINUX_DIR="$CLIENT_SIM_DIR/linux"
+  fi
   CONFIGS_DIR="$CLIENT_SIM_DIR/configs"
 
   if [[ -d "$LINUX_DIR" ]]; then
@@ -707,7 +716,7 @@ PATH_EOF
 
     cd "$HOME"
   else
-    warn "linux/ directory not found in client-sim repo — skipping file deployment"
+    warn "neither clients/linux/ nor linux/ found in client-sim repo — skipping file deployment"
     REPO_RSYSLOG_CONF=""
   fi
 else
