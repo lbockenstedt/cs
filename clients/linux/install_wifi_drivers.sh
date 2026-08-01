@@ -393,7 +393,71 @@ lsusb 2>/dev/null | grep -iE "wireless|wlan|802\.11|realtek|ralink|mediatek|athe
 echo "=== wireless interfaces ==="
 iw dev 2>/dev/null | grep -E "Interface" || echo "  (none — driver missing, or dongle still in CD-ROM mode)"
 echo ""
+###############################################################################
+# 5. CD-ROM (mass-storage) MODE — detect and actually fix it
+#
+# This used to print a static "you may need usb_modeswitch" tip on EVERY run,
+# regardless of what was plugged in. That is worse than useless: it appears when
+# nothing is wrong, so a real occurrence reads as boilerplate and gets ignored.
+#
+# A dongle in this state presents as USB MASS STORAGE, never gets a wl*
+# interface, and produces NO dmesg driver error — the kernel is doing exactly
+# what the device asked. Detect it structurally: a mass-storage interface
+# (bInterfaceClass 08) on a device whose vendor is a known Wi-Fi silicon vendor
+# is not a flash drive.
+###############################################################################
+# Vendors that ship CD-ROM-mode Wi-Fi dongles. A real USB stick from one of
+# these is vanishingly unlikely, and the flip is a no-op on anything that does
+# not respond to it.
+WIFI_VENDORS=" 0bda a69c 2357 0b05 148f 0e8d 35bc 368b 2001 0846 7392 0cf3 "
+
+stuck_dongles() {
+  local _if _dev _v _p
+  for _if in /sys/bus/usb/devices/*:*; do
+    [[ -r "$_if/bInterfaceClass" ]] || continue
+    [[ "$(cat "$_if/bInterfaceClass" 2>/dev/null)" == "08" ]] || continue
+    _dev="${_if%%:*}"
+    [[ -r "$_dev/idVendor" && -r "$_dev/idProduct" ]] || continue
+    _v="$(cat "$_dev/idVendor")"; _p="$(cat "$_dev/idProduct")"
+    [[ "$WIFI_VENDORS" == *" $_v "* ]] && echo "$_v:$_p"
+  done | sort -u
+}
+
+echo ""
+echo "=== CD-ROM / mass-storage mode check ==="
+STUCK="$(stuck_dongles)"
+if [[ -z "$STUCK" ]]; then
+  echo "  none — no Wi-Fi dongle is sitting in mass-storage mode"
+else
+  for _id in $STUCK; do
+    _v="${_id%%:*}"; _p="${_id##*:}"
+    warn "Wi-Fi dongle $_v:$_p is in mass-storage (CD-ROM) mode — flipping"
+    # -K (StandardEject) covers most; -J is the Huawei-style fallback. Quiet, and
+    # a failure here is not fatal: report it and keep going.
+    if usb_modeswitch -v "$_v" -p "$_p" -K -Q >>"$LOG" 2>&1 \
+       || usb_modeswitch -v "$_v" -p "$_p" -J -Q >>"$LOG" 2>&1; then
+      ok "flipped $_v:$_p — it re-enumerates with a different PID"
+      echo "modeswitch-$_v:$_p:FLIPPED" >>"$DRIVER_STATE"
+    else
+      warn "could not flip $_v:$_p — try manually: usb_modeswitch -v $_v -p $_p -K"
+      echo "modeswitch-$_v:$_p:FAILED" >>"$DRIVER_STATE"
+    fi
+    # Persist it. Without a udev rule the device returns to mass-storage mode on
+    # the next boot or re-plug and the interface silently disappears again.
+    cat >"/etc/udev/rules.d/40-wifi-modeswitch-$_v-$_p.rules" <<UDEVEOF
+# Managed by install_wifi_drivers.sh — do not edit manually
+ACTION=="add", SUBSYSTEM=="usb", ATTR{idVendor}=="$_v", ATTR{idProduct}=="$_p", RUN+="/usr/sbin/usb_modeswitch -v $_v -p $_p -K -Q"
+UDEVEOF
+    chmod 644 "/etc/udev/rules.d/40-wifi-modeswitch-$_v-$_p.rules"
+  done
+  udevadm control --reload-rules >>"$LOG" 2>&1 || true
+  echo ""
+  echo "  Flipped devices re-enumerate under a NEW product ID. Re-check with:"
+  echo "    lsusb; ip -br a | grep -i wl"
+  echo "  If a flipped dongle still has no interface, its driver is the issue,"
+  echo "  not the mode switch."
+fi
+
+echo ""
 echo "State: $DRIVER_STATE   Log: $LOG"
 echo "Driver matrix: cs/clients/linux/WIFI-DRIVERS.md (repo)"
-echo "In lsusb but no wl* and no dmesg error => CD-ROM mode:"
-echo "  usb_modeswitch -v <vid> -p <pid> -J"
