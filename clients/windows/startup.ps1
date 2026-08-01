@@ -18,6 +18,14 @@ Start-Job -ScriptBlock {
 . 'C:\Scripts\ini-parser.ps1'
 . 'C:\Scripts\common.ps1'
 
+# Safety net: drop the DNS self-throttle at every boot (mirrors startup.sh).
+# Reset-DnsCeilingOnBoot already handles this, so on a healthy client this is a
+# no-op. It is here because the failure it guards is SILENT: the throttle only
+# ratchets down in practice, the floor is 0, and a client stuck at 0 generates NO
+# DNS traffic while still looking healthy. Windows does not clear TEMP at boot,
+# so an unconditional reset here costs nothing and removes the whole class.
+Reset-DnsCeiling
+
 # Sleep / monitor-off / hibernate + SCREEN SAVER all disabled (shared helper in
 # common.ps1, sourced just above). Runs in the sim user's context at logon, so
 # the per-user screen-saver registry (HKCU) is the sim user's — the reliable spot.

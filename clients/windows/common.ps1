@@ -340,8 +340,12 @@ function Invoke-DnsCeilingUpprobe {
     Set-DnsCeiling $next
     return $next
 }
+# Drop the self-throttle entirely — back to the CONFIGURED rate. Clears the
+# legacy C:\Scripts path too, so calling this on a client that has not yet had
+# that copy removed still fully resets it (mirrors dns_ceiling_reset).
 function Reset-DnsCeiling {
-    try { Remove-Item -LiteralPath $script:DNS_CEILING_FILE -ErrorAction SilentlyContinue } catch {}
+    try { Remove-Item -LiteralPath $script:DNS_CEILING_FILE -Force -ErrorAction SilentlyContinue } catch {}
+    try { Remove-Item -LiteralPath $script:DNS_CEILING_FILE_LEGACY -Force -ErrorAction SilentlyContinue } catch {}
 }
 
 # ── DNS-latency server selection (self-healing) ──────────────────────────────

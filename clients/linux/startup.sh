@@ -60,6 +60,19 @@ source '/usr/local/scripts/ini-parser.sh'
 # Shared helpers (derive_username/derive_bucket/adapter detection) — canonical
 # source clients/lib/common.sh.
 source '/usr/local/scripts/common.sh'
+
+#------------------------------------------------------------
+# Safety net: drop the DNS self-throttle at every boot.
+#
+# The ceiling already lives on tmpfs and should be gone by now, so on a healthy
+# client this is a no-op. It exists because the failure it guards against is
+# SILENT and open-ended: the throttle only ratchets down in practice (x0.8 on
+# every bail, up-probe on ~1 in 5 clean bursts), the floor is 0, and a client
+# stuck at 0 generates NO DNS traffic while still looking healthy. If the file
+# ever survives a boot again -- a different tmpfs layout, a restored image, a
+# path change -- the fleet quietly stops producing alerts and nothing says why.
+# One rm at boot removes that whole class of failure.
+dns_ceiling_reset
 #------------------------------------------------------------
 # Print a full table of every deployed script's version + the CI-maintained
 # deploy VERSION, so the boot terminal shows FOR SURE what code is on this box.

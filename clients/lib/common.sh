@@ -319,7 +319,12 @@ dns_ceiling_upprobe() {
 }
 
 # Clear the persisted self-throttle (fully recovered → back to the configured target).
-dns_ceiling_reset() { rm -f "$_DNS_CEILING_FILE" 2>/dev/null || true; }
+# Drop the self-throttle entirely — back to the CONFIGURED rate. Clears the
+# legacy on-disk path as well, so calling this on a client that has not yet had
+# its /usr/local/scripts copy removed still fully resets it.
+dns_ceiling_reset() {
+  rm -f "$_DNS_CEILING_FILE" "$_DNS_CEILING_FILE_LEGACY" 2>/dev/null || true
+}
 
 # ── DNS-latency server selection (self-healing) ──────────────────────────────
 # The dns_latency sim needs a server whose lookups take >= the latency threshold
