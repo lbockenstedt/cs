@@ -320,6 +320,25 @@ if [[ "$DHCP_SKIP" != "1" ]]; then
         # which makes it look like the sim config is at fault when it is valid.
         # 'k' = lock permission, required for the interprocess logger_lockfile
         # (denied separately from the PID file).
+        # Resolve apparmor_parser by ABSOLUTE PATH.
+        #
+        # It lives in /sbin (or /usr/sbin), which is NOT on a non-login root
+        # shell's PATH — `su` without `-` keeps the invoking user's PATH. Both
+        # AppArmor blocks below were guarded by `command -v apparmor_parser`, so
+        # in that environment the installer SILENTLY SKIPPED the grant, the
+        # reload and the complain fallback, and still reported a successful
+        # install. A guard that turns "the tool is not on PATH" into "this
+        # feature was not needed" is how a fleet ends up installed and handing
+        # out no addresses.
+        AA_PARSER=""
+        for _c in /sbin/apparmor_parser /usr/sbin/apparmor_parser \
+                  /usr/bin/apparmor_parser "$(command -v apparmor_parser 2>/dev/null)"; do
+            [ -n "$_c" ] && [ -x "$_c" ] && { AA_PARSER="$_c"; break; }
+        done
+        if [ -z "$AA_PARSER" ] && [ -f /etc/apparmor.d/usr.sbin.kea-dhcp4 ]; then
+            warn "AppArmor profiles are present but apparmor_parser was NOT FOUND (checked /sbin, /usr/sbin, /usr/bin and PATH). The sim Kea grant cannot be applied or reloaded — kea-dhcp4-sim will be denied its lease DB and serve no addresses. Install the 'apparmor' package or re-run with /sbin on PATH."
+        fi
+
         # Make complain mode SURVIVE A REBOOT, by writing the flag into the
         # POLICY TEXT rather than relying on the loader.
         #
@@ -383,7 +402,7 @@ PYFLAG
             # the running mode matches what the next boot will produce.
             for _cp in usr.sbin.kea-dhcp4 usr.sbin.kea-ctrl-agent usr.sbin.kea-lfc; do
                 [ -f "/etc/apparmor.d/$_cp" ] || continue
-                apparmor_parser -r "/etc/apparmor.d/$_cp" 2>/dev/null || true
+                [ -n "$AA_PARSER" ] && "$AA_PARSER" -r "/etc/apparmor.d/$_cp" 2>/dev/null || true
             done
             systemctl restart kea-dhcp4-sim kea-ctrl-agent-sim >/dev/null 2>&1 || true
         }
@@ -467,8 +486,8 @@ AARULES
                      /sys/kernel/security/apparmor/profiles 2>/dev/null | head -1)"
             _aa_flag=""
             [ "$_mode" = "complain" ] && _aa_flag="-C"
-            if command -v apparmor_parser >/dev/null 2>&1; then
-                _aa_err="$(apparmor_parser $_aa_flag -r "/etc/apparmor.d/$_p" 2>&1 >/dev/null)" && {
+            if [ -n "$AA_PARSER" ]; then
+                _aa_err="$("$AA_PARSER" $_aa_flag -r "/etc/apparmor.d/$_p" 2>&1 >/dev/null)" && {
                     ok "AppArmor: ${_p} reloaded${_mode:+ (kept in $_mode mode)}"
                     _aa_reloaded=1
                 } || warn "AppArmor: ${_p} FAILED to reload${_aa_err:+ — $_aa_err}. Kea will keep being denied; fix and run: apparmor_parser -r /etc/apparmor.d/${_p}"
@@ -749,7 +768,7 @@ EOF
             if systemctl is-active --quiet kea-dhcp4-sim; then _kea_ok=1; break; fi
             sleep 1
         done
-        if [ -z "$_kea_ok" ] && command -v apparmor_parser >/dev/null 2>&1 \
+        if [ -z "$_kea_ok" ] && [ -n "$AA_PARSER" ] \
            && [ -f /etc/apparmor.d/usr.sbin.kea-dhcp4 ]; then
             warn "kea-dhcp4-sim did not start with the AppArmor grant applied — falling back to complain mode for the kea profiles (permits + logs; the packaged profile likely carries a deny that a local include cannot override)."
             # PERSIST the complain mode. `apparmor_parser -C -r` changes only the
