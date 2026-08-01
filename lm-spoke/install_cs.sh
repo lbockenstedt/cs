@@ -795,14 +795,28 @@ EOF
         # Reboot-survival check, independent of how we got here: if any kea
         # profile is complain ONLY at runtime, say so loudly — that box is one
         # reboot away from losing DHCP.
+        # Detect from SECURITYFS, not aa-status: apparmor-utils is NOT installed
+        # on these spokes, so `aa-status` is command-not-found and this audit
+        # silently found nothing — the exact failure it exists to prevent. The
+        # profile-reload code above already reads securityfs for the same reason.
+        #
+        # A profile that is complain at RUNTIME but has no complain flag in its
+        # FILE is the dangerous state: it works now and dies at the next boot.
+        # That is precisely how this fleet was left — the installer ran on boxes
+        # already in runtime-complain, kea started, so the fallback below never
+        # fired and nothing was persisted.
         _aa_transient=""
         for _cp in usr.sbin.kea-dhcp4 usr.sbin.kea-ctrl-agent usr.sbin.kea-lfc; do
             [ -f "/etc/apparmor.d/$_cp" ] || continue
-            _m="$(sed -n "s/^[[:space:]]*profile[[:space:]].*flags=(\(.*\)).*/\1/p" \
-                    "/etc/apparmor.d/$_cp" 2>/dev/null | head -1)"
-            if aa-status 2>/dev/null | grep -q "^ *${_cp##usr.sbin.} (complain)" \
-               || echo "$_m" | grep -q complain; then
-                [ -L "/etc/apparmor.d/force-complain/$_cp" ] || _aa_transient="${_aa_transient} $_cp"
+            _prof2="${_cp#usr.sbin.}"
+            _rt="$(sed -n "s/^${_prof2} (\([a-z]*\)).*/\1/p" \
+                   /sys/kernel/security/apparmor/profiles 2>/dev/null | head -1)"
+            # complain flag present in the policy TEXT = survives a reboot
+            _persisted=""
+            if grep -m1 -E "^[^#].*\{[[:space:]]*$" "/etc/apparmor.d/$_cp" 2>/dev/null \
+               | grep -q complain; then _persisted=1; fi
+            if [ "$_rt" = "complain" ] && [ -z "$_persisted" ]; then
+                _aa_transient="${_aa_transient} $_cp"
             fi
         done
         if [ -n "$_aa_transient" ]; then
