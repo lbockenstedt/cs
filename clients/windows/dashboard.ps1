@@ -39,10 +39,35 @@ function Get-ConnectedSsid {
     return $null
 }
 
+function Get-WifiConnected {
+    # Association state straight from the adapter. Returns $true / $false, or
+    # $null when the State line is absent (non-English Windows, no wlan adapter)
+    # so the caller can fall back rather than guess.
+    $output = netsh wlan show interfaces 2>$null
+    foreach ($line in $output) {
+        if ($line -match '^\s*State\s*:\s*(.+)$') {
+            return ($matches[1].Trim() -ieq 'connected')
+        }
+    }
+    return $null
+}
+
 function Get-WifiStatus {
+    # Ask the adapter whether it is ASSOCIATED; use the SSID only as a label.
+    # Treating "no SSID" as "disconnected" reports DISCONNECTED on a hidden
+    # network while the client is associated and the gateway is answering --
+    # the same contradiction fixed on the Linux dashboard, where an empty scan
+    # cache caused it too.
+    $connected = Get-WifiConnected
     $ssid = Get-ConnectedSsid
-    if ($ssid) {
-        return "CONNECTED ($ssid)"
+    if ($connected -eq $true) {
+        if ($ssid) { return "CONNECTED ($ssid)" }
+        return 'CONNECTED (SSID unknown)'
+    }
+    if ($null -eq $connected) {
+        # State unreadable -- fall back to the previous SSID-presence behaviour
+        # rather than reporting a state we did not actually observe.
+        if ($ssid) { return "CONNECTED ($ssid)" }
     }
     return 'DISCONNECTED'
 }

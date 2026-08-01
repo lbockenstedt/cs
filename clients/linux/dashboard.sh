@@ -143,10 +143,35 @@ run_cache_worker() {
     # netlink queries (ip route + iw dev link) — no network I/O — so safe here.
     detect_phy_type
     echo "$phy_type" > "$CACHE_DIR/phy_type"
-    # WiFi SSID
-    nmcli -t -f active,ssid dev wifi 2>/dev/null \
-      | awk -F: '$1=="yes"{print $2}' \
-      > "$CACHE_DIR/wifi_ssid" 2>/dev/null || true
+    # ---- WiFi association state + SSID ---------------------------------------
+    # State comes from the DEVICE, not from the scan list. `nmcli dev wifi` is a
+    # list of APs the radio can SEE, with the joined one flagged active — so
+    # deriving "connected" from it reports DISCONNECTED whenever the scan cache
+    # is empty or mid-refresh, while the client is associated and the gateway is
+    # answering. That is the "wifi disconnected but gateway up" contradiction on
+    # the dashboard. A hidden SSID produced the same false negative: a real
+    # association with an empty ssid field.
+    #
+    # `nmcli dev status` reports the interface's own state and needs no scan.
+    local _wifdev=""
+    _wifdev=$(nmcli -t -f DEVICE,TYPE,STATE dev status 2>/dev/null \
+              | awk -F: '$2=="wifi" && $3=="connected"{print $1; exit}')
+    if [[ -n "$_wifdev" ]]; then
+      echo "connected" > "$CACHE_DIR/wifi_state" 2>/dev/null || true
+      # Label only. Prefer the live association (works for hidden SSIDs and
+      # needs no scan cache), fall back to the scan list.
+      local _ssid=""
+      _ssid=$(iw dev "$_wifdev" link 2>/dev/null | sed -n 's/^[[:space:]]*SSID: //p' | head -1)
+      [[ -z "$_ssid" ]] && _ssid=$(nmcli -t -f active,ssid dev wifi 2>/dev/null \
+                                   | awk -F: '$1=="yes"{print $2}' | head -1)
+      # Left EMPTY when unknown, never a placeholder: this same file feeds the
+      # heartbeat's connected_ssid, and inventing a value there would be a lie
+      # the hub cannot distinguish from a real SSID.
+      echo "$_ssid" > "$CACHE_DIR/wifi_ssid" 2>/dev/null || true
+    else
+      echo "disconnected" > "$CACHE_DIR/wifi_state" 2>/dev/null || true
+      : > "$CACHE_DIR/wifi_ssid" 2>/dev/null || true
+    fi
 
     # Default gateway + reachability
     local gw
@@ -258,10 +283,20 @@ sys.stdout.write(json.dumps(d))' 2>/dev/null)
 }
 
 get_wifi_status() {
-  local ssid
+  local ssid state
   ssid=$(cat "$CACHE_DIR/wifi_ssid" 2>/dev/null)
-  if [[ -n "$ssid" ]]; then
-    echo "${GRN}CONNECTED${RST} ($ssid)"
+  state=$(cat "$CACHE_DIR/wifi_state" 2>/dev/null)
+  # wifi_state is authoritative (device state). Fall back to the old
+  # SSID-presence test only when the file is absent — a cache written by a
+  # dashboard from before this split, where the empty file is all we have.
+  if [[ -z "$state" ]]; then
+    [[ -n "$ssid" ]] && state="connected" || state="disconnected"
+  fi
+  if [[ "$state" == "connected" ]]; then
+    # Associated but the SSID is unknown (hidden network, or the scan cache has
+    # not caught up). Still CONNECTED — the association is the fact that matters.
+    [[ -n "$ssid" ]] && echo "${GRN}CONNECTED${RST} ($ssid)" \
+                     || echo "${GRN}CONNECTED${RST} (SSID unknown)"
   else
     echo "${RED}DISCONNECTED${RST}"
   fi
