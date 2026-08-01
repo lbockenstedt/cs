@@ -94,8 +94,12 @@ done
 #    not found" — install both the exact and the meta package.
 #------------------------------------------------------------
 echo "-- build prerequisites"
+# wireless-regdb + iw are what make 6 GHz usable at all: without a regulatory
+# database the kernel falls back to world-roaming, and every 6E/Wi-Fi 7 channel
+# is silently unavailable. The adapter associates fine on 2.4/5 GHz, so this
+# looks like a hardware limitation rather than a missing package.
 for p in dkms build-essential bc "linux-headers-$(uname -r)" linux-headers-amd64 \
-         git iw wireless-tools rfkill usbutils libelf-dev
+         git iw wireless-tools wireless-regdb rfkill usbutils libelf-dev
 do
     _try "$p" env DEBIAN_FRONTEND=noninteractive apt-get install -y -q "$p"
 done
@@ -164,6 +168,11 @@ if [[ $OUT_OF_TREE -eq 1 ]]; then
     _dkms_git 8188eu   20210902 https://github.com/morrownr/8188eu-20210902.git
     # RTL8814AU — not in the current fleet, harmless if unused
     _dkms_git 8814au   20210629 https://github.com/morrownr/8814au-20210629.git
+    # RTL8852AU/8832AU — Wi-Fi 6 over USB. No mainline USB driver exists for
+    # these, so this is the only way to get Wi-Fi 6 on a Realtek dongle.
+    # (MT7921AU is the other Wi-Fi 6 USB option and needs NOTHING — mt7921u has
+    # been mainline since 5.16.)
+    _dkms_git rtl8852au 1.15.0.1 https://github.com/morrownr/rtl8852au.git
     # RTL8192EU  0bda:818b — rtl8xxxu claims it but is unstable on many units
     _dkms_git rtl8192eu 1.0      https://github.com/Mange/rtl8192eu-linux-driver.git
 
