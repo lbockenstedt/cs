@@ -39,6 +39,30 @@ jobs:
           token: ${{ secrets.GITHUB_TOKEN }}
           fetch-depth: 1
 
+      - name: Enforce n.nn VERSION format
+        run: |
+          # RULE: every tracked VERSION file is MAJOR.MM — one or more digits, a
+          # dot, exactly TWO digits (0.01, 0.98, 1.02). Nothing else.
+          #
+          # Enforced because a non-conforming value does not fail loudly, it
+          # DRIFTS: the bump step below only recognises n.nn and the legacy .NN
+          # counter, so a value like 1.232 or 1.0.0 is silently skipped and that
+          # component's version freezes while the rest of the repo advances. The
+          # client scripts sat at 1.232 exactly this way.
+          #
+          # Fails the run rather than warning: a warning in a green run is how
+          # the 0.97 freeze went unnoticed for days.
+          bad=0
+          while IFS= read -r f; do
+            v="$(tr -d '[:space:]' < "$f")"
+            if ! printf '%s' "$v" | grep -qE '^[0-9]+\.[0-9]{2}$'; then
+              echo "::error file=$f::VERSION '$v' is not n.nn (MAJOR.MM, exactly two minor digits)"
+              bad=1
+            fi
+          done < <(git ls-files | grep -E '(^|/)VERSION$')
+          [ "$bad" -eq 0 ] || exit 1
+          echo "all tracked VERSION files are n.nn"
+
       - name: Bump every tracked VERSION file
         run: |
           set -e
