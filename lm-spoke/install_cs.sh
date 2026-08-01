@@ -320,6 +320,74 @@ if [[ "$DHCP_SKIP" != "1" ]]; then
         # which makes it look like the sim config is at fault when it is valid.
         # 'k' = lock permission, required for the interprocess logger_lockfile
         # (denied separately from the PID file).
+        # Make complain mode SURVIVE A REBOOT, by writing the flag into the
+        # POLICY TEXT rather than relying on the loader.
+        #
+        # Two weaker approaches already failed on this fleet:
+        #   1. `apparmor_parser -C -r` alone — RUNTIME only. At boot AppArmor
+        #      reloads from /etc/apparmor.d/ in ENFORCE, the packaged profile's
+        #      explicit deny applies again (an explicit deny beats any later
+        #      allow and cannot be overridden from local/), and every spoke lost
+        #      DHCP simultaneously at the first reboot.
+        #   2. an /etc/apparmor.d/force-complain/<profile> symlink — whether that
+        #      directory is honoured depends on the AppArmor version and on
+        #      whether the systemd unit or the SysV functions load policy. It was
+        #      NOT honoured here: the fleet died again on the next reboot.
+        #
+        # `flags=(complain)` in the profile header is part of the policy itself,
+        # so any loader, at any boot, brings the profile up in complain. This is
+        # exactly what `aa-complain` does; apparmor-utils is not installed on
+        # these spokes, so we edit the header directly. A .lm-bak copy is kept so
+        # the change is reversible, and the symlink is still created as
+        # belt-and-braces where the loader does honour it.
+        #
+        # NOTE: these are dpkg conffiles, so a kea package upgrade may prompt
+        # about the local modification. Keeping the local version preserves DHCP.
+        _kea_force_complain() {
+            mkdir -p /etc/apparmor.d/force-complain
+            for _cp in usr.sbin.kea-dhcp4 usr.sbin.kea-ctrl-agent usr.sbin.kea-lfc; do
+                _cf="/etc/apparmor.d/$_cp"
+                [ -f "$_cf" ] || continue
+                ln -sf "$_cf" "/etc/apparmor.d/force-complain/$_cp" 2>/dev/null || true
+                [ -f "${_cf}.lm-bak" ] || cp -a "$_cf" "${_cf}.lm-bak" 2>/dev/null || true
+                python3 - "$_cf" <<'PYFLAG' || warn "AppArmor: could not set complain flag in $_cf"
+import re, sys
+p = sys.argv[1]
+s = open(p).read()
+# The profile header is the first non-comment line ending in '{'. Forms seen:
+#   /usr/sbin/kea-dhcp4 {
+#   /usr/sbin/kea-dhcp4 flags=(attach_disconnected) {
+#   profile kea-dhcp4 /usr/sbin/kea-dhcp4 flags=(...) {
+out, done = [], False
+for line in s.splitlines(True):
+    if not done:
+        t = line.strip()
+        if t and not t.startswith(('#', 'include', 'abi')) and t.endswith('{'):
+            if 'complain' in line:
+                done = True                      # already complain — leave it alone
+            elif 'flags=(' in line:
+                line = re.sub(r'flags=\(([^)]*)\)',
+                              lambda m: 'flags=(%s,complain)' % m.group(1).strip(),
+                              line, count=1)
+                done = True
+            else:
+                line = line.rstrip()[:-1].rstrip() + ' flags=(complain) {\n'
+                done = True
+    out.append(line)
+if done:
+    open(p, 'w').write(''.join(out))
+sys.exit(0 if done else 1)
+PYFLAG
+            done
+            # Reload PLAINLY now: the flag lives in the file, so no -C needed and
+            # the running mode matches what the next boot will produce.
+            for _cp in usr.sbin.kea-dhcp4 usr.sbin.kea-ctrl-agent usr.sbin.kea-lfc; do
+                [ -f "/etc/apparmor.d/$_cp" ] || continue
+                apparmor_parser -r "/etc/apparmor.d/$_cp" 2>/dev/null || true
+            done
+            systemctl restart kea-dhcp4-sim kea-ctrl-agent-sim >/dev/null 2>&1 || true
+        }
+
         _aa_reloaded=0
         # kea-lfc too: the Lease File Cleanup helper runs hourly against the
         # SAME renamed lease DB, so it hits the identical denial --
@@ -699,17 +767,7 @@ EOF
             # make it stick: the AppArmor init unit honours these symlinks when
             # it loads policy at boot. Remove the symlink + `apparmor_parser -r`
             # to go back to enforce once the profile is fixed properly.
-            mkdir -p /etc/apparmor.d/force-complain
-            for _cp in usr.sbin.kea-dhcp4 usr.sbin.kea-ctrl-agent usr.sbin.kea-lfc; do
-                [ -f "/etc/apparmor.d/$_cp" ] || continue
-                ln -sf "/etc/apparmor.d/$_cp" "/etc/apparmor.d/force-complain/$_cp" 2>/dev/null || true
-            done
-            apparmor_parser -C -r /etc/apparmor.d/usr.sbin.kea-dhcp4 2>/dev/null || true
-            [ -f /etc/apparmor.d/usr.sbin.kea-ctrl-agent ] && \
-                apparmor_parser -C -r /etc/apparmor.d/usr.sbin.kea-ctrl-agent 2>/dev/null || true
-            [ -f /etc/apparmor.d/usr.sbin.kea-lfc ] && \
-                apparmor_parser -C -r /etc/apparmor.d/usr.sbin.kea-lfc 2>/dev/null || true
-            systemctl restart kea-dhcp4-sim kea-ctrl-agent-sim >/dev/null 2>&1 || true
+            _kea_force_complain
             for _i in $(seq 1 12); do
                 if systemctl is-active --quiet kea-dhcp4-sim; then _kea_ok=1; break; fi
                 sleep 1
@@ -729,10 +787,7 @@ EOF
             fi
         done
         if [ -n "$_aa_transient" ]; then
-            mkdir -p /etc/apparmor.d/force-complain
-            for _cp in $_aa_transient; do
-                ln -sf "/etc/apparmor.d/$_cp" "/etc/apparmor.d/force-complain/$_cp" 2>/dev/null || true
-            done
+            _kea_force_complain
             warn "AppArmor: made complain mode PERSISTENT for:${_aa_transient} (was runtime-only — it would have reverted to enforce at the next reboot and taken sim DHCP down)."
         fi
         if [ -n "$_kea_ok" ]; then
