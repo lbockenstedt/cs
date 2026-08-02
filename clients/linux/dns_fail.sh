@@ -25,8 +25,14 @@ process_ini_file '/usr/local/scripts/simulation.conf'
 # RANDOMIZE the record order each burst so every client/burst queries a different
 # random subset of the (10k) bogus names instead of marching the same first-N in
 # file order — makes the failure traffic look like real, scattered typo lookups.
-dnsfile=$(shuf /usr/local/scripts/dns_fail.txt 2>/dev/null)
-[[ -n "$dnsfile" ]] || dnsfile=$(< /usr/local/scripts/dns_fail.txt)   # fallback if shuf absent
+# Names come from a CURSOR that walks the shuffled list end-to-end (see
+# dns_names_take in common.sh). Re-shuffling per burst re-drew overlapping names
+# while the resolver still had them cached as NXDOMAIN, so the repeat answered
+# instantly from cache -- a query with no recursion and no failure latency.
+# Refreshed once per outer pass below, not once per burst.
+_names_slice=500
+dnsfile=$(dns_names_take "$_names_slice")
+[[ -n "$dnsfile" ]] || dnsfile=$(< /usr/local/scripts/dns_fail.txt)
 # dns_fail queries UNREACHABLE / bogus servers only (dns_bad_record_* +
 # dns_bad_ip_*) so the lookups FAIL. The slow-responder set (dns_latency_*) is a
 # DIFFERENT condition (high DNS latency, not failure) and now lives in its own
@@ -166,6 +172,10 @@ _pauses=0
 # cannot make one burst run forever.
 _stop_at_max=$(( stop_at + burst_seconds ))
 while (( SECONDS < stop_at )); do
+  # Fresh names every pass so a long burst never re-queries a name it has
+  # already put into the resolver's negative cache.
+  dnsfile=$(dns_names_take "$_names_slice")
+  [[ -n "$dnsfile" ]] || dnsfile=$(< /usr/local/scripts/dns_fail.txt)
   for record in $dnsfile; do
     for server in "${bad_records[@]}" "${bad_ips[@]}"; do
 

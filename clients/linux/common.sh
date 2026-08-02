@@ -181,6 +181,120 @@ json_escape() {
   printf '%s' "$value"
 }
 
+# ── query-name rotation (negative-cache aware) ──────────────────────────────
+# Every burst used to run `shuf` over the whole name file and consume only the
+# first few hundred entries. Successive bursts therefore re-drew at random and
+# overlapped heavily -- and a resolver CACHES NXDOMAIN (negative TTL, commonly
+# 300-3600s), so a repeated name answers instantly from cache with no recursion
+# and produces NO latency. Roughly the same failure as a typo'd TLD: the query
+# fires, something comes back fast, and the sim looks busy while generating no
+# signal.
+#
+# A persisted cursor walks the shuffled list end-to-end before any name repeats.
+# With 10k names and a few hundred consumed per burst, a given name is not seen
+# again for many bursts -- far beyond any negative TTL. The order is reshuffled
+# only when the list is exhausted, so the walk stays a walk rather than a
+# re-draw. State lives on tmpfs: losing it at boot just means a fresh shuffle.
+_DNS_NAMES_SRC="/usr/local/scripts/dns_fail.txt"
+_DNS_NAMES_ORDER=""
+_DNS_NAMES_CURSOR=""
+
+# Write a shuffled copy ATOMICALLY. `shuf src > order` truncates the target
+# BEFORE shuf runs, so on a client without coreutils' shuf the order file was
+# left EMPTY -- and an empty order file makes dns_names_take fall back to
+# `head -n`, returning the SAME names forever. That is silent and permanent, and
+# it recreates the exact negative-cache problem the cursor exists to avoid.
+_dns_names_shuffle() {
+  local tmp="${_DNS_NAMES_ORDER}.tmp.$$"
+  if shuf "$_DNS_NAMES_SRC" > "$tmp" 2>/dev/null && [[ -s "$tmp" ]]; then
+    mv -f "$tmp" "$_DNS_NAMES_ORDER" 2>/dev/null && return 0
+  fi
+  # No shuf (or it failed): an UNSHUFFLED walk still visits every name exactly
+  # once per pass, which is what the negative cache actually cares about.
+  if cp "$_DNS_NAMES_SRC" "$tmp" 2>/dev/null && [[ -s "$tmp" ]]; then
+    mv -f "$tmp" "$_DNS_NAMES_ORDER" 2>/dev/null && return 0
+  fi
+  rm -f "$tmp" 2>/dev/null
+  return 1
+}
+
+_dns_names_init() {
+  [[ -n "$_DNS_NAMES_ORDER" ]] && return 0
+  local d
+  for d in /dev/shm /tmp; do
+    [[ -d "$d" && -w "$d" ]] || continue
+    _DNS_NAMES_ORDER="$d/dns_names_order"
+    _DNS_NAMES_CURSOR="$d/dns_names_cursor"
+    break
+  done
+  [[ -n "$_DNS_NAMES_ORDER" ]] || return 1
+  if [[ ! -s "$_DNS_NAMES_ORDER" ]]; then
+    _dns_names_shuffle || return 1
+    printf '0' > "$_DNS_NAMES_CURSOR" 2>/dev/null
+    chmod 0666 "$_DNS_NAMES_ORDER" "$_DNS_NAMES_CURSOR" 2>/dev/null || true
+  fi
+  [[ -s "$_DNS_NAMES_CURSOR" ]] || printf '0' > "$_DNS_NAMES_CURSOR" 2>/dev/null
+  return 0
+}
+
+# Echo the next $1 names and advance the cursor. Reshuffles and wraps at the end
+# of the list. Falls back to a plain shuf slice if state is unavailable, so a
+# read-only /tmp degrades to the old behaviour instead of firing nothing.
+dns_names_take() {
+  local n="${1:-500}" cur total
+  if ! _dns_names_init; then
+    shuf -n "$n" "$_DNS_NAMES_SRC" 2>/dev/null || head -n "$n" "$_DNS_NAMES_SRC"
+    return
+  fi
+  # NB: `$(< f)` is bash's fast-read form and CANNOT be piped -- `$(< f | tr)`
+  # leaves the redirect with no command to feed and yields an EMPTY string, so
+  # the cursor read silently returned 0 every time and the walk restarted from
+  # the top on every call. Strip with parameter expansion instead of a pipe.
+  # `$(< f)` is bash's fast-read and is defeated by ANY extra redirection:
+  # both `$(< f | tr)` and `$(< f 2>/dev/null)` yield an EMPTY string, because
+  # what is left is a redirect with no command to run. That made every cursor
+  # read return 0, so the walk restarted from the top on each call and the
+  # rotation silently did nothing. Guard with -r and read bare.
+  cur=""
+  [[ -r "$_DNS_NAMES_CURSOR" ]] && cur=$(< "$_DNS_NAMES_CURSOR")
+  cur="${cur//[^0-9]/}"
+  [[ "$cur" =~ ^[0-9]+$ ]] || cur=0
+  # BSD `wc -l < f` pads with leading spaces ("    1000") while GNU does not.
+  # Unstripped, the numeric test below fails, total reads 0, and the function
+  # silently falls back to `head -n` and NEVER advances the cursor -- the whole
+  # rotation quietly stops working.
+  total=$(wc -l < "$_DNS_NAMES_ORDER" 2>/dev/null | tr -d '[:space:]')
+  [[ "$total" =~ ^[0-9]+$ ]] || total=0
+  (( total == 0 )) && { head -n "$n" "$_DNS_NAMES_SRC"; return; }
+  if (( cur >= total )); then          # full pass done -> reshuffle, start over
+    _dns_names_shuffle || true
+    cur=0
+  fi
+  sed -n "$(( cur + 1 )),$(( cur + n ))p" "$_DNS_NAMES_ORDER" 2>/dev/null
+  printf '%s' "$(( cur + n ))" > "$_DNS_NAMES_CURSOR" 2>/dev/null
+}
+
+# How far through the list are we (for logging)?
+dns_names_progress() {
+  _dns_names_init || { printf 'n/a'; return; }
+  local cur total
+  # NB: `$(< f)` is bash's fast-read form and CANNOT be piped -- `$(< f | tr)`
+  # leaves the redirect with no command to feed and yields an EMPTY string, so
+  # the cursor read silently returned 0 every time and the walk restarted from
+  # the top on every call. Strip with parameter expansion instead of a pipe.
+  # `$(< f)` is bash's fast-read and is defeated by ANY extra redirection:
+  # both `$(< f | tr)` and `$(< f 2>/dev/null)` yield an EMPTY string, because
+  # what is left is a redirect with no command to run. That made every cursor
+  # read return 0, so the walk restarted from the top on each call and the
+  # rotation silently did nothing. Guard with -r and read bare.
+  cur=""
+  [[ -r "$_DNS_NAMES_CURSOR" ]] && cur=$(< "$_DNS_NAMES_CURSOR")
+  cur="${cur//[^0-9]/}"
+  [[ "$cur" =~ ^[0-9]+$ ]] || cur=0
+  total=$(wc -l < "$_DNS_NAMES_ORDER" 2>/dev/null | tr -d '[:space:]'); [[ "$total" =~ ^[0-9]+$ ]] || total=0
+  printf '%s/%s' "$cur" "$total"
+}
+
 # ── DNS flood self-throttle (gateway circuit-breaker) ───────────────────────
 # dns_fail / dns_latency flood background digs to trip Central's rate-based
 # alarm. Pushed too hard on a small VM the box saturates until its OWN default

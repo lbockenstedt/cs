@@ -25,8 +25,11 @@ source '/usr/local/scripts/common.sh'
 process_ini_file '/usr/local/scripts/simulation.conf'
 # RANDOMIZE the record order each burst (see dns_fail.sh) so the query stream
 # varies per client/burst instead of the same file-order first-N.
-dnsfile=$(shuf /usr/local/scripts/dns_fail.txt 2>/dev/null)
-[[ -n "$dnsfile" ]] || dnsfile=$(< /usr/local/scripts/dns_fail.txt)   # fallback if shuf absent
+# Cursor-walked names (see dns_names_take): a repeat inside the resolver's
+# negative-cache TTL answers instantly and generates no latency at all.
+_names_slice=500
+dnsfile=$(dns_names_take "$_names_slice")
+[[ -n "$dnsfile" ]] || dnsfile=$(< /usr/local/scripts/dns_fail.txt)
 # The dns_latency server POOL (any number). Prefer the [address] `dns_latency`
 # list (space-separated, UNLIMITED — real DNS servers blacklist a flooding client
 # over time, so we keep a big pool and rotate to a still-slow one); fall back to
@@ -146,6 +149,8 @@ _bailed=0
 _pauses=0
 _stop_at_max=$(( stop_at + burst_seconds ))
 while (( SECONDS < stop_at )); do
+  dnsfile=$(dns_names_take "$_names_slice")
+  [[ -n "$dnsfile" ]] || dnsfile=$(< /usr/local/scripts/dns_fail.txt)
   for record in $dnsfile; do
 
     # Stop the moment the burst window closes.
