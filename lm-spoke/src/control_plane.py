@@ -459,6 +459,11 @@ class CSControlPlane(AgentHostingControlPlane):
                 parts.append(("gate", dg.get("reason"), dg.get("threshold_exceeded")))
                 parts.append(("qt", tuple(sorted(str((q or {}).get("bus_path"))
                                                  for q in (hpx.get("quarantine") or [])))))
+                # Bus exclusions ride the signature too — they cull dongles the
+                # same way quarantine does, so a change here moves the WebUI's
+                # available-dongle count and must mark the frame dirty.
+                parts.append(("excl", tuple(sorted(str((x or {}).get("bus_path"))
+                                                   for x in (hpx.get("excluded") or [])))))
                 pv = hpx.get("provision") or {}
                 parts.append(("provn", pv.get("reason"), pv.get("halt"),
                               pv.get("loop_running"), pv.get("auto_provision_on")))

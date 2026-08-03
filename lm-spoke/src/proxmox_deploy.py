@@ -94,6 +94,9 @@ class ProxmoxDeploy:
         # Quarantined dongles (dmesg kernel USB errors — bus-id + reason + when
         # + seconds until the 1h auto-recovery) for the WebUI QT badge.
         "quarantine",
+        # Excluded buses (destroy-fail / anti-churn) — culled like quarantine, so
+        # the WebUI dongle-availability breakdown must subtract them.
+        "excluded",
         # Delete-gate decision trace + the 1h averages the gate acts on, so the
         # WebUI can show WHAT auto-prov decides on and WHY it did/didn't shed.
         "delete_gate", "gate_averages",
@@ -255,6 +258,10 @@ class ProxmoxDeploy:
             # reason + recovers_in_s. Tagged with the source host like the other
             # USB lists so the hub-side per-host projection keeps them attributed.
             "quarantine":       [_tag_usb(q, hostname) for q in body.get("quarantine", [])],
+            # Excluded buses (destroy-fail / anti-churn), host-tagged like the
+            # other USB lists. The provision loop culls these alongside
+            # quarantine, so the WebUI availability count subtracts both.
+            "excluded":         [_tag_usb(x, hostname) for x in body.get("excluded", [])],
             # Auto-provision diagnostic from the pxmx agent (cs_enabled,
             # loop_running heartbeat, auto_provision_on, reason, halt, config
             # snapshot). Projected into the per-host ``proxmox`` block via
