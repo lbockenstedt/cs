@@ -474,6 +474,13 @@ class CSControlPlane(AgentHostingControlPlane):
                                            for m in (_ud.get("missing") or []))),
                               len(_ud.get("causes") or []),
                               bool((_ud.get("uhubctl") or {}).get("supported"))))
+                # Guest-agent watchdog: signature on the ACTIONS only, not ran_at
+                # (which changes every sweep and would pin the frame dirty).
+                _gw = hpx.get("guest_watchdog") or {}
+                parts.append(("guestwd",
+                              tuple(_gw.get("reset") or []),
+                              tuple(_gw.get("power_cycled") or []),
+                              tuple(_gw.get("started") or [])))
                 pv = hpx.get("provision") or {}
                 parts.append(("provn", pv.get("reason"), pv.get("halt"),
                               pv.get("loop_running"), pv.get("auto_provision_on")))

@@ -99,6 +99,9 @@ class ProxmoxDeploy:
         "excluded",
         # Missing-dongle diagnostics + probable cause (Setup → Diagnostics).
         "usb_diagnostics",
+        # Guest-agent watchdog sweep outcome — makes an automatic VM reset /
+        # power cycle attributable rather than an unexplained restart.
+        "guest_watchdog",
         # Delete-gate decision trace + the 1h averages the gate acts on, so the
         # WebUI can show WHAT auto-prov decides on and WHY it did/didn't shed.
         "delete_gate", "gate_averages",
@@ -268,6 +271,9 @@ class ProxmoxDeploy:
             # evidence, autosuspend, controllers, uhubctl PPPS support) for
             # Setup → Diagnostics. A dict, not a list — relayed as-is.
             "usb_diagnostics":  body.get("usb_diagnostics") or {},
+            # Guest-agent watchdog: last sweep outcome (reset/power_cycled/started
+            # VM lists) so the WebUI can attribute an automatic VM restart.
+            "guest_watchdog":   body.get("guest_watchdog") or {},
             # Auto-provision diagnostic from the pxmx agent (cs_enabled,
             # loop_running heartbeat, auto_provision_on, reason, halt, config
             # snapshot). Projected into the per-host ``proxmox`` block via
