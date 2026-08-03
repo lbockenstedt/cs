@@ -104,7 +104,7 @@ class ProxmoxDeploy:
         "guest_watchdog",
         # Delete-gate decision trace + the 1h averages the gate acts on, so the
         # WebUI can show WHAT auto-prov decides on and WHY it did/didn't shed.
-        "delete_gate", "gate_averages",
+        "delete_gate",
         # Rolling 1h averages (computed from per-host sample rings); the VM
         # Server Details header renders px.cpu_1h_avg / px.mem_1h_avg, falling
         # back to "—" when None. Projected via _SUMMARY_KEYS so they relay to
@@ -288,7 +288,6 @@ class ProxmoxDeploy:
             # eligible candidates, human reason) + the 1h averages the gate acts
             # on — surfaced so the WebUI shows what auto-prov decides on and why.
             "delete_gate":      body.get("delete_gate") or {},
-            "gate_averages":    body.get("gate_averages") or {},
             # Fleet "Reclone All" batch state (status/current_vm/phase/total/
             # completed/failed/started_at/type/log/last_run) from the pxmx agent's
             # reclone-batch tracker. Relayed per-host + top-level (freshest) below
