@@ -464,6 +464,16 @@ class CSControlPlane(AgentHostingControlPlane):
                 # available-dongle count and must mark the frame dirty.
                 parts.append(("excl", tuple(sorted(str((x or {}).get("bus_path"))
                                                    for x in (hpx.get("excluded") or [])))))
+                # Missing-dongle diagnostics: signature on the missing set + the
+                # cause count, NOT the whole blob (kernel sample lines and
+                # generated_at churn every collection and would make the frame
+                # permanently dirty, defeating the conditional relay).
+                _ud = hpx.get("usb_diagnostics") or {}
+                parts.append(("usbdiag",
+                              tuple(sorted(str((m or {}).get("bus_path"))
+                                           for m in (_ud.get("missing") or []))),
+                              len(_ud.get("causes") or []),
+                              bool((_ud.get("uhubctl") or {}).get("supported"))))
                 pv = hpx.get("provision") or {}
                 parts.append(("provn", pv.get("reason"), pv.get("halt"),
                               pv.get("loop_running"), pv.get("auto_provision_on")))

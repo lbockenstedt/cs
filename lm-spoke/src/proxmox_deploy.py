@@ -97,6 +97,8 @@ class ProxmoxDeploy:
         # Excluded buses (destroy-fail / anti-churn) — culled like quarantine, so
         # the WebUI dongle-availability breakdown must subtract them.
         "excluded",
+        # Missing-dongle diagnostics + probable cause (Setup → Diagnostics).
+        "usb_diagnostics",
         # Delete-gate decision trace + the 1h averages the gate acts on, so the
         # WebUI can show WHAT auto-prov decides on and WHY it did/didn't shed.
         "delete_gate", "gate_averages",
@@ -262,6 +264,10 @@ class ProxmoxDeploy:
             # other USB lists. The provision loop culls these alongside
             # quarantine, so the WebUI availability count subtracts both.
             "excluded":         [_tag_usb(x, hostname) for x in body.get("excluded", [])],
+            # Missing-dongle diagnostic snapshot (roster vs present, kernel
+            # evidence, autosuspend, controllers, uhubctl PPPS support) for
+            # Setup → Diagnostics. A dict, not a list — relayed as-is.
+            "usb_diagnostics":  body.get("usb_diagnostics") or {},
             # Auto-provision diagnostic from the pxmx agent (cs_enabled,
             # loop_running heartbeat, auto_provision_on, reason, halt, config
             # snapshot). Projected into the per-host ``proxmox`` block via
