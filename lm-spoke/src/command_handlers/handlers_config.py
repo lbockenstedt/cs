@@ -500,6 +500,16 @@ class ConfigCommandsMixin:
                         row["client_last_seen_age_s"] = cl["last_seen_age_s"]
                     vms.append(row)
                 drift = [v for v in vms if not v["in_sync"]]
+                # UNLABELLED-and-unexplained VMs. An excluded VM (no client match
+                # / never reported / stale) gets desired=[]; when it ALSO carries
+                # no sim- tag, desired == actual == [] so in_sync is True and it
+                # vanished from drift_count AND from the UI (which renders only
+                # !in_sync rows). That is precisely the "some clients still have
+                # no label in Proxmox" case the panel exists to explain, reported
+                # as perfectly healthy. Counted separately because it is NOT
+                # drift — nothing is out of sync; the VM simply maps to no live
+                # client, so no tags were ever computed for it.
+                unlabeled = [v for v in vms if v.get("excluded") and not v["actual"]]
                 # Telemetry age. proxmox_states retains a host FOREVER once seen
                 # (deliberate: a briefly-offline server keeps its identity), so a
                 # host that was rebuilt/renamed leaves a permanent entry whose VM
@@ -516,6 +526,7 @@ class ConfigCommandsMixin:
                     "agent_connected": agent_ok,
                     "skip_reason": skips.get(hn) or (None if agent_ok else "agent_not_connected"),
                     "vm_count": len(vms), "drift_count": len(drift),
+                    "unlabeled_count": len(unlabeled),
                     "telemetry_age_s": round(_age, 1) if _age is not None else None,
                     "agent_points_at": pointing.get(_nh(hn)),
                     "stale": bool(_age is not None and _age > _STALE_HOST_S),

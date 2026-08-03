@@ -4611,11 +4611,17 @@ window.csCopySimTagHealth = function (btn) {
         (sp.hosts || []).forEach(h => {
             lines.push(`  HOST ${h.hostname} agent_connected=${h.agent_connected}` +
                        `${h.skip_reason ? ' skip=' + h.skip_reason : ''} drift=${h.drift_count}/${h.vm_count}` +
+                       `${h.unlabeled_count ? ' unlabeled=' + h.unlabeled_count : ''}` +
                        ` telemetry_age_s=${h.telemetry_age_s == null ? 'never' : Math.round(h.telemetry_age_s)}` +
                        `${h.stale ? ' STALE' : ''}${h.agent_points_at ? ' points_at=' + h.agent_points_at : ''}`);
-            (h.vms || []).filter(v => !v.in_sync).forEach(v => {
+            // Drift AND unlabeled: a VM with no client match gets desired=[]
+            // and, if it also carries no tags, desired==actual so in_sync is
+            // TRUE — it would silently vanish from a !in_sync filter, which is
+            // exactly the "no label in Proxmox" case this panel must explain.
+            (h.vms || []).filter(v => !v.in_sync || (v.excluded && !(v.actual || []).length)).forEach(v => {
                 lines.push(`    ${v.vmid} ${v.name}: desired=[${(v.desired || []).join(' ')}] ` +
-                           `actual=[${(v.actual || []).join(' ')}]${v.excluded ? ' why=' + v.excluded : ''}`);
+                           `actual=[${(v.actual || []).join(' ')}]${v.excluded ? ' why=' + v.excluded : ''}` +
+                           `${v.excluded && !(v.actual || []).length ? ' UNLABELED' : ''}`);
             });
         });
     });
