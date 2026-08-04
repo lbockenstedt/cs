@@ -7777,6 +7777,16 @@ function csRebootBadge(v) {
 // The optional spoke/target enable a per-bus "Remove from QT" button (admin
 // un-quarantines a dongle once the issue is fixed) that dispatches the agent's
 // clear_usb_quarantine CS_COMMAND; omitted on the fleet summary pill.
+// Physical location chip for a PROBLEM dongle (quarantined / recovering /
+// excluded). The agent stamps `location` only on those, falling back to the
+// position recorded while the dongle was still present -- a sidelined dongle is
+// often absent, which is exactly when you need to know which slot to go to.
+// Renders nothing for older agents that don't send the field.
+function _csLoc(x) {
+    const l = (x && x.location) || '';
+    return l ? ` · <span class="font-bold not-italic">${csEscape(l)}</span>` : '';
+}
+
 function csQtBadge(q, spoke, target) {
     if (!q || !q.bus_path) return '';
     const at = Number(q.recovers_at);
@@ -7792,7 +7802,7 @@ function csQtBadge(q, spoke, target) {
         ? `<button onclick="event.stopPropagation(); csClearQt('${csEscape(spoke)}','${csEscape(target)}','${csEscape(q.bus_path)}')" title="Remove this dongle from quarantine (clears its strike history)" class="ml-1 px-1 py-0.5 rounded bg-red-600 hover:bg-red-700 text-white text-[9px] font-bold normal-case">✕ Remove</button>`
         : '';
     return `<span class="inline-flex items-center gap-1 px-2 py-0.5 rounded text-[10px] font-bold uppercase tracking-wider bg-red-100 text-red-700" title="${csEscape(title)}">`
-        + `<span class="w-1.5 h-1.5 rounded-full bg-red-500 animate-pulse"></span>🚫 QT ${csEscape(q.bus_path)} · ${csEscape(reason)}${perm} · clears in ${cnt}${rm}</span>`;
+        + `<span class="w-1.5 h-1.5 rounded-full bg-red-500 animate-pulse"></span>🚫 QT ${csEscape(q.bus_path)}${_csLoc(q)} · ${csEscape(reason)}${perm} · clears in ${cnt}${rm}</span>`;
 }
 
 // Badge for a dongle the agent is actively RECOVERING (usb_state[].recovery) —
@@ -7810,7 +7820,7 @@ function csRecoveryBadge(e) {
     const title = `${String(r.reason || 'recovering')}. Ladder: ${ladder}.`;
     const vm = (e.vmid != null && e.vmid !== '') ? ` · VM ${csEscape(String(e.vmid))}` : '';
     return `<span class="inline-flex items-center gap-1 px-2 py-0.5 rounded text-[10px] font-bold bg-amber-100 text-amber-800" title="${csEscape(title)}">`
-        + `<span class="w-1.5 h-1.5 rounded-full bg-amber-500 animate-pulse"></span>🔧 ${csEscape(e.bus_path || '')} · ${csEscape(e.name || e.vidpid || '')}${vm}`
+        + `<span class="w-1.5 h-1.5 rounded-full bg-amber-500 animate-pulse"></span>🔧 ${csEscape(e.bus_path || '')}${_csLoc(e)} · ${csEscape(e.name || e.vidpid || '')}${vm}`
         + ` · <span class="uppercase">${csEscape(stage)}</span> ${Number(r.attempts || 0)}/${Number(r.max || 0)}</span>`;
 }
 
