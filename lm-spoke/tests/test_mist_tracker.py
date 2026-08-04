@@ -42,7 +42,10 @@ def test_mist_cc_thresholds_defaults_and_clamp():
                  "die_off_frac": 0.2, "min_peak": 5,
                  # Steady-state baselines default to die_off_pct so an
                  # already-tuned tenant keeps its number.
-                 "daily_frac": 0.2, "weekly_frac": 0.2, "monthly_frac": 0.2}
+                 "daily_frac": 0.2, "weekly_frac": 0.2, "monthly_frac": 0.2,
+                 # Trend rules: period = day/week-over-period drop -> error,
+                 # rate = short-window drop -> warning.
+                 "period_drop_pct": 20.0, "rate_drop_pct": 5.0, "rate_samples": 5}
     # error_pct coerced up to warn_pct so red never trips before amber.
     t2 = mt._mist_cc_thresholds({"cc_thresholds": {"warn_pct": 40, "error_pct": 10}})
     assert t2["warn_pct"] == 40.0

@@ -42,7 +42,7 @@ from check_eval import count_for_check, normalize_counts
 # across the whole sim system, not Central-specific code.
 from mist_tracker import (
     MistClientCountTracker, MistCheckHealthHistory,
-    _mist_cc_thresholds, _mist_cc_worst, _MIST_CC_SCOPE,
+    _mist_cc_thresholds, _mist_cc_worst, _mist_cc_site_floor, _MIST_CC_SCOPE,
 )
 
 logger = logging.getLogger("MistPoller")
@@ -186,6 +186,10 @@ class MistPoller:
             self._cc.record(_MIST_CC_SCOPE, wireless_site, current)
             self._cc.record(_MIST_CC_SCOPE, wireless_site, wired, kind="wired")
             self._cc.record(_MIST_CC_SCOPE, wireless_site, wireless, kind="wireless")
+            # Per-site FLOOR, resolved here because entry() only sees thresholds.
+            cc_thresh = dict(cc_thresh or {})
+            cc_thresh["floor"] = _mist_cc_site_floor(
+                self.spoke.local_store.get_mist_config(), mist_site)
             cc_entry = self._cc.entry(_MIST_CC_SCOPE, wireless_site, mist_site, cc_thresh)
             w_entry = self._cc.entry(_MIST_CC_SCOPE, wireless_site, mist_site, cc_thresh, kind="wired")
             wl_entry = self._cc.entry(_MIST_CC_SCOPE, wireless_site, mist_site, cc_thresh, kind="wireless")
