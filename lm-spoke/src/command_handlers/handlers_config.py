@@ -509,7 +509,20 @@ class ConfigCommandsMixin:
                 # as perfectly healthy. Counted separately because it is NOT
                 # drift — nothing is out of sync; the VM simply maps to no live
                 # client, so no tags were ever computed for it.
-                unlabeled = [v for v in vms if v.get("excluded") and not v["actual"]]
+                # Only SIM VMs can be "unlabeled" in any meaningful sense.
+                # Infrastructure guests — the cs spoke LXC itself (1001-1004),
+                # hand-built VMs like 105/106 — match no client by definition and
+                # are never meant to carry sim- tags, so counting them made the
+                # new count read 3-4 per host of pure noise and would bury the
+                # real finding. The sim range is the 90000 floor every other
+                # module uses (usb_provision VMID_FLOOR / _protected_vmids).
+                def _is_sim_vm(v):
+                    try:
+                        return int(v.get("vmid") or 0) > 90000
+                    except (TypeError, ValueError):
+                        return False
+                unlabeled = [v for v in vms
+                             if _is_sim_vm(v) and v.get("excluded") and not v["actual"]]
                 # Telemetry age. proxmox_states retains a host FOREVER once seen
                 # (deliberate: a briefly-offline server keeps its identity), so a
                 # host that was rebuilt/renamed leaves a permanent entry whose VM
