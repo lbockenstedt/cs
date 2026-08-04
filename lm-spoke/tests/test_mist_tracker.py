@@ -39,7 +39,10 @@ def test_mist_tracker_does_not_import_central_poller():
 def test_mist_cc_thresholds_defaults_and_clamp():
     t = mt._mist_cc_thresholds({})
     assert t == {"warn_pct": 20.0, "error_pct": 50.0,
-                 "die_off_frac": 0.2, "min_peak": 5}
+                 "die_off_frac": 0.2, "min_peak": 5,
+                 # Steady-state baselines default to die_off_pct so an
+                 # already-tuned tenant keeps its number.
+                 "daily_frac": 0.2, "weekly_frac": 0.2, "monthly_frac": 0.2}
     # error_pct coerced up to warn_pct so red never trips before amber.
     t2 = mt._mist_cc_thresholds({"cc_thresholds": {"warn_pct": 40, "error_pct": 10}})
     assert t2["warn_pct"] == 40.0
