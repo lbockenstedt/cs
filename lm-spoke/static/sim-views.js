@@ -9182,6 +9182,177 @@ async function csFillLinkApproval(h) {
     const el = document.getElementById('cs-link-agent');
     if (el) el.innerHTML = `<span class="text-slate-400">Agent link:</span> ` + html;
 }
+// ── Diagnostic tile primitives (ported from the hub WebUI copy) ───────────
+// ── Tile primitives, matching the Telemetry Freshness panel ──────────────────
+// Same treatment as csFreshnessPanel: bordered white tile, micro-caps label,
+// mono value, optional hint — laid out on a responsive grid that FILLS the
+// width. The point is that the numbers you scan for sit in fixed-width tiles
+// across the screen instead of wrapping inside a paragraph.
+function csDiagTile(label, val, hint, tone) {
+    const v = tone === 'bad' ? 'text-red-600'
+        : tone === 'warn' ? 'text-amber-600'
+        : tone === 'good' ? 'text-[#01A982]' : 'text-slate-700';
+    return `<div class="rounded-md border border-slate-200 bg-white px-3 py-2">
+        <div class="text-[10px] uppercase tracking-wider text-slate-400">${csEscape(label)}</div>
+        <div class="text-sm font-mono font-bold ${v} truncate" title="${csEscape(val)}">${csEscape(val)}</div>
+        ${hint ? `<div class="text-[10px] text-slate-400 truncate" title="${csEscape(hint)}">${csEscape(hint)}</div>` : ''}</div>`;
+}
+
+// Default 5-up on large screens, matching the freshness grid.
+function csDiagTiles(tiles, cols) {
+    return `<div class="grid grid-cols-2 sm:grid-cols-3 ${cols || 'lg:grid-cols-5'} gap-2 mb-3">${tiles.join('')}</div>`;
+}
+
+// Group label inside a section (freshness's "Agent collect phase — last tick").
+function csDiagSub(text, right) {
+    return `<div class="flex items-center justify-between mb-2 flex-wrap gap-2 mt-3">
+      <p class="text-[11px] font-bold text-slate-400 uppercase tracking-wider">${csEscape(text)}</p>
+      ${right ? `<span class="text-xs text-slate-500">${right}</span>` : ''}</div>`;
+}
+
+// Footer note, freshness's closing-paragraph treatment.
+function csDiagNote(html) {
+    return `<div class="text-[10px] text-slate-400 mt-2">${html}</div>`;
+}
+
+// ── USB dongle diagnostics panel (ported from the hub WebUI copy) ─────────
+// The hub's full Setup->Diagnostics view is hub-only; the spoke needs just
+// this per-host panel, which VM Server -> Details renders.
+const _CS_CAUSE_STYLE = {
+    high:    'border-red-200 bg-red-50 text-red-700',
+    medium:  'border-amber-200 bg-amber-50 text-amber-700',
+    low:     'border-slate-200 bg-slate-50 text-slate-600',
+    unknown: 'border-slate-200 bg-slate-50 text-slate-500',
+};
+
+// uhubctl verdict badge — the answer to "can we take the power-cycle path?".
+// Three distinct states: supported (PPPS hub present), installed-but-no-PPPS
+// (the common on-board-controller case), and not installed.
+function csUhubctlBadge(u) {
+    if (!u || typeof u !== 'object') return '<span class="text-[10px] text-slate-400">uhubctl: unknown</span>';
+    if (u.supported) {
+        const hubs = (u.ppps_hubs || []).map(h => h.hub).join(', ');
+        return `<span class="px-1.5 py-0.5 rounded text-[10px] font-bold bg-green-100 text-green-700" title="${csEscape('PPPS-capable hub(s): ' + hubs + '. Power-cycle with: uhubctl -a cycle')}">uhubctl ✓ ${csEscape(String((u.ppps_hubs || []).length))} PPPS hub(s)</span>`;
+    }
+    if (u.installed) {
+        return `<span class="px-1.5 py-0.5 rounded text-[10px] font-bold bg-amber-100 text-amber-700" title="${csEscape(u.error || 'no per-port-power-switching hub found')}">uhubctl installed · no PPPS hub</span>`;
+    }
+    return `<span class="px-1.5 py-0.5 rounded text-[10px] font-bold bg-slate-100 text-slate-500" title="${csEscape((u.error || 'not installed') + ' — install: ' + (u.install_hint || 'apt-get install -y uhubctl'))}">uhubctl not installed</span>`;
+}
+
+function _csDongleDiagHost(h) {
+    const px = h.proxmox || {};
+    const d = px.usb_diagnostics;
+    const name = csEscape(h.spoke_name || h.spoke_hostname || h.spoke_id || '?');
+    if (!d || !d.generated_at) {
+        return `<div class="border border-slate-200 rounded-lg p-3 mb-3">
+          <div class="flex items-center justify-between mb-1">
+            <span class="font-mono text-xs font-bold text-slate-600">${name}</span>
+            <span class="text-[10px] text-slate-400">no diagnostic reported</span>
+          </div>
+          <p class="text-[11px] text-slate-500">This host's agent has not sent a dongle diagnostic. That is <b>not</b> the same as "no dongles missing" — it usually means the agent predates this feature and needs an update.</p>
+        </div>`;
+    }
+    const missing = Array.isArray(d.missing) ? d.missing : [];
+    // Absent BY DESIGN: their PCI controller was handed to a VM (T1/T3
+    // passthrough), so the host correctly stops seeing them — ~4 per host. Kept
+    // out of the "missing" count so that number only ever means "lost".
+    const passed = Array.isArray(d.passed_through) ? d.passed_through : [];
+    // Boot-anchored losses: present at boot, gone now, excluding controllers
+    // handed to VMs and dongles too briefly attached to be inventory. This is
+    // the authoritative "what should be here and is not".
+    const lost = Array.isArray(d.lost_since_boot) ? d.lost_since_boot : [];
+    const bootPt = Array.isArray(d.boot_passthrough) ? d.boot_passthrough : [];
+    const transient = (Array.isArray(d.lost_transient) ? d.lost_transient : [])
+        .concat(Array.isArray(d.missing_transient) ? d.missing_transient : []);
+    const bb = d.boot_baseline || {};
+    const causes = Array.isArray(d.causes) ? d.causes : [];
+    const kernel = d.kernel || {};
+    const power = Array.isArray(d.power) ? d.power : [];
+    const autoN = power.filter(p => p && p.autosuspend_enabled).length;
+    const ctrls = Array.isArray(d.controllers) ? d.controllers : [];
+    const nowS = Date.now() / 1000;
+    const age = d.generated_at ? csAgeShort(nowS - d.generated_at) + ' ago' : '—';
+
+    const missRows = missing.map(m => `<tr>
+      <td class="px-3 py-1.5 font-mono text-xs">${csEscape(m.bus_path || '—')}</td>
+      <td class="px-3 py-1.5 text-xs text-slate-600">${csEscape(m.product || '—')}</td>
+      <td class="px-3 py-1.5 font-mono text-[11px] text-slate-500">${csEscape(m.vidpid || '—')}</td>
+      <td class="px-3 py-1.5 text-xs text-slate-500">${csEscape(m.last_seen ? csAgeShort(nowS - m.last_seen) + ' ago' : '—')}</td>
+      <td class="px-3 py-1.5 text-xs ${m.missing_for_s > 86400 ? 'text-red-600 font-bold' : 'text-amber-600'}">${m.missing_for_s != null ? csEscape(csAgeShort(m.missing_for_s)) : '—'}</td>
+    </tr>`).join('');
+
+    const causeCards = causes.map(c => {
+        const cls = _CS_CAUSE_STYLE[c.confidence] || _CS_CAUSE_STYLE.low;
+        return `<div class="border rounded-md p-2 mb-1.5 ${cls}">
+          <div class="flex items-center gap-2 mb-0.5">
+            <span class="text-xs font-bold">${csEscape(c.cause || '—')}</span>
+            <span class="text-[9px] uppercase tracking-wider opacity-70">${csEscape(c.confidence || '')}</span>
+          </div>
+          <p class="text-[11px] opacity-90">${csEscape(c.detail || '')}</p>
+          ${c.remedy ? `<p class="text-[11px] mt-1"><b>Fix:</b> ${csEscape(c.remedy)}</p>` : ''}
+        </div>`;
+    }).join('');
+
+    // Guest-agent watchdog last sweep, as a tile: an automatic VM reset or power
+    // cycle should be attributable at a glance, not buried in raw telemetry.
+    const gw = px.guest_watchdog || {};
+    const gwActs = (gw.reset || []).length + (gw.power_cycled || []).length + (gw.started || []).length;
+    const gwTile = !gw.ran_at
+        ? { val: '—', hint: 'no sweep reported', tone: null }
+        : { val: `${gw.responding ?? '?'}/${gw.checked ?? '?'}`,
+            hint: gwActs ? `${(gw.reset || []).length} reset · ${(gw.power_cycled || []).length} cycled · ${(gw.started || []).length} started`
+                         : 'guests responding, no action taken',
+            tone: gwActs ? 'warn' : 'good' };
+
+    const kTotals = Object.entries(kernel.totals || {});
+    const kernelLine = !kernel.available
+        ? '<span class="text-amber-600">kernel log unreadable — evidence could not be checked (not the same as a clean log)</span>'
+        : kTotals.length
+            ? kTotals.map(([k, v]) => `<span class="mr-3"><b>${csEscape(k)}</b> ${csEscape(String(v))}</span>`).join('')
+            : '<span class="text-slate-400">no USB errors logged in the window</span>';
+
+    const u = d.uhubctl || {};
+    const kTotalN = kTotals.reduce((n, [, v]) => n + Number(v || 0), 0);
+    return `<div class="hpe-card rounded-lg p-4 shadow-sm mb-4">
+      <div class="flex items-center justify-between mb-2 flex-wrap gap-2">
+        <p class="text-[11px] font-bold text-slate-400 uppercase tracking-wider">${name}</p>
+        <span class="text-xs text-slate-500">${missing.length
+            ? `<span class="text-red-600 font-bold">● ${missing.length} MISSING</span>`
+            : '<span class="text-green-600 font-bold">● NONE MISSING</span>'} · collected ${csEscape(age)}</span>
+      </div>
+      ${csDiagTiles([
+        csDiagTile('Present', String(d.present_count ?? '—'), 'certified, on the bus'),
+        csDiagTile('Missing', String(missing.length), 'was seen, now gone', missing.length ? 'bad' : 'good'),
+        csDiagTile('Lost since boot', String(lost.length),
+                   bb.trusted === false ? 'baseline taken mid-boot — not authoritative'
+                                        : 'present at boot, gone now',
+                   lost.length ? 'bad' : 'good'),
+        csDiagTile('Passed through', String(passed.length + bootPt.length),
+                   (passed.length + bootPt.length) ? 'VM-owned controller — expected' : 'none'),
+        csDiagTile('Transient', String(transient.length),
+                   `seen < ${csAgeShort(d.inventory_min_age_s || 14400)} — not inventory`),
+        csDiagTile('Ever seen', String(d.known_count ?? '—'), 'persisted roster'),
+        csDiagTile('Autosuspend', `${autoN}/${power.length}`, "power/control=auto", autoN ? 'warn' : null),
+        csDiagTile('Kernel events', String(kTotalN), `${csAgeShort(kernel.window_s || 0)} window`,
+                   !kernel.available ? 'warn' : (kTotalN ? 'bad' : null)),
+        csDiagTile('uhubctl', u.supported ? 'PPPS ✓' : u.installed ? 'no PPPS hub' : 'not installed',
+                   u.supported ? `${(u.ppps_hubs || []).length} hub(s) — uhubctl -a cycle`
+                               : (u.error || 'port power cycling unavailable'),
+                   u.supported ? 'good' : 'warn'),
+        csDiagTile('Controllers', String(ctrls.length),
+                   ctrls.map(c => `${c.pci_address} (${c.device_count})`).join(' · ') || '—'),
+        csDiagTile('Guest watchdog', gwTile.val, gwTile.hint, gwTile.tone),
+      ], 'lg:grid-cols-4')}
+      ${missing.length ? csDiagSub('Missing dongles') +
+        `<div class="overflow-x-auto mb-2">${csTable(['Bus', 'Product', 'vid:pid', 'Last seen', 'Missing for'], missRows)}</div>` : ''}
+      ${causes.length ? csDiagSub('Probable cause — ranked') +
+        `<div class="grid grid-cols-1 xl:grid-cols-2 gap-2">${causeCards}</div>` : ''}
+      ${kernel.available && kTotals.length ? csDiagNote(`Kernel: ${kernelLine}`) : ''}
+      ${!kernel.available ? csDiagNote('<span class="text-amber-600">Kernel log unreadable — evidence could not be checked. This is <b>not</b> the same as a clean log.</span>') : ''}
+    </div>`;
+}
+
 
 async function csRenderVmServerDetails() {
     csSetToolbar('');
@@ -9199,7 +9370,7 @@ async function csRenderVmServerDetails() {
     // badly as a raw csKvTile and deserves a readable layout.
     // agent_version is already the headline "Agent" stat in the row above, so a
     // second AGENT_VERSION tile in the grid just repeated it.
-    const skip = ['vms','usb_state','present_usb','unknown_usb','node','usb_count','provision','agent_version'];
+    const skip = ['vms','usb_state','present_usb','unknown_usb','node','usb_count','provision','agent_version','usb_diagnostics'];
     const entries = Object.entries(px).filter(([k]) => !skip.includes(k));
     // cpu_1h_avg + mem_1h_avg are ONE reading of the same thing (the rolling
     // averages the delete gate acts on), so they get one tile instead of two
@@ -9291,6 +9462,8 @@ async function csRenderVmServerDetails() {
       </div>
       ${csLinkApprovalCard(h)}
       ${csFreshnessPanel(h)}
+      <p class="text-[11px] font-bold text-slate-400 uppercase tracking-wider mt-4 mb-2">USB Diagnostics</p>
+      ${_csDongleDiagHost(h)}
       <div class="flex items-center justify-between mb-2">
         <p class="text-[11px] font-bold text-slate-400 uppercase tracking-wider">Telemetry</p>
         <span class="text-[10px] text-slate-400">${entries.length} field${entries.length === 1 ? '' : 's'}</span>
