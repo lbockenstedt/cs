@@ -327,6 +327,7 @@ class ClientCountTracker:
         avg_1day = round(sum(vals_1d) / len(vals_1d), 1) if vals_1d else 0.0
         avg_7day = round(sum(vals_7d) / len(vals_7d), 1) if vals_7d else 0.0
         avg_30day = round(sum(vals_30d) / len(vals_30d), 1) if vals_30d else 0.0
+        die_off_peak = 0.0  # the average the current avg fell below, if die-off tripped
         # Trend inputs. Each returns None when it lacks the history to judge,
         # so a fresh site never alarms on an empty comparison.
         day_drop_pct = _cc_period_drop(hist, now, _CC_1DAY_WINDOW)
@@ -375,6 +376,26 @@ class ClientCountTracker:
             # the day boundary would show it.
             if rate_drop_pct is not None and rate_drop_pct > rate_drop_thresh:
                 status = _cc_worst(status, "warning")
+            # STEADY-STATE DIE-OFF: current hourly average vs the 7d/30d AVERAGE
+            # baseline (not peak -- see the docstring/comments above on why).
+            # Gated on min_peak (checked against the site's own recorded PEAK,
+            # not its average) so a genuinely quiet site cannot alarm on
+            # ordinary noise in a tiny number. die_off_frac<=0 disables it.
+            #
+            # This was previously unimplemented on this (spoke) side entirely —
+            # weekly_frac/monthly_frac/min_peak were computed from config and
+            # described in the comments above but never compared against
+            # anything, and die_off_peak didn't even exist as a variable. Mirror
+            # of the fix in lm's central_hub_poller.py ClientCountTracker.entry.
+            if die_off_frac > 0 and max_7day >= min_peak and avg_7day > 0:
+                if hourly_avg < avg_7day * weekly_frac:
+                    status = _cc_worst(status, "error")
+                    die_off_peak = avg_7day
+            if die_off_frac > 0 and max_30day >= min_peak and avg_30day > 0:
+                if hourly_avg < avg_30day * monthly_frac:
+                    status = _cc_worst(status, "warning")
+                    if not die_off_peak:
+                        die_off_peak = avg_30day
         return {"site_name": central_site, "current": current,
                 "hourly_avg": round(hourly_avg, 1), "drop_pct": round(drop_pct, 1),
                 "max_7day": max_7day, "max_30day": max_30day,
@@ -383,6 +404,7 @@ class ClientCountTracker:
                 "day_drop_pct": None if day_drop_pct is None else round(day_drop_pct, 1),
                 "week_drop_pct": None if week_drop_pct is None else round(week_drop_pct, 1),
                 "rate_drop_pct": None if rate_drop_pct is None else round(rate_drop_pct, 1),
+                "die_off": die_off_peak, "die_off_frac": die_off_frac,
                 "status": status, "ts": samples[-1][0]}
 
     def maybe_snapshot(self) -> None:
@@ -744,11 +766,38 @@ class CentralPoller:
             # Surface the site's client-count monitor as a CHECK so "everything
             # monitored" shows on the dashboard Checks view. Direct (NOT inverted)
             # semantics: a DROP means the sim clients died -> warning / error.
+            _cc_msg = (f"{cc_entry['current']} clients vs {cc_entry['hourly_avg']} hr-avg "
+                       f"(down {cc_entry['drop_pct']}%) · wired {wired} (down {w_entry['drop_pct']}%) "
+                       f"· wireless {wireless} (down {wl_entry['drop_pct']}%)")
+            # PERIOD (day/week vs the prior period) and RATE (short-window) are
+            # LIVE rules that can force a non-ok status on their own even while
+            # the within-hour drop above reads 0% — show whichever trend figures
+            # are non-trivial so the message explains itself instead of leaving
+            # "0% drop, still red" with no visible cause. Mirror of the fix in
+            # lm's central_hub_poller.py.
+            _trend_bits = []
+            if cc_entry.get("day_drop_pct") is not None and cc_entry["day_drop_pct"] >= 5:
+                _trend_bits.append(f"day {cc_entry['day_drop_pct']}%")
+            if cc_entry.get("week_drop_pct") is not None and cc_entry["week_drop_pct"] >= 5:
+                _trend_bits.append(f"week {cc_entry['week_drop_pct']}%")
+            if cc_entry.get("rate_drop_pct") is not None and cc_entry["rate_drop_pct"] >= 2:
+                _trend_bits.append(f"rate {cc_entry['rate_drop_pct']}%")
+            if _trend_bits:
+                _cc_msg += " · trend down " + ", ".join(_trend_bits) + " vs prior period"
+            # When the ERROR is the sustained die-off-vs-average rule (not the
+            # within-hour drop, which is often 0%), name it + show the average
+            # that tripped it — otherwise a steady-state die-off reads "0% drop"
+            # with no explanation for the color.
+            _do = [(lbl, e) for lbl, e in (("total", cc_entry), ("wired", w_entry),
+                                           ("wireless", wl_entry)) if e.get("die_off")]
+            if _do:
+                _frac = int((_do[0][1].get("die_off_frac") or 0) * 100)
+                _do_txt = ", ".join(f"{lbl} {e['hourly_avg']} < {_frac}% of avg {e['die_off']}"
+                                    for lbl, e in _do)
+                _cc_msg += f" · ⚠ sustained die-off vs average ({_do_txt})"
             checks["Steady Client Count 1hr Average"] = {
                 "status": cc_entry["status"],
-                "message": (f"{cc_entry['current']} clients vs {cc_entry['hourly_avg']} hr-avg "
-                            f"(down {cc_entry['drop_pct']}%) · wired {wired} (down {w_entry['drop_pct']}%) "
-                            f"· wireless {wireless} (down {wl_entry['drop_pct']}%)"),
+                "message": _cc_msg,
             }
             for alert_id, devices in (data.get("hw_devices") or {}).items():
                 hw_totals[alert_id] = hw_totals.get(alert_id, 0) + sum(devices.values())
