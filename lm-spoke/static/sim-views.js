@@ -1456,6 +1456,167 @@ function csSummaryRow(items) {
 let csClientCache = [];
 let csClientTier = 'all'; // 'all' | 't1' | 't2' | 't3'
 
+// ── Faceted Clients drill-down (scales to thousands) ─────────────────────────
+// Instead of one flat table of every client, the Clients tab summarizes by
+// Simulation, then drills Simulation → Tier → Site → the client list, with a
+// name/IP/MAC search that works at any level. Each facet is a chip row whose
+// counts reflect the OTHER active facets (standard faceted counting). Ported
+// from lm/WebUI/sim-views.js — the spoke's own /aggregate/clients route
+// supports this the same way the hub's aggregation does.
+let csFacet = { sim: null, tier: null, site: null };
+// Client-list paging: 10 per page by default; the user can pick up to 100 from
+// a selector at the bottom of the table. Capping the page size at 100 also keeps
+// the DOM bounded no matter how large the match set is.
+let csClientPage = 1;
+let csClientPageSize = 10;
+const CS_CLIENT_PAGE_SIZES = [10, 25, 50, 100];
+
+// Reset to page 1 + re-render — called whenever the filter set changes (facet,
+// search, or status) so the user isn't stranded on a now-empty page.
+window.csClientResetPage = function () { csClientPage = 1; csRenderClientsFaceted(); };
+window.csClientGoPage = function (delta) { csClientPage += Number(delta) || 0; csRenderClientsFaceted(); };
+window.csClientSetPageSize = function (size) {
+    csClientPageSize = Math.max(1, Math.min(100, Number(size) || 10));
+    csClientPage = 1;
+    csRenderClientsFaceted();
+};
+
+// Active simulation flags for a client — a per-client override WINS, else its
+// active_simulations / effective config. Mirrors csClientSimBar's isOn.
+function csClientActiveSims(c) {
+    const active = new Set((Array.isArray(c.active_simulations) ? c.active_simulations : [])
+        .map(s => String(s).toLowerCase()));
+    const cfg = c.effective_config || c.config || {};
+    const ov = c.overrides || {};
+    return CS_CONTROL_FLAGS.filter(f => {
+        if (Object.prototype.hasOwnProperty.call(ov, f))
+            return ['on', 'true', '1'].includes(String(ov[f]).toLowerCase());
+        // "Enabled" reflects the resolved CONFIG (per-client override wins, else
+        // the bucket/user-overrides effective config) — NOT active_simulations
+        // (what the client is momentarily running), so a cleared override drops
+        // off immediately instead of lingering until the client stops the sim.
+        return ['on', 'true', '1'].includes(String(cfg[f] == null ? '' : cfg[f]).toLowerCase());
+    });
+}
+function csClientSite(c) { return (c.config && c.config.wsite) || c.wsite || '—'; }
+function csClientSearchHay(c) {
+    return [c.hostname, c.id, c.connected_ssid, c.simulation_id, c.platform,
+            c.ip, c.mac, c.address, c.config && c.config.address, c.config && c.config.ip]
+        .filter(Boolean).join(' ').toLowerCase();
+}
+// Passes the active facets? `skip` omits one dimension (used for facet counts so
+// a facet's own selection doesn't collapse its counts to the chosen value).
+function csClientPass(c, skip) {
+    const st = csEl('cs-client-status') && csEl('cs-client-status').value;
+    const q = ((csEl('cs-client-search') && csEl('cs-client-search').value) || '').trim().toLowerCase();
+    if (skip !== 'status') {
+        if (st === 'online' && !c.online) return false;
+        if (st === 'offline' && c.online) return false;
+    }
+    if (skip !== 'search' && q && !csClientSearchHay(c).includes(q)) return false;
+    if (skip !== 'sim' && csFacet.sim && csClientActiveSims(c).indexOf(csFacet.sim) === -1) return false;
+    if (skip !== 'tier' && csFacet.tier && csClassifyClient(c) !== csFacet.tier) return false;
+    if (skip !== 'site' && csFacet.site && csClientSite(c) !== csFacet.site) return false;
+    return true;
+}
+window.csFacetSelect = function (dim, val) {
+    csFacet[dim] = val || null;   // '' (the All option) clears the facet
+    if (dim === 'tier') csClientTier = csFacet.tier || 'all';
+    csClientPage = 1;             // a new filter set → back to page 1
+    csRenderClientsFaceted();
+};
+window.csFacetReset = function () {
+    csFacet = { sim: null, tier: null, site: null };
+    csClientTier = 'all';
+    csClientPage = 1;
+    if (csEl('cs-client-search')) csEl('cs-client-search').value = '';
+    if (csEl('cs-client-status')) csEl('cs-client-status').value = '';
+    csRenderClientsFaceted();
+};
+
+// Render the facet chip bar + either the summary hint (no facet/search) or the
+// filtered, PAGED client list (10/page default, up to 100; pager at the bottom).
+// Cheap: O(clients × facets), and only one page of rows ever hits the DOM.
+function csRenderClientsFaceted() {
+    const facetsEl = csEl('cs-facets');
+    const bodyEl = csEl('cs-client-body') || csEl('cs-content');
+    if (!facetsEl || !bodyEl) return;
+    const q = ((csEl('cs-client-search') && csEl('cs-client-search').value) || '').trim();
+
+    const simCounts = {};
+    CS_CONTROL_FLAGS.forEach(f => { simCounts[f] = 0; });
+    const tierCounts = { t1: 0, t2: 0, t3: 0 };
+    const siteCounts = {};
+    csClientCache.forEach(c => {
+        if (csClientPass(c, 'sim')) csClientActiveSims(c).forEach(f => { if (f in simCounts) simCounts[f]++; });
+        if (csClientPass(c, 'tier')) { const t = csClassifyClient(c); if (t in tierCounts) tierCounts[t]++; }
+        if (csClientPass(c, 'site')) { const s = csClientSite(c); siteCounts[s] = (siteCounts[s] || 0) + 1; }
+    });
+
+    // Compact <select> dropdowns (Simulation / Tier / Site) — all available from
+    // the start, so there can be many simulations/sites without overflowing.
+    // Option labels carry the (other-facet-scoped) counts; the value is passed at
+    // runtime via this.value (no interpolation into the handler → injection-safe).
+    const selCls = 'bg-white border border-slate-300 rounded-md px-3 py-1.5 text-sm outline-none focus:ring-2 focus:ring-green-500';
+    const lblCls = 'text-[11px] font-bold text-slate-400 uppercase tracking-wider';
+    const opt = (v, label, count, cur) =>
+        `<option value="${csEscape(v)}"${v === cur ? ' selected' : ''}>${csEscape(label)}${count != null ? ` (${count})` : ''}</option>`;
+    const dropdown = (dim, allLabel, opts, cur) =>
+        `<select onchange="csFacetSelect('${dim}', this.value)" class="${selCls}"><option value="">${csEscape(allLabel)}</option>${opts.join('')}</select>`;
+
+    const simOpts = CS_CONTROL_FLAGS.filter(f => simCounts[f] > 0 || csFacet.sim === f)
+        .map(f => opt(f, f, simCounts[f], csFacet.sim));
+    const tierOpts = ['t1', 't2', 't3'].map(t => opt(t, t.toUpperCase(), tierCounts[t], csFacet.tier));
+    const siteOpts = Object.keys(siteCounts).sort().map(s => opt(s, s, siteCounts[s], csFacet.site));
+
+    // Any facet OR search lists clients (Simulation, Tier, and Site are all entry
+    // points); nothing selected → the summary hint.
+    const showList = !!(csFacet.sim || csFacet.tier || csFacet.site || q);
+    const total = csClientCache.length;
+    facetsEl.innerHTML = `
+      <div class="flex flex-wrap items-center gap-x-2 gap-y-2 mb-3">
+        <span class="${lblCls}">Simulation</span>${dropdown('sim', `All Simulations (${total})`, simOpts, csFacet.sim)}
+        <span class="${lblCls} ml-2">Tier</span>${dropdown('tier', 'All Tiers', tierOpts, csFacet.tier)}
+        <span class="${lblCls} ml-2">Site</span>${dropdown('site', 'All Sites', siteOpts, csFacet.site)}
+        ${showList ? `<button onclick="csFacetReset()" class="text-xs text-slate-400 hover:text-slate-600 underline ml-2">Clear</button>` : ''}
+      </div>`;
+
+    if (!showList) {
+        bodyEl.innerHTML = `<div class="text-center text-slate-400 text-sm py-10 border border-dashed border-slate-200 rounded-lg">${total.toLocaleString()} client(s). Pick a <span class="font-semibold text-slate-600">Simulation</span>, <span class="font-semibold text-slate-600">Tier</span>, or <span class="font-semibold text-slate-600">Site</span> above — or search by name / IP / MAC — to list clients.</div>`;
+        return;
+    }
+    const matches = csClientCache.filter(c => csClientPass(c))
+        .sort((a, b) => String(a.hostname || a.id || '')
+            .localeCompare(String(b.hostname || b.id || ''), undefined, { numeric: true, sensitivity: 'base' }));
+    // Paginate.
+    const pageSize = csClientPageSize;
+    const totalPages = Math.max(1, Math.ceil(matches.length / pageSize));
+    if (csClientPage > totalPages) csClientPage = totalPages;
+    if (csClientPage < 1) csClientPage = 1;
+    const start = (csClientPage - 1) * pageSize;
+    const shown = matches.slice(start, start + pageSize);
+    const first = matches.length ? start + 1 : 0;
+    const last = Math.min(start + pageSize, matches.length);
+
+    const sizeOpts = CS_CLIENT_PAGE_SIZES.map(n =>
+        `<option value="${n}"${n === pageSize ? ' selected' : ''}>${n}</option>`).join('');
+    const btn = (label, delta, disabled) =>
+        `<button onclick="csClientGoPage(${delta})" ${disabled ? 'disabled' : ''} class="px-2 py-0.5 rounded border ${disabled ? 'border-slate-100 text-slate-300 cursor-not-allowed' : 'border-slate-200 text-slate-600 hover:bg-slate-50'}">${label}</button>`;
+    // Pager sits at the BOTTOM of the table.
+    const pager = `<div class="flex flex-wrap items-center justify-between gap-2 mt-3 text-xs text-slate-500">
+        <span>Showing ${first.toLocaleString()}–${last.toLocaleString()} of ${matches.length.toLocaleString()}</span>
+        <div class="flex items-center gap-2">
+          ${btn('‹ Prev', -1, csClientPage <= 1)}
+          <span>Page ${csClientPage} of ${totalPages}</span>
+          ${btn('Next ›', 1, csClientPage >= totalPages)}
+          <span class="ml-2">Per page</span>
+          <select onchange="csClientSetPageSize(this.value)" class="bg-white border border-slate-200 rounded px-2 py-0.5 text-xs">${sizeOpts}</select>
+        </div>
+      </div>`;
+    bodyEl.innerHTML = `<div class="text-xs text-slate-400 mb-2">${matches.length.toLocaleString()} client(s)</div><div id="cs-client-rows"></div>${pager}`;
+    csRenderClientRows(shown, 'cs-client-rows');
+}
+
 // Tier by PASSTHROUGH (authoritative, from the agent's compute_vm_tiers):
 // T2 = USB dongle passthrough; T1/T3 = PCI passthrough (T1=physical/1912:0015,
 // T3=configured PCI vid:pid). Prefer the agent-computed c.tier; fall back to the
@@ -1472,10 +1633,14 @@ function csClassifyClient(c) {
 
 async function csRenderClients(tier) {
     // tier may come in as a boolean `force` arg from the legacy primary-switch
-    // fallback; only accept real tier strings.
-    if (tier === 't1' || tier === 't2' || tier === 't3' || tier === 'all') csClientTier = tier;
-    csSetToolbar(`<input id="cs-client-search" oninput="csClientFilterKey()" placeholder="Search clients…" class="bg-white border border-slate-300 rounded-md px-3 py-1.5 text-sm outline-none focus:ring-2 focus:ring-green-500 w-64">
-      <select id="cs-client-status" onchange="csClientFilter()" class="bg-white border border-slate-300 rounded-md px-3 py-1.5 text-sm outline-none focus:ring-2 focus:ring-green-500">
+    // fallback; only accept real tier strings. The Clients::T1/T2/T3 sub-nav tabs
+    // pre-seed the Tier facet (drill still goes Simulation → Tier → Site).
+    if (tier === 't1' || tier === 't2' || tier === 't3' || tier === 'all') {
+        csClientTier = tier;
+        csFacet.tier = (tier === 'all') ? null : tier;
+    }
+    csSetToolbar(`<input id="cs-client-search" oninput="csClientFilterKey()" placeholder="Search name / IP / MAC…" class="bg-white border border-slate-300 rounded-md px-3 py-1.5 text-sm outline-none focus:ring-2 focus:ring-green-500 w-64">
+      <select id="cs-client-status" onchange="csClientResetPage()" class="bg-white border border-slate-300 rounded-md px-3 py-1.5 text-sm outline-none focus:ring-2 focus:ring-green-500">
         <option value="">All</option><option value="online">Online</option><option value="offline">Offline</option>
       </select>
       <button id="cs-purge-clients-btn" onclick="csPurgeClients(this)" title="Remove all client records from memory and disk" class="ml-auto bg-white border border-red-300 text-red-600 hover:bg-red-50 rounded-md px-3 py-1.5 text-sm font-semibold">🗑 Purge Clients</button>
@@ -1488,19 +1653,13 @@ async function csRenderClients(tier) {
         csFetch(`/aggregate/clients?tenant_id=${csTenant()}`),
         csDemoCard(),
     ]);
-    const rows = csNormalizeClients(data);
-    csClientCache = rows;
-    const all = rows.length;
-    const t1 = rows.filter(c => csClassifyClient(c) === 't1').length;
-    const t2 = rows.filter(c => csClassifyClient(c) === 't2').length;
-    const t3 = rows.filter(c => csClassifyClient(c) === 't3').length;
-    const online = rows.filter(c => c.online).length;
-    const pills = csSummaryRow([[all, 'Clients'], [t1, 'T1'], [t2, 'T2'], [t3, 'T3'], [online, 'Online']]);
+    csClientCache = csNormalizeClients(data);
     const fhBadge = csFleetHealthBadge(data && data.fleet_health);
-    // Kill switch moved to the All/T1/T2 child strip (renderSecondaryNav →
-    // csKillSwitchMountChip), pinned far right — no longer a content banner here.
-    csSet(`<div class="space-y-4">${fhBadge}${demoCard}${pills}<div id="cs-client-body"></div></div>`);
-    csClientFilter();
+    // Faceted drill-down: fleet-health banner, the demo card, then the
+    // Simulation/Tier/Site facet bar, then the (drill-gated, capped) client list,
+    // then a static legend. Kill switch stays in the secondary-nav chip.
+    csSet(`<div class="space-y-4">${fhBadge}${demoCard}<div id="cs-facets"></div><div id="cs-client-body"></div>${csClientsLegend()}</div>`);
+    csRenderClientsFaceted();
 }
 
 // Fleet-health banner: working ÷ (provisioned − exclusive), judged against the
@@ -1519,6 +1678,40 @@ function csFleetHealthBadge(fh) {
       <span class="font-mono">${csEscape(String(fh.working))}/${csEscape(String(fh.eligible))} working · ${csEscape(String(fh.pct))}%</span>
       <span class="text-[10px] font-bold uppercase tracking-wider px-1.5 py-0.5 rounded bg-white/60">${label}</span>
       ${fh.exclusive ? `<span class="text-[11px] text-slate-500">(${csEscape(String(fh.exclusive))} exclusive excluded)</span>` : ''}
+    </div>`;
+}
+
+// Static legend under the Clients view — what the sim-bar button colors, the
+// demo mark, the red last-seen, and the tier badges mean. Swatch classes mirror
+// csSimBtnClass / the row renderer so the samples match the live UI exactly.
+function csClientsLegend() {
+    const sw = cls => `<span class="${cls} px-2 py-0.5 rounded-md text-[11px] font-bold">sim</span>`;
+    const tier = (cls, t) => `<span class="font-bold text-slate-600">${t}</span>`;
+    const lbl = t => `<span class="font-bold uppercase tracking-wider text-slate-400 mr-1">${t}</span>`;
+    return `<div class="mt-4 pt-3 border-t border-slate-100 text-[11px] text-slate-500">
+      <span class="font-bold uppercase tracking-wider text-slate-400">Legend</span>
+      <div class="mt-2 space-y-1.5">
+        <div class="flex flex-wrap items-center gap-x-4 gap-y-1">
+          ${lbl('Status')}
+          <span class="flex items-center gap-1.5"><span class="inline-block w-2 h-2 rounded-full bg-green-500"></span> Online</span>
+          <span class="flex items-center gap-1.5"><span class="inline-block w-2 h-2 rounded-full bg-amber-400"></span> Offline &lt; 30 min</span>
+          <span class="flex items-center gap-1.5"><span class="inline-block w-2 h-2 rounded-full bg-red-500"></span> Offline &gt; 30 min</span>
+          <span class="flex items-center gap-1.5"><span class="text-red-600 font-bold">0.75 hrs</span> Last Seen over 30 min ago</span>
+        </div>
+        <div class="flex flex-wrap items-center gap-x-4 gap-y-1">
+          ${lbl('Sim')}
+          <span class="flex items-center gap-1.5">${sw('bg-[#263040]/10 text-[#263040] border border-[#263040]')} SID default ON</span>
+          <span class="flex items-center gap-1.5">${sw('bg-white text-slate-400 border border-slate-200')} SID default OFF</span>
+          <span class="flex items-center gap-1.5">${sw('bg-white text-[#263040] border-2 border-[#263040]')} Override ON</span>
+          <span class="flex items-center gap-1.5">${sw('bg-[#263040]/5 text-[#263040]/60 border border-[#263040]/40')} Override OFF</span>
+          <span class="flex items-center gap-1.5"><span class="bolt text-amber-600 font-bold">⚡</span> Demo scenario active (auto-reverts in 2h)</span>
+          <span class="flex items-center gap-1.5"><span class="bg-amber-50 border border-amber-200 px-1.5 rounded">row</span> highlighted while a demo runs</span>
+        </div>
+        <div class="flex flex-wrap items-center gap-x-4 gap-y-1">
+          ${lbl('Tier')}
+          <span class="flex items-center gap-1.5">${tier('', 'T1')} Physical Hardware · ${tier('', 'T2')} USB dongle · ${tier('', 'T3')} PCI passthrough</span>
+        </div>
+      </div>
     </div>`;
 }
 
@@ -1629,8 +1822,8 @@ function csHealthBadge(c) {
          + (seen ? `<span class="ml-1 text-[10px] text-slate-400" title="${csEscape(seenTitle)}">${seen}</span>` : '');
 }
 
-function csRenderClientRows(rows) {
-    const body = csEl('cs-client-body') || csEl('cs-content');
+function csRenderClientRows(rows, targetId) {
+    const body = (targetId && csEl(targetId)) || csEl('cs-client-body') || csEl('cs-content');
     if (!rows || rows.length === 0) {
         body.innerHTML = csEmpty('No clients reported.',
             'Connected client simulators will appear here once spokes check in.');
@@ -1940,24 +2133,13 @@ window.csCtlClear = async function (btn) {
 
 
 
-window.csClientFilter = function () {
-    const q = (csEl('cs-client-search') && csEl('cs-client-search').value || '').toLowerCase();
-    const st = csEl('cs-client-status') && csEl('cs-client-status').value;
-    const filtered = csClientCache.filter(c => {
-        if (csClientTier !== 'all' && csClassifyClient(c) !== csClientTier) return false;
-        if (st === 'online' && !c.online) return false;
-        if (st === 'offline' && c.online) return false;
-        if (!q) return true;
-        const hay = [c.spoke_name, c.spoke_id, c.hostname, c.id, c.connected_ssid, c.simulation_id, c.platform]
-            .filter(Boolean).join(' ').toLowerCase();
-        return hay.includes(q);
-    });
-    csRenderClientRows(filtered);
-};
+window.csClientFilter = function () { csRenderClientsFaceted(); };
 
 // Keystroke-debounced entry point for the free-text search input (the status
-// <select> stays on the immediate onchange= above). See csDebounce.
-window.csClientFilterKey = csDebounce(window.csClientFilter, 200);
+// <select> stays on the immediate onchange= above, via csClientResetPage). See
+// csDebounce. Resets to page 1 on each new search term, same as the status
+// filter, so the user isn't stranded on a now-empty page.
+window.csClientFilterKey = csDebounce(function () { csClientResetPage(); }, 200);
 
 /* ===========================================================================
  * 3. Central — sites / alerts / clients + save form
@@ -2128,6 +2310,7 @@ async function csRenderCentral() {
     if (!sites.length) { csSet(`${warn}${csEmpty('No Central sites returned.', 'Verify the Central API token/mode in Setup → Central API and that the account has sites.')}`); return; }
     const sm = (sitesCfg && sitesCfg.site_mappings && typeof sitesCfg.site_mappings === 'object') ? sitesCfg.site_mappings : {};
     const monitored = new Set(Object.values(sm).map(v => String(v)));  // Central-site names enrolled
+    const minBySite = (sitesCfg && sitesCfg.site_min_clients && typeof sitesCfg.site_min_clients === 'object') ? sitesCfg.site_min_clients : {};  // per-site min-client floor
     // Per-site alert/insight counts from the browse data. Insights tagged
     // "All Sites" (global) count toward every site.
     const alertsBySite = {}, insightsBySite = {}; let globalInsights = 0;
@@ -2138,9 +2321,10 @@ async function csRenderCentral() {
         const isMon = monitored.has(String(name));
         const nAlerts = alertsBySite[name] || 0;
         const nInsights = (insightsBySite[name] || 0) + globalInsights;
+        const _minLbl = minBySite[name] ? ` · min ${csEscape(String(minBySite[name]))}` : '';
         const btn = isMon
-            ? `<button onclick="csToggleMonitorSite(${csEscape(JSON.stringify(name))}, false)" class="bg-emerald-50 text-emerald-700 border border-emerald-200 px-2.5 py-1 rounded-md text-xs font-bold hover:bg-emerald-100" title="Stop monitoring this site's client count">✓ Monitored</button>`
-            : `<button onclick="csToggleMonitorSite(${csEscape(JSON.stringify(name))}, true)" class="bg-slate-100 text-slate-700 border border-slate-200 px-2.5 py-1 rounded-md text-xs font-bold hover:bg-slate-200" title="Monitor this site's client count for change (shows on the dashboard)">Monitor</button>`;
+            ? `<button onclick="csMonitorSiteModal(${csEscape(JSON.stringify(name))})" class="bg-emerald-50 text-emerald-700 border border-emerald-200 px-2.5 py-1 rounded-md text-xs font-bold hover:bg-emerald-100" title="Edit monitoring / min-client threshold">✓ Monitored${_minLbl}</button>`
+            : `<button onclick="csMonitorSiteModal(${csEscape(JSON.stringify(name))})" class="bg-slate-100 text-slate-700 border border-slate-200 px-2.5 py-1 rounded-md text-xs font-bold hover:bg-slate-200" title="Monitor this site's client count (set a min-client floor)">Monitor</button>`;
         return { name, health: st.health_score, clients: st.wireless_clients != null ? st.wireless_clients : 0,
                  alerts: nAlerts, insights: nInsights, monitored: isMon, btn: name ? btn : '' };
     });
@@ -2155,31 +2339,107 @@ async function csRenderCentral() {
     csSet(`<div class="space-y-4">${warn}<div class="hpe-card rounded-lg p-4 shadow-sm">${csCentralTable('central-sites', siteCols, rows, { monitorOf: r => r.monitored, caption: `${sites.length} site(s) — Monitor a site to track its client count for change on the dashboard` })}</div></div>`);
 }
 
-// Enroll / un-enroll a Central site for client-count monitoring by toggling it in
-// central_sites_config.site_mappings (key=value=Central site name), preserving the
-// monitored alert/insight + hardware checks. Once enrolled the hub/spoke poller
-// tracks its client count (7-day baseline) and it appears on the dashboard.
-window.csToggleMonitorSite = async function (siteName, monitor, rerender) {
+// Open the Monitor dialog for a Central site. Enrolls/stops client-count
+// monitoring AND sets an optional per-site minimum-client floor: if the live
+// count drops below the floor the poller raises a "Minimum Client Threshold"
+// error check on the dashboard, IN ADDITION to the existing % drop check.
+// ``rerender`` is 'clients' when opened from the Clients view so the save
+// re-renders the right pane. Ported from lm/WebUI/sim-views.js — the spoke's
+// own /central-sites-config route supports this the same way the hub does.
+window.csMonitorSiteModal = async function (siteName, rerender) {
+    const existing = document.getElementById('cs-monitor-site-modal');
+    if (existing) { existing.remove(); return; }
+    let cfg = {};
+    try { cfg = await csFetch(`/${csTenant()}/central-sites-config?tenant_id=${csTenant()}`) || {}; } catch (e) { /* tolerate, defaults below */ }
+    const sm = (cfg.site_mappings && typeof cfg.site_mappings === 'object') ? cfg.site_mappings : {};
+    const isMon = Object.values(sm).some(v => String(v) === String(siteName));
+    const minBySite = (cfg.site_min_clients && typeof cfg.site_min_clients === 'object') ? cfg.site_min_clients : {};
+    const curMin = minBySite[siteName] || '';
+    const rr = rerender === 'clients' ? 'clients' : 'sites';
+    const esc = csEscape;  // shared escaper (escapes &<>"')
+
+    const modal = document.createElement('div');
+    modal.id = 'cs-monitor-site-modal';
+    modal.dataset.rerender = rr;
+    modal.className = 'fixed inset-0 z-50 flex items-center justify-center bg-black bg-opacity-50 backdrop-blur-sm p-4';
+    modal.innerHTML = `
+        <div class="bg-white rounded-xl shadow-2xl w-full max-w-md overflow-hidden">
+            <div class="px-6 py-4 border-b border-slate-200 flex justify-between items-center bg-slate-50">
+                <h3 class="text-lg font-bold text-[#263040]">${isMon ? 'Monitored' : 'Monitor'} — ${esc(siteName)}</h3>
+                <button onclick="this.closest('#cs-monitor-site-modal').remove()" class="text-slate-400 hover:text-slate-600 transition-colors">
+                    <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"></path></svg>
+                </button>
+            </div>
+            <div class="p-6 space-y-4">
+                <div class="space-y-2">
+                    <label class="text-xs text-slate-500 uppercase font-bold">Minimum clients <span class="font-normal normal-case text-slate-400">(optional floor)</span></label>
+                    <input id="cs-monitor-min" type="number" min="0" step="1" value="${esc(curMin)}" placeholder="blank = no floor (drop-based only)" class="w-full bg-white border border-slate-300 rounded-md px-4 py-2 text-sm outline-none focus:ring-2 focus:ring-green-500">
+                    <p class="text-[11px] text-slate-400 leading-relaxed">If this site's live client count drops below this number, an error is raised on the dashboard — in addition to the existing % drop check. Leave blank to monitor for change only.</p>
+                </div>
+                <div id="cs-monitor-status" class="text-xs text-slate-500 hidden"></div>
+                <div class="pt-2 flex justify-between gap-3">
+                    ${isMon ? `<button onclick="csSaveMonitorSite(${csEscape(JSON.stringify(siteName))}, false, null)" class="px-4 py-2 text-sm font-medium text-rose-600 hover:text-rose-800 border border-rose-200 rounded-md">Stop monitoring</button>` : `<span></span>`}
+                    <div class="flex gap-3">
+                        <button onclick="this.closest('#cs-monitor-site-modal').remove()" class="px-4 py-2 text-sm font-medium text-slate-600 hover:text-slate-800">Cancel</button>
+                        <button id="cs-monitor-save" class="bg-emerald-100 hover:bg-emerald-200 text-emerald-800 border border-emerald-300 px-6 py-2 rounded-md text-sm font-bold transition-all shadow-sm">${isMon ? 'Save' : 'Start monitoring'}</button>
+                    </div>
+                </div>
+            </div>
+        </div>`;
+    document.body.appendChild(modal);
+    const inp = document.getElementById('cs-monitor-min');
+    if (inp) { inp.focus(); inp.select(); }
+    const saveBtn = document.getElementById('cs-monitor-save');
+    if (saveBtn) saveBtn.addEventListener('click', () => {
+        const raw = ((inp || {}).value || '').trim();
+        const n = raw === '' ? 0 : parseInt(raw, 10);
+        if (raw !== '' && (!Number.isFinite(n) || n < 0)) {
+            if (typeof showToast === 'function') showToast('Minimum clients must be a non-negative integer', 'error');
+            return;
+        }
+        csSaveMonitorSite(siteName, true, n);
+    });
+};
+
+// Worker for the monitor dialog: writes site_mappings (+ site_min_clients) into
+// central_sites_config, preserving the monitored alert/insight + hardware
+// checks. ``minClients``: null = leave the floor untouched (Stop), 0 = clear it,
+// >0 = set it. Reads data-rerender on the modal to re-render the opening pane.
+window.csSaveMonitorSite = async function (siteName, monitor, minClients) {
+    const modal = document.getElementById('cs-monitor-site-modal');
+    const statusEl = modal ? modal.querySelector('#cs-monitor-status') : null;
+    const saveBtn = modal ? modal.querySelector('#cs-monitor-save') : null;
+    if (saveBtn) { saveBtn.disabled = true; saveBtn.classList.add('opacity-50', 'cursor-not-allowed'); }
+    if (statusEl) { statusEl.textContent = 'Saving…'; statusEl.classList.remove('hidden'); }
     try {
         const cfg = await csFetch(`/${csTenant()}/central-sites-config?tenant_id=${csTenant()}`) || {};
         const sm = (cfg.site_mappings && typeof cfg.site_mappings === 'object') ? { ...cfg.site_mappings } : {};
+        const minBySite = (cfg.site_min_clients && typeof cfg.site_min_clients === 'object') ? { ...cfg.site_min_clients } : {};
         if (monitor) {
             sm[siteName] = siteName;
+            if (minClients === null) { /* keep existing floor */ }
+            else if (minClients > 0) { minBySite[siteName] = minClients; }
+            else { delete minBySite[siteName]; }
         } else {
             Object.keys(sm).forEach(k => { if (String(sm[k]) === String(siteName) || k === siteName) delete sm[k]; });
+            delete minBySite[siteName];
         }
         const body = {
             site_mappings: sm,
+            site_min_clients: minBySite,
             monitored_checks: Array.isArray(cfg.monitored_checks) ? cfg.monitored_checks : [],
             hardware_checks: Array.isArray(cfg.hardware_checks) ? cfg.hardware_checks : [],
         };
         const r = await csFetch(`/${csTenant()}/central-sites-config?tenant_id=${csTenant()}`, { method: 'POST', body: JSON.stringify(body) });
         if (typeof csPushToast === 'function') csPushToast(r, monitor ? `Monitoring ${siteName}` : `Stopped monitoring ${siteName}`);
         else if (typeof showToast === 'function') showToast(monitor ? `Monitoring ${siteName}` : `Stopped monitoring ${siteName}`, 'success');
-        (rerender === 'clients' ? csRenderCentralClients : csRenderCentral)();
+        if (modal) modal.remove();
+        ((modal && modal.dataset.rerender) === 'clients' ? csRenderCentralClients : csRenderCentral)();
     } catch (e) {
-        console.error('csToggleMonitorSite failed', e);
+        console.error('csSaveMonitorSite failed', e);
         if (typeof showToast === 'function') showToast(e.message, 'error');
+        if (statusEl) { statusEl.textContent = (e.message || 'Save failed'); statusEl.classList.remove('hidden'); }
+        if (saveBtn) { saveBtn.disabled = false; saveBtn.classList.remove('opacity-50', 'cursor-not-allowed'); }
     }
 };
 
@@ -2300,12 +2560,14 @@ async function csRenderCentralClients() {
     if (!clients.length) { csSet(`${warn}${csEmpty('No Central clients returned.')}`); return; }
     const sm = (sitesCfg && sitesCfg.site_mappings && typeof sitesCfg.site_mappings === 'object') ? sitesCfg.site_mappings : {};
     const monitored = new Set(Object.values(sm).map(v => String(v)));
+    const minBySite = (sitesCfg && sitesCfg.site_min_clients && typeof sitesCfg.site_min_clients === 'object') ? sitesCfg.site_min_clients : {};
     const rows = clients.map(cl => {
         const site = cl.site || '';
         const isMon = site && monitored.has(String(site));
+        const _minLbl = site && minBySite[site] ? ` · min ${csEscape(String(minBySite[site]))}` : '';
         const btn = !site ? '—' : (isMon
-            ? `<button onclick="csToggleMonitorSite(${csEscape(JSON.stringify(site))}, false, 'clients')" class="bg-emerald-50 text-emerald-700 border border-emerald-200 px-2.5 py-1 rounded-md text-xs font-bold hover:bg-emerald-100" title="Stop monitoring this client's site">✓ Site monitored</button>`
-            : `<button onclick="csToggleMonitorSite(${csEscape(JSON.stringify(site))}, true, 'clients')" class="bg-slate-100 text-slate-700 border border-slate-200 px-2.5 py-1 rounded-md text-xs font-bold hover:bg-slate-200" title="Monitor this client's site (client-count on the dashboard)">Monitor</button>`);
+            ? `<button onclick="csMonitorSiteModal(${csEscape(JSON.stringify(site))}, 'clients')" class="bg-emerald-50 text-emerald-700 border border-emerald-200 px-2.5 py-1 rounded-md text-xs font-bold hover:bg-emerald-100" title="Edit monitoring / min-client threshold">✓ Site monitored${_minLbl}</button>`
+            : `<button onclick="csMonitorSiteModal(${csEscape(JSON.stringify(site))}, 'clients')" class="bg-slate-100 text-slate-700 border border-slate-200 px-2.5 py-1 rounded-md text-xs font-bold hover:bg-slate-200" title="Monitor this client's site (set a min-client floor)">Monitor</button>`);
         return { host: cl.hostname || cl.mac || '—', ip: cl.ip || '—', mac: cl.mac || '—',
                  site: cl.site || '—', os: cl.os || '—', status: cl.status || 'unknown',
                  monitored: !!isMon, btn };
@@ -3142,9 +3404,9 @@ async function csRenderMist() {
 
 // Enroll / un-enroll a Mist site for client-count monitoring by toggling it in
 // mist_sites_config.site_mappings (key=value=Mist site name), preserving the
-// monitored alert/insight + hardware checks. MIRROR of csToggleMonitorSite —
-// direct toggle (no min-client floor modal; the cs local copy keeps Central's
-// simpler flow), writing to mist-sites-config, never Central's config.
+// monitored alert/insight + hardware checks. Direct toggle (no min-client
+// floor modal — Mist keeps the simpler flow Central's csMonitorSiteModal
+// superseded), writing to mist-sites-config, never Central's config.
 window.csToggleMistSite = async function (siteName, monitor, rerender) {
     try {
         const cfg = await csFetch(`/${csTenant()}/mist-sites-config?tenant_id=${csTenant()}`) || {};
