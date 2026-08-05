@@ -828,17 +828,19 @@ class CentralPoller:
         if not self._client or not self._client.is_configured():
             return {"status": "SUCCESS", "sites": [], "alerts": [], "insights": [],
                     "clients": [], "devices_by_site": {}, "clients_by_site": {},
-                    "os_counts": {}, "warning": "Central not configured."}
+                    "os_counts": {}, "warning": "Central not configured.",
+                    "fetched_at": time.time()}
         try:
             data = await self._client.browse_all()
             return {"status": "SUCCESS", **data,
-                    "os_counts": client_os_counts(data.get("clients"))}
+                    "os_counts": client_os_counts(data.get("clients")),
+                    "fetched_at": time.time()}
         except Exception as exc:  # noqa: BLE001
             logger.warning("Central browse failed [%s]: %s",
                            self.spoke.spoke_id, exc)
             return {"status": "ERROR", "message": str(exc),
                     "sites": [], "alerts": [], "insights": [], "clients": [],
-                    "os_counts": {}}
+                    "os_counts": {}, "fetched_at": time.time()}
 
     async def test_connection(self) -> Dict[str, Any]:
         """Best-effort connectivity check for the Setup → Central API tab's
