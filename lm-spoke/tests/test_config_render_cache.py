@@ -8,6 +8,7 @@ overrides — and verify the cache actually invalidates when the config file or
 the per-client overrides change.
 """
 
+import re
 from pathlib import Path
 
 import pytest
@@ -108,7 +109,7 @@ def reference_render(spoke, configs_dir: Path, hostname: str) -> str:
         sim_conf.set("simulation", "ambient_control",
                      "on" if control_on else "off")
         _uname = sim_config.username_for(hostname) if hostname else ""
-        if _exclusive_sim_active(overrides, user_conf, _uname):
+        if _exclusive_sim_active(hostname, sim_conf, overrides, user_conf, _uname):
             sim_conf.set("simulation", "ambient_pct", "0")
         elif control_on:
             site_w = spoke.local_store.get_ambient_site_weights()
@@ -209,6 +210,25 @@ def test_render_with_registry_overrides(client, spoke, configs):
     client.post("/api/clients/jdoe-7/control",
                 json={"overrides": {"iperf": "on"}})
     _assert_matches_reference(client, spoke, configs, hosts=["kbell-1", "jdoe-7"])
+
+
+def test_ambient_suppressed_for_bucket_default_exclusive_sim(client, spoke, configs):
+    """A client whose EXCLUSIVE sim (ssidpw_fail) is only its BUCKET DEFAULT —
+    no registry override, no human pin — must still suppress ambient_pct.
+    _exclusive_sim_active used to check only the engine override + a human
+    pin, silently missing the bucket-default layer: that client's ambient_pct
+    stayed enabled, letting the client-side ambient rotation stack a shareable
+    sim (e.g. ping_test) on top of a bucket-default exclusive one."""
+    h = "bucket-default-excl-test"                # bucket_for(h) == "s1" — new,
+    bucket = sim_config.bucket_for(h)              # doesn't collide with s0/s3
+    conf = configs / "simulation.conf"
+    conf.write_text(conf.read_text(encoding="utf-8") + f"\n[{bucket}]\nssidpw_fail=on\n",
+                    encoding="utf-8")
+    spoke.local_store.set_ambient_pct(50)
+    spoke.local_store.set_ambient_control(False)
+    text = client.get("/api/config", params={"hostname": h}).text
+    m = re.search(r"(?m)^ambient_pct\s*=\s*(\S+)", text)
+    assert m and m.group(1) == "0", f"expected ambient_pct=0, got {m.group(1) if m else None!r}"
 
 
 def test_cache_invalidation_on_conf_change(client, spoke, configs):
