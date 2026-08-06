@@ -116,6 +116,18 @@ class ClientCommandsMixin:
             res = await self.registry.purge()
             return {"status": "SUCCESS", **res}
 
+        if cmd == "CS_DELETE_CLIENT":
+            # Surgical counterpart to CS_PURGE_CLIENTS — removes ONE client's
+            # registry record (a renamed/recloned VM's stale old hostname, a
+            # one-off test client, etc.) instead of wiping the entire fleet's
+            # history. Hub forwards here via
+            # DELETE /sim/api/{tenant}/clients/{hostname}.
+            hostname = (d.get("hostname") or "").strip()
+            if not hostname:
+                return {"status": "ERROR", "message": "missing hostname"}
+            removed = await self.registry.delete_one(hostname)
+            return {"status": "SUCCESS", "hostname": hostname, "removed": removed}
+
         if cmd == "CS_PURGE_HOST":
             # Operator deleted a VM Server row for an intentionally shut-down
             # host (hub DELETE /sim/api/proxmox/host/{hostname} forwards here).

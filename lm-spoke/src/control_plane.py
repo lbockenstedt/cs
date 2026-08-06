@@ -355,6 +355,10 @@ class CSControlPlane(AgentHostingControlPlane):
             logger.info("CS agent listener disabled (relay-only; --no-agent-listener was passed)")
         # Start the demo-scenario TTL expiry sweep (no-op without a loop).
         cs_spoke.demo.start()
+        # Start the client registry's stale-client prune sweep (hourly; see
+        # client_registry.py ClientRegistry.start()/prune_stale) — previously
+        # nothing removed an individual stale client short of a full Purge.
+        cs_spoke.registry.start()
         # Start the Aruba Central poll loop (see central_poller.py). Runs
         # regardless of hub-connection — its output feeds both the local
         # dashboard's Simulations tab AND (via _cs_telemetry_relay_loop below)

@@ -70,7 +70,8 @@ class ClientRegistry:
     a client's overrides into its profile. See the module docstring."""
 
     def __init__(self, data_dir: Path,
-                 bucket_resolver: Optional[Callable[[str], Dict[str, Any]]] = None
+                 bucket_resolver: Optional[Callable[[str], Dict[str, Any]]] = None,
+                 stale_prune_hours: float = 48.0,
                  ) -> None:
         self.data_dir = Path(data_dir)
         self.data_dir.mkdir(parents=True, exist_ok=True)
@@ -87,8 +88,40 @@ class ClientRegistry:
         # _flush_task is the armed coalescing flusher (None/done = disarmed).
         self._dirty = False
         self._flush_task: Optional[asyncio.Task] = None
+        # Stale-client prune sweep (see start()/prune_stale()). 48h default:
+        # long enough that an ordinary overnight outage (dongle churn, a host
+        # reboot) never gets pruned as a false ghost, short enough that a
+        # genuinely renamed/decommissioned VM's old hostname doesn't linger
+        # indefinitely — previously NOTHING removed an individual stale entry
+        # short of a full Purge Clients wipe of the whole registry.
+        self._stale_prune_hours = stale_prune_hours
+        self._prune_task: Optional[asyncio.Task] = None
         _REGISTRIES.add(self)
         self._load()
+
+    def start(self) -> None:
+        """Start the background stale-client prune sweep. No-op if there's no
+        running loop (e.g. unit tests constructing a registry without one) —
+        mirrors DemoManager.start()'s pattern."""
+        if self._prune_task is not None and not self._prune_task.done():
+            return
+        try:
+            self._prune_task = asyncio.create_task(self._prune_loop())
+        except RuntimeError:
+            pass  # no current event loop
+
+    async def _prune_loop(self) -> None:
+        while True:
+            try:
+                await asyncio.sleep(3600)  # hourly — this is an hours-scale concern, not a hot path
+                res = await self.prune_stale(self._stale_prune_hours * 3600)
+                if res["count"]:
+                    logger.info("ClientRegistry: pruned %d stale client(s) (no heartbeat in %.0fh): %s",
+                               res["count"], self._stale_prune_hours, res["pruned"])
+            except asyncio.CancelledError:
+                return
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("client-registry prune loop error: %s", exc)
 
     # ── persistence ────────────────────────────────────────────────────────
     def _load(self) -> None:
@@ -242,6 +275,45 @@ class ClientRegistry:
 
     def count(self) -> int:
         return len(self.clients)
+
+    async def delete_one(self, hostname: str) -> bool:
+        """Remove ONE client's registry record — the surgical counterpart to
+        ``purge()`` (which wipes everything). For a single stale/unrecognized
+        entry (a renamed/recloned VM's old hostname left behind, a one-off
+        manual test client, etc.) that never ages out on its own — there is
+        no automatic expiry here (see ``prune_stale`` for that), and until
+        this method existed the only way to remove ONE ghost entry was to
+        Purge Clients and lose every real client's history too. Returns
+        False if the hostname wasn't registered (nothing to delete)."""
+        hostname = str(hostname or "").strip()
+        if not hostname:
+            return False
+        async with self._lock:
+            if hostname not in self.clients:
+                return False
+            del self.clients[hostname]
+            await self._apersist()
+            return True
+
+    async def prune_stale(self, max_age_s: float) -> Dict[str, Any]:
+        """Remove every client whose ``last_seen`` is older than ``max_age_s``
+        (or has no ``last_seen`` at all — a malformed/never-reported entry).
+        Called on a slow periodic cadence (see the spoke's poll loop) so a
+        renamed/decommissioned VM's old hostname doesn't linger in the
+        registry forever — previously nothing ever removed an individual
+        stale entry short of a full Purge Clients wipe. Returns
+        {"pruned": [hostnames...], "count": N} so the caller can log what
+        was removed (never silent — an unexpectedly large prune is exactly
+        the kind of thing that should be visible, not swallowed)."""
+        now = time.time()
+        async with self._lock:
+            stale = [h for h, c in self.clients.items()
+                     if not c.get("last_seen") or (now - float(c["last_seen"])) > max_age_s]
+            for h in stale:
+                del self.clients[h]
+            if stale:
+                await self._apersist()
+            return {"pruned": stale, "count": len(stale)}
 
     # ── per-client overrides ───────────────────────────────────────────────
     def _bucket_profile(self, hostname: str) -> Optional[Dict[str, Any]]:
