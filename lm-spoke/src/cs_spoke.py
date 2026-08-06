@@ -235,6 +235,32 @@ class CSSpoke(AgentCommandsMixin, SimCommandsMixin, ConfigCommandsMixin,
                 pass
         return "unknown"
 
+    def get_local_commit(self) -> str:
+        """Best-effort ``git rev-parse HEAD`` at the repo root (same directory
+        as the VERSION file in get_version()). '' if this isn't a git
+        checkout or git isn't available — never raises. Process-lifetime
+        cached: the commit only changes on a restart-triggering update, so
+        there's no need to re-shell out on every call (unlike get_version's
+        mtime-keyed VERSION read, which tracks a file that can change without
+        a restart)."""
+        cached = getattr(self, "_local_commit_cache", None)
+        if cached is not None:
+            return cached
+        sha = ""
+        try:
+            import subprocess
+            repo_root = Path(__file__).resolve().parent.parent.parent
+            out = subprocess.run(
+                ["git", "-C", str(repo_root), "rev-parse", "HEAD"],
+                capture_output=True, text=True, timeout=10,
+            )
+            if out.returncode == 0:
+                sha = out.stdout.strip()
+        except Exception:  # noqa: BLE001
+            pass
+        self._local_commit_cache = sha
+        return sha
+
     # ── agent registry (cs-dialed pxmx agents) ──────────────────────────────
 
     def _get_agents(self) -> Dict[str, Any]:
@@ -492,7 +518,8 @@ class CSSpoke(AgentCommandsMixin, SimCommandsMixin, ConfigCommandsMixin,
 
         # ── identity / status ──────────────────────────────────────────────
         if cmd in ("GET_VERSION", "CS_GET_VERSION"):
-            return {"status": "SUCCESS", "version": self.get_version()}
+            return {"status": "SUCCESS", "version": self.get_version(),
+                    "commit_sha": self.get_local_commit()}
 
         # ── domain dispatch (handlers in command_handlers/*) ────────────────
         # The ~900-line CS_* if-chain was moved verbatim into per-domain mixin
