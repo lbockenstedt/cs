@@ -328,6 +328,9 @@ class ClientCountTracker:
         avg_7day = round(sum(vals_7d) / len(vals_7d), 1) if vals_7d else 0.0
         avg_30day = round(sum(vals_30d) / len(vals_30d), 1) if vals_30d else 0.0
         die_off_peak = 0.0  # the average the current avg fell below, if die-off tripped
+        # WHICH rule(s) actually fired this cycle — debug-only, returned + surfaced
+        # in the Central Diagnostic tab (mirror of lm's central_hub_poller.py).
+        triggered = []
         # Trend inputs. Each returns None when it lacks the history to judge,
         # so a fresh site never alarms on an empty comparison.
         day_drop_pct = _cc_period_drop(hist, now, _CC_1DAY_WINDOW)
@@ -367,15 +370,18 @@ class ClientCountTracker:
             # averages alone could not cover.
             if floor is not None and hourly_avg < floor:
                 status = _cc_worst(status, "error")
+                triggered.append("floor(%s<%s)" % (hourly_avg, floor))
             # PERIOD: this day/week vs the one before -> catches a slow bleed
             # that no short-window rate rule can see.
-            for _drop in (day_drop_pct, week_drop_pct):
+            for _label, _drop in (("day", day_drop_pct), ("week", week_drop_pct)):
                 if _drop is not None and _drop > period_drop_pct:
                     status = _cc_worst(status, "error")
+                    triggered.append("period_%s(%s%%>%s%%)" % (_label, _drop, period_drop_pct))
             # RATE: short-window fall -> catches a fast collapse hours before
             # the day boundary would show it.
             if rate_drop_pct is not None and rate_drop_pct > rate_drop_thresh:
                 status = _cc_worst(status, "warning")
+                triggered.append("rate(%s%%>%s%%)" % (rate_drop_pct, rate_drop_thresh))
             # STEADY-STATE DIE-OFF: current hourly average vs the 7d/30d AVERAGE
             # baseline (not peak -- see the docstring/comments above on why).
             # Gated on min_peak (checked against the site's own recorded PEAK,
@@ -391,11 +397,15 @@ class ClientCountTracker:
                 if hourly_avg < avg_7day * weekly_frac:
                     status = _cc_worst(status, "error")
                     die_off_peak = avg_7day
+                    triggered.append("die_off_weekly(%s<%s*%s=%s)" %
+                                     (hourly_avg, avg_7day, weekly_frac, round(avg_7day * weekly_frac, 1)))
             if die_off_frac > 0 and max_30day >= min_peak and avg_30day > 0:
                 if hourly_avg < avg_30day * monthly_frac:
                     status = _cc_worst(status, "warning")
                     if not die_off_peak:
                         die_off_peak = avg_30day
+                    triggered.append("die_off_monthly(%s<%s*%s=%s)" %
+                                     (hourly_avg, avg_30day, monthly_frac, round(avg_30day * monthly_frac, 1)))
         return {"site_name": central_site, "current": current,
                 "hourly_avg": round(hourly_avg, 1), "drop_pct": round(drop_pct, 1),
                 "max_7day": max_7day, "max_30day": max_30day,
@@ -404,6 +414,12 @@ class ClientCountTracker:
                 "day_drop_pct": None if day_drop_pct is None else round(day_drop_pct, 1),
                 "week_drop_pct": None if week_drop_pct is None else round(week_drop_pct, 1),
                 "rate_drop_pct": None if rate_drop_pct is None else round(rate_drop_pct, 1),
+                "sample_count": len(samples), "min_samples": _CC_MIN_SAMPLES,
+                "warn_pct": warn_pct, "error_pct": error_pct,
+                "weekly_frac": weekly_frac, "monthly_frac": monthly_frac,
+                "min_peak": min_peak, "period_drop_pct": period_drop_pct,
+                "rate_drop_thresh": rate_drop_thresh, "rate_samples": rate_samples,
+                "triggered": triggered,
                 "die_off": die_off_peak, "die_off_frac": die_off_frac,
                 "status": status, "ts": samples[-1][0]}
 
@@ -816,9 +832,22 @@ class CentralPoller:
                 _do_txt = ", ".join(f"{lbl} {e['hourly_avg']} < {_frac}% of avg {e['die_off']}"
                                     for lbl, e in _do)
                 _cc_msg += f" · ⚠ sustained die-off vs average ({_do_txt})"
+            # Debug breakdown per series, for the Central Diagnostic tab — mirror of
+            # the fix in lm's central_hub_poller.py (see its comment for why).
+            _cc_debug_fields = ("current", "hourly_avg", "drop_pct", "avg_1day", "avg_7day",
+                                "avg_30day", "max_7day", "max_30day", "floor", "day_drop_pct",
+                                "week_drop_pct", "rate_drop_pct", "die_off", "die_off_frac",
+                                "sample_count", "min_samples", "warn_pct", "error_pct",
+                                "weekly_frac", "monthly_frac", "min_peak", "period_drop_pct",
+                                "rate_drop_thresh", "rate_samples", "triggered", "status")
             checks["Steady Client Count 1hr Average"] = {
                 "status": cc_entry["status"],
                 "message": _cc_msg,
+                "debug": {
+                    "total": {k: cc_entry.get(k) for k in _cc_debug_fields},
+                    "wired": {k: w_entry.get(k) for k in _cc_debug_fields},
+                    "wireless": {k: wl_entry.get(k) for k in _cc_debug_fields},
+                },
             }
             for alert_id, devices in (data.get("hw_devices") or {}).items():
                 hw_totals[alert_id] = hw_totals.get(alert_id, 0) + sum(devices.values())
