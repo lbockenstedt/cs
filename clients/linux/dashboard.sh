@@ -83,6 +83,7 @@ refresh_config() {
   iperf_bw=$(get_value 'simulation' 'iperf_bw')
   auth_fail=$(get_value 'simulation' 'auth_fail')
   ssidpw_fail=$(get_value 'simulation' 'ssidpw_fail')
+  mac_auth_fail=$(get_value 'simulation' 'mac_auth_fail')
   allow_offline=$(get_value 'simulation' 'allow_offline')
   web_server=$(get_value 'simulation' 'web_server')
   # Default to ON (hub mode); flip to off ONLY when the conf literally says "off"
@@ -238,6 +239,7 @@ sys.stdout.write(json.dumps(d))' 2>/dev/null)
         [[ "$www_traffic" == "on" ]] && active_sims+=("www_traffic")
         [[ "$ssidpw_fail" == "on" ]] && active_sims+=("ssidpw_fail")
         [[ "$auth_fail"   == "on" ]] && active_sims+=("auth_fail")
+        [[ "$mac_auth_fail" == "on" ]] && active_sims+=("mac_auth_fail")
         if [[ ${#active_sims[@]} -gt 0 ]]; then
           active_sims_json=$(printf '"%s",' "${active_sims[@]}" | sed 's/,$//')
           active_sims_json="[$active_sims_json]"
@@ -447,6 +449,7 @@ get_sim_status() {
   print_inline_sim_row "port_flap"   "$port_flap"   && (( shown++ ))
   print_inline_sim_row "ssidpw_fail" "$ssidpw_fail" && (( shown++ ))
   print_inline_sim_row "auth_fail"   "$auth_fail"   && (( shown++ ))
+  print_inline_sim_row "mac_auth_fail" "$mac_auth_fail" && (( shown++ ))
   (( shown == 0 )) && printf "  ${GRN}None active${RST}\n"
 }
 #------------------------------------------------------------
@@ -503,8 +506,8 @@ while true; do
   # WHY: Bash associative arrays have no guaranteed iteration order so the
   # flags would appear in a different sequence every refresh. Parallel arrays
   # give consistent ordering so the operator can scan quickly.
-  flag_labels=("Kill Switch" "DHCP Fail" "DNS Fail" "DNS Latency" "WWW Traffic" "iPerf" "Download" "Port Flap" "Bad SSID PW" "Auth Fail")
-  flag_values=("$kill_switch" "$dhcp_fail" "$dns_fail" "$dns_latency" "$www_traffic" "$iperf" "$download" "$port_flap" "$ssidpw_fail" "$auth_fail")
+  flag_labels=("Kill Switch" "DHCP Fail" "DNS Fail" "DNS Latency" "WWW Traffic" "iPerf" "Download" "Port Flap" "Bad SSID PW" "Auth Fail" "MAC Auth Fail")
+  flag_values=("$kill_switch" "$dhcp_fail" "$dns_fail" "$dns_latency" "$www_traffic" "$iperf" "$download" "$port_flap" "$ssidpw_fail" "$auth_fail" "$mac_auth_fail")
   printf "  %sSimulations:%s\n" "$BOLD" "$RST"
   col=0
   for i in "${!flag_labels[@]}"; do

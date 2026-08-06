@@ -331,6 +331,35 @@ async def sim_auth_fail(profile: Dict[str, str], ctx: SimCtx) -> PrimResult:
     return _ok("auth_fail", f"toggled wifi radio x{ctx.wifi_iters}", "nmcli")
 
 
+async def sim_mac_auth_fail(profile: Dict[str, str], ctx: SimCtx) -> PrimResult:
+    """SPECIFIC-known-MAC auth failure: pin the connection's cloned-mac-address
+    to a fixed, predictable spoofed MAC (``mac_auth_fail_mac``) then flap it, so
+    a RADIUS/ClearPass MAC-Auth deny rule pre-configured against that exact MAC
+    rejects it repeatedly (nmcli). Bootstraps the connection profile via
+    ``device wifi connect`` ONCE if missing (needed to negotiate WPA2/WPA3),
+    then uses ONLY ``connection up``/``down`` from there — ``device wifi
+    connect`` resets the cloned MAC on every call, silently undoing the spoof."""
+    if not shutil.which("nmcli"):
+        return _degraded("mac_auth_fail", "nmcli", "install NetworkManager (nmcli)")
+    ssid = _effective_ssid(profile)
+    target_mac = (profile.get("mac_auth_fail_mac", "") or "").strip() or "02:BA:D0:00:00:01"
+    exists = await _nmcli("connection", "show", ssid, timeout=5.0)
+    if not exists:
+        await _nmcli("device", "wifi", "connect", ssid, "password",
+                     profile.get("ssidpw", ""), timeout=15.0)
+    await _nmcli("connection", "modify", ssid,
+                 "802-11-wireless.cloned-mac-address", target_mac, timeout=5.0)
+    for _ in range(ctx.wifi_iters):
+        await _nmcli("connection", "up", ssid, timeout=5.0)
+        await asyncio.sleep(1.0)
+        await _nmcli("connection", "down", ssid, timeout=5.0)
+    # Clear the override so a subsequent non-mac_auth_fail primitive's connect
+    # doesn't inherit the spoofed identity.
+    await _nmcli("connection", "modify", ssid,
+                 "802-11-wireless.cloned-mac-address", "", timeout=5.0)
+    return _ok("mac_auth_fail", f"spoofed MAC {target_mac} auth attempts to {ssid} x{ctx.wifi_iters}", "nmcli")
+
+
 # ── port_flap (wired) ─────────────────────────────────────────────────────────
 #
 # These two run via ``create_subprocess_exec`` + ``communicate`` with a timeout
@@ -453,6 +482,7 @@ PRIMITIVES: Dict[str, PrimFn] = {
     "assoc_fail": sim_assoc_fail,
     "ssidpw_fail": sim_ssidpw_fail,
     "auth_fail": sim_auth_fail,
+    "mac_auth_fail": sim_mac_auth_fail,
     "port_flap": sim_port_flap,
     "dhcp_fail": sim_dhcp_fail,
 }

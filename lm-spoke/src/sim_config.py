@@ -42,16 +42,18 @@ logger = logging.getLogger("CSConfig")
 # over its home-bucket profile for the Clients view.
 _SIM_TOGGLE_KEYS = (
     "dhcp_fail", "dns_fail", "dns_latency", "assoc_fail", "port_flap", "ping_test",
-    "download", "iperf", "www_traffic", "ssidpw_fail", "auth_fail", "kill_switch",
+    "download", "iperf", "www_traffic", "ssidpw_fail", "auth_fail", "mac_auth_fail",
+    "kill_switch",
 )
 
 SIM_FLAG_KEYS = (
     "kill_switch", "rapid_update", "sim_load", "github_repo", "repo_location",
-    "site_based_ssid", "iperf_bw", "ssidpw_fail", "auth_fail", "allow_offline",
+    "site_based_ssid", "iperf_bw", "ssidpw_fail", "auth_fail", "mac_auth_fail",
+    "allow_offline",
     "web_server", "server_url",
     "wsite", "ssid", "ssidpw", "dhcp_fail", "dns_fail", "dns_latency", "assoc_fail",
     "port_flap", "ping_test", "download", "iperf", "www_traffic", "sim_phy",
-    "l1", "smb_address", "ping_address", "iperf_server",
+    "l1", "smb_address", "ping_address", "iperf_server", "mac_auth_fail_mac",
     "dns_bad_ip_1", "dns_bad_ip_2", "dns_bad_ip_3",
     "dns_bad_record_1", "dns_bad_record_2", "dns_bad_record_3",
     "central_check", "mutter_cpu_limit",
