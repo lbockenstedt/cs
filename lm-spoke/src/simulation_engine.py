@@ -401,7 +401,15 @@ async def _connected_ssid() -> str:
 
 
 async def _gateway_reachable() -> Optional[bool]:
-    """Quick ping of the default gateway; None if undeterminable."""
+    """Ping of the default gateway; None if undeterminable.
+
+    Sends 2 packets (-c 2), 2s timeout per packet — ping's own exit code is 0
+    if AT LEAST ONE reply came back, so a single lost ICMP reply under host
+    load (CPU contention, virtual-switch jitter — routine on a multi-VM fleet
+    host) no longer flips a genuinely-connected client to "unreachable" the
+    way a single -c 1 -W 1 probe did. A truly unreachable gateway still fails
+    both packets and correctly reports unreachable; this only removes the
+    false-negative window, not the check's ability to catch a real outage."""
     if not shutil.which("ip") or not shutil.which("ping"):
         return None
     out, _ = await _run_capture(["ip", "route"], timeout=3.0)
@@ -412,5 +420,5 @@ async def _gateway_reachable() -> Optional[bool]:
             break
     if not gw:
         return None
-    _, rc = await _run_capture(["ping", "-c", "1", "-W", "1", gw], timeout=3.0)
+    _, rc = await _run_capture(["ping", "-c", "2", "-W", "2", gw], timeout=6.0)
     return rc == 0
