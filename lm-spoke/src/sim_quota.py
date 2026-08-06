@@ -42,7 +42,10 @@ SIM_QUOTA_KEYS = ("alert_id", "alert_type", "sim_id", "count", "site",
                   # Consumer-row (Adaptive, not Learning) knob floor — see the hub
                   # twin's comment (_learned_knob_floor / _knob_overrides_for_tenant,
                   # both hub-only; this spoke only carries the schema fields through).
-                  "inherit_learned_knobs", "knob_overrides")
+                  "inherit_learned_knobs", "knob_overrides",
+                  # Consumer-row count floor — see the hub twin's adaptive_step /
+                  # apply_adaptive_targets (hub-only; schema field only here).
+                  "inherit_learned_count")
 # Per-quota client-tier policy. "best" (default) = prefer T1 (dedicated PCI —
 # highest reliability), fall back to T2 (USB dongle). "t1"/"t2" = that tier ONLY
 # (underfill rather than degrade a high-reliability sim onto an unreliable dongle).
@@ -294,6 +297,8 @@ def normalize_quota(raw: Any) -> Dict[str, Any]:
         "inherit_learned_knobs": _as_bool(raw.get("inherit_learned_knobs"), True),
         "knob_overrides": ({str(k): v for k, v in raw["knob_overrides"].items()}
                            if isinstance(raw.get("knob_overrides"), dict) else {}),
+        # Consumer-row count floor — schema symmetry with the hub twin.
+        "inherit_learned_count": _as_bool(raw.get("inherit_learned_count"), True),
     }
     # Adaptive-controller fields (design doc §9) — carried through only when the
     # quota declares them, so a fixed-count quota stays exactly as before. The
