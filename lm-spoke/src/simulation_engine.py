@@ -40,7 +40,7 @@ logger = logging.getLogger("SimulationEngine")
 # resolved profile is the only source (mirrors the original hub effective_config).
 _BEACON_CONFIG_KEYS = (
     "kill_switch", "dns_fail", "iperf", "www_traffic", "download", "ping_test",
-    "ssidpw_fail", "auth_fail", "dhcp_fail", "sim_phy", "wsite",
+    "ssidpw_fail", "auth_fail", "mac_auth_fail", "dhcp_fail", "sim_phy", "wsite",
 )
 
 

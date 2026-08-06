@@ -27,7 +27,7 @@ logger = logging.getLogger("CSDemo")
 
 DEMO_TTL_SECONDS = 120 * 60  # 120 minutes
 FAILURE_FLAGS = ("dns_fail", "dns_latency", "dhcp_fail", "assoc_fail",
-                 "auth_fail", "ssidpw_fail", "port_flap")
+                 "auth_fail", "ssidpw_fail", "mac_auth_fail", "port_flap")
 
 
 def build_scenarios() -> Dict[str, Dict[str, str]]:

@@ -139,6 +139,7 @@ while ($true) {
         iperf_bw         = get_value 'simulation' 'iperf_bw'
         auth_fail        = get_value 'simulation' 'auth_fail'
         ssidpw_fail      = get_value 'simulation' 'ssidpw_fail'
+        mac_auth_fail    = get_value 'simulation' 'mac_auth_fail'
         allow_offline    = get_value 'simulation' 'allow_offline'
         wsite            = get_value $simulationId 'wsite'
         sim_phy          = get_value $simulationId 'sim_phy'
@@ -154,7 +155,7 @@ while ($true) {
         www_traffic      = get_value $simulationId 'www_traffic'
     }
 
-    foreach ($key in @('kill_switch','sim_load','public_repo','repo_location','vh_server','site_based_ssid','iperf_bw','wsite','sim_phy','ssid','ssidpw','dhcp_fail','dns_fail','assoc_fail','port_flap','ping_test','download','iperf','www_traffic','ssidpw_fail','auth_fail')) {
+    foreach ($key in @('kill_switch','sim_load','public_repo','repo_location','vh_server','site_based_ssid','iperf_bw','wsite','sim_phy','ssid','ssidpw','dhcp_fail','dns_fail','assoc_fail','port_flap','ping_test','download','iperf','www_traffic','ssidpw_fail','auth_fail','mac_auth_fail')) {
         Apply-Override -Section $username -Name $key -Config $config
     }
 

@@ -79,7 +79,8 @@ except Exception:  # noqa: BLE001
 # raises a bulk alarm (infrastructure, not dongles) and suppresses the shed.
 QT_GRACE_S_DEFAULT = 3600.0          # 1h after first heartbeat before "never connected"
 QT_EXCLUDE_SIMS_DEFAULT = ("dhcp_fail", "assoc_fail", "ssidpw_fail",
-                           "auth_fail", "port_flap")  # sims where no-IP is the point
+                           "auth_fail", "mac_auth_fail",
+                           "port_flap")  # sims where no-IP is the point
 QT_BULK_THRESHOLD = 0.20             # >20% per host failed → bulk alarm, no mass shed
 QT_BULK_MIN_HOST = 3                 # a host needs ≥3 T2 clients before the ratio
                                      # is meaningful — a 1-client host at "100%

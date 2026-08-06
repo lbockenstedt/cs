@@ -230,6 +230,12 @@ site_based_ssid=$(get_value 'simulation' 'site_based_ssid')
 iperf_bw=$(get_value 'simulation' 'iperf_bw')
 auth_fail=$(get_value 'simulation' 'auth_fail')
 ssidpw_fail=$(get_value 'simulation' 'ssidpw_fail')
+# mac_auth_fail: same "connectivity-failure, inline in the connect loop" kind as
+# ssidpw_fail/auth_fail (see the section below) — associates with a fixed,
+# PREDICTABLE spoofed MAC (mac_auth_fail_mac, [address]) so the operator can
+# pre-configure that exact MAC as a RADIUS/ClearPass MAC-Auth deny entry and
+# watch it get rejected repeatedly.
+mac_auth_fail=$(get_value 'simulation' 'mac_auth_fail')
 allow_offline=$(get_value 'simulation' 'allow_offline')
 web_server=$(get_value 'simulation' 'web_server')
 # Default to ON (hub mode); flip to off ONLY when the conf literally says "off"
@@ -287,7 +293,7 @@ if [[ "$web_server" == "on" ]]; then
   # Start every sim OFF. The engine turns failure sims on via the [username]
   # override applied further down; the roll below is what turns AMBIENT traffic on.
   for sim in dhcp_fail dns_fail dns_latency assoc_fail port_flap ssidpw_fail auth_fail \
-             ping_test download iperf www_traffic; do declare -g "$sim=off"; done
+             mac_auth_fail ping_test download iperf www_traffic; do declare -g "$sim=off"; done
   #
   # Ambient distribution — two-step model (level, then weighted split)
   # ------------------------------------------------------------------
@@ -359,7 +365,7 @@ else
     random_bucket="s$(( RANDOM % 10 ))"
     echo "Ambient random pool: rolling behaviour from bucket ${random_bucket}" | tee -a ${LOG_FILE}
     for sim in dhcp_fail dns_fail assoc_fail port_flap ssidpw_fail auth_fail \
-               ping_test download iperf www_traffic; do
+               mac_auth_fail ping_test download iperf www_traffic; do
       if [[ " $randomizable_sims " == *" $sim "* ]]; then
         declare -g "$sim=$(get_value $random_bucket "$sim")"
       else
@@ -381,6 +387,11 @@ dns_bad_record_2=$(get_value 'address' 'dns_bad_record_2')
 dns_bad_record_3=$(get_value 'address' 'dns_bad_record_3')
 iperf_server=$(get_value 'address' 'iperf_server')
 collab_server=$(get_value 'address' 'collab_server')
+# mac_auth_fail_mac: the SHARED, predictable spoofed MAC every mac_auth_fail
+# client associates with (same value fleet-wide — a single known RADIUS/
+# ClearPass deny-list entry, matching how ssidpw_fail corrupts the SAME real
+# password by the same rule rather than deriving a per-client value).
+mac_auth_fail_mac=$(get_value 'address' 'mac_auth_fail_mac')
 #------------------------------------------------------------
 #User/Device Specific Overrides — apply_override + the shared SUPERSET
 #CS_OVERRIDE_KEYS list live in common.sh (kept in sync with dashboard.sh).
@@ -411,6 +422,7 @@ echo "Collab: $collab app=${collab_app:-teams} server=${collab_server:-unset}" |
 echo Download: $download | tee -a ${LOG_FILE}
 echo Port Flap: $port_flap | tee -a ${LOG_FILE}
 echo Incorrect SSID PW: $ssidpw_fail | tee -a ${LOG_FILE}
+echo "MAC Auth Fail: $mac_auth_fail (target mac=${mac_auth_fail_mac:-unset})" | tee -a ${LOG_FILE}
 echo ------------------------------| tee -a ${LOG_FILE}
 _rsleep 5
 #------------------------------------------------------------
@@ -476,7 +488,7 @@ report_status() {
   # (its heartbeat rides a separate backend network, so absence here ≠ offline).
   sim_ip=$(ip -4 -o route get 1.1.1.1 2>/dev/null | grep -oP 'src \K\S+' | head -n1)
   [[ "${gateway_reachable:-}" == "true" ]] && gateway_json=true
-  for sim in dns_fail dns_latency assoc_fail port_flap iperf download www_traffic ping_test ssidpw_fail auth_fail dhcp_fail collab; do
+  for sim in dns_fail dns_latency assoc_fail port_flap iperf download www_traffic ping_test ssidpw_fail auth_fail mac_auth_fail dhcp_fail collab; do
     if [[ "${!sim}" == "on" ]]; then
       [[ $first == true ]] && first=false || active_simulations+=","
       active_simulations+="\"$sim\""
@@ -494,12 +506,12 @@ report_status() {
   local dns_ceiling; dns_ceiling=$(_dns_ceiling_saved); [[ "$dns_ceiling" =~ ^[0-9]+$ ]] || dns_ceiling=0
   local payload
   printf -v payload \
-    '{"hostname":"%s","simulation_id":"%s","platform":"%s","iteration":%s,"connected_ssid":"%s","ip":"%s","gateway_reachable":%s,"dns_ceiling":%s,"active_simulations":[%s],"errors":%s,"config":{"kill_switch":"%s","dns_fail":"%s","dns_latency":"%s","iperf":"%s","www_traffic":"%s","download":"%s","ping_test":"%s","ssidpw_fail":"%s","auth_fail":"%s","dhcp_fail":"%s","collab":"%s"}}' \
+    '{"hostname":"%s","simulation_id":"%s","platform":"%s","iteration":%s,"connected_ssid":"%s","ip":"%s","gateway_reachable":%s,"dns_ceiling":%s,"active_simulations":[%s],"errors":%s,"config":{"kill_switch":"%s","dns_fail":"%s","dns_latency":"%s","iperf":"%s","www_traffic":"%s","download":"%s","ping_test":"%s","ssidpw_fail":"%s","auth_fail":"%s","mac_auth_fail":"%s","dhcp_fail":"%s","collab":"%s"}}' \
     "$(json_escape "$hostname")" "$(json_escape "${simulation_id:-}")" "$(json_escape "$platform")" \
     "$iteration" "$(json_escape "${connected_ssid:-}")" "$(json_escape "${sim_ip:-}")" "$gateway_json" "$dns_ceiling" "$active_simulations" "$errors_json" \
     "$(json_escape "${kill_switch:-off}")" "$(json_escape "${dns_fail:-off}")" "$(json_escape "${dns_latency:-off}")" "$(json_escape "${iperf:-off}")" \
     "$(json_escape "${www_traffic:-off}")" "$(json_escape "${download:-off}")" "$(json_escape "${ping_test:-off}")" \
-    "$(json_escape "${ssidpw_fail:-off}")" "$(json_escape "${auth_fail:-off}")" "$(json_escape "${dhcp_fail:-off}")" \
+    "$(json_escape "${ssidpw_fail:-off}")" "$(json_escape "${auth_fail:-off}")" "$(json_escape "${mac_auth_fail:-off}")" "$(json_escape "${dhcp_fail:-off}")" \
     "$(json_escape "${collab:-off}")"
   local status_file="/usr/local/scripts/client-status.json"
   printf '%s\n' "$payload" > "$status_file" 2>/dev/null && \
@@ -738,12 +750,16 @@ if [ "$kill_switch" != "on" ]; then
   # (each a 30s run) finish, which is minutes of staleness.
   report_status $z
   #------------------------------------------------------------
-  #SSID Incorrect Password Simulation or Auth Failure Simulation
-  #since these are very similar they are in the same section one
-  #has a bad PSK and others have a blocked mac or invalud username/password combo
-  #both need to be constantly connecting so we trigger insights
+  #SSID Incorrect Password / Auth Failure / MAC Auth Failure Simulation
+  #since these are very similar they are in the same section: one
+  #has a bad PSK, one has a blocked mac or invalid username/password combo
+  #(auth_fail — a generic/no-particular-MAC flap), and mac_auth_fail is the
+  #SPECIFIC-known-MAC case: it associates with a fixed, predictable spoofed
+  #MAC (mac_auth_fail_mac) so the operator can pre-configure that EXACT MAC as
+  #a RADIUS/ClearPass MAC-Auth deny entry and watch it get rejected. All three
+  #need to be constantly connecting so we trigger insights.
   #------------------------------------------------------------
-  if [[ ($ssidpw_fail == "on" || $auth_fail == "on") && -n ${wladapter} ]]; then
+  if [[ ($ssidpw_fail == "on" || $auth_fail == "on" || $mac_auth_fail == "on") && -n ${wladapter} ]]; then
     if [[ "$ssidpw_fail" == "on" ]]; then
      # Base the wrong password on the client's EFFECTIVE password: the
      # [username]/cell override (get_value $username) wins over the [s0-s9]
@@ -786,9 +802,54 @@ if [ "$kill_switch" != "on" ]; then
       manage_connection down 5
      done
     fi
+    if [[ "$mac_auth_fail" == "on" ]]; then
+     echo "Running MAC Auth Failure (spoofed MAC deny-list test, target=${mac_auth_fail_mac})" | tee -a ${LOG_FILE}
+     # Resolve the connection PROFILE name the same way connect_wifi does.
+     mac_fail_ssid="$ssid"
+     [[ "$site_based_ssid" == "on" ]] && mac_fail_ssid="$wsite-$ssid"
+     # Bootstrap the profile ONCE, unspoofed, if it doesn't exist yet — `device
+     # wifi connect` negotiates WPA2/WPA3/security automatically (a manual
+     # `connection add` can't easily replicate that). This is the ONLY
+     # `device wifi connect` call in this block: every iteration after this
+     # uses `connection up` (via manage_connection), which HONORS
+     # cloned-mac-address. `device wifi connect` does NOT — it silently resets
+     # the wifi MAC back to permanent on EVERY call, so it must never drive the
+     # spoofed connection or the spoof is undone the instant it's applied.
+     if ! nmcli -t -f NAME connection show 2>/dev/null | grep -Fxq "$mac_fail_ssid"; then
+       echo "  [mac_auth_fail] bootstrapping connection profile '${mac_fail_ssid}' (one-time, unspoofed)" | tee -a ${LOG_FILE}
+       nmcli -w 30 device wifi connect "$mac_fail_ssid" password "$ssidpw" >/dev/null 2>&1
+     fi
+     for i in {1..100}; do
+      echo "Enable/Disable WLAN interface (spoofed MAC deny-list test)" | tee -a ${LOG_FILE}
+      echo Iteration $i of 100 | tee -a ${LOG_FILE}
+      # Pin the deny-listed MAC onto the connection PROFILE every iteration —
+      # cheap/idempotent, and belt-and-suspenders against anything else having
+      # reset it. manage_connection's "up" drives `nmcli connection up`, which
+      # honors this; it must NEVER be replaced with device-wifi-connect (see
+      # the gotcha above).
+      _mac_mod_err=$(nmcli connection modify "$mac_fail_ssid" 802-11-wireless.cloned-mac-address "$mac_auth_fail_mac" 2>&1)
+      _mac_mod_rc=$?
+      manage_connection up 5 reset 5 0
+      _mac_up_rc=$?
+      manage_connection down 5
+      _mac_actual=$(cat "/sys/class/net/${wladapter}/address" 2>/dev/null)
+      # Log every resolved value — modify rc/stderr, up rc, and the ACTUAL
+      # interface MAC read from sysfs — so a spoof that silently doesn't land
+      # is diagnosable from the log alone, not a manual guest-exec session.
+      echo "  [mac_auth_fail] modify_rc=${_mac_mod_rc} modify_err='${_mac_mod_err}' up_rc=${_mac_up_rc} target_mac=${mac_auth_fail_mac} actual_iface_mac=${_mac_actual}" | tee -a ${LOG_FILE}
+     done
+    fi
    #------------------------------------------------------------
    #Resetting the WIFI Password so it can connect correctly for updates/maintenance
    #------------------------------------------------------------
+   if [[ "$mac_auth_fail" == "on" && -n "${mac_fail_ssid:-}" ]]; then
+     # Clear the cloned-mac override so the maintenance connect_wifi below (and
+     # any subsequent normal reconnect) is NOT left running on the spoofed
+     # identity — an empty value unsets the property.
+     _mac_clr_err=$(nmcli connection modify "$mac_fail_ssid" 802-11-wireless.cloned-mac-address "" 2>&1)
+     _mac_clr_rc=$?
+     echo "  [mac_auth_fail] cleared cloned-mac-address override on '${mac_fail_ssid}' before maintenance reconnect (rc=${_mac_clr_rc} err='${_mac_clr_err}')" | tee -a ${LOG_FILE}
+   fi
    ssidpw=$(get_value $username 'ssidpw'); [[ -z "$ssidpw" ]] && ssidpw=$(get_value $simulation_id 'ssidpw')
    # Restore dot1x_password too — the fail loop corrupts it for 1X clients
    # (${real_dot1x}_fail), and without a restore the maintenance connect_wifi 5
@@ -977,8 +1038,9 @@ _run_apt_once
 # silence the sim and stop the insight/alert it exists to fire. "Engine
 # controlling a specific sim" = a [username] override has turned ON one of the
 # engine-owned failure sims (dhcp_fail/dns_fail/assoc_fail/port_flap/
-# ssidpw_fail/auth_fail). Ambient traffic (ping/download/iperf/www) is a local
-# roll, NOT per-client engine control, so it does NOT block offline.
+# ssidpw_fail/auth_fail/mac_auth_fail). Ambient traffic (ping/download/iperf/
+# www) is a local roll, NOT per-client engine control, so it does NOT block
+# offline.
 # Connectivity pinning (wsite/ssid/ssidpw) is intentionally excluded too — every
 # hub-mode client has it, so including it would disable the offline feature
 # entirely. Activate by uncommenting _engine_driving_sim + the && ! gate below.
@@ -986,7 +1048,8 @@ _run_apt_once
 #_engine_driving_sim() {
 #  [[ "${dhcp_fail:-off}" == "on" || "${dns_fail:-off}" == "on" || \
 #     "${assoc_fail:-off}" == "on" || "${port_flap:-off}" == "on" || \
-#     "${ssidpw_fail:-off}" == "on" || "${auth_fail:-off}" == "on" ]]
+#     "${ssidpw_fail:-off}" == "on" || "${auth_fail:-off}" == "on" || \
+#     "${mac_auth_fail:-off}" == "on" ]]
 #}
 #------------------------------------------------------------
 #if [[ "$allow_offline" == "yes" ]] && ! _engine_driving_sim; then

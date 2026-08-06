@@ -86,7 +86,7 @@ function Send-Status {
         }
 
         $activeSimulations = @()
-        foreach ($name in @('dns_fail','dns_latency','collab','iperf','download','www_traffic','ping_test','ssidpw_fail','auth_fail','dhcp_fail')) {
+        foreach ($name in @('dns_fail','dns_latency','collab','iperf','download','www_traffic','ping_test','ssidpw_fail','auth_fail','mac_auth_fail','dhcp_fail')) {
             if ((Get-Variable -Name $name -Scope Script -ValueOnly -ErrorAction SilentlyContinue) -eq 'on') {
                 $activeSimulations += $name
             }
@@ -113,6 +113,7 @@ function Send-Status {
                 ping_test = [string]$script:ping_test
                 ssidpw_fail = [string]$script:ssidpw_fail
                 auth_fail = [string]$script:auth_fail
+                mac_auth_fail = [string]$script:mac_auth_fail
                 dhcp_fail = [string]$script:dhcp_fail
             }
         } | ConvertTo-Json -Depth 4 -Compress
@@ -266,6 +267,65 @@ function Manage-Connection {
     return $false
 }
 
+function Set-WifiMacSpoof {
+    # Windows has no NetworkManager-style per-CONNECTION MAC override (unlike
+    # Linux's nmcli 802-11-wireless.cloned-mac-address, which is pinned on the
+    # connection PROFILE and survives up/down cycles) — the spoof here is a
+    # NIC-level property instead: the driver's "NetworkAddress" advanced
+    # setting (the same value a manual driver-key edit under
+    # SOFTWARE\...\Class\{4d36e972-e325-11ce-bfc1-08002be10318}\<NNNN> would
+    # set), applied via Set-NetAdapterAdvancedProperty, then a disable/enable
+    # cycle to force the NIC to re-init with it.
+    #
+    # UNVERIFIED ON REAL HARDWARE — there is no Windows box in this dev loop to
+    # confirm against (same "hardware-untested" honesty flag the T3 IoT port
+    # carries elsewhere in this codebase). Most modern WLAN miniport drivers
+    # (Intel/Realtek/Qualcomm) expose NetworkAddress and honor it for
+    # association, but some WLAN driver/firmware stacks silently IGNORE it
+    # (Windows' own per-network "random hardware addresses" privacy feature is
+    # a DIFFERENT mechanism entirely and does not go through this property) —
+    # always log the ACTUAL adapter MAC read back after the cycle so a spoof
+    # that silently didn't land is diagnosable from the log alone, not a guess.
+    param([string]$TargetMac)
+
+    $adapterName = Get-WlanAdapter
+    if ([string]::IsNullOrWhiteSpace($adapterName)) { return $null }
+
+    $macNoSep = ($TargetMac -replace '[:\-]', '').ToUpperInvariant()
+    $setOk = $true
+    $setErr = ''
+    try {
+        Set-NetAdapterAdvancedProperty -Name $adapterName -RegistryKeyword 'NetworkAddress' -RegistryValue $macNoSep -NoRestart -ErrorAction Stop
+    } catch {
+        $setOk = $false
+        $setErr = $_.Exception.Message
+    }
+    Disable-NetAdapter -Name $adapterName -Confirm:$false -ErrorAction SilentlyContinue | Out-Null
+    Start-Sleep -Seconds 2
+    Enable-NetAdapter -Name $adapterName -Confirm:$false -ErrorAction SilentlyContinue | Out-Null
+    Start-Sleep -Seconds 3
+    $actualMac = (Get-NetAdapter -Name $adapterName -ErrorAction SilentlyContinue).MacAddress
+    Write-SimDebug "  [mac_auth_fail] NetworkAddress set_ok=$setOk set_err='$setErr' target_mac=$TargetMac actual_iface_mac=$actualMac"
+    return $adapterName
+}
+
+function Clear-WifiMacSpoof {
+    # Remove the NetworkAddress override and cycle the adapter back to its
+    # permanent MAC, so the maintenance Connect-Wifi call below (and any
+    # subsequent normal reconnect) is NOT left running on the spoofed identity.
+    param([string]$AdapterName)
+    if ([string]::IsNullOrWhiteSpace($AdapterName)) { return }
+    try {
+        Remove-NetAdapterAdvancedProperty -Name $AdapterName -RegistryKeyword 'NetworkAddress' -ErrorAction SilentlyContinue
+    } catch {}
+    Disable-NetAdapter -Name $AdapterName -Confirm:$false -ErrorAction SilentlyContinue | Out-Null
+    Start-Sleep -Seconds 2
+    Enable-NetAdapter -Name $AdapterName -Confirm:$false -ErrorAction SilentlyContinue | Out-Null
+    Start-Sleep -Seconds 3
+    $actualMac = (Get-NetAdapter -Name $AdapterName -ErrorAction SilentlyContinue).MacAddress
+    Write-SimDebug "  [mac_auth_fail] cleared NetworkAddress override on '$AdapterName' before maintenance reconnect (actual_iface_mac=$actualMac)"
+}
+
 function Test-ScriptRunning {
     param([string]$ScriptName)
 
@@ -359,6 +419,11 @@ while ($true) {
     $script:iperf_bw = get_value 'simulation' 'iperf_bw'
     $script:auth_fail = get_value 'simulation' 'auth_fail'
     $script:ssidpw_fail = get_value 'simulation' 'ssidpw_fail'
+    # mac_auth_fail: same "connectivity-failure, inline in the connect loop" kind
+    # as ssidpw_fail/auth_fail (see the loop below) — associates with a fixed,
+    # PREDICTABLE spoofed MAC (mac_auth_fail_mac, [address]) so the operator can
+    # pre-configure that exact MAC as a RADIUS/ClearPass MAC-Auth deny entry.
+    $script:mac_auth_fail = get_value 'simulation' 'mac_auth_fail'
     $script:allow_offline = get_value 'simulation' 'allow_offline'
     $script:web_server = get_value 'simulation' 'web_server'
     $script:server_url = get_value 'server' 'server_url'
@@ -398,7 +463,7 @@ while ($true) {
         $randomBucket = 's' + (Get-Random -Minimum 0 -Maximum 10)
         Write-SimLog "Ambient random pool: rolling behaviour from bucket $randomBucket"
         $randomizableList = $randomizableSims -split '\s+' | Where-Object { $_ }
-        foreach ($sim in @('dhcp_fail','dns_fail','dns_latency','collab','assoc_fail','port_flap','ssidpw_fail','auth_fail','ping_test','download','iperf','www_traffic')) {
+        foreach ($sim in @('dhcp_fail','dns_fail','dns_latency','collab','assoc_fail','port_flap','ssidpw_fail','auth_fail','mac_auth_fail','ping_test','download','iperf','www_traffic')) {
             if ($randomizableList -contains $sim) {
                 Set-Variable -Name $sim -Scope Script -Value (get_value $randomBucket $sim)
             } else {
@@ -416,11 +481,16 @@ while ($true) {
     $script:dns_bad_record_2 = get_value 'address' 'dns_bad_record_2'
     $script:dns_bad_record_3 = get_value 'address' 'dns_bad_record_3'
     $script:iperf_server = get_value 'address' 'iperf_server'
+    # mac_auth_fail_mac: the SHARED, predictable spoofed MAC every mac_auth_fail
+    # client associates with (same value fleet-wide — a single known RADIUS/
+    # ClearPass deny-list entry, matching how ssidpw_fail corrupts the SAME real
+    # password by the same rule rather than deriving a per-client value).
+    $script:mac_auth_fail_mac = get_value 'address' 'mac_auth_fail_mac'
 
     Apply-UserOverrides -Section $script:username -Names @(
         'kill_switch','sim_load','public_repo','repo_location','site_based_ssid','iperf_bw',
         'wsite','sim_phy','ssid','ssidpw','dhcp_fail','dns_fail','dns_latency','collab','assoc_fail','port_flap','ping_test',
-        'download','iperf','www_traffic','ssidpw_fail','auth_fail','smb_address','ping_address',
+        'download','iperf','www_traffic','ssidpw_fail','auth_fail','mac_auth_fail','mac_auth_fail_mac','smb_address','ping_address',
         'dns_bad_ip_1','dns_bad_ip_2','dns_bad_ip_3',
         'dns_bad_record_1','dns_bad_record_2','dns_bad_record_3','iperf_server',
         'collab_app','collab_bw','collab_time','collab_server','dot1x_password','web_server'
@@ -507,7 +577,7 @@ while ($true) {
             $gateway = Get-DefaultGateway
             $script:gateway_reachable = Test-GatewayReachable -Gateway $gateway
             Send-Status -Iteration $z
-            if ((($script:ssidpw_fail -eq 'on') -or ($script:auth_fail -eq 'on')) -and $null -ne $wladapter) {
+            if ((($script:ssidpw_fail -eq 'on') -or ($script:auth_fail -eq 'on') -or ($script:mac_auth_fail -eq 'on')) -and $null -ne $wladapter) {
                 $correctSsidpw = get_value $script:simulation_id 'ssidpw'
                 if ($script:ssidpw_fail -eq 'on') {
                     # Fast wrong-password loop (<=~6s/attempt) so the "WPA Passphrase
@@ -530,6 +600,22 @@ while ($true) {
                         Start-Sleep -Seconds 5
                         [void](Manage-Connection -Action 'down' -WaitTime 5)
                     }
+                }
+                if ($script:mac_auth_fail -eq 'on') {
+                    Write-SimDebug "Running MAC Auth Failure (spoofed MAC deny-list test, target=$($script:mac_auth_fail_mac))"
+                    $macAdapterName = Set-WifiMacSpoof -TargetMac $script:mac_auth_fail_mac
+                    for ($i = 1; $i -le 100; $i++) {
+                        Write-SimDebug "Enable/Disable WLAN interface (spoofed MAC deny-list test) — iteration $i of 100"
+                        [void](Manage-Connection -Action 'up' -WaitTime 5)
+                        Start-Sleep -Seconds 5
+                        [void](Manage-Connection -Action 'down' -WaitTime 5)
+                        $actualMac = if ($macAdapterName) { (Get-NetAdapter -Name $macAdapterName -ErrorAction SilentlyContinue).MacAddress } else { $null }
+                        Write-SimDebug "  [mac_auth_fail] iteration $i up target_mac=$($script:mac_auth_fail_mac) actual_iface_mac=$actualMac"
+                    }
+                    # Clear the spoof BEFORE the maintenance Connect-Wifi below so
+                    # it reconnects on the adapter's normal identity, not the
+                    # deny-listed one.
+                    Clear-WifiMacSpoof -AdapterName $macAdapterName
                 }
                 $script:ssidpw = $correctSsidpw
                 [void](Connect-Wifi)
