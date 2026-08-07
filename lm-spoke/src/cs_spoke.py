@@ -89,6 +89,12 @@ class CSSpoke(AgentCommandsMixin, SimCommandsMixin, ConfigCommandsMixin,
             bucket_resolver=lambda hn: sim_config.pure_bucket_profile(hn, config_dir),
         )
         self.settings = CSSettings(data_dir, config_dir)
+        # VM running but its sim client stopped reporting -> reclone. See
+        # stale_client_reclone.py's module docstring for why this exists and
+        # how it's distinct from guest_watchdog (pxmx agent) and the dongle-
+        # health ladder. Started by CSControlPlane.run().
+        from stale_client_reclone import StaleClientReclone
+        self.stale_client_reclone = StaleClientReclone(self, data_dir)
         self.queue = CommandQueue(data_dir, self.settings)
         self.deploy = ProxmoxDeploy()
         # GitHub push (Source of Truth = GitHub): repo/token pushed by the hub via

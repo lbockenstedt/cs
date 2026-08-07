@@ -359,6 +359,13 @@ class CSControlPlane(AgentHostingControlPlane):
         # client_registry.py ClientRegistry.start()/prune_stale) — previously
         # nothing removed an individual stale client short of a full Purge.
         cs_spoke.registry.start()
+        # Start the stale-client-reclone sweep (5 min; see
+        # stale_client_reclone.py) — a VM Proxmox reports running but whose
+        # sim client has stopped reporting to the API gets reclonded, a
+        # failure mode neither guest_watchdog (QGA-only) nor the dongle-
+        # health ladder (T2-only, and deliberately never escalates a
+        # no_gateway infra fault) ever covered.
+        cs_spoke.stale_client_reclone.start()
         # Start the Aruba Central poll loop (see central_poller.py). Runs
         # regardless of hub-connection — its output feeds both the local
         # dashboard's Simulations tab AND (via _cs_telemetry_relay_loop below)
