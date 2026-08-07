@@ -1454,7 +1454,7 @@ function csSummaryRow(items) {
  * ========================================================================= */
 
 let csClientCache = [];
-let csClientTier = 'all'; // 'all' | 't1' | 't2' | 't3'
+let csClientTier = 'all'; // 'all' | 't1' | 't2' | 't3' | 'offline'
 
 // ── Faceted Clients drill-down (scales to thousands) ─────────────────────────
 // Instead of one flat table of every client, the Clients tab summarizes by
@@ -1463,7 +1463,30 @@ let csClientTier = 'all'; // 'all' | 't1' | 't2' | 't3'
 // counts reflect the OTHER active facets (standard faceted counting). Ported
 // from lm/WebUI/sim-views.js — the spoke's own /aggregate/clients route
 // supports this the same way the hub's aggregation does.
-let csFacet = { sim: null, tier: null, site: null };
+let csFacet = { sim: null, tier: null, site: null, notWorking: null };
+
+// Sims that DELIBERATELY break association/auth — a client running one is
+// SUPPOSED to be unreachable, so it's excluded from "not working" the same
+// way it's excluded from the Fleet Health working/eligible ratio (see the
+// hub's service.py _fleet_health — keep this list in exact sync with that
+// one).
+const CS_FLEET_HEALTH_EXCLUSIVE_SIMS = new Set(
+    ['ssidpw_fail', 'auth_fail', 'mac_auth_fail', 'assoc_fail', 'port_flap']);
+
+// "Not working" = the Clients::Offline tab's filter — the same criterion
+// Fleet Health counts against eligible (online AND gateway_reachable),
+// inverted, MINUS clients intentionally running an exclusive failure sim
+// (those are supposed to be unreachable — nothing to troubleshoot there).
+// Uses the RAW active_simulations field, not the override-resolved
+// csClientActiveSims(), to match _fleet_health's own c.get("active_simulations")
+// exactly — a client's resolved/effective flags aren't what it's actually
+// doing on the wire right now.
+function csClientNotWorking(c) {
+    const sims = (Array.isArray(c.active_simulations) ? c.active_simulations : [])
+        .map(s => String(s).toLowerCase());
+    if (sims.some(s => CS_FLEET_HEALTH_EXCLUSIVE_SIMS.has(s))) return false;
+    return !(c.online && c.gateway_reachable);
+}
 // Client-list paging: 10 per page by default; the user can pick up to 100 from
 // a selector at the bottom of the table. Capping the page size at 100 also keeps
 // the DOM bounded no matter how large the match set is.
@@ -1517,6 +1540,7 @@ function csClientPass(c, skip) {
     if (skip !== 'sim' && csFacet.sim && csClientActiveSims(c).indexOf(csFacet.sim) === -1) return false;
     if (skip !== 'tier' && csFacet.tier && csClassifyClient(c) !== csFacet.tier) return false;
     if (skip !== 'site' && csFacet.site && csClientSite(c) !== csFacet.site) return false;
+    if (skip !== 'notWorking' && csFacet.notWorking && !csClientNotWorking(c)) return false;
     return true;
 }
 window.csFacetSelect = function (dim, val) {
@@ -1526,7 +1550,7 @@ window.csFacetSelect = function (dim, val) {
     csRenderClientsFaceted();
 };
 window.csFacetReset = function () {
-    csFacet = { sim: null, tier: null, site: null };
+    csFacet = { sim: null, tier: null, site: null, notWorking: null };
     csClientTier = 'all';
     csClientPage = 1;
     if (csEl('cs-client-search')) csEl('cs-client-search').value = '';
@@ -1571,7 +1595,7 @@ function csRenderClientsFaceted() {
 
     // Any facet OR search lists clients (Simulation, Tier, and Site are all entry
     // points); nothing selected → the summary hint.
-    const showList = !!(csFacet.sim || csFacet.tier || csFacet.site || q);
+    const showList = !!(csFacet.sim || csFacet.tier || csFacet.site || csFacet.notWorking || q);
     const total = csClientCache.length;
     facetsEl.innerHTML = `
       <div class="flex flex-wrap items-center gap-x-2 gap-y-2 mb-3">
@@ -1638,6 +1662,15 @@ async function csRenderClients(tier) {
     if (tier === 't1' || tier === 't2' || tier === 't3' || tier === 'all') {
         csClientTier = tier;
         csFacet.tier = (tier === 'all') ? null : tier;
+        csFacet.notWorking = null;
+    } else if (tier === 'offline') {
+        // Spans every tier by design (clears the tier facet) — same
+        // "not working" criterion Fleet Health counts against eligible,
+        // inverted. The Tier dropdown inside this view still narrows
+        // further (e.g. "T2, not working") since it's a separate facet.
+        csClientTier = 'offline';
+        csFacet.tier = null;
+        csFacet.notWorking = true;
     }
     csSetToolbar(`<input id="cs-client-search" oninput="csClientFilterKey()" placeholder="Search name / IP / MAC…" class="bg-white border border-slate-300 rounded-md px-3 py-1.5 text-sm outline-none focus:ring-2 focus:ring-green-500 w-64">
       <select id="cs-client-status" onchange="csClientResetPage()" class="bg-white border border-slate-300 rounded-md px-3 py-1.5 text-sm outline-none focus:ring-2 focus:ring-green-500">
@@ -10660,6 +10693,7 @@ window.CS_CHILD_RENDERERS['Clients::All'] = function () { return csRenderClients
 window.CS_CHILD_RENDERERS['Clients::T1']  = function () { return csRenderClients('t1'); };
 window.CS_CHILD_RENDERERS['Clients::T2']  = function () { return csRenderClients('t2'); };
 window.CS_CHILD_RENDERERS['Clients::T3']  = function () { return csRenderClients('t3'); };
+window.CS_CHILD_RENDERERS['Clients::Offline'] = function () { return csRenderClients('offline'); };
 
 window.csOpenVmConsole = async function (key) {
     // VNC console for a cs sim VM — the cs VM Server table's analogue of the
