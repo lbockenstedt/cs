@@ -39,6 +39,11 @@ logger = logging.getLogger("ClientRegistry")
 
 # Keep at most this many recent error strings per client (rolling window).
 _MAX_RECENT_ERRORS = 20
+# How long gateway_reachable must hold a value continuously before the
+# sim-quota engine trusts it as a confirmed drop/recovery, not on/off
+# flicker (see apply_status). Mirrors sim_quota_engine.OFFLINE_TTL_S — keep
+# both at 60 min.
+_GATEWAY_CONFIRM_S = 3600.0
 _STATE_FILE = "clients.json"
 # Coalescing window for the debounced persist: at most one clients.json write
 # per this many seconds, no matter how many beacons/mutations land.
@@ -251,6 +256,27 @@ class ClientRegistry:
                 entry["ever_connected"] = True
             elif "ever_connected" not in entry:
                 entry["ever_connected"] = False
+
+            # Gateway-reachability stability latch for the sim-quota engine's
+            # working-client count (see sim_quota_engine._is_gateway_down_confirmed).
+            # gateway_reachable flickers on/off within a single sim-loop iteration
+            # normally, so the instantaneous reading is noisy — only a streak tells
+            # a genuine drop (e.g. a detached dongle) apart from that flicker.
+            # gateway_state/gateway_state_since track the CURRENT streak;
+            # gateway_confirmed_down only flips once a streak (down or up) has
+            # held continuously for _GATEWAY_CONFIRM_S (60 min) — so a client stays
+            # excluded until it's been reachable that whole window, not just once.
+            if "gateway_reachable" in payload and payload["gateway_reachable"] is not None:
+                gw = bool(payload["gateway_reachable"])
+                if entry.get("gateway_state") != gw:
+                    entry["gateway_state"] = gw
+                    entry["gateway_state_since"] = entry["last_seen"]
+                streak_s = entry["last_seen"] - float(entry.get("gateway_state_since") or entry["last_seen"])
+                if not gw and streak_s >= _GATEWAY_CONFIRM_S:
+                    entry["gateway_confirmed_down"] = True
+                elif gw and streak_s >= _GATEWAY_CONFIRM_S:
+                    entry["gateway_confirmed_down"] = False
+                # else: mid-streak (< 60 min either way) — leave the latch as-is
 
             # Merge errors into a rolling recent_errors window.
             errs: List[str] = list(payload.get("errors") or [])

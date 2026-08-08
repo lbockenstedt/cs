@@ -59,6 +59,15 @@ OFFLINE_TTL_S = 3600.0           # keep an offline runner this long before
                                  # treating it as dead (the sim keeps running on
                                  # the VM through a WS blip; release only a
                                  # truly-gone client so it can rejoin the pool).
+GATEWAY_EXEMPT_SIMS = frozenset({
+    "ssidpw_fail", "auth_fail", "mac_auth_fail", "assoc_fail", "port_flap",
+})                                # connectivity-breaking sims — gateway_reachable
+                                 # =False is the INTENDED effect while one of
+                                 # these runs, not a sign of a broken client.
+                                 # Mirrors lm/core/src/simulations/service.py::
+                                 # _fleet_health's `exclusive` set and WebUI's
+                                 # CS_FLEET_HEALTH_EXCLUSIVE_SIMS — keep all
+                                 # three in sync.
 RECONCILE_INTERVAL_S = 60.0      # periodic self-heal sweep
 # Trailing-edge debounce for event-driven reconciles (trigger()). A burst of sim
 # clients connecting/disconnecting used to fire a full O(quotas×clients) reconcile
@@ -295,11 +304,41 @@ class SimQuotaEngine:
         return {h: c for h, c in allc.items() if str(h).strip().lower() not in ignored}
 
     def _is_harvestable(self, c: Dict[str, Any], now: float) -> bool:
-        """Eligible for the pool if seen within HARVEST_WINDOW_S. Clients flap in
-        and out constantly (like real ones), so "seen recently" — not "connected
-        right now" — is what keeps the pool from collapsing to a handful."""
+        """Eligible for the pool/ledger if seen within HARVEST_WINDOW_S AND not a
+        confirmed gateway drop. Clients flap in and out constantly (like real
+        ones), so "seen recently" — not "connected right now" — is what keeps
+        the pool from collapsing to a handful; the same flicker-tolerance
+        applies to gateway_reachable (see client_registry.apply_status's
+        gateway_state latch) — only a drop confirmed continuously for a full
+        OFFLINE_TTL_S (60 min) marks a client as genuinely not working, and it
+        stays excluded until it proves an equally continuous 60 min back up."""
         ls = c.get("last_seen")
-        return bool(ls and (now - float(ls)) < HARVEST_WINDOW_S)
+        if not (ls and (now - float(ls)) < HARVEST_WINDOW_S):
+            return False
+        return not self._is_gateway_down_confirmed(c)
+
+    def _gateway_exempt(self, c: Dict[str, Any]) -> bool:
+        """True while the client runs a connectivity-breaking sim (see
+        GATEWAY_EXEMPT_SIMS) — no gateway is that sim's intended effect, so a
+        gateway drop while running one is never held against the client."""
+        sims = c.get("active_simulations")
+        try:
+            keys = set(sims.keys()) if isinstance(sims, dict) else set(sims or [])
+        except (TypeError, ValueError):
+            return False
+        return bool(keys & GATEWAY_EXEMPT_SIMS)
+
+    def _is_gateway_down_confirmed(self, c: Dict[str, Any]) -> bool:
+        """True once gateway_reachable has held False continuously for a full
+        OFFLINE_TTL_S (60 min) — a genuine drop (e.g. a detached dongle), not
+        the normal on/off flicker every sim-loop iteration can see. Reads the
+        latch client_registry.apply_status maintains (gateway_confirmed_down),
+        so this needs no ``now`` — the 60-min confirmation already happened
+        (or hasn't) by the time it's set. Exempt while running a
+        connectivity-breaking sim."""
+        if not c.get("gateway_confirmed_down"):
+            return False
+        return not self._gateway_exempt(c)
 
     def _refresh_host_index(self) -> None:
         """Snapshot the client→host and host→site indices for this sweep. Both
@@ -1496,12 +1535,17 @@ class SimQuotaEngine:
                         continue
                     if not self._is_harvestable(c, now):
                         last_seen = float(c.get("last_seen") or 0)
-                        if (now - last_seen) > OFFLINE_TTL_S:
-                            # Gone past OFFLINE_TTL_S → DEAD → release so a
-                            # substitute replaces it. This is the ONLY point we
-                            # churn a runner: the ample buffer up to here (a real
-                            # agent flaps offline for up to ~15 min while its VM
-                            # keeps running the sim) prevents thrashing.
+                        gw_down = self._is_gateway_down_confirmed(c)
+                        if gw_down or (now - last_seen) > OFFLINE_TTL_S:
+                            # Gone past OFFLINE_TTL_S (unseen) → DEAD, OR a
+                            # confirmed gateway drop (no gateway for a full
+                            # OFFLINE_TTL_S — see _is_gateway_down_confirmed,
+                            # which already applied that same 60-min grace) →
+                            # release so a substitute replaces it. A gateway-
+                            # confirmed-down client is heartbeating fine but
+                            # isn't actually producing (e.g. a detached
+                            # dongle), so it gets NO further last_seen grace on
+                            # top of the 60 min it already had.
                             await self._release(h, sim_id, from_site, key)
                             assigned.pop(h, None)
                             actions["released"] += 1
