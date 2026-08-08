@@ -19,7 +19,7 @@ if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
 from sim_quota_engine import (  # noqa: E402
-    SimQuotaEngine, OFFLINE_TTL_S, TIER_UPGRADE_PER_SWEEP)
+    SimQuotaEngine, OFFLINE_TTL_S, TIER_UPGRADE_PER_SWEEP, GATEWAY_EXEMPT_SIMS)
 
 
 class _FakeRegistry:
@@ -1356,3 +1356,90 @@ def test_t1_cooldown_exemption_surfaces_in_diag(tmp_path):
     _run(eng.reconcile())
     blocked = eng._quota_diag["alert:A:MIA"]["blocked"]
     assert blocked.get("harvest_cooldown", 0) == 1, blocked   # the T2, never the T1
+
+
+# ── gateway-confirmed-down: not-working clients don't inflate the count ─────
+# A client can heartbeat perfectly (fresh last_seen) while being functionally
+# dead — e.g. a detached T2 dongle means no gateway_reachable even though the
+# WS/API connection never drops. client_registry.apply_status latches
+# gateway_confirmed_down only once gateway_reachable has held False for a full
+# 60 continuous minutes (never a single bad reading), and clears it only after
+# an equally continuous 60-min recovery. These tests drive that latch directly
+# rather than the 60-min real-time wait.
+
+def test_reconcile_releases_gateway_confirmed_down_immediately(tmp_path):
+    # Fresh last_seen (would pass the old harvestable check outright) but a
+    # confirmed gateway drop must be released NOW, not ridden on the
+    # last_seen-based OFFLINE_TTL_S grace meant for WS blips.
+    clients = {f"c{i}": _client(f"c{i}", "MIA") for i in range(5)}
+    spoke = _FakeSpoke(clients, [{"alert_id": "A", "sim_id": "dns_fail", "count": 3, "site": "MIA", "enabled": True}], tmp_path)
+    eng = SimQuotaEngine(spoke)
+    _run(eng.reconcile())
+    first = list(eng._ledger["alert:A:MIA"]["clients"].keys())
+    down = first[0]
+    spoke.registry.clients[down]["gateway_confirmed_down"] = True
+    actions = _run(eng.reconcile())
+    assert actions["released"] == 1 and actions["assigned"] == 1
+    assigned = list(eng._ledger["alert:A:MIA"]["clients"].keys())
+    assert down not in assigned and len(assigned) == 3
+
+
+def test_reconcile_gateway_flicker_not_latched_stays_counted(tmp_path):
+    # gateway_state=False but gateway_confirmed_down never latched (< 60 min
+    # streak) — this is the normal per-loop-iteration flicker; must NOT be
+    # treated as a drop.
+    clients = {f"c{i}": _client(f"c{i}", "MIA") for i in range(3)}
+    clients["c0"]["gateway_state"] = False
+    clients["c0"]["gateway_state_since"] = time.time() - 30
+    spoke = _FakeSpoke(clients, [{"alert_id": "A", "sim_id": "dns_fail", "count": 3, "site": "MIA", "enabled": True}], tmp_path)
+    eng = SimQuotaEngine(spoke)
+    actions = _run(eng.reconcile())
+    assert actions["released"] == 0
+    assert set(eng._ledger["alert:A:MIA"]["clients"]) == set(clients)
+
+
+def test_reconcile_gateway_down_exempt_while_running_connectivity_breaking_sim(tmp_path):
+    # A client running e.g. ssidpw_fail is EXPECTED to have no gateway — a
+    # confirmed drop while running one of GATEWAY_EXEMPT_SIMS must not release it.
+    exempt_sim = sorted(GATEWAY_EXEMPT_SIMS)[0]
+    clients = {f"c{i}": _client(f"c{i}", "MIA") for i in range(5)}
+    quotas = [{"alert_id": "A", "sim_id": "dns_fail", "count": 3, "site": "MIA", "enabled": True}]
+    spoke = _FakeSpoke(clients, quotas, tmp_path)
+    eng = SimQuotaEngine(spoke)
+    _run(eng.reconcile())
+    first = list(eng._ledger["alert:A:MIA"]["clients"].keys())
+    down = first[0]
+    spoke.registry.clients[down]["gateway_confirmed_down"] = True
+    spoke.registry.clients[down]["active_simulations"] = {exempt_sim: {}}
+    actions = _run(eng.reconcile())
+    assert actions["released"] == 0
+    assert down in eng._ledger["alert:A:MIA"]["clients"]
+
+
+def test_pool_eligible_excludes_gateway_confirmed_down_client(tmp_path):
+    # A free (unassigned) client that's gateway-confirmed-down must never be
+    # freshly picked into a quota, same as it must not be kept once assigned.
+    clients = {f"c{i}": _client(f"c{i}", "MIA") for i in range(3)}
+    clients["c0"]["gateway_confirmed_down"] = True
+    spoke = _FakeSpoke(clients, [{"alert_id": "A", "sim_id": "dns_fail", "count": 3, "site": "MIA", "enabled": True}], tmp_path)
+    eng = SimQuotaEngine(spoke)
+    actions = _run(eng.reconcile())
+    assigned = set(eng._ledger["alert:A:MIA"]["clients"])
+    assert "c0" not in assigned
+    assert actions["assigned"] == 2   # only c1, c2 — underfilled, no substitute for c0
+
+
+def test_gateway_down_confirmed_readmits_after_latch_clears(tmp_path):
+    # Once client_registry clears the latch (60 continuous min back up), the
+    # client is eligible again — this drives the latch directly to prove the
+    # engine reads gateway_confirmed_down fresh each sweep, not a cached verdict.
+    clients = {f"c{i}": _client(f"c{i}", "MIA") for i in range(3)}
+    clients["c0"]["gateway_confirmed_down"] = True
+    spoke = _FakeSpoke(clients, [{"alert_id": "A", "sim_id": "dns_fail", "count": 3, "site": "MIA", "enabled": True}], tmp_path)
+    eng = SimQuotaEngine(spoke)
+    _run(eng.reconcile())
+    assert "c0" not in eng._ledger["alert:A:MIA"]["clients"]
+    spoke.registry.clients["c0"]["gateway_confirmed_down"] = False
+    actions = _run(eng.reconcile())
+    assert actions["assigned"] == 1
+    assert "c0" in eng._ledger["alert:A:MIA"]["clients"]
