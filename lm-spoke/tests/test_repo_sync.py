@@ -139,12 +139,16 @@ def test_happy_path_resets_to_origin_branch(spoke_loop):
 
     args = _git_args(rec)
     assert args[0] == ("remote", "set-url", "origin", "https://gh/r")
-    assert args[1] == ("fetch", "--prune", "origin")
+    # HEAD is captured BEFORE the fetch/checkout (head_before), so the sync can
+    # tell afterwards whether the pull advanced lm-spoke/src/ and needs a
+    # reload — see repo_sync._sync_once / commit 018b60e.
+    assert args[1] == ("rev-parse", "HEAD")
+    assert args[2] == ("fetch", "--prune", "origin")
     # fetch must carry the GITHUB_TOKEN env (askpass feed)
-    assert rec.calls[1][1] is not None
-    assert rec.calls[1][1].get("GITHUB_TOKEN") == "tok"
-    assert args[2] == ("checkout", "-B", "LRB", "origin/LRB")
-    assert args[3] == ("rev-parse", "HEAD")
+    assert rec.calls[2][1] is not None
+    assert rec.calls[2][1].get("GITHUB_TOKEN") == "tok"
+    assert args[3] == ("checkout", "-B", "LRB", "origin/LRB")
+    assert args[4] == ("rev-parse", "HEAD")
     # askpass script was created and cleaned up (no leftover in repo_dir)
     assert set(askpass_dir.glob(".git-askpass-*.sh")) == set()
 
@@ -156,7 +160,7 @@ def test_branch_defaults_to_main(spoke_loop):
     spoke._git = rec  # type: ignore[assignment]
     _run(loop, spoke.repo_sync._sync_once())
     args = _git_args(rec)
-    assert args[2] == ("checkout", "-B", "main", "origin/main")
+    assert args[3] == ("checkout", "-B", "main", "origin/main")
 
 
 # ── resilience ───────────────────────────────────────────────────────────────
@@ -170,9 +174,10 @@ def test_never_raises_on_git_failure(spoke_loop):
     spoke._git = rec  # type: ignore[assignment]
     # No exception should escape _sync_once (it's caught inside).
     _run(loop, spoke.repo_sync._sync_once())
-    # The fetch call was attempted (and failed), nothing after it.
+    # The fetch call was attempted (and failed), nothing after it. A
+    # rev-parse HEAD (head_before) now runs between remote + fetch.
     attempted = [a[0][0] for a in rec.calls]
-    assert attempted == ["remote", "fetch"]
+    assert attempted == ["remote", "rev-parse", "fetch"]
     # askpass still cleaned up despite the failure path
     assert set(spoke.settings.config_dir.parent.glob(".git-askpass-*.sh")) == set()
 

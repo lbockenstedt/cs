@@ -73,6 +73,12 @@ def test_get_returns_empty_map_and_connected_agents(spoke_loop):
 
 def test_set_persists_and_round_trips(spoke_loop):
     s, loop = spoke_loop
+    # CS_SET_PXMX_SITE_MAP validates each site against simulation.conf buckets +
+    # Central site_mappings (see test_set_flags_unknown_site_but_keeps_host for
+    # that path) — seed MIA/DFW as known sites so this test stays a clean
+    # round-trip check, not a validation-error one.
+    s.local_store.set_central_sites_config(
+        {"site_mappings": {"MIA": "MIA", "DFW": "DFW"}})
     res = _run(loop, s.handle_command(
         "CS_SET_PXMX_SITE_MAP", {"pxmx_site_map": {"px1": "MIA", "px2": "DFW"}}))
     assert res["status"] == "SUCCESS"

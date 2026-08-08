@@ -126,6 +126,22 @@ def reference_render(spoke, configs_dir: Path, hostname: str) -> str:
             sim_conf.set("simulation", "ambient_pct", str(base_pct))
     except Exception:
         pass
+    # T3 IoT-fleet detection list (client_api.py api_config): deliver the
+    # hub-config t3_pci_vidpids into [simulation] so the linux client's
+    # iot_sim.sh detect_t3_pci matches. local_store defaults this list to
+    # ["168c:0034"], so it is present unless explicitly cleared.
+    try:
+        _hc = (spoke.local_store.get_hub_config() or {}).get("hub_config") or {}
+        _t3 = _hc.get("t3_pci_vidpids") or []
+        if isinstance(_t3, str):
+            _t3 = [_t3]
+        _t3_str = " ".join(str(x).strip() for x in _t3 if str(x).strip())
+        if _t3_str:
+            if not sim_conf.has_section("simulation"):
+                sim_conf.add_section("simulation")
+            sim_conf.set("simulation", "t3_pci_vidpids", _t3_str)
+    except Exception:
+        pass
     if hostname and overrides:
         uname = sim_config.username_for(hostname)
         human_keys = (set(user_conf.options(uname))

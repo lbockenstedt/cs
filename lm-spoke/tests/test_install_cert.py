@@ -120,11 +120,15 @@ def test_install_cert_one_agent_error_does_not_abort_others():
     assert {c["agent_id"] for c in s.control_plane.sent} == {"node-a", "node-b"}
 
 
-def test_install_cert_no_agents_connected_is_error():
+def test_install_cert_no_agents_connected_is_deferred():
+    """No connected agents at all → DEFERRED (not ERROR): the hub retries the
+    target every distribution sweep, so this self-heals on agent reconnect —
+    surfacing it as a hard FAILED would just alarm the operator about a
+    transient condition (see cs_spoke._install_cert_relay)."""
     s = _spoke()
     s.control_plane = _FakeCP({})
     res = _run(s.handle_command("INSTALL_CERT", _cert_data()))
-    assert res["status"] == "ERROR"
+    assert res["status"] == "DEFERRED"
     assert "no managed pxmx agents connected" in res["message"]
     assert s.control_plane.sent == []
 
@@ -160,15 +164,23 @@ def test_install_cert_identifier_targets_one_node():
     assert [c["agent_id"] for c in s.control_plane.sent] == ["node-b"]
 
 
-def test_install_cert_explicit_agent_not_connected_is_error():
+def test_install_cert_explicit_agent_not_connected_broadcasts_to_fleet():
+    """An explicit target id that is NOT a connected agent (e.g. the hub's
+    wildcard fan-out sends a spoke/group id, never an agent id) falls through
+    to a fleet-wide broadcast rather than hard-failing — see the fix in
+    cs_spoke._install_cert_relay: 'a specific-but-offline node falls through
+    to the fleet too' is the documented, intentional behavior."""
     s = _spoke()
-    s.control_plane = _FakeCP({"node-a": {"hostname": "a"}})
+    s.control_plane = _FakeCP(
+        {"node-a": {"hostname": "a"}},
+        responses={"node-a": {"payload": {"data": {"status": "SUCCESS",
+                                                    "message": "ok"}}}})
     data = dict(_cert_data())
     data["agent_id"] = "node-z"
     res = _run(s.handle_command("INSTALL_CERT", data))
-    assert res["status"] == "ERROR"
-    assert "node-z" in res["message"]
-    assert s.control_plane.sent == []
+    assert res["status"] == "SUCCESS"
+    # Broadcast to every connected agent, not the missing "node-z".
+    assert [c["agent_id"] for c in s.control_plane.sent] == ["node-a"]
 
 
 def test_install_cert_send_to_agent_exception_is_caught_per_agent():
@@ -291,9 +303,14 @@ def _real_cert_pair():
 
 
 def test_apply_local_cert_writes_files_and_rebinds(monkeypatch, tmp_path):
+    """_apply_local_cert refuses by default (cs client API is plaintext-only on
+    the isolated sim segment — see control_plane._local_cert_allowed); an
+    operator who explicitly wants TLS on the local webui sets
+    LM_CS_ALLOW_LOCAL_CERT=1, which is what this test exercises."""
     from control_plane import CSControlPlane
     _ensure_loop()
     monkeypatch.setenv("LM_CS_TLS_DIR", str(tmp_path / "tls"))
+    monkeypatch.setenv("LM_CS_ALLOW_LOCAL_CERT", "1")
     cp = CSControlPlane("test-cs", "secret", api_host="127.0.0.1", api_port=0)
     cp._api_app = object()  # dummy; rebind is mocked so it never serves
     rebound = []
@@ -329,6 +346,7 @@ def test_apply_local_cert_agent_rebind_failure_does_not_mask_success(monkeypatch
     from control_plane import CSControlPlane
     _ensure_loop()
     monkeypatch.setenv("LM_CS_TLS_DIR", str(tmp_path / "tls"))
+    monkeypatch.setenv("LM_CS_ALLOW_LOCAL_CERT", "1")
     cp = CSControlPlane("test-cs", "secret", api_host="127.0.0.1", api_port=0)
     cp._api_app = object()
 
@@ -400,6 +418,7 @@ def test_apply_local_cert_rejects_invalid_material(monkeypatch, tmp_path):
     from control_plane import CSControlPlane
     _ensure_loop()
     monkeypatch.setenv("LM_CS_TLS_DIR", str(tmp_path / "tls"))
+    monkeypatch.setenv("LM_CS_ALLOW_LOCAL_CERT", "1")
     cp = CSControlPlane("test-cs", "secret")
     wrote = []
     cp._atomic_write_text = lambda p, t: wrote.append(("text", p))  # type: ignore
@@ -411,10 +430,28 @@ def test_apply_local_cert_rejects_invalid_material(monkeypatch, tmp_path):
     assert wrote == []
 
 
-def test_apply_local_cert_missing_material_is_error():
+def test_apply_local_cert_missing_material_is_error(monkeypatch):
     from control_plane import CSControlPlane
     _ensure_loop()
+    monkeypatch.setenv("LM_CS_ALLOW_LOCAL_CERT", "1")
     cp = CSControlPlane("test-cs", "secret")
     res = _run(cp._apply_local_cert("", "key"))
     assert res["status"] == "ERROR"
     assert "missing cert material" in res["message"]
+
+
+def test_apply_local_cert_refused_when_not_allowed(monkeypatch, tmp_path):
+    """Default posture: the cs client API is plaintext-only on the isolated
+    sim segment (agents hard-code http://169.253.1.1:8080), so an INSTALL_CERT
+    delivered here is a no-op SUCCESS unless LM_CS_ALLOW_LOCAL_CERT=1 — see
+    control_plane._apply_local_cert / _local_cert_allowed."""
+    from control_plane import CSControlPlane
+    _ensure_loop()
+    monkeypatch.setenv("LM_CS_TLS_DIR", str(tmp_path / "tls"))
+    monkeypatch.delenv("LM_CS_ALLOW_LOCAL_CERT", raising=False)
+    cp = CSControlPlane("test-cs", "secret")
+    res = _run(cp._apply_local_cert(_PEM, _KEY))
+    assert res["status"] == "SUCCESS"
+    assert "plaintext-only" in res["message"]
+    # Nothing was written — the cert was refused, not silently applied.
+    assert not (tmp_path / "tls" / "fullchain.pem").exists()
