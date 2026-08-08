@@ -241,4 +241,4 @@ def test_defaults_are_the_locked_decisions():
     assert QT_GRACE_S_DEFAULT == 3600.0
     assert set(QT_EXCLUDE_SIMS_DEFAULT) == {"dhcp_fail", "assoc_fail",
                                             "ssidpw_fail", "auth_fail",
-                                            "port_flap"}
+                                            "mac_auth_fail", "port_flap"}

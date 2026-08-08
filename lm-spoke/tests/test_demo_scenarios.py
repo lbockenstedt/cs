@@ -49,7 +49,11 @@ def spoke_loop(tmp_path):
         yield s, loop
     finally:
         loop.close()
-        asyncio.set_event_loop(None)
+        # Leave a fresh open loop as the global, not None — set_event_loop(None)
+        # poisons the process-wide loop state (Py3.9) for every sibling test
+        # module that calls asyncio.get_event_loop() afterward, in the same
+        # pytest session (see test_pxmx_site_map.py's spoke_loop fixture).
+        asyncio.set_event_loop(asyncio.new_event_loop())
 
 
 def test_scenario_catalog_has_normal_plus_each_failure(spoke_loop):
@@ -92,7 +96,7 @@ def test_effective_flags_layer_on_registry_overrides(spoke_loop):
     eff = spoke.demo.effective_flags("host-a")
     assert eff == {"dns_fail": "off", "dns_latency": "off", "dhcp_fail": "on",
                    "assoc_fail": "off", "auth_fail": "off", "ssidpw_fail": "off",
-                   "port_flap": "off"}
+                   "mac_auth_fail": "off", "port_flap": "off"}
     # Registry override untouched by the demo.
     entry = spoke.registry.get("host-a")
     assert entry["overrides"] == {"sim_load": "50"}
@@ -205,5 +209,6 @@ def test_demo_on_change_callback_fires_on_apply_and_clear():
         _run(loop, dm.clear("host-a"))
     finally:
         loop.close()
-        asyncio.set_event_loop(None)
+        # See spoke_loop's fixture teardown above — leave a fresh loop, not None.
+        asyncio.set_event_loop(asyncio.new_event_loop())
     assert fired == ["host-a", "host-a"]

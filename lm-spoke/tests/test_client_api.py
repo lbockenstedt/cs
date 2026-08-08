@@ -176,13 +176,19 @@ def test_build_client_rows_no_ip_is_empty_not_missing(spoke):
 
 # ── config delivery ──────────────────────────────────────────────────────────
 def test_config_renders_host_bucket(client):
+    # HUB mode (configs/simulation.conf has web_server=on, the canon this test
+    # runs against) strips the s0-s9 bucket sections entirely — see api_config's
+    # "HUB mode... Strip the dead bucket sections" comment. Placement is driven
+    # through the client's [username] override instead, not a baked bucket
+    # section, so the served config for a host with no registry overrides has
+    # no bucket section to assert on; this pins that stripping, not a bucket.
     hostname = "sim-host-9"
     r = client.get("/api/config", params={"hostname": hostname})
     assert r.status_code == 200
     text = r.text
     assert "[simulation]" in text
     bucket = sim_config.bucket_for(hostname)  # e.g. "s3"
-    assert f"[{bucket}]" in text
+    assert f"[{bucket}]" not in text
 
 
 def _ambient_pct(text):

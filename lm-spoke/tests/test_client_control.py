@@ -47,7 +47,11 @@ def spoke_loop(tmp_path):
         yield s, loop
     finally:
         loop.close()
-        asyncio.set_event_loop(None)
+        # Leave a fresh open loop as the global, not None — set_event_loop(None)
+        # poisons the process-wide loop state (Py3.9) for every sibling test
+        # module that calls asyncio.get_event_loop() afterward, in the same
+        # pytest session (see test_pxmx_site_map.py's spoke_loop fixture).
+        asyncio.set_event_loop(asyncio.new_event_loop())
 
 
 def test_get_overrides_empty_when_unset(spoke_loop):
@@ -105,8 +109,11 @@ def test_set_all_applies_to_every_registered_client(spoke_loop):
         {"overrides": {"dhcp_fail": "on"}}))
     assert resp["status"] == "SUCCESS"
     assert resp["applied"] == 3
+    # set_overrides MERGES (see its docstring: a single-flag toggle must not
+    # wipe a client's other overrides) — sim_load survives alongside the newly
+    # applied dhcp_fail, it isn't replaced.
     for h in ("host-a", "host-b", "host-c"):
-        assert spoke.registry.get(h)["overrides"] == {"dhcp_fail": "on"}
+        assert spoke.registry.get(h)["overrides"] == {"sim_load": "100", "dhcp_fail": "on"}
 
 
 def test_set_all_with_no_clients_applies_zero(spoke_loop):
