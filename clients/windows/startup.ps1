@@ -71,9 +71,16 @@ Write-StartupLog "VH server: $vh_server"
 Write-StartupLog "Simulation phy: $sim_phy"
 Write-StartupLog "Rapid update: $rapid_update"
 
-$rn = $reboot_schedule + (Get-Random -Minimum 0 -Maximum 600)
-Write-StartupLog "Scheduling reboot in $rn minutes"
-shutdown /r /t ([int]$rn * 60) | Out-Null
+# reboot_schedule is in MINUTES. Guard: if it's missing/invalid/<=0, skip
+# scheduling — mirrors the Linux startup.sh guard, which exists because a
+# missing value used to cast to 0 and fire shutdown /r /t 0 (immediate reboot).
+if ($reboot_schedule -gt 0) {
+    $rn = $reboot_schedule + (Get-Random -Minimum 0 -Maximum 600)
+    Write-StartupLog "Scheduling reboot in $rn minutes"
+    shutdown /r /t ([int]$rn * 60) | Out-Null
+} else {
+    Write-StartupLog "Skipping reboot schedule (reboot_schedule missing/invalid: '$reboot_schedule')"
+}
 
 Write-StartupLog 'Bringing up all interfaces online'
 Get-NetAdapter -ErrorAction SilentlyContinue | ForEach-Object {

@@ -504,11 +504,15 @@ report_status() {
   # ratchet settled on for this dongle) up to the hub — VISIBILITY only (the
   # dashboard badge). 0 = not yet throttled / sidelined.
   local dns_ceiling; dns_ceiling=$(_dns_ceiling_saved); [[ "$dns_ceiling" =~ ^[0-9]+$ ]] || dns_ceiling=0
+  # Full adapter inventory (wired/wireless/other per interface) — lets the
+  # spoke keep media-tagged sims (assoc_fail etc.) off clients that lack a
+  # matching adapter. detect_adapter_inventory lives in common.sh.
+  detect_adapter_inventory
   local payload
   printf -v payload \
-    '{"hostname":"%s","simulation_id":"%s","platform":"%s","iteration":%s,"connected_ssid":"%s","ip":"%s","gateway_reachable":%s,"dns_ceiling":%s,"active_simulations":[%s],"errors":%s,"config":{"kill_switch":"%s","dns_fail":"%s","dns_latency":"%s","iperf":"%s","www_traffic":"%s","download":"%s","ping_test":"%s","ssidpw_fail":"%s","auth_fail":"%s","mac_auth_fail":"%s","dhcp_fail":"%s","collab":"%s"}}' \
+    '{"hostname":"%s","simulation_id":"%s","platform":"%s","iteration":%s,"connected_ssid":"%s","ip":"%s","gateway_reachable":%s,"dns_ceiling":%s,"active_simulations":[%s],"errors":%s,"adapters":%s,"config":{"kill_switch":"%s","dns_fail":"%s","dns_latency":"%s","iperf":"%s","www_traffic":"%s","download":"%s","ping_test":"%s","ssidpw_fail":"%s","auth_fail":"%s","mac_auth_fail":"%s","dhcp_fail":"%s","collab":"%s"}}' \
     "$(json_escape "$hostname")" "$(json_escape "${simulation_id:-}")" "$(json_escape "$platform")" \
-    "$iteration" "$(json_escape "${connected_ssid:-}")" "$(json_escape "${sim_ip:-}")" "$gateway_json" "$dns_ceiling" "$active_simulations" "$errors_json" \
+    "$iteration" "$(json_escape "${connected_ssid:-}")" "$(json_escape "${sim_ip:-}")" "$gateway_json" "$dns_ceiling" "$active_simulations" "$errors_json" "$adapters_json" \
     "$(json_escape "${kill_switch:-off}")" "$(json_escape "${dns_fail:-off}")" "$(json_escape "${dns_latency:-off}")" "$(json_escape "${iperf:-off}")" \
     "$(json_escape "${www_traffic:-off}")" "$(json_escape "${download:-off}")" "$(json_escape "${ping_test:-off}")" \
     "$(json_escape "${ssidpw_fail:-off}")" "$(json_escape "${auth_fail:-off}")" "$(json_escape "${mac_auth_fail:-off}")" "$(json_escape "${dhcp_fail:-off}")" \
@@ -668,11 +672,14 @@ fi
 if [[ "$sim_load" -lt "$rn_sim_load" ]]; then
   echo Simulation load under threshold | tee -a ${LOG_FILE}
   echo Skipping Simulations but staying associated | tee -a ${LOG_FILE}
-  if [[ "$ssidpw_fail" != "on" ]] && [[ -n ${wladapter} ]] && ! _is_wifi_connected; then
+  if [[ "$sim_phy" != "ethernet" ]] && [[ "$ssidpw_fail" != "on" ]] && [[ -n ${wladapter} ]] && ! _is_wifi_connected; then
     # Only reconnect if we're NOT already associated. manage_connection up is
     # event-driven (iw event + nmcli exit) — the 180 is just the silent-AP
     # backstop, not a blind wait: it returns the instant activation completes or
-    # the AP deauths.
+    # the AP deauths. Gated on sim_phy != ethernet: a wired-designated client
+    # must never re-associate wifi just because a WLAN adapter happens to also
+    # be physically present (e.g. a dual-adapter box) — sim_phy is the
+    # authoritative statement of intent, not adapter presence.
     manage_connection up 180
   fi
 fi
@@ -759,7 +766,14 @@ if [ "$kill_switch" != "on" ]; then
   #a RADIUS/ClearPass MAC-Auth deny entry and watch it get rejected. All three
   #need to be constantly connecting so we trigger insights.
   #------------------------------------------------------------
-  if [[ ($ssidpw_fail == "on" || $auth_fail == "on" || $mac_auth_fail == "on") && -n ${wladapter} ]]; then
+  # Gated on sim_phy != ethernet, not just adapter presence: these are
+  # wireless-only sims (SIM_META media=wireless on the engine side). A
+  # wired-designated client (sim_phy=ethernet) must never attempt an SSID
+  # connect just because a WLAN adapter is also physically detected (e.g. a
+  # dual-adapter box, or one whose wladapter was already brought down at the
+  # sim_phy=="ethernet" disable-unused-interface step above) — sim_phy is the
+  # authoritative statement of intent here, adapter presence alone is not.
+  if [[ "$sim_phy" != "ethernet" ]] && [[ ($ssidpw_fail == "on" || $auth_fail == "on" || $mac_auth_fail == "on") && -n ${wladapter} ]]; then
     if [[ "$ssidpw_fail" == "on" ]]; then
      # Base the wrong password on the client's EFFECTIVE password: the
      # [username]/cell override (get_value $username) wins over the [s0-s9]

@@ -238,7 +238,12 @@ class ClientRegistry:
                         # T3 IoT: the host advertises whether it can run the vwlan
                         # fleet + how many interfaces, so the sim-quota engine's
                         # device-quota pass can target it (see _reconcile_device_quotas).
-                        "iot_capable", "iot_capacity"):
+                        "iot_capable", "iot_capacity",
+                        # Full adapter inventory (name/mac/media_type/is_default_route
+                        # per interface), self-reported live each heartbeat — lets the
+                        # sim-quota engine keep media-tagged sims (assoc_fail etc.) off
+                        # clients that lack a matching wired/wireless adapter.
+                        "adapters"):
                 if key in payload:
                     entry[key] = payload[key]
 

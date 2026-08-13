@@ -83,11 +83,47 @@ derive_bucket() {
 # ── adapter detection ───────────────────────────────────────────────────────
 # Sets $wladapter / $eadapter. Unified SUPERSET patterns — startup.sh's wired
 # pattern included `ens` while simulation.sh's didn't; the superset wins.
+# `enx*` (USB-Ethernet/wired-dongle MAC-keyed naming) is included so a T2
+# wired dongle isn't missed the way it was before this fix.
 detect_wlan_adapter() {
   wladapter=$(ip -br a 2>/dev/null | grep "wlx\|wlan" | cut -d ' ' -f '1')
 }
 detect_eth_adapter() {
-  eadapter=$(ip -br a 2>/dev/null | grep "enp\|eno\|eth0\|eth1\|eth2\|eth3\|eth4\|eth5\|eth6\|ens" | cut -d ' ' -f '1')
+  eadapter=$(ip -br a 2>/dev/null | grep "enx\|enp\|eno\|eth0\|eth1\|eth2\|eth3\|eth4\|eth5\|eth6\|ens" | cut -d ' ' -f '1')
+}
+
+# Enumerate EVERY non-loopback interface (not just the default-route one that
+# detect_phy_type classifies) and classify each wired/wireless/other, so the
+# hub/spoke can see a client's full adapter mix — e.g. a T2 box with one wired
+# dongle and one wireless dongle — rather than just whichever iface currently
+# owns the route. This is what gets reported off-box (see simulation.sh's
+# report_status); detect_phy_type/detect_wlan_adapter/detect_eth_adapter stay
+# local-only (dashboard display, connect/reset targeting).
+# Sets $adapters_json — a JSON array of
+#   {"name","mac","media_type":"wired"|"wireless"|"other","is_default_route"}
+detect_adapter_inventory() {
+  adapters_json="[]"
+  local default_iface entries="" first=true line name mac media is_default
+  default_iface=$(ip route show default 2>/dev/null \
+    | awk '/default/{for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}')
+  while read -r line; do
+    [[ -z "$line" ]] && continue
+    name=$(awk '{print $1}' <<<"$line")
+    [[ "$name" == "lo" ]] && continue
+    mac=$(awk '{print $3}' <<<"$line")
+    [[ "$mac" =~ ^[0-9a-fA-F:]{17}$ ]] || mac=""
+    case "$name" in
+      wlx*|wlan*|wlp*) media="wireless" ;;
+      enx*|enp*|eno*|eth*|ens*) media="wired" ;;
+      *) media="other" ;;
+    esac
+    is_default=false
+    [[ "$name" == "$default_iface" ]] && is_default=true
+    [[ $first == true ]] && first=false || entries+=","
+    entries+=$(printf '{"name":"%s","mac":"%s","media_type":"%s","is_default_route":%s}' \
+      "$(json_escape "$name")" "$(json_escape "$mac")" "$media" "$is_default")
+  done < <(ip -br link 2>/dev/null)
+  adapters_json="[${entries}]"
 }
 
 # Detect the ACTIVE PHY type dynamically — NOT from simulation.conf's sim_phy

@@ -367,6 +367,7 @@ def fallback_status():
         "gateway_reachable": False,
         "active_simulations": [],
         "errors": [],
+        "adapters": [],
         "config": {},
         "has_usb": detect_has_usb(),
         **_iot_fields(),
@@ -388,6 +389,7 @@ def load_status():
     payload.setdefault("gateway_reachable", False)
     payload.setdefault("active_simulations", [])
     payload.setdefault("errors", [])
+    payload.setdefault("adapters", [])
     payload.setdefault("config", {})
     # Live-detected each frame (hardware fact, not from the status file) so the
     # hub can classify this client T1 (no USB WiFi) vs T2 (USB WiFi dongle).

@@ -169,13 +169,21 @@ class _FakeSpoke:
         self.deploy = _FakeDeploy(name_to_host or {})
 
 
-def _client(host, site, online=True, overrides=None, sim_flags=None):
+def _client(host, site, online=True, overrides=None, sim_flags=None, adapters=None):
     cfg = {"wsite": site}
     if sim_flags:
         cfg.update(sim_flags)
+    # Default to reporting BOTH media types so the generic fixture is neutral
+    # to the wired/wireless media gate (_media_ok) — tests that care about it
+    # pass an explicit adapters= list (see test_media_* below).
+    if adapters is None:
+        adapters = [
+            {"name": "eth0", "mac": "", "media_type": "wired", "is_default_route": False},
+            {"name": "wlan0", "mac": "", "media_type": "wireless", "is_default_route": True},
+        ]
     return {
         "hostname": host, "last_seen": time.time() if online else 0,
-        "config": cfg, "overrides": overrides or {},
+        "config": cfg, "overrides": overrides or {}, "adapters": adapters,
     }
 
 
@@ -1443,3 +1451,64 @@ def test_gateway_down_confirmed_readmits_after_latch_clears(tmp_path):
     actions = _run(eng.reconcile())
     assert actions["assigned"] == 1
     assert "c0" in eng._ledger["alert:A:MIA"]["clients"]
+# ── media gate (_media_ok): wired/wireless-tagged sims vs reported adapters ──
+# SIM_META tags assoc_fail/ssidpw_fail/auth_fail/mac_auth_fail "wireless" and
+# port_flap "wired"; everything else is "any". A client only qualifies for a
+# media-tagged sim if its self-reported adapters (client["adapters"]) include
+# that media — fail-closed when the list is empty/missing (no heartbeat yet).
+
+_WIRED_ONLY = [{"name": "eth0", "media_type": "wired", "is_default_route": True}]
+_WIRELESS_ONLY = [{"name": "wlan0", "media_type": "wireless", "is_default_route": True}]
+
+
+def test_media_gate_keeps_wireless_sim_off_a_wired_only_client(tmp_path):
+    clients = {"c0": _client("c0", "MIA", adapters=_WIRED_ONLY),
+               "c1": _client("c1", "MIA", adapters=_WIRELESS_ONLY)}
+    spoke = _FakeSpoke(clients, [{"alert_id": "A", "sim_id": "assoc_fail", "count": 2,
+                                  "site": "MIA", "enabled": True}], tmp_path)
+    eng = SimQuotaEngine(spoke)
+    _run(eng.reconcile())
+    assert set(eng._ledger["alert:A:MIA"]["clients"].keys()) == {"c1"}, \
+        "the wired-only client must never be picked for a wireless sim; underfill instead"
+
+
+def test_media_gate_keeps_wired_sim_off_a_wireless_only_client(tmp_path):
+    clients = {"c0": _client("c0", "MIA", adapters=_WIRED_ONLY),
+               "c1": _client("c1", "MIA", adapters=_WIRELESS_ONLY)}
+    spoke = _FakeSpoke(clients, [{"alert_id": "A", "sim_id": "port_flap", "count": 2,
+                                  "site": "MIA", "enabled": True}], tmp_path)
+    eng = SimQuotaEngine(spoke)
+    _run(eng.reconcile())
+    assert set(eng._ledger["alert:A:MIA"]["clients"].keys()) == {"c0"}
+
+
+def test_media_gate_fails_closed_with_no_reported_adapters(tmp_path):
+    # A client that hasn't sent adapter data yet (fresh boot, or an old
+    # client-sim build predating this field) is NOT eligible for a
+    # media-tagged sim — the exact rollout gap that could reproduce the
+    # original bug if left fail-open.
+    clients = {"c0": _client("c0", "MIA", adapters=[])}
+    spoke = _FakeSpoke(clients, [{"alert_id": "A", "sim_id": "assoc_fail", "count": 1,
+                                  "site": "MIA", "enabled": True}], tmp_path)
+    eng = SimQuotaEngine(spoke)
+    _run(eng.reconcile())
+    assert not eng._ledger["alert:A:MIA"]["clients"]
+
+
+def test_media_gate_does_not_apply_to_any_media_sims(tmp_path):
+    # dns_fail is media="any" — unaffected by adapter reporting, even with none.
+    clients = {"c0": _client("c0", "MIA", adapters=[])}
+    spoke = _FakeSpoke(clients, [_tq(1)], tmp_path)
+    eng = SimQuotaEngine(spoke)
+    _run(eng.reconcile())
+    assert set(eng._ledger["alert:A:MIA"]["clients"].keys()) == {"c0"}
+
+
+def test_media_mismatch_surfaces_in_diag(tmp_path):
+    clients = {"c0": _client("c0", "MIA", adapters=_WIRED_ONLY)}
+    spoke = _FakeSpoke(clients, [{"alert_id": "A", "sim_id": "assoc_fail", "count": 1,
+                                  "site": "MIA", "enabled": True}], tmp_path)
+    eng = SimQuotaEngine(spoke)
+    _run(eng.reconcile())
+    blocked = eng._quota_diag["alert:A:MIA"]["blocked"]
+    assert blocked.get("media_mismatch", 0) == 1, blocked

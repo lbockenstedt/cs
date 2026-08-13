@@ -126,7 +126,9 @@ ssid=PSK                # SSID to connect to
 ssidpw=PassW0rd!        # WPA passphrase
 dhcp_fail=off           # simulate DHCP failure
 dns_fail=on             # simulate DNS failure (generates DNS alert in Central)
-assoc_fail=off          # simulate 802.11 association failure
+assoc_fail=off          # count toward an SSID pre-configured on the AP/controller
+                        # side to fire association-failure alerts — the client just
+                        # attempts a normal connect, no client-side failure behavior
 port_flap=off           # simulate wired port link flap
 ping_test=on            # run continuous ICMP ping test
 download=on             # run HTTP download traffic
@@ -143,7 +145,7 @@ sim_phy=wireless        # wireless or wired
 | `dhcp_fail`   | Releases and does not renew DHCP lease             | DHCP failure alert           |
 | `ssidpw_fail` | Connects with wrong WPA passphrase                 | Auth failure alert           |
 | `auth_fail`   | Sends bad 802.1X credentials                      | Auth failure alert           |
-| `assoc_fail`  | Sends malformed association requests               | Assoc failure alert          |
+| `assoc_fail`  | Normal connect attempt; the SSID itself is pre-configured on the AP/controller side to fire the alert — no client-side failure behavior | Assoc failure alert |
 | `port_flap`   | Bounces the wired interface repeatedly             | Port flap alert              |
 | `ping_test`   | Sends ICMP to `ping_address` (traffic generation)  | —                            |
 | `download`    | Downloads a file repeatedly (traffic generation)   | —                            |
