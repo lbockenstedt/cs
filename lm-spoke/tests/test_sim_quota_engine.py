@@ -1504,6 +1504,29 @@ def test_media_gate_does_not_apply_to_any_media_sims(tmp_path):
     assert set(eng._ledger["alert:A:MIA"]["clients"].keys()) == {"c0"}
 
 
+def test_media_gate_allows_auth_fail_on_a_wired_only_client(tmp_path):
+    # auth_fail is media="any" (unlike assoc_fail/ssidpw_fail): it has a real
+    # wired path (wired 802.1X bad-credential reject, connect_wired_1x.sh) as
+    # well as the wireless one, so a wired-only client must still qualify.
+    clients = {"c0": _client("c0", "MIA", adapters=_WIRED_ONLY)}
+    spoke = _FakeSpoke(clients, [{"alert_id": "A", "sim_id": "auth_fail", "count": 1,
+                                  "site": "MIA", "enabled": True}], tmp_path)
+    eng = SimQuotaEngine(spoke)
+    _run(eng.reconcile())
+    assert set(eng._ledger["alert:A:MIA"]["clients"].keys()) == {"c0"}
+
+
+def test_media_gate_allows_mac_auth_fail_on_a_wired_only_client(tmp_path):
+    # mac_auth_fail is media="any" too: wired MAC-Auth-Bypass (MAB) deny is a
+    # real equivalent of the wireless spoofed-MAC deny test.
+    clients = {"c0": _client("c0", "MIA", adapters=_WIRED_ONLY)}
+    spoke = _FakeSpoke(clients, [{"alert_id": "A", "sim_id": "mac_auth_fail", "count": 1,
+                                  "site": "MIA", "enabled": True}], tmp_path)
+    eng = SimQuotaEngine(spoke)
+    _run(eng.reconcile())
+    assert set(eng._ledger["alert:A:MIA"]["clients"].keys()) == {"c0"}
+
+
 def test_media_mismatch_surfaces_in_diag(tmp_path):
     clients = {"c0": _client("c0", "MIA", adapters=_WIRED_ONLY)}
     spoke = _FakeSpoke(clients, [{"alert_id": "A", "sim_id": "assoc_fail", "count": 1,

@@ -20,6 +20,10 @@ source '/usr/local/scripts/common.sh'
 source '/usr/local/scripts/network_common.sh'
 source '/usr/local/scripts/connect_psk.sh'
 source '/usr/local/scripts/connect_1x.sh'
+# Wired 802.1X / MAC-Auth-Bypass counterparts to connect_1x.sh — auth_fail and
+# mac_auth_fail are media="any" (both have a real wired path); see the file
+# header for why this is split out from the (wireless-only) connect_1x.sh.
+source '/usr/local/scripts/connect_wired_1x.sh'
 source '/usr/local/scripts/recovery.sh'
 # T3 IoT-fleet mode (vwlan multi-device) — detect_t3_pci + run_iot_simulation.
 # Guarded: a T1/T2 client that hasn't been shipped iot_sim.sh yet simply never
@@ -95,6 +99,7 @@ _NET_SOURCE_FILES=(
   /usr/local/scripts/network_common.sh
   /usr/local/scripts/connect_psk.sh
   /usr/local/scripts/connect_1x.sh
+  /usr/local/scripts/connect_wired_1x.sh
   /usr/local/scripts/recovery.sh
 )
 # One mtime fingerprint of simulation.sh + every sourced network file, compared
@@ -765,16 +770,26 @@ if [ "$kill_switch" != "on" ]; then
   #MAC (mac_auth_fail_mac) so the operator can pre-configure that EXACT MAC as
   #a RADIUS/ClearPass MAC-Auth deny entry and watch it get rejected. All three
   #need to be constantly connecting so we trigger insights.
+  #
+  # Media split: ssidpw_fail is wireless-only (a WPA passphrase has no wired
+  # equivalent — see the sim_phy=="ethernet" skip inside its block below).
+  # auth_fail and mac_auth_fail, though, are media="any" on the engine side
+  # (sim_quota.py SIM_META): a switch port doing 802.1X or MAC-Auth-Bypass
+  # (MAB) can reject a client exactly like an AP/RADIUS does over wifi, so
+  # each has its OWN wired path (connect_wired_1x.sh, wired_auth_fail_run /
+  # wired_mac_auth_fail_run on $eadapter) picked when sim_phy=="ethernet",
+  # falling back to the original wifi path otherwise. sim_phy is the
+  # authoritative statement of intent — never adapter presence alone (a
+  # dual-adapter box, or one whose wladapter was deliberately brought down at
+  # the disable-unused-interface step above, must not fall through to wifi).
   #------------------------------------------------------------
-  # Gated on sim_phy != ethernet, not just adapter presence: these are
-  # wireless-only sims (SIM_META media=wireless on the engine side). A
-  # wired-designated client (sim_phy=ethernet) must never attempt an SSID
-  # connect just because a WLAN adapter is also physically detected (e.g. a
-  # dual-adapter box, or one whose wladapter was already brought down at the
-  # sim_phy=="ethernet" disable-unused-interface step above) — sim_phy is the
-  # authoritative statement of intent here, adapter presence alone is not.
-  if [[ "$sim_phy" != "ethernet" ]] && [[ ($ssidpw_fail == "on" || $auth_fail == "on" || $mac_auth_fail == "on") && -n ${wladapter} ]]; then
+  if [[ "$ssidpw_fail" == "on" || "$auth_fail" == "on" || "$mac_auth_fail" == "on" ]]; then
     if [[ "$ssidpw_fail" == "on" ]]; then
+     if [[ "$sim_phy" == "ethernet" ]]; then
+      echo "SSID Incorrect Password has no wired equivalent — skipping (sim_phy=ethernet)" | tee -a ${LOG_FILE}
+     elif [[ -z ${wladapter} ]]; then
+      echo "SSID Incorrect Password requires a wireless adapter — none detected, skipping" | tee -a ${LOG_FILE}
+     else
      # Base the wrong password on the client's EFFECTIVE password: the
      # [username]/cell override (get_value $username) wins over the [s0-s9]
      # bucket, so it's genuinely one char off the REAL password for the SSID this
@@ -800,8 +815,18 @@ if [ "$kill_switch" != "on" ]; then
         connect_wifi_fail 5
       fi
      done
+     fi
     fi
     if [[ "$auth_fail" == "on" ]]; then
+     if [[ "$sim_phy" == "ethernet" ]]; then
+      if [[ -n ${eadapter} ]]; then
+        wired_auth_fail_run
+      else
+        echo "Auth Failure (wired) requires a wired adapter — none detected, skipping" | tee -a ${LOG_FILE}
+      fi
+     elif [[ -z ${wladapter} ]]; then
+      echo "Auth Failure (wireless) requires a wireless adapter — none detected, skipping" | tee -a ${LOG_FILE}
+     else
      echo Running Auth Failure | tee -a ${LOG_FILE}
      for i in {1..100}; do
       echo Enable/Disable WLAN interface | tee -a ${LOG_FILE}
@@ -815,8 +840,18 @@ if [ "$kill_switch" != "on" ]; then
       manage_connection up 5 reset 5 0
       manage_connection down 5
      done
+     fi
     fi
     if [[ "$mac_auth_fail" == "on" ]]; then
+     if [[ "$sim_phy" == "ethernet" ]]; then
+      if [[ -n ${eadapter} ]]; then
+        wired_mac_auth_fail_run
+      else
+        echo "MAC Auth Failure (wired) requires a wired adapter — none detected, skipping" | tee -a ${LOG_FILE}
+      fi
+     elif [[ -z ${wladapter} ]]; then
+      echo "MAC Auth Failure (wireless) requires a wireless adapter — none detected, skipping" | tee -a ${LOG_FILE}
+     else
      echo "Running MAC Auth Failure (spoofed MAC deny-list test, target=${mac_auth_fail_mac})" | tee -a ${LOG_FILE}
      # Resolve the connection PROFILE name the same way connect_wifi does.
      mac_fail_ssid="$ssid"
@@ -852,6 +887,7 @@ if [ "$kill_switch" != "on" ]; then
       # is diagnosable from the log alone, not a manual guest-exec session.
       echo "  [mac_auth_fail] modify_rc=${_mac_mod_rc} modify_err='${_mac_mod_err}' up_rc=${_mac_up_rc} target_mac=${mac_auth_fail_mac} actual_iface_mac=${_mac_actual}" | tee -a ${LOG_FILE}
      done
+     fi
     fi
    #------------------------------------------------------------
    #Resetting the WIFI Password so it can connect correctly for updates/maintenance
@@ -864,6 +900,12 @@ if [ "$kill_switch" != "on" ]; then
      _mac_clr_rc=$?
      echo "  [mac_auth_fail] cleared cloned-mac-address override on '${mac_fail_ssid}' before maintenance reconnect (rc=${_mac_clr_rc} err='${_mac_clr_err}')" | tee -a ${LOG_FILE}
    fi
+   if [[ "$sim_phy" == "ethernet" ]]; then
+     # Wired maintenance reconnect — clears the wired fail-sim profiles
+     # (connect_wired_1x.sh) and brings the plain DHCP connection back up on
+     # $eadapter, the wired counterpart of the connect_wifi 5 restore below.
+     wired_1x_restore
+   else
    ssidpw=$(get_value $username 'ssidpw'); [[ -z "$ssidpw" ]] && ssidpw=$(get_value $simulation_id 'ssidpw')
    # Restore dot1x_password too — the fail loop corrupts it for 1X clients
    # (${real_dot1x}_fail), and without a restore the maintenance connect_wifi 5
@@ -871,6 +913,7 @@ if [ "$kill_switch" != "on" ]; then
    # (dot1x_password lives there, not in [s0-s9]).
    dot1x_password=$(get_value $username 'dot1x_password'); [[ -z "$dot1x_password" ]] && dot1x_password=$(get_value 'simulation' 'dot1x_password')
    connect_wifi 5
+   fi
    #------------------------------------------------------------
    #End SSID Incorrect Password Simualtion or Auth Failure Simulation
    #------------------------------------------------------------

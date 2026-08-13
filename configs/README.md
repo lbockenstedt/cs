@@ -143,10 +143,11 @@ sim_phy=wireless        # wireless or wired
 |---------------|----------------------------------------------------|------------------------------|
 | `dns_fail`    | Resolves DNS to bad IPs / bad records              | DNS failure insight/alert    |
 | `dhcp_fail`   | Releases and does not renew DHCP lease             | DHCP failure alert           |
-| `ssidpw_fail` | Connects with wrong WPA passphrase                 | Auth failure alert           |
-| `auth_fail`   | Sends bad 802.1X credentials                      | Auth failure alert           |
-| `assoc_fail`  | Normal connect attempt; the SSID itself is pre-configured on the AP/controller side to fire the alert — no client-side failure behavior | Assoc failure alert |
-| `port_flap`   | Bounces the wired interface repeatedly             | Port flap alert              |
+| `ssidpw_fail` | Connects with wrong WPA passphrase (wireless-only) | Auth failure alert           |
+| `auth_fail`   | Sends bad 802.1X credentials — wifi RADIUS reject when `sim_phy=wireless`, wired switch-port 802.1X reject when `sim_phy=wired` | Auth failure alert |
+| `assoc_fail`  | Normal connect attempt; the SSID itself is pre-configured on the AP/controller side to fire the alert — no client-side failure behavior (wireless-only) | Assoc failure alert |
+| `mac_auth_fail` | Associates/links up with a fixed, predictable spoofed deny-listed MAC — wireless spoofed association when `sim_phy=wireless`, wired MAC-Auth-Bypass (MAB) deny when `sim_phy=wired` | MAC auth deny alert |
+| `port_flap`   | Bounces the wired interface repeatedly (wired-only)| Port flap alert              |
 | `ping_test`   | Sends ICMP to `ping_address` (traffic generation)  | —                            |
 | `download`    | Downloads a file repeatedly (traffic generation)   | —                            |
 | `www_traffic` | Fetches web pages (traffic generation)             | —                            |

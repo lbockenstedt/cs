@@ -844,14 +844,19 @@ class SimQuotaEngine:
         return media
 
     def _media_ok(self, c: Dict[str, Any], sim_id: str) -> bool:
-        """Media gate: SIM_META tags assoc_fail/ssidpw_fail/auth_fail/
-        mac_auth_fail "wireless" and port_flap "wired" (everything else is
-        "any", the default when unset). A client only qualifies for a
-        media-tagged sim if its reported adapter inventory includes that
-        media. FAIL-CLOSED on missing/empty adapter data — a client that
-        hasn't reported yet is ineligible for wired/wireless sims (not
-        "any" ones) until it does, so the reporting gap can't reproduce a
-        wireless-only sim landing on a wired-only client."""
+        """Media gate: SIM_META tags assoc_fail/ssidpw_fail "wireless" (no
+        wired equivalent — SSID association / a WPA passphrase are wireless-
+        only concepts) and port_flap "wired" (needs a wired NIC to flap).
+        auth_fail/mac_auth_fail are "any": both have a real wired path (wired
+        802.1X bad-credential reject / wired MAC-Auth-Bypass deny — see
+        clients/linux/connect_wired_1x.sh) as well as the wireless one, so
+        either media qualifies. Everything else is "any" too, the default
+        when unset. A client only qualifies for a media-tagged sim if its
+        reported adapter inventory includes that media. FAIL-CLOSED on
+        missing/empty adapter data — a client that hasn't reported yet is
+        ineligible for wired/wireless sims (not "any" ones) until it does, so
+        the reporting gap can't reproduce a wireless-only sim landing on a
+        wired-only client."""
         if not sim_id:
             return True
         meta = getattr(self, "_sim_meta", None)
