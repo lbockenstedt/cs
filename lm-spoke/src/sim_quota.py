@@ -99,21 +99,30 @@ def prefixed_alert_id(source: str, bare_id: str) -> str:
 # (the default bucket state — the abundant generic pool the quota draws from).
 # multi_capable: True = may pack onto a client already running other sims;
 # False (exclusive) = the engine assigns it only to a client not already running
-# another exclusive quota sim. Defaults are overrideable per-quota in the tenant
-# Config → Sim Quotas subtab.
+# another exclusive quota sim. media: "wired" | "wireless" | "any" — the
+# physical adapter a sim needs. assoc_fail/ssidpw_fail are wireless-only (SSID
+# association / a WPA passphrase have no wired equivalent). auth_fail and
+# mac_auth_fail are "any": both have a genuine wired equivalent (wired 802.1X
+# bad-credential reject / wired MAC-Auth-Bypass deny on the switch port — see
+# clients/linux/connect_wired_1x.sh) as well as the wireless one, so either a
+# wired-only or wireless-only client qualifies. port_flap needs a wired NIC to
+# flap. Consulted by sim_quota_engine._media_ok against the client's
+# self-reported adapter inventory so a wireless-only sim never lands on a
+# wired-only client (and vice versa). Defaults are overrideable per-quota in
+# the tenant Config → Sim Quotas subtab.
 SIM_META: Dict[str, Dict[str, object]] = {
-    "dns_fail":    {"category": "failure", "multi_capable": False},
-    "dns_latency": {"category": "failure", "multi_capable": False},
-    "dhcp_fail":   {"category": "failure", "multi_capable": False},
-    "assoc_fail":  {"category": "failure", "multi_capable": False},
-    "auth_fail":   {"category": "failure", "multi_capable": False},
-    "ssidpw_fail": {"category": "failure", "multi_capable": False},
-    "mac_auth_fail": {"category": "failure", "multi_capable": False},
-    "port_flap":   {"category": "failure", "multi_capable": False},
-    "ping_test":   {"category": "traffic", "multi_capable": True},
-    "download":    {"category": "traffic", "multi_capable": True},
-    "www_traffic": {"category": "traffic", "multi_capable": True},
-    "iperf":       {"category": "traffic", "multi_capable": True},
+    "dns_fail":    {"category": "failure", "multi_capable": False, "media": "any"},
+    "dns_latency": {"category": "failure", "multi_capable": False, "media": "any"},
+    "dhcp_fail":   {"category": "failure", "multi_capable": False, "media": "any"},
+    "assoc_fail":  {"category": "failure", "multi_capable": False, "media": "wireless"},
+    "auth_fail":   {"category": "failure", "multi_capable": False, "media": "any"},
+    "ssidpw_fail": {"category": "failure", "multi_capable": False, "media": "wireless"},
+    "mac_auth_fail": {"category": "failure", "multi_capable": False, "media": "any"},
+    "port_flap":   {"category": "failure", "multi_capable": False, "media": "wired"},
+    "ping_test":   {"category": "traffic", "multi_capable": True, "media": "any"},
+    "download":    {"category": "traffic", "multi_capable": True, "media": "any"},
+    "www_traffic": {"category": "traffic", "multi_capable": True, "media": "any"},
+    "iperf":       {"category": "traffic", "multi_capable": True, "media": "any"},
 }
 
 # Suggested alert/insight → sim linkage (global defaults the tenant UI

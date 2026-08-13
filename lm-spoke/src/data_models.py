@@ -27,6 +27,10 @@ class Client(BaseModel):
     vh_connected: bool = False
     active_simulations: List[str] = Field(default_factory=list)
     errors: List[str] = Field(default_factory=list)
+    # Self-reported physical adapter inventory: [{name, mac, media_type, is_default_route}].
+    # media_type is "wired" | "wireless" | "other". Empty until the client's first
+    # heartbeat lands (or on old clients that predate this field).
+    adapters: List[Dict[str, Any]] = Field(default_factory=list)
     config: Dict[str, Any] = Field(default_factory=dict)
     status: str = "pending"  # pending | approved | rejected
     vmid: Optional[int] = None

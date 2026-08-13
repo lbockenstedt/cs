@@ -295,21 +295,32 @@ def _effective_ssid(profile: Dict[str, str]) -> str:
 
 
 async def sim_assoc_fail(profile: Dict[str, str], ctx: SimCtx) -> PrimResult:
-    """802.11 assoc failure: cycle the WLAN interface up/down repeatedly (nmcli)."""
+    """Client-count sim, NOT a client-side failure: the AP/controller side is
+    pre-configured out of band so this SSID fires CLIENT_ASSOCIATION_FAILURE /
+    CLIENT_DISCONNECTED / WIRELESS_CLIENT_ROAM on its own. The client's only
+    job is to be one more ordinary association attempt against that SSID —
+    the same "connection up, else device wifi connect" a normal client does.
+    No wrong password, no interface cycling, no radio toggling here; those
+    live in ssidpw_fail/auth_fail. (Previously cycled the interface up/down
+    itself, which the production clients/linux/simulation.sh path never did —
+    removed to match: a plain connect there is the whole simulation.)"""
     if not shutil.which("nmcli"):
         return _degraded("assoc_fail", "nmcli", "install NetworkManager (nmcli)")
+    if not await _find_wireless_adapter():
+        return _degraded("assoc_fail", "wlan-iface", "no wireless interface found")
     ssid = _effective_ssid(profile)
-    for _ in range(ctx.wifi_iters):
-        await _nmcli("connection", "up", ssid, timeout=5.0)
-        await asyncio.sleep(1.0)
-        await _nmcli("connection", "down", ssid, timeout=5.0)
-    return _ok("assoc_fail", f"cycled {ssid} x{ctx.wifi_iters}", "nmcli")
+    if not await _nmcli("connection", "up", ssid, timeout=10.0):
+        await _nmcli("device", "wifi", "connect", ssid,
+                     "password", profile.get("ssidpw", ""), timeout=15.0)
+    return _ok("assoc_fail", f"connect attempt to {ssid}", "nmcli")
 
 
 async def sim_ssidpw_fail(profile: Dict[str, str], ctx: SimCtx) -> PrimResult:
     """Wrong-PSK auth failure: attempt to connect with ``<ssidpw>_fail`` (nmcli)."""
     if not shutil.which("nmcli"):
         return _degraded("ssidpw_fail", "nmcli", "install NetworkManager (nmcli)")
+    if not await _find_wireless_adapter():
+        return _degraded("ssidpw_fail", "wlan-iface", "no wireless interface found")
     ssid = _effective_ssid(profile)
     badpw = f"{profile.get('ssidpw', '')}_fail"
     # Drop any stale PSK connections first, like delete_matching_connections().
@@ -323,6 +334,8 @@ async def sim_auth_fail(profile: Dict[str, str], ctx: SimCtx) -> PrimResult:
     """802.1X/blocked-MAC style auth failure: toggle WLAN radio + interface (nmcli)."""
     if not shutil.which("nmcli"):
         return _degraded("auth_fail", "nmcli", "install NetworkManager (nmcli)")
+    if not await _find_wireless_adapter():
+        return _degraded("auth_fail", "wlan-iface", "no wireless interface found")
     for _ in range(ctx.wifi_iters):
         await _nmcli("radio", "wifi", "off", timeout=5.0)
         await asyncio.sleep(0.5)
@@ -341,6 +354,8 @@ async def sim_mac_auth_fail(profile: Dict[str, str], ctx: SimCtx) -> PrimResult:
     connect`` resets the cloned MAC on every call, silently undoing the spoof."""
     if not shutil.which("nmcli"):
         return _degraded("mac_auth_fail", "nmcli", "install NetworkManager (nmcli)")
+    if not await _find_wireless_adapter():
+        return _degraded("mac_auth_fail", "wlan-iface", "no wireless interface found")
     ssid = _effective_ssid(profile)
     target_mac = (profile.get("mac_auth_fail_mac", "") or "").strip() or "02:BA:D0:00:00:01"
     exists = await _nmcli("connection", "show", ssid, timeout=5.0)
@@ -392,13 +407,31 @@ async def _run_capture(argv, timeout: float = 3.0):
 
 
 async def _find_wired_adapter() -> Optional[str]:
-    """Best-effort wired interface name (``enp*/eno*/eth*``) via ``ip -br a``."""
+    """Best-effort wired interface name (``enx*/enp*/eno*/eth*``) via ``ip -br a``.
+    ``enx*`` is USB-Ethernet/wired-dongle naming (MAC-keyed) — without it a T2
+    wired dongle is invisible to this check."""
     if not shutil.which("ip"):
         return None
     out, _ = await _run_capture(["ip", "-br", "a"], timeout=3.0)
     for line in out.splitlines():
         name = line.split()[0] if line.split() else ""
-        if name.startswith(("enp", "eno", "eth")):
+        if name.startswith(("enx", "enp", "eno", "eth")):
+            return name
+    return None
+
+
+async def _find_wireless_adapter() -> Optional[str]:
+    """Best-effort wireless interface name (``wlx*/wlan*/wlp*``) via ``ip -br a``.
+    Mirrors ``_find_wired_adapter`` — the hardware-presence guard the wireless
+    primitives (assoc_fail/ssidpw_fail/auth_fail/mac_auth_fail) need but
+    previously lacked (they only checked that ``nmcli`` the binary exists, not
+    that a radio is actually present)."""
+    if not shutil.which("ip"):
+        return None
+    out, _ = await _run_capture(["ip", "-br", "a"], timeout=3.0)
+    for line in out.splitlines():
+        name = line.split()[0] if line.split() else ""
+        if name.startswith(("wlx", "wlan", "wlp")):
             return name
     return None
 

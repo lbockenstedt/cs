@@ -260,7 +260,8 @@ sys.stdout.write(json.dumps(d))' 2>/dev/null)
             \"ssid\": \"$ssid\",
             \"wsite\": \"$wsite\"
           },
-          \"errors\": []
+          \"errors\": [],
+          \"adapters\": []
         }"
       fi
 

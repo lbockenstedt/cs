@@ -120,6 +120,10 @@ def build_client_rows(spoke, now: float | None = None
             "recent_errors": c.get("recent_errors") or [],
             "vmid": vmid,
             "has_usb": has_usb,
+            # Self-reported physical adapter inventory (name/mac/media_type/
+            # is_default_route per interface). [] until the client's first
+            # heartbeat with this field lands. See sim_quota_engine._media_ok.
+            "adapters": c.get("adapters") or [],
             # Authoritative tier (t1/t2/t3) from the agent's per-VM passthrough
             # classification; csClassifyClient prefers this over has_usb.
             "tier": tier,

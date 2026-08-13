@@ -831,6 +831,45 @@ class SimQuotaEngine:
             return {"t2": 0, "t1": 1}.get(t, 2)
         return {"t1": 0, "t2": 1}.get(t, 2)
 
+    def _client_media(self, c: Dict[str, Any]) -> set:
+        """Media types ("wired"/"wireless") present in this client's self-
+        reported adapter inventory (``c["adapters"]``, from the heartbeat —
+        see client_registry.apply_status). Empty set = no inventory reported
+        yet (fresh client, or a client-sim build that predates this field)."""
+        media = set()
+        for a in (c.get("adapters") or []):
+            m = (a or {}).get("media_type")
+            if m in ("wired", "wireless"):
+                media.add(m)
+        return media
+
+    def _media_ok(self, c: Dict[str, Any], sim_id: str) -> bool:
+        """Media gate: SIM_META tags assoc_fail/ssidpw_fail "wireless" (no
+        wired equivalent — SSID association / a WPA passphrase are wireless-
+        only concepts) and port_flap "wired" (needs a wired NIC to flap).
+        auth_fail/mac_auth_fail are "any": both have a real wired path (wired
+        802.1X bad-credential reject / wired MAC-Auth-Bypass deny — see
+        clients/linux/connect_wired_1x.sh) as well as the wireless one, so
+        either media qualifies. Everything else is "any" too, the default
+        when unset. A client only qualifies for a media-tagged sim if its
+        reported adapter inventory includes that media. FAIL-CLOSED on
+        missing/empty adapter data — a client that hasn't reported yet is
+        ineligible for wired/wireless sims (not "any" ones) until it does, so
+        the reporting gap can't reproduce a wireless-only sim landing on a
+        wired-only client."""
+        if not sim_id:
+            return True
+        meta = getattr(self, "_sim_meta", None)
+        if meta is None:
+            try:
+                from sim_quota import SIM_META as meta
+            except Exception:  # noqa: BLE001
+                return True
+        required = (meta.get(sim_id) or {}).get("media", "any")
+        if required not in ("wired", "wireless"):
+            return True
+        return required in self._client_media(c)
+
     def _in_harvest_cooldown(self, hostname: str, now: float,
                              c: Optional[Dict[str, Any]] = None) -> bool:
         """True while ``hostname`` is inside its post-harvest cooldown window
@@ -884,6 +923,11 @@ class SimQuotaEngine:
         # served config would honor the human, so counting it here would lie.
         if self._human_pinned_sim(hostname, sim_id):
             return False
+        # Media gate: a wireless-only sim (assoc_fail etc.) or wired-only sim
+        # (port_flap) only admits a client whose reported adapter inventory
+        # matches — see _media_ok.
+        if not self._media_ok(c, sim_id):
+            return False
         # Harvest cooldown: a client that recently finished a harvest rests before
         # it can be re-harvested (anti-flap → realistic Central data). A client
         # CURRENTLY serving a quota is EXEMPT — it's being kept/packed, not freshly
@@ -915,6 +959,8 @@ class SimQuotaEngine:
             return "human_pin"
         if sim_id and self._human_pinned_sim(hostname, sim_id):
             return "human_pin"
+        if not self._media_ok(c, sim_id):
+            return "media_mismatch"           # sim needs wired/wireless this client lacks
         if (not self._engine_sims_for(hostname)
                 and self._in_harvest_cooldown(hostname, getattr(self, "_sweep_now", 0.0), c)):
             return "harvest_cooldown"

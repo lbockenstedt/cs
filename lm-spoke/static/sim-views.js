@@ -10571,6 +10571,11 @@ async function csRenderVmServerDetails() {
     // the sticky id first), so the new pick looked like it did nothing.
     csSet(`<div>${csVmHostBanner({ single: true })}
       <div class="flex justify-end gap-2 mb-3">
+        <button onclick="csClearUsbHistory('')"
+          class="bg-slate-700 hover:bg-slate-800 text-white px-3 py-1.5 rounded-md text-xs font-bold"
+          title="Clears the missing-dongle HISTORY (presence roster + boot baseline) — but FLEET-WIDE, on every host, not just this one. For after a deliberate hardware change (dongles moved, ports rewired, a controller card pulled) where the recorded history describes a machine that no longer exists and would otherwise report permanent phantom losses. Does not touch quarantine or exclusions; missing counts rebuild from what is actually attached on the next pass. No confirmation — cheap and self-repairing.">
+          ⟲ Clear Missing Dongles (all hosts)
+        </button>
         <button onclick="csShowTech(this)"
           class="bg-slate-700 hover:bg-slate-800 text-white px-3 py-1.5 rounded-md text-xs font-bold"
           title="Download EVERYTHING the hub holds for this host as JSON — the complete raw telemetry record, including USB dongle state, PCI slots/ports, VM list and agent internals that are deliberately NOT rendered on screen. Built from the source record, so anything removed from this page is still in the download.">
