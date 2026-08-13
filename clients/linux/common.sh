@@ -89,7 +89,28 @@ detect_wlan_adapter() {
   wladapter=$(ip -br a 2>/dev/null | grep "wlx\|wlan" | cut -d ' ' -f '1')
 }
 detect_eth_adapter() {
-  eadapter=$(ip -br a 2>/dev/null | grep "enx\|enp\|eno\|eth0\|eth1\|eth2\|eth3\|eth4\|eth5\|eth6\|ens" | cut -d ' ' -f '1')
+  # A box can have TWO wired NICs at once: the onboard out-of-band management
+  # NIC (carries the 169.253.* address used to reach the hub — see
+  # server_url/syslog_server in configs/README.md) PLUS a wired test dongle.
+  # The grep above can match both, so picking the plain first line risked
+  # grabbing the mgmt NIC, and letting $eadapter hold BOTH names (newline-
+  # separated) silently broke every single-value consumer downstream
+  # (`ip link set dev $eadapter up`, ea_is_mgmt, nmcli ifname "$eadapter"...)
+  # — symptoms: "dev" not a valid ifname, dashboard PHY stuck on "unknown".
+  # Prefer the first candidate NOT carrying the mgmt IP; fall back to the
+  # first candidate at all (mgmt-only box, no test dongle attached) so
+  # $eadapter is never left multi-valued or pointed at the wrong interface.
+  local candidates cand
+  candidates=$(ip -br a 2>/dev/null | grep -E "enx|enp|eno|eth[0-6]|ens" | cut -d ' ' -f '1')
+  eadapter=""
+  while read -r cand; do
+    [[ -z "$cand" ]] && continue
+    if ! ip -4 -o addr show dev "$cand" 2>/dev/null | grep -q '169\.253\.'; then
+      eadapter="$cand"
+      break
+    fi
+  done <<<"$candidates"
+  [[ -z "$eadapter" ]] && eadapter=$(head -n1 <<<"$candidates")
 }
 
 # Enumerate EVERY non-loopback interface (not just the default-route one that
