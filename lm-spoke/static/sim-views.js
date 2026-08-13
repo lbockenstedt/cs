@@ -9543,6 +9543,14 @@ window.csClearUsbQuarantine = async function (spokeId, host) {
 window.csClearUsbExclusions = async function (spokeId, host) {
     _csUsbClearCmd(host, 'clear_usb_exclusions', 'Exclusion list cleared on all spokes + driver-bound dongles released — available on the next provision pass', true);
 };
+// Clear the missing-dongle HISTORY (presence roster + boot baseline) FLEET-WIDE
+// (all_spokes: the history is per-host state and each cs spoke owns its own
+// host(s), so it's only meaningful cleared fleet-wide — same reasoning as the
+// two functions above). Backend action: pxmx agent `clear_usb_history` →
+// usb_diagnostics.purge_history(). Same self-repairing, no-confirm contract.
+window.csClearUsbHistory = async function (host) {
+    _csUsbClearCmd(host, 'clear_usb_history', 'Missing-dongle history cleared on all hosts — presence roster + boot baseline purged; missing counts rebuild on the next pass', true);
+};
 
 window.csCmdDelete = async function (btn) {
     const id = btn.dataset.csCmdId;
