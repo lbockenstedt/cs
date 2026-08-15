@@ -574,6 +574,11 @@ run_simulation() {
     _rsleep "$sleep_time"
     return
   fi
+  # Auto-reclone if the sim client stopped reporting
+  if [ "$(get_value '$username' 'client_last_seen_age_s')" -gt 300 ]; then
+    echo Cloning VM due to client inactivity | tee -a ${LOG_FILE}
+    bash /usr/local/scripts/auto_reclone.sh &
+  fi
   case "$script" in
     dns_fail.sh|dns_latency.sh)
       # DNS sims: surface each fire-and-forget dig on the LIVE console (this
