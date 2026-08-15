@@ -530,9 +530,11 @@ while ($true) {
 
     Write-SimDebug 'Disabling unused interface'
     if ($script:sim_phy -eq 'ethernet' -and $wladapter) {
+        # Add dongle IP detection and sim_phy gating here if needed
         Disable-NetAdapter -Name $wladapter.Name -Confirm:$false -ErrorAction SilentlyContinue | Out-Null
     }
     if ($script:sim_phy -eq 'wireless' -and $eadapter) {
+        # Add wired 802.1X/MAB handling here if needed
         Disable-NetAdapter -Name $eadapter.Name -Confirm:$false -ErrorAction SilentlyContinue | Out-Null
     }
 

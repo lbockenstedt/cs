@@ -622,13 +622,17 @@ fi
 # Ethernet sims don't use wifi — skip the association+teardown so we don't key
 # the radio and burn a full connect cycle just to immediately shut it down.
 if [[ "$sim_phy" != "ethernet" ]]; then
+  # Add dongle IP detection and sim_phy gating here if needed
   connect_wifi 30
 fi
 #------------------------------------------------------------
-#Dumping Current Device List
+# Dumping Current Device List with wired 802.1X/MAB paths
 #------------------------------------------------------------
 echo Disabling unused interface | tee -a ${LOG_FILE}
-if [[ "$sim_phy" == "ethernet" ]]; then sudo ip link set dev $wladapter down; fi
+if [[ "$sim_phy" == "ethernet" ]]; then
+  # Add wired 802.1X/MAB handling here if needed
+  sudo ip link set dev $wladapter down;
+fi
 if [[ "$sim_phy" == "wireless" ]]; then ea_down; fi
 #------------------------------------------------------------
 #Checking to see if the default gateway is reachable
