@@ -1335,9 +1335,11 @@ function csDongleTriplet(d) {
     const seg = (n, cls, title) =>
         `<span class="${n ? cls : 'text-slate-300'}"${title ? ` title="${csEscape(title)}"` : ''}>${csEscape(String(n || 0))}</span>`;
     const inUseCls = d.absentAssigned ? 'text-red-600' : 'text-slate-700';
+    const gwDown = d.gatewayDown || d.gateway_down || 0;
+    const workingCount = Math.max(0, (d.avail || 0) - gwDown);
     return `<span class="font-mono text-xs font-bold" title="${csEscape(csDongleTitle(d))}">`
          + `<span class="${inUseCls}">${csEscape(String(d.inUse || 0))}</span>`
-         + sep + seg(d.avail, d.avail > 0 ? 'text-[#01A982]' : 'text-amber-600')
+         + sep + seg(workingCount, workingCount > 0 ? 'text-[#01A982]' : 'text-amber-600')
          + sep + seg(d.qtTotal, 'text-red-600')
          + sep + seg(d.excludedTotal, 'text-amber-600')
          + `</span>`;
@@ -1372,13 +1374,15 @@ function csResourceStat(px) {
 function csDongleStats(h) {
     const d = csDongleCounts(h);
     const t = csEscape(csDongleTitle(d));
+    const gwDown = d.gatewayDown || d.gateway_down || 0;
+    const workingCount = Math.max(0, (d.avail || 0) - gwDown);
     // Freshness-panel chrome, matching csStat / csKvTile.
     const tile = (label, value, cls) => `<div class="rounded-md border border-slate-200 bg-white px-3 py-2 text-center" title="${t}">
       <p class="text-[10px] uppercase tracking-wider text-slate-400">${csEscape(label)}</p>
       <div class="text-xl font-mono font-bold ${cls} mt-1">${value}</div>
     </div>`;
     return tile('In use', d.inUse, 'text-slate-700')
-         + tile('Available', d.avail, d.avail > 0 ? 'text-[#01A982]' : 'text-amber-600')
+         + tile('Available', workingCount, workingCount > 0 ? 'text-[#01A982]' : 'text-amber-600')
          + tile('Quarantined', d.qtTotal, d.qtTotal > 0 ? 'text-red-600' : 'text-slate-700')
          // Assigned to a VM but gone from the bus. Shown only when nonzero, and
          // deliberately NOT folded into "In use" — that is what made USB 13 /
