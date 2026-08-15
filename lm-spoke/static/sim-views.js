@@ -9303,11 +9303,12 @@ async function csRenderVmServerUsb() {
     const _btnCls = 'text-[11px] font-bold px-3 py-1.5 rounded-md border border-amber-300 bg-amber-50 text-amber-700 hover:bg-amber-100 whitespace-nowrap';
     const _clearQtBtn = `<button onclick="csClearUsbQuarantine('${_usbSid}','${_usbHost}')" title="Clear the dmesg quarantine list (incl. the 5-strike permanent flag) + force-release driver-bound dongles on this host. Leaves the exclusion list intact." class="${_btnCls}">Clear Quarantine</button>`;
     const _clearExclBtn = `<button onclick="csClearUsbExclusions('${_usbSid}','${_usbHost}')" title="Clear the destroy-fail bus exclusions (repeated spin-up/down trips these) + force-release driver-bound dongles on this host. Leaves the quarantine list intact." class="${_btnCls}">Clear Exclusion List</button>`;
+    const _clearHistBtn = `<button onclick="csClearUsbHistory('${_usbSid}','${_usbHost}')" title="Clear the missing USB history (forget dongles no longer physically present on this host)." class="${_btnCls}">Clear Missing Dongles</button>`;
     csSet(`<div>${csVmHostBanner({ single: true })}
       ${dbgBox}
       <div class="flex items-center justify-between gap-3 mb-4">
-        <p class="text-[11px] text-slate-400 min-w-0">Release sidelined dongles. Both actions also force-unbind a driver-bound dongle from the host (no reboot); they differ only in which state store they clear.</p>
-        <div class="flex items-center gap-2">${_clearQtBtn}${_clearExclBtn}</div>
+        <p class="text-[11px] text-slate-400 min-w-0">Release sidelined dongles. These actions also force-unbind a driver-bound dongle from the host (no reboot); they differ only in which state store they clear.</p>
+        <div class="flex items-center gap-2">${_clearQtBtn}${_clearExclBtn}${_clearHistBtn}</div>
       </div>
       ${summary}
       ${recBox}
@@ -9339,6 +9340,19 @@ window.csUsbVidpid = async function (vid, pid, action, type) {
         csVmFlash(action + ' queued for ' + vid + ':' + pid);
         setTimeout(() => loadCSData('VM Server', currentSubChild, true), 800);
     } catch (e) { console.error('csUsbVidpid: usb action failed', e); if (typeof showToast === 'function') showToast('USB action failed: ' + (e.message || e), 'error'); }
+};
+
+window.csClearUsbHistory = async function (spokeId, hostname) {
+    try {
+        await csFetch(`/${csTenant()}/proxmx/commands?tenant_id=${csTenant()}`, {
+            method: 'POST',
+            body: JSON.stringify({ spoke_id: spokeId, hostname: hostname, action: 'clear_usb_history' })
+        });
+        if (typeof csVmFlash === 'function') csVmFlash('Clear USB history queued for ' + hostname);
+    } catch (e) {
+        console.error('csClearUsbHistory failed', e);
+        if (typeof showToast === 'function') showToast(e.message, 'error');
+    }
 };
 
 // Per-row Certify from the Uncertified table: reads the row's type <select>
