@@ -244,6 +244,7 @@ const SIM_ROUTES = {
     // ── Aggregate (read-only dashboard / tab data) ──
     csSimLoadCentral:            { m: 'GET',    p: '/aggregate/central',                         api: 'get_central' },
     csRenderClients:             { m: 'GET',    p: '/aggregate/clients',                         api: 'get_clients' },
+        csRenderOfflineClients:     { m: 'GET',    p: '/aggregate/offline-clients',                 api: 'get_offline_clients' },
     csRenderCentral:             { m: 'GET',    p: '/aggregate/central-status',                  api: 'get_central_status' },
     csRenderCentralAlerts:       { m: 'GET',    p: '/aggregate/central',                         api: 'get_central' },
     csRenderCentralClients:      { m: 'GET',    p: '/aggregate/central',                         api: 'get_central' },
