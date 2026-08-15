@@ -329,6 +329,51 @@ read_agent_port() {
 # ── Boot startup event ────────────────────────────────────────────────────────
 # Fires exactly once per boot (keyed on kernel boot ID). Sends immediately;
 # if the network is not yet up, caches to disk for replay on next tick.
+
+auto_reclone_vm() {
+    local vm_id template_vm_id current_hostname
+    vm_id=$(qm list | awk -v name="${SERVICE_NAME}" '$2 == name {print $1}' 2>/dev/null)
+    template_vm_id=${TEMPLATE_VM_ID}
+
+    if [[ -z "$template_vm_id" ]]; then
+        log_event "ERROR: TEMPLATE_VM_ID is not set. Aborting reclone for service=${SERVICE_NAME}."
+        return 1
+    fi
+
+    current_hostname=$(hostname -f 2>/dev/null || hostname)
+
+    if [[ -n "$vm_id" ]]; then
+        log_event "STOPPING_VM vm_id=${vm_id} for service=${SERVICE_NAME}"
+        qm stop $vm_id >/dev/null 2>&1
+        if [[ $? -ne 0 ]]; then
+            log_event "ERROR: Failed to stop VM id=${vm_id}. Aborting reclone for service=${SERVICE_NAME}."
+            return 1
+        fi
+        log_event "DESTROYING_VM vm_id=${vm_id} for service=${SERVICE_NAME}"
+        qm destroy $vm_id >/dev/null 2>&1
+        if [[ $? -ne 0 ]]; then
+            log_event "ERROR: Failed to destroy VM id=${vm_id}. Aborting reclone for service=${SERVICE_NAME}."
+            return 1
+        fi
+    fi
+
+    log_event "CLONING_VM template_vm_id=${template_vm_id} for service=${SERVICE_NAME}"
+    qm clone $template_vm_id $vm_id --name ${current_hostname}
+    if [[ $? -ne 0 ]]; then
+        log_event "ERROR: Failed to clone VM from template id=${template_vm_id}. Aborting reclone for service=${SERVICE_NAME}."
+        return 1
+    fi
+
+    log_event "STARTING_VM vm_id=${vm_id} for service=${SERVICE_NAME}"
+    qm start $vm_id >/dev/null 2>&1
+    if [[ $? -ne 0 ]]; then
+        log_event "ERROR: Failed to start cloned VM id=${vm_id}. Aborting reclone for service=${SERVICE_NAME}."
+        return 1
+    fi
+
+    log_event "SUCCESSFULLY_RECLONED_VM vm_id=${vm_id} template_vm_id=${template_vm_id} for service=${SERVICE_NAME}"
+    return 0
+}
 report_boot_startup() {
     local boot_id uptime_secs boot_time_iso timestamp payload
     [[ -n "${CLIENT_SIM_SERVER_URL:-}" ]] || return 0
@@ -491,8 +536,14 @@ if (( FAILURE_COUNT == 2 )); then
     fi
     report_event "restart"
 elif (( FAILURE_COUNT >= 5 )); then
-    reinstall_agent
-    report_event "reinstall"
-    FAILURE_COUNT=0
-    save_state
+    log_event "ATTEMPTING_RECLONE service=${SERVICE_NAME} failure_count=${FAILURE_COUNT}"
+    auto_reclone_vm
+    if [[ $? -eq 0 ]]; then
+        report_event "reclone_success"
+        FAILURE_COUNT=0
+        save_state
+    else
+        log_event "RECLONE_FAILED service=${SERVICE_NAME} failure_count=${FAILURE_COUNT}"
+        report_event "failure"
+    fi
 fi
