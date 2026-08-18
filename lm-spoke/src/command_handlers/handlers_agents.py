@@ -82,6 +82,9 @@ class AgentCommandsMixin:
         if cmd == "SPOKE_RELAY":
             target = d.get("target_agent_id")
             command = d.get("command")
+            logger.info(
+                "[cs-spoke] SPOKE_RELAY received: command=%r target_agent_id=%r "
+                "control_plane=%s", command, target, bool(self.control_plane))
             if command == "APPROVAL_SUCCESS" and target and self.control_plane:
                 await self.control_plane.approve_pending_agent(target)
                 return {"status": "SUCCESS", "message": f"Agent {target} approved"}
