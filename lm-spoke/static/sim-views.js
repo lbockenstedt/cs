@@ -9547,8 +9547,17 @@ window.csClearUsbExclusions = async function (spokeId, host) {
 // (all_spokes: the history is per-host state and each cs spoke owns its own
 // host(s), so it's only meaningful cleared fleet-wide — same reasoning as the
 // two functions above). Backend action: pxmx agent `clear_usb_history` →
-// usb_diagnostics.purge_history(). Same self-repairing, no-confirm contract.
+// usb_diagnostics.purge_history(). UNLIKE the quarantine/exclusion clears above
+// (which self-repair from live faults), this is genuinely DESTRUCTIVE: the
+// roster rebuilds only from what is CURRENTLY ATTACHED, so a genuinely-missing
+// dongle is forgotten for good, not re-learned — so it confirms first.
 window.csClearUsbHistory = async function (host) {
+    if (!confirm('Purge missing-dongle history on ALL hosts (fleet-wide)?\n\n'
+               + 'This forgets every recorded dongle. Genuinely-missing dongles '
+               + 'will disappear from this panel and will NOT return on their own '
+               + '— only currently-attached dongles are re-learned. Use this only '
+               + 'after a deliberate hardware change (dongles moved / ports '
+               + 'rewired / a controller card pulled).')) return;
     _csUsbClearCmd(host, 'clear_usb_history', 'Missing-dongle history cleared on all hosts — presence roster + boot baseline purged; missing counts rebuild on the next pass', true);
 };
 
