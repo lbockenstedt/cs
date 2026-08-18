@@ -4087,6 +4087,16 @@ execute_vm_command() {
             log "provision_unassigned: cleared ${_excl_count} bus exclusion(s)"
             usb_provision_loop || log "WARNING: provision_unassigned loop failed"
             ;;
+        clear_usb_exclusions|clear-usb-exclusions)
+            log "clear_usb_exclusions: clearing all bus exclusions and running provision loop"
+            scan_usb_devices
+            load_excluded_buses
+            local _excl_count="${#STATE_EXCLUDED_BUS[@]}"
+            STATE_EXCLUDED_BUS=()
+            save_excluded_buses
+            log "clear_usb_exclusions: cleared ${_excl_count} bus exclusion(s)"
+            usb_provision_loop || log "WARNING: clear_usb_exclusions loop failed"
+            ;;
         unlock_template)
             local _unlock_failed=0
             local -A _unlocked_templates=()

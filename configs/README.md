@@ -49,14 +49,14 @@ These apply to every client unless overridden in a bucket or user section.
 ```ini
 [simulation]
 kill_switch=off          # on = stop all simulations immediately (emergency stop)
-rapid_update=off         # on  = run update.sh every iteration (dev/testing mode — frequent checks,
+rapid_update=on          # on  = run update.sh every iteration (dev/testing mode — frequent checks,
                          #       version check keeps it lightweight when nothing has changed).
                          # off = run update.sh only at exec-restart (every 100 iterations) — prevents
                          #       hammering update services in production deployments.
 sim_load=100             # CPU throttle target for cpulimit (percentage)
-github_repo=on           # on = repo cloned without auth
+github_repo=off          # on = repo cloned without auth
 repo_location=https://github.com/lbockenstedt/cs/
-server_url=http://169.253.1.1:8000   # webUI heartbeat endpoint (set in [server] section)
+server_url=http://169.253.1.1:8080   # webUI heartbeat endpoint (set in [server] section)
 repo_branch=main          # which branch clients pull from
 smb_repo=off             # on = enable Tier 2 SMB share as an update source (see [address] smb_address)
                          # Update priority: WebUI → SMB → GitHub (each tier only tried if previous fails)
@@ -74,10 +74,24 @@ allow_offline=on         # on = after each 100-iteration cycle, bring all networ
 ssidpw_fail=off          # global default — can be overridden per bucket or user
 auth_fail=off
 iperf_bw=1k              # iPerf bandwidth target
-syslog=on                # on = forward all client logs to syslog_server via rsyslog.
+syslog=off               # on = forward all client logs to syslog_server via rsyslog.
                          #      The syslog_server address is set in the [address] section.
 web_server=on            # on = sync scripts/config from WebUI server (preferred over GitHub)
+dns_fail_rate=750
+dns_fail_duration=300
+dns_latency_rate=750
+dns_latency_duration=60
+dns_latency_threshold_ms=500
+dns_latency_recheck_s=30
+collab_app=teams
+collab_bw=200k
+collab_time=120
 ```
+
+> **Windows 802.1X note:** `dot1x_eap=tls` is supported by the Linux client
+> path only. Windows clients fail closed and report `status=unsupported` until
+> certificate-store/PFX onboarding is implemented; do not schedule Windows
+> EAP-TLS quotas as successful runs.
 
 ### [server] — Alternate server block
 
@@ -105,6 +119,7 @@ dns_bad_record_1=172.31.201.1 # DNS records that resolve to wrong addresses
 dns_bad_record_2=172.31.202.2
 dns_bad_record_3=100.100.0.1
 iperf_server=172.31.201.135
+collab_server=                  # UDP sink for collab traffic; blank disables the leaf script
 syslog_server=169.253.1.5
 ```
 
@@ -134,6 +149,7 @@ ping_test=on            # run continuous ICMP ping test
 download=on             # run HTTP download traffic
 www_traffic=on          # run web browsing simulation traffic
 iperf=off               # run iPerf throughput test
+collab=off              # run collaboration-style UDP media traffic
 sim_phy=wireless        # wireless or wired
 ```
 
@@ -152,6 +168,7 @@ sim_phy=wireless        # wireless or wired
 | `download`    | Downloads a file repeatedly (traffic generation)   | —                            |
 | `www_traffic` | Fetches web pages (traffic generation)             | —                            |
 | `iperf`       | Runs iPerf to `iperf_server` (bandwidth test)      | —                            |
+| `collab`      | Sends media-like UDP traffic to `collab_server`    | —                            |
 
 #### How many clients does a simulation need to fire an alert?
 
@@ -245,12 +262,22 @@ or when you want to balance client counts across buckets precisely.
 ## Contributing a new simulation
 
 1. Fork the repo and create your branch.
-2. Edit `configs/simulation.conf` — modify an existing `[sX]` profile or add
-   settings to an unused bucket.
-3. If you need a user-specific override, add it to `configs/user-overrides.conf`.
-4. Test on your own hardware.
-5. Submit a pull request. The PR diff will show exactly which simulation flags
-   changed — easy to review with no code changes required.
+2. Add or update both client leaf scripts: `clients/linux/<sim>.sh` and
+   `clients/windows/<sim>.ps1`. Keep the orchestrators as launchers only.
+3. If the sim needs shared helpers or override keys, edit canonical
+   `clients/lib/common.sh`, copy it to `clients/linux/common.sh`, and port the
+   behavior/key list to `clients/windows/common.ps1`.
+4. Add defaults/tuning keys to `configs/simulation.conf`.
+5. Wire both orchestrators: bucket reads, ambient/randomizable lists, dispatch,
+   active-simulation status, and config status.
+6. Wire the UI schema/list in `lm-spoke/static/sim-views.js` (and sync the same
+   construct to the hub UI twin when working in the full workspace).
+7. For alert/quota sims, add quota metadata/primitives in `lm-spoke/src/`
+   (`sim_quota.py`, `sim_quota_engine.py`, and `sim_primitives.py` as needed)
+   and keep hub/spoke quota twins matched.
+8. If you need a user-specific override, add it to `configs/user-overrides.conf`.
+9. Test on your own hardware and run syntax checks for changed scripts.
+10. Submit a pull request.
 
 > **Tip:** INI format is intentional — it renders clearly in GitHub, diffs are
 > readable, and anyone can edit with any text editor. Keep it that way.

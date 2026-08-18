@@ -216,16 +216,21 @@ function Build-1xProfile {
     Remove-WifiProfileByName -ProfileName $TargetSsid
 
     if ($eap -eq 'tls') {
-        # ---- EAP-TLS (cert-based, Cloud NAC) — TODO ------------------------
+        # ---- EAP-TLS (cert-based, Cloud NAC) — unsupported on Windows -------
         # The Linux path (connect_1x.sh + cloud_nac_onboard.py) points nmcli at
         # PEM files: dot1x_client_cert / dot1x_private_key / dot1x_ca_cert.
         # Windows EAP-TLS instead requires the client cert+key imported into the
         # LocalMachine\My cert store and referenced by THUMBPRINT inside the
         # profile's <EapType> (SmartCardOrOtherCertificate) — netsh cannot consume
-        # raw PEM. That onboarding (import PFX -> thumbprint -> profile) is the
-        # out-of-reach piece and is NOT implemented here. Fail closed so we never
-        # silently associate with the wrong method.
-        Write-SimLog '  [1x] EAP-TLS requested but not implemented on Windows (TODO: import client PFX to cert store + reference thumbprint). Skipping.'
+        # raw PEM. Fail closed and mark the status beacon unsupported so the
+        # hub/orchestrator can skip/block TLS quotas instead of treating this as
+        # a scheduled-but-silent success.
+        $msg = 'dot1x_eap=tls unsupported on Windows: client certificate store onboarding is not implemented'
+        $script:dot1xTlsUnsupported = $true
+        if (Get-Command Add-StatusError -ErrorAction SilentlyContinue) {
+            Add-StatusError $msg
+        }
+        Write-SimLog "  [1x] $msg. Skipping."
         return $false
     }
 

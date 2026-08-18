@@ -123,6 +123,7 @@ SIM_META: Dict[str, Dict[str, object]] = {
     "download":    {"category": "traffic", "multi_capable": True, "media": "any"},
     "www_traffic": {"category": "traffic", "multi_capable": True, "media": "any"},
     "iperf":       {"category": "traffic", "multi_capable": True, "media": "any"},
+    "collab":      {"category": "traffic", "multi_capable": True, "media": "any"},
 }
 
 # Suggested alert/insight → sim linkage (global defaults the tenant UI

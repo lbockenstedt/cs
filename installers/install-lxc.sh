@@ -147,11 +147,11 @@ if [[ -n "$HUB_TENANT_ARG" ]] && ! [[ "$HUB_TENANT_ARG" =~ ^[0-9a-f]{8}-[0-9a-f]
     python3 -c "
 import sys, json
 data = json.load(sys.stdin)
-name = '${HUB_TENANT_ARG}'.lower()
+name = sys.argv[1].lower()
 tenants = data if isinstance(data, list) else data.get('tenants', [])
 match = next((t for t in tenants if t.get('name','').lower() == name), None)
 print(match['id'] if match else '')
-" 2>/dev/null || true)
+  " "$HUB_TENANT_ARG" 2>/dev/null || true)
 
   if [[ -n "$_resolved_uuid" ]]; then
     echo "[info] Resolved hub tenant '${HUB_TENANT_ARG}' → ${_resolved_uuid}"

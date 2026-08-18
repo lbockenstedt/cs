@@ -11,6 +11,8 @@ $debugPath = 'C:\Scripts\debug-simulation.log'
 $tempDir = 'C:\Temp'
 $killSwitchPath = 'C:\Scripts\kill_switch.txt'
 $vhCachePath = 'C:\Scripts\vhcached.txt'
+$script:statusErrors = @()
+$script:dot1xTlsUnsupported = $false
 
 "Simulation Script Version $version" | Tee-Object -FilePath $debugPath
 "Simulation Script Version $version" | Tee-Object -FilePath $logPath -Append | Out-Null
@@ -62,6 +64,50 @@ function Get-ConnectedSsid {
     return $null
 }
 
+function Add-StatusError {
+    param([string]$Message)
+    if ([string]::IsNullOrWhiteSpace($Message)) { return }
+    if (-not $script:statusErrors) { $script:statusErrors = @() }
+    if ($script:statusErrors -notcontains $Message) {
+        $script:statusErrors += $Message
+    }
+}
+
+function Get-AdapterInventory {
+    $defaultIfIndex = $null
+    try {
+        $route = Get-NetRoute -DestinationPrefix '0.0.0.0/0' -ErrorAction SilentlyContinue |
+            Sort-Object RouteMetric, InterfaceMetric |
+            Select-Object -First 1
+        if ($route) { $defaultIfIndex = $route.InterfaceIndex }
+    } catch {
+    }
+
+    $items = @()
+    foreach ($adapter in (Get-NetAdapter -ErrorAction SilentlyContinue)) {
+        $name = [string]$adapter.Name
+        if ([string]::IsNullOrWhiteSpace($name)) { continue }
+        $desc = [string]$adapter.InterfaceDescription
+        $media = 'other'
+        if ($name -match 'wi-fi|wireless|wlan' -or $desc -match 'wi-fi|wireless|wlan|802\.11') {
+            $media = 'wireless'
+        } elseif ($name -match 'ethernet|eth' -or $desc -match 'ethernet|gigabit|usb.*lan|usb.*ethernet|realtek|intel') {
+            $media = 'wired'
+        }
+        $isDefault = $false
+        if ($defaultIfIndex -ne $null -and $adapter.ifIndex -eq $defaultIfIndex) {
+            $isDefault = $true
+        }
+        $items += @{
+            name = $name
+            mac = [string]$adapter.MacAddress
+            media_type = $media
+            is_default_route = $isDefault
+        }
+    }
+    return $items
+}
+
 function Get-TargetSsid {
     if ($script:site_based_ssid -eq 'on') {
         return "$($script:wsite)-$($script:ssid)"
@@ -91,6 +137,8 @@ function Send-Status {
                 $activeSimulations += $name
             }
         }
+        $clientStatus = 'ok'
+        if ($script:dot1xTlsUnsupported) { $clientStatus = 'unsupported' }
 
         $payload = @{
             hostname = $hostname
@@ -100,9 +148,13 @@ function Send-Status {
             connected_ssid = $connectedSsid
             gateway_reachable = [bool]$script:gateway_reachable
             vh_connected = $false
+            status = $clientStatus
+            errors = @($script:statusErrors)
+            adapters = @(Get-AdapterInventory)
             active_simulations = $activeSimulations
             config = @{
                 sim_phy = [string]$script:sim_phy
+                dot1x_eap = [string]$script:dot1x_eap
                 kill_switch = [string]$script:kill_switch
                 dns_fail = [string]$script:dns_fail
                 dns_latency = [string]$script:dns_latency
@@ -417,6 +469,11 @@ while ($true) {
     $script:repo_location = get_value 'simulation' 'repo_location'
     $script:site_based_ssid = get_value 'simulation' 'site_based_ssid'
     $script:iperf_bw = get_value 'simulation' 'iperf_bw'
+    $script:dot1x_eap = get_value 'simulation' 'dot1x_eap'
+    if ([string]$script:dot1x_eap -ne 'tls') {
+        $script:dot1xTlsUnsupported = $false
+        $script:statusErrors = @($script:statusErrors | Where-Object { $_ -notmatch '^dot1x_eap=tls unsupported' })
+    }
     $script:auth_fail = get_value 'simulation' 'auth_fail'
     $script:ssidpw_fail = get_value 'simulation' 'ssidpw_fail'
     # mac_auth_fail: same "connectivity-failure, inline in the connect loop" kind
@@ -493,7 +550,7 @@ while ($true) {
         'download','iperf','www_traffic','ssidpw_fail','auth_fail','mac_auth_fail','mac_auth_fail_mac','smb_address','ping_address',
         'dns_bad_ip_1','dns_bad_ip_2','dns_bad_ip_3',
         'dns_bad_record_1','dns_bad_record_2','dns_bad_record_3','iperf_server',
-        'collab_app','collab_bw','collab_time','collab_server','dot1x_password','web_server'
+        'collab_app','collab_bw','collab_time','collab_server','dot1x_password','dot1x_eap','web_server'
     )
 
     if (Test-Path -LiteralPath $killSwitchPath) {

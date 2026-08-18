@@ -870,6 +870,18 @@ class SimQuotaEngine:
             return True
         return required in self._client_media(c)
 
+    def _client_supports_sim(self, c: Dict[str, Any], sim_id: str) -> bool:
+        """Fail closed for platform/sim combinations clients explicitly report
+        as unsupported."""
+        if (sim_id or "") != "auth_fail":
+            return True
+        platform = str(c.get("platform") or "").lower()
+        cfg = c.get("config") or {}
+        dot1x_eap = str((cfg or {}).get("dot1x_eap") or "").lower()
+        if platform == "windows" and dot1x_eap == "tls":
+            return False
+        return str(c.get("status") or "").lower() != "unsupported"
+
     def _in_harvest_cooldown(self, hostname: str, now: float,
                              c: Optional[Dict[str, Any]] = None) -> bool:
         """True while ``hostname`` is inside its post-harvest cooldown window
@@ -928,6 +940,8 @@ class SimQuotaEngine:
         # matches — see _media_ok.
         if not self._media_ok(c, sim_id):
             return False
+        if not self._client_supports_sim(c, sim_id):
+            return False
         # Harvest cooldown: a client that recently finished a harvest rests before
         # it can be re-harvested (anti-flap → realistic Central data). A client
         # CURRENTLY serving a quota is EXEMPT — it's being kept/packed, not freshly
@@ -961,6 +975,8 @@ class SimQuotaEngine:
             return "human_pin"
         if not self._media_ok(c, sim_id):
             return "media_mismatch"           # sim needs wired/wireless this client lacks
+        if not self._client_supports_sim(c, sim_id):
+            return "unsupported_platform"
         if (not self._engine_sims_for(hostname)
                 and self._in_harvest_cooldown(hostname, getattr(self, "_sweep_now", 0.0), c)):
             return "harvest_cooldown"

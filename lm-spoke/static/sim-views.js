@@ -2083,7 +2083,7 @@ async function csDemoLoad() {
 
 function csDemoOptions(activeScenario) {
     const names = Object.keys(window._csDemoScenarios || {});
-    if (!names.length) names.push('normal', 'dns_fail', 'dns_latency', 'dhcp_fail', 'assoc_fail', 'auth_fail', 'ssidpw_fail', 'mac_auth_fail', 'port_flap');
+    if (!names.length) names.push('normal', 'dns_fail', 'dns_latency', 'dhcp_fail', 'assoc_fail', 'auth_fail', 'ssidpw_fail', 'mac_auth_fail', 'port_flap', 'collab');
     return names.map(n => `<option value="${csEscape(n)}" ${n === activeScenario ? 'selected' : ''}>${csEscape(n)}</option>`).join('');
 }
 
@@ -2173,7 +2173,7 @@ window.csDemoClear = async function (btn) {
 // current overrides and seeds the toggles.
 const CS_CONTROL_FLAGS = ['kill_switch', 'dns_fail', 'dns_latency', 'iperf', 'download',
     'www_traffic', 'ping_test', 'ssidpw_fail', 'auth_fail', 'mac_auth_fail', 'dhcp_fail',
-    'port_flap', 'assoc_fail'];
+    'port_flap', 'assoc_fail', 'collab'];
 
 
 
@@ -3982,7 +3982,7 @@ const CS_ONOFF_KEYS = new Set([
     'kill_switch', 'rapid_update', 'github_repo', 'smb_repo', 'site_based_ssid',
     'ssidpw_fail', 'auth_fail', 'mac_auth_fail', 'syslog', 'web_server',
     'dhcp_fail', 'dns_fail', 'dns_latency', 'assoc_fail', 'port_flap', 'ping_test',
-    'download', 'www_traffic', 'iperf',
+    'download', 'www_traffic', 'iperf', 'collab',
 ]);
 
 // Ordered field schema per section → [{key, label}]. Drives the labeled-input
@@ -4007,6 +4007,9 @@ const CS_SIM_SECTION_FIELDS = {
         ['dns_latency_duration', 'DNS Latency Duration (s)'],
         ['dns_latency_threshold_ms', 'DNS Latency Threshold (ms)'],
         ['dns_latency_recheck_s', 'DNS Latency Recheck (s)'],
+        ['collab_app', 'Collab App'],
+        ['collab_bw', 'Collab Bandwidth'],
+        ['collab_time', 'Collab Duration (s; 0 = until stopped)'],
         ['dns_max_inflight', 'DNS Max In-Flight Digs'],
         ['gw_ping_timeout_s', 'Gateway Ping Timeout'],
     ],
@@ -4018,7 +4021,7 @@ const CS_SIM_SECTION_FIELDS = {
         ['dns_bad_ip_3', 'Dns Bad Ip 3'],
         ['dns_bad_record_1', 'Dns Bad Record 1'], ['dns_bad_record_2', 'Dns Bad Record 2'],
         ['dns_bad_record_3', 'Dns Bad Record 3'],
-        ['iperf_server', 'Iperf Server'], ['syslog_server', 'Syslog Server'],
+        ['iperf_server', 'Iperf Server'], ['collab_server', 'Collab Server'], ['syslog_server', 'Syslog Server'],
         ['mac_auth_fail_mac', 'Mac Auth Fail Mac (deny-listed MAC — pre-configure this exact MAC as a RADIUS/ClearPass MAC-Auth deny entry)'],
     ],
 };
@@ -4028,7 +4031,7 @@ const CS_SIM_BUCKET_FIELDS = [
     ['dhcp_fail', 'Dhcp Fail'], ['dns_fail', 'Dns Fail'], ['dns_latency', 'Dns Latency'],
     ['assoc_fail', 'Assoc Fail'], ['port_flap', 'Port Flap'],
     ['ping_test', 'Ping Test'], ['download', 'Download'],
-    ['www_traffic', 'Www Traffic'], ['iperf', 'Iperf'],
+    ['www_traffic', 'Www Traffic'], ['iperf', 'Iperf'], ['collab', 'Collab'],
     ['sim_phy', 'Sim Phy'], ['l1', 'L1'],
 ];
 const CS_SIM_BUCKETS = ['s0', 's1', 's2', 's3', 's4', 's5', 's6', 's7', 's8', 's9'];
@@ -10588,11 +10591,6 @@ async function csRenderVmServerDetails() {
     // the sticky id first), so the new pick looked like it did nothing.
     csSet(`<div>${csVmHostBanner({ single: true })}
       <div class="flex justify-end gap-2 mb-3">
-        <button onclick="csClearUsbHistory('')"
-          class="bg-slate-700 hover:bg-slate-800 text-white px-3 py-1.5 rounded-md text-xs font-bold"
-          title="Clears the missing-dongle HISTORY (presence roster + boot baseline) — but FLEET-WIDE, on every host, not just this one. For after a deliberate hardware change (dongles moved, ports rewired, a controller card pulled) where the recorded history describes a machine that no longer exists and would otherwise report permanent phantom losses. Does not touch quarantine or exclusions; missing counts rebuild from what is actually attached on the next pass. No confirmation — cheap and self-repairing.">
-          ⟲ Clear Missing Dongles (all hosts)
-        </button>
         <button onclick="csShowTech(this)"
           class="bg-slate-700 hover:bg-slate-800 text-white px-3 py-1.5 rounded-md text-xs font-bold"
           title="Download EVERYTHING the hub holds for this host as JSON — the complete raw telemetry record, including USB dongle state, PCI slots/ports, VM list and agent internals that are deliberately NOT rendered on screen. Built from the source record, so anything removed from this page is still in the download.">
@@ -10831,9 +10829,7 @@ async function csRenderSpokeManagement() {
     // search hides/shows the pair together.
     window._csSpokeRowHtml = function (s) {
         const isPending = !s.approved;
-        const assignBtn = admin
-            ? `<button onclick="openSpokeAssignModal('${csEscape(s.spoke_id)}','${csEscape(s.tenant_id || '')}')" class="text-xs text-[#01A982] font-bold hover:underline whitespace-nowrap">${!s.tenant_id ? 'Assign' : 'Rebind'}</button>`
-            : '';
+        const assignBtn = '';
         const approveBtn = admin
             ? `<button onclick="csSpokeApprove('${csEscape(s.spoke_id)}',${isPending ? 'true' : 'false'})" class="text-xs ${isPending ? 'text-green-600 font-bold' : 'text-amber-600'} hover:underline whitespace-nowrap">${isPending ? 'Approve' : 'Revoke'}</button>`
             : '';

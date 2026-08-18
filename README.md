@@ -453,7 +453,7 @@ Resolution order on a client VM is:
 | `[simulation]` | `kill_switch` | `off` | Local emergency stop for the client loop |
 | `[simulation]` | `rapid_update` | `on` | Run `update.sh` every loop instead of only at exec-restart checkpoints |
 | `[simulation]` | `sim_load` | `100` | Probability/CPU-style load gate for enabled simulations |
-| `[simulation]` | `github_repo` | `on` | Allow GitHub as an update source |
+| `[simulation]` | `github_repo` | `off` | Allow GitHub as an update source |
 | `[simulation]` | `repo_location` | `https://github.com/lbockenstedt/cs/` | Git repo used by update logic |
 | `[simulation]` | `repo_branch` | `main` | Branch used by client update logic |
 | `[simulation]` | `smb_repo` | `off` | Enable SMB as a fallback update source |
@@ -464,10 +464,25 @@ Resolution order on a client VM is:
 | `[simulation]` | `ssidpw_fail` | `off` | Global default for wrong-PSK simulation |
 | `[simulation]` | `auth_fail` | `off` | Global default for 802.1X auth-failure simulation |
 | `[simulation]` | `dot1x_password` | `password` | Base 802.1X password |
-| `[simulation]` | `dot1x_eap` | `peap` | 802.1X EAP method used by the DOT1X helper |
+| `[simulation]` | `dot1x_eap` | `peap` | 802.1X EAP method used by the DOT1X helper; Windows reports `unsupported` for `tls` |
 | `[simulation]` | `iperf_bw` | `1k` | iPerf target bandwidth |
-| `[simulation]` | `syslog` | `on` | Forward logs to the configured syslog target |
+| `[simulation]` | `syslog` | `off` | Forward logs to the configured syslog target |
 | `[simulation]` | `web_server` | `on` | Use the spoke API as the primary source for config/scripts |
+| `[simulation]` | `dns_fail_rate` | `750` | DNS-failure query rate per minute |
+| `[simulation]` | `dns_fail_duration` | `300` | DNS-failure run duration in seconds |
+| `[simulation]` | `dns_latency_rate` | `750` | DNS-latency query rate per minute |
+| `[simulation]` | `dns_latency_duration` | `60` | DNS-latency run duration in seconds |
+| `[simulation]` | `dns_latency_threshold_ms` | `500` | Minimum response latency to keep a DNS latency target |
+| `[simulation]` | `dns_latency_recheck_s` | `30` | DNS latency target recheck interval |
+| `[simulation]` | `dns_max_inflight` | `200` | Maximum concurrent DNS queries |
+| `[simulation]` | `gw_ping_timeout_s` | `4` | Gateway probe timeout for DNS circuit breaker |
+| `[simulation]` | `dns_gw_settle_s` | `10` | Stable-gateway settle time after DNS breaker trips |
+| `[simulation]` | `dns_rate_floor` | `100` | DNS self-throttle floor |
+| `[simulation]` | `dns_pause_max` | `5` | Maximum DNS pause after gateway trouble |
+| `[simulation]` | `dns_pause_window_s` | `300` | DNS pause-window size |
+| `[simulation]` | `collab_app` | `teams` | Collaboration traffic profile label |
+| `[simulation]` | `collab_bw` | `200k` | Collaboration traffic bandwidth target |
+| `[simulation]` | `collab_time` | `120` | Collaboration traffic duration in seconds |
 
 #### `simulation.conf` server and address keys
 
@@ -476,13 +491,15 @@ Resolution order on a client VM is:
 | `[server]` | `server_url` | `http://169.253.1.1:8080` | Spoke URL used by clients for health/config/scripts/status/inbox |
 | `[address]` | `smb_address` | `//nas/scripts` | SMB fallback path for updates |
 | `[address]` | `ping_address` | `172.31.201.3` | Ping target for traffic testing |
-| `[address]` | `dns_bad_ip_1` | `10.0.0.1` | Bad DNS response IP 1 |
-| `[address]` | `dns_bad_ip_2` | `172.16.0.1` | Bad DNS response IP 2 |
-| `[address]` | `dns_bad_ip_3` | `192.168.0.1` | Bad DNS response IP 3 |
-| `[address]` | `dns_bad_record_1` | `172.31.201.1` | Wrong-record target 1 |
-| `[address]` | `dns_bad_record_2` | `172.31.202.2` | Wrong-record target 2 |
-| `[address]` | `dns_bad_record_3` | `100.100.0.1` | Wrong-record target 3 |
+| `[address]` | `dns_latency` | long resolver pool | DNS latency candidate servers (space/newline separated in UI) |
+| `[address]` | `dns_bad_ip_1` | `10.252.0.1` | Bad DNS response IP 1 |
+| `[address]` | `dns_bad_ip_2` | `172.16.252.1` | Bad DNS response IP 2 |
+| `[address]` | `dns_bad_ip_3` | `192.168.252.1` | Bad DNS response IP 3 |
+| `[address]` | `dns_bad_record_1` | `172.31.201.130` | Wrong-record target 1 |
+| `[address]` | `dns_bad_record_2` | `172.31.201.131` | Wrong-record target 2 |
+| `[address]` | `dns_bad_record_3` | `172.31.201.129` | Wrong-record target 3 |
 | `[address]` | `iperf_server` | `172.31.201.135` | iPerf target |
+| `[address]` | `collab_server` | blank | UDP sink for collaboration traffic |
 | `[address]` | `syslog_server` | `169.253.1.5` | Remote syslog target |
 
 #### Bucket-profile and user-override keys
@@ -505,6 +522,7 @@ These keys are valid in `[s0]`-`[s9]` bucket sections and in `[username]` sectio
 | `download` | `on` | HTTP download traffic generation |
 | `www_traffic` | `on` | Browser/web traffic generation |
 | `iperf` | `off` except `s2=on` in shipped sample | iPerf bandwidth generation |
+| `collab` | `off` | Collaboration/media-style UDP traffic generation |
 | `sim_phy` | `wireless` | Expected physical medium: `wireless`, `ethernet`, or `any`; when `any` is used for USB provisioning, the guest override is rewritten to the actual certified dongle type |
 | `l1` | `no` | If `yes`, Proxmox agent adds an L1 VLAN NIC for that bucket |
 | `kill_switch` | `off` in user override examples | User-specific local kill switch override |
@@ -517,6 +535,9 @@ These keys are valid in `[s0]`-`[s9]` bucket sections and in `[username]` sectio
 | `simulation_id` | unset | Pin to a specific bucket (`s0`–`s9`), overriding the hostname hash |
 | `reboot_schedule` | `300` in examples | User-specific reboot timing override |
 | `iperf_bw` | `1k` in examples | User-specific iPerf target |
+| `collab_app` | `teams` | User-specific collaboration traffic profile |
+| `collab_bw` | `200k` | User-specific collaboration bandwidth |
+| `collab_time` | `120` | User-specific collaboration duration |
 | `smb_address` | `//nas/scripts` in examples | User-specific SMB fallback path override |
 | `ping_address` | `172.31.201.1` in examples | User-specific ping target override |
 | `dns_bad_ip_1` | `10.0.0.2` in examples | User-specific bad DNS IP 1 override |
@@ -526,6 +547,7 @@ These keys are valid in `[s0]`-`[s9]` bucket sections and in `[username]` sectio
 | `dns_bad_record_2` | `172.31.202.2` in examples | User-specific wrong-record target 2 override |
 | `dns_bad_record_3` | `100.100.0.1` in examples | User-specific wrong-record target 3 override |
 | `iperf_server` | `172.31.201.135` in examples | User-specific iPerf target override |
+| `collab_server` | blank | User-specific collaboration UDP sink |
 | `dot1x_password` | commented example | User-specific 802.1X password |
 | `dot1x_eap` | commented example | User-specific 802.1X EAP method |
 

@@ -298,7 +298,7 @@ if [[ "$web_server" == "on" ]]; then
   # Start every sim OFF. The engine turns failure sims on via the [username]
   # override applied further down; the roll below is what turns AMBIENT traffic on.
   for sim in dhcp_fail dns_fail dns_latency assoc_fail port_flap ssidpw_fail auth_fail \
-             mac_auth_fail ping_test download iperf www_traffic; do declare -g "$sim=off"; done
+             mac_auth_fail ping_test download iperf www_traffic collab; do declare -g "$sim=off"; done
   #
   # Ambient distribution — two-step model (level, then weighted split)
   # ------------------------------------------------------------------
@@ -362,6 +362,7 @@ else
   download=$(get_value $simulation_id 'download')
   iperf=$(get_value $simulation_id 'iperf')
   www_traffic=$(get_value $simulation_id 'www_traffic')
+  collab=$(get_value $simulation_id 'collab')
   # Ambient random pool: pick a random bucket, take only its randomizable flags;
   # every failure sim is forced off (harvest-only). A [username] harvest override
   # applied just below still WINS.
@@ -370,7 +371,7 @@ else
     random_bucket="s$(( RANDOM % 10 ))"
     echo "Ambient random pool: rolling behaviour from bucket ${random_bucket}" | tee -a ${LOG_FILE}
     for sim in dhcp_fail dns_fail assoc_fail port_flap ssidpw_fail auth_fail \
-               mac_auth_fail ping_test download iperf www_traffic; do
+               mac_auth_fail ping_test download iperf www_traffic collab; do
       if [[ " $randomizable_sims " == *" $sim "* ]]; then
         declare -g "$sim=$(get_value $random_bucket "$sim")"
       else

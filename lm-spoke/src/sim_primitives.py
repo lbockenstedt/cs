@@ -17,6 +17,8 @@ import asyncio
 import logging
 import random
 import shutil
+import socket
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Awaitable, Callable, Dict, Optional
@@ -270,6 +272,56 @@ async def sim_iperf(profile: Dict[str, str], ctx: SimCtx) -> PrimResult:
     return _ok("iperf", f"iperf3 -> {server} on {ran} port(s), -b {bw} -t {t}", "iperf3")
 
 
+async def sim_collab(profile: Dict[str, str], ctx: SimCtx) -> PrimResult:
+    """Send bounded UDP media-like traffic to ``collab_server``."""
+    server = (profile.get("collab_server", "") or "").strip()
+    if not server:
+        return _degraded("collab", "collab_server", "no collab target configured")
+    app_profiles = {
+        "teams": ([3478, 3481, 3479], 1280, 1200000),
+        "zoom": ([8801, 8802, 8803], 1280, 1500000),
+        "webex": ([9000, 5004, 5006], 1280, 1000000),
+    }
+    app = (profile.get("collab_app", "") or "teams").strip().lower()
+    ports, payload_size, default_bps = app_profiles.get(app, app_profiles["teams"])
+    bw_raw = (profile.get("collab_bw", "") or "200k").strip().lower()
+    seconds_raw = (profile.get("collab_time", "") or "120").strip()
+    try:
+        seconds = max(1, min(int(seconds_raw), 3))
+    except ValueError:
+        seconds = 3
+    mult = 1
+    if bw_raw.endswith("m"):
+        mult = 1000 * 1000
+        bw_raw = bw_raw[:-1]
+    elif bw_raw.endswith("k"):
+        mult = 1000
+        bw_raw = bw_raw[:-1]
+    try:
+        bps = max(1000, int(float(bw_raw) * mult))
+    except ValueError:
+        bps = default_bps
+
+    def _send() -> PrimResult:
+        packet = b"x" * payload_size
+        interval = max(0.005, len(packet) * 8 / float(bps))
+        sent = 0
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+                end = time.monotonic() + seconds
+                port_idx = 0
+                while time.monotonic() < end:
+                    sock.sendto(packet, (server, ports[port_idx % len(ports)]))
+                    port_idx += 1
+                    sent += len(packet)
+                    time.sleep(interval)
+            return _ok("collab", f"sent {sent} bytes to {server} ports={ports}", "udp")
+        except Exception as exc:  # noqa: BLE001
+            return _degraded("collab", "udp", str(exc))
+
+    return await asyncio.to_thread(_send)
+
+
 # ── nmcli-based WiFi sims (assoc_fail / ssidpw_fail / auth_fail) ──────────────
 async def _nmcli(*args: str, timeout: float = 10.0) -> bool:
     if not shutil.which("nmcli"):
@@ -512,6 +564,7 @@ PRIMITIVES: Dict[str, PrimFn] = {
     "download": sim_download,
     "www_traffic": sim_www_traffic,
     "iperf": sim_iperf,
+    "collab": sim_collab,
     "assoc_fail": sim_assoc_fail,
     "ssidpw_fail": sim_ssidpw_fail,
     "auth_fail": sim_auth_fail,

@@ -31,8 +31,8 @@ source '/usr/local/scripts/ini-parser.sh'
 process_ini_file '/usr/local/scripts/simulation.conf'
 
 # Resolve the active iface — wifi first, then wired (mirror simulation.sh).
-iface=$(ip -br a | grep "wlx\|wlan" | cut -d ' ' -f '1')
-[[ -z "$iface" ]] && iface=$(ip -br a | grep "enp\|eno\|eth0\|ens" | cut -d ' ' -f '1')
+iface=$(ip -br a | grep "wlx\|wlan" | cut -d ' ' -f '1' | head -n1)
+[[ -z "$iface" ]] && iface=$(ip -br a | grep "enp\|eno\|eth0\|ens" | cut -d ' ' -f '1' | head -n1)
 if [[ -z "$iface" ]]; then
   echo "$(date) dhcp_fail: no usable iface — exiting" | tee -a "$debug" "$log"
   exit 1
