@@ -349,6 +349,17 @@ class CSControlPlane(AgentHostingControlPlane):
         # agents); --no-agent-listener opts out so an all-in-one / relay-only cs
         # spoke never binds :443 on the hub box.
         if self._agent_listener_enabled():
+            # Mint + persist an agent_secret if the listener came up without an
+            # installer-provisioned one (upgraded before the secret step, or the
+            # listener toggled on at runtime). Without it approve_pending_agent
+            # can only ship {"secret": null} → hosted pxmx agents flap in
+            # "pending / needs approval" forever. Mirrors RoleConnection.__init__
+            # and is a no-op when install_cs.sh already wrote the secret.
+            # getattr-guarded so a staged self-update (cs code ahead of lm-core)
+            # can't crash startup if the base method isn't present yet.
+            _ensure = getattr(self, "_ensure_agent_secret", None)
+            if callable(_ensure):
+                _ensure()
             self._start_agent_server_task()
             logger.info("CS agent listener enabled (cs-dialed agents accepted)")
         else:
