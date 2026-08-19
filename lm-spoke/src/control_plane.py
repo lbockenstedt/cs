@@ -330,6 +330,31 @@ class CSControlPlane(AgentHostingControlPlane):
         except Exception as e:  # noqa: BLE001
             logger.warning(f"Failed to re-push config to agent '{agent_id}': {e}")
 
+    async def _on_agent_telemetry(self, agent_id: str, rec: Optional[Dict[str, Any]],
+                                  data: Dict[str, Any]) -> None:
+        """Cache Proxmox nodes/vms/cluster + agent_metrics into connected_agents,
+        mirroring pxmx's ``PxmxControlPlane._on_agent_telemetry``.
+
+        This hook never existed on CS — the base ``AgentHostingControlPlane``
+        default is a no-op, so ``connected_agents[agent_id]["cluster_name"]``
+        stayed at its connect-time default (``agent_id``, i.e. the agent's own
+        hostname) forever, and ``["nodes"]``/``["vms"]``/``["telemetry_ts"]``
+        never populated at all. For a Proxmox host hosted directly by a cs
+        spoke (the split-topology case), that meant the hub's shared
+        GET_NODE_STATS/PXMX_LIST_VMS aggregator (``pxmx_node_vm_aggregation``)
+        always read the stale hostname-as-cluster default and a permanently
+        empty telemetry cache — regardless of the agent correctly resolving
+        and sending its real Proxmox cluster name every tick. Filling in the
+        same fields pxmx does fixes both the "cluster shows as hostname" bug
+        and the freshness-based cross-agent/cross-spoke dedup (which needs
+        telemetry_ts to rank a cs-hosted agent's report against others)."""
+        if rec is not None:
+            rec["cluster_name"] = data.get("cluster_name", agent_id)
+            rec["nodes"]        = data.get("nodes", {}).get("nodes", [])
+            rec["vms"]          = data.get("vms", {}).get("vms", [])
+            rec["agent_metrics"] = data.get("metrics", {})
+            rec["telemetry_ts"] = time.time()
+
     async def run(self):
         """Boot the cs spoke: register ``CSSpoke``, (conditionally) start the
         cs-dialed agent listener, start the demo TTL sweep + Aruba Central
