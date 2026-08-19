@@ -937,7 +937,7 @@ class ConfigCommandsMixin:
     # ``CSSettings.usb_config_payload`` → cs_bridge → agent usb_config).
     _HUB_DIRECT_KEYS = (
         "usb_vidpids", "usb_ignored_vidpids",
-        "t1_pci_vidpids", "t3_pci_vidpids", "usb_auto_provision",
+        "t1_pci_vidpids", "t3_pci_vidpids", "t1_exclude_hosts", "usb_auto_provision",
         "usb_missing_timeout", "usb_max_slots", "vm_image_1_pct", "sim_pool",
         "reclone_concurrency", "l1_vlan_start", "l1_vlan_end",
         "vmid_start", "vmid_end", "vm_set_override", "use_all_dongles",
