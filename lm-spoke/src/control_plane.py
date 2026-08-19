@@ -47,7 +47,6 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from cs_spoke import CSSpoke
 from client_api import build_client_api_app
-from client_rows import build_client_rows
 try:
     from core.src.messaging.agent_hosting import AgentHostingControlPlane
 except ImportError:
@@ -379,7 +378,7 @@ class CSControlPlane(AgentHostingControlPlane):
         cs_spoke.stale_client_reclone.start()
         # Start the Aruba Central poll loop (see central_poller.py). Runs
         # regardless of hub-connection — its output feeds both the local
-        # dashboard's Simulations tab AND (via _cs_telemetry_relay_loop below)
+        # dashboard's Simulations tab AND (via the CSSpoke telemetry relay loop)
         # the hub's Simulations tab when this spoke is hub-connected.
         cs_spoke.central_poller.start()
         # Start the Central On-Prem poll loop (twin of the cloud Central loop
@@ -438,301 +437,18 @@ class CSControlPlane(AgentHostingControlPlane):
     def _create_spoke_tasks(self, websocket):
         """Attach the CS telemetry relay loop.
 
-        Every CS_TELEMETRY_INTERVAL_S (default 10s) the cs spoke re-emits its
-        per-host Proxmox state (built by ``CSSpoke.deploy.relay_payload``) to the
-        hub as a signed ``CS_TELEMETRY`` frame. The hub caches it in
-        ``simulations_cache[spoke_id]`` (main.py) and the Simulations/VM Server
-        view serves from that cache. Returned tasks are cancelled/awaited by the
-        base class when the hub connection closes.
+        The relay loop lives on the ``CSSpoke`` module (``create_spoke_tasks``)
+        so it runs identically whether the module is driven by this standalone
+        control plane OR hosted as a role by the generic multi-role agent
+        (``RoleConnection``). Without this delegation a role-hosted simulation
+        spoke would never emit ``CS_TELEMETRY`` and would be invisible in the
+        hub's Simulations view. Returned tasks are cancelled/awaited by the base
+        class when the hub connection closes.
         """
-        return [asyncio.create_task(self._cs_telemetry_relay_loop(websocket))]
-
-    @staticmethod
-    def _relay_content_sig(payload: Dict[str, Any]) -> Optional[str]:
-        """Stable hash of the STATE that matters in a relay frame — so an idle
-        fleet stops re-sending byte-identical frames every 10s (conditional
-        relay). Deliberately EXCLUDES per-cycle noise (timestamps, rolling
-        CPU/mem averages) but INCLUDES every client/VM state signal
-        (running/cloning/shedding/stopped/started, prov/delete-gate, USB,
-        quarantine, central/mist status, command queue) — those transitions are
-        exactly what the Quota Engine + UI act on, so a change to any of them
-        changes the sig and forces an immediate send. Returns None on any error
-        → caller treats that as "changed" and sends (fail-safe: never skip)."""
-        try:
-            import hashlib
-            import json
-            parts: list = []
-            for h in payload.get("proxmox_hosts") or []:
-                h = h or {}
-                hpx = h.get("proxmox") or {}
-                for v in h.get("proxmox_vms") or []:
-                    v = v or {}
-                    parts.append(("vm", v.get("vmid"), v.get("status"), v.get("prov_status"),
-                                  tuple(sorted(str(t) for t in (v.get("tags") or [])))))
-                for u in h.get("usb_devices") or []:
-                    u = u or {}
-                    parts.append(("usb", u.get("bus_path") or u.get("bus"),
-                                  u.get("vidpid"), u.get("state")))
-                pr = hpx.get("prov_run") or {}
-                parts.append(("prov", bool(pr.get("running")),
-                              tuple(sorted((str((it or {}).get("vmid")), str((it or {}).get("status")))
-                                           for it in (pr.get("items") or [])))))
-                dg = hpx.get("delete_gate") or {}
-                parts.append(("gate", dg.get("reason"), dg.get("threshold_exceeded")))
-                parts.append(("qt", tuple(sorted(str((q or {}).get("bus_path"))
-                                                 for q in (hpx.get("quarantine") or [])))))
-                # Bus exclusions ride the signature too — they cull dongles the
-                # same way quarantine does, so a change here moves the WebUI's
-                # available-dongle count and must mark the frame dirty.
-                parts.append(("excl", tuple(sorted(str((x or {}).get("bus_path"))
-                                                   for x in (hpx.get("excluded") or [])))))
-                # Missing-dongle diagnostics: signature on the missing set + the
-                # cause count, NOT the whole blob (kernel sample lines and
-                # generated_at churn every collection and would make the frame
-                # permanently dirty, defeating the conditional relay).
-                _ud = hpx.get("usb_diagnostics") or {}
-                parts.append(("usbdiag",
-                              tuple(sorted(str((m or {}).get("bus_path"))
-                                           for m in (_ud.get("missing") or []))),
-                              len(_ud.get("causes") or []),
-                              bool((_ud.get("uhubctl") or {}).get("supported"))))
-                # Guest-agent watchdog: signature on the ACTIONS only, not ran_at
-                # (which changes every sweep and would pin the frame dirty).
-                _gw = hpx.get("guest_watchdog") or {}
-                parts.append(("guestwd",
-                              tuple(_gw.get("reset") or []),
-                              tuple(_gw.get("power_cycled") or []),
-                              tuple(_gw.get("started") or [])))
-                pv = hpx.get("provision") or {}
-                parts.append(("provn", pv.get("reason"), pv.get("halt"),
-                              pv.get("loop_running"), pv.get("auto_provision_on")))
-                parts.append(("range", str(hpx.get("vmid_range")), hpx.get("connected"),
-                              hpx.get("agent_version")))
-            for c in payload.get("clients") or []:
-                c = c or {}
-                parts.append(("cli", c.get("hostname"), c.get("online"), c.get("status"),
-                              tuple(sorted(str(s) for s in (c.get("active_simulations") or []))),
-                              c.get("tier"), c.get("simulation_id")))
-            cen = payload.get("central") or {}
-            parts.append(("cen", cen.get("status") or cen.get("token_state"),
-                          cen.get("wireless_clients"), cen.get("hardware_alerts")))
-            mist = payload.get("mist") or {}
-            parts.append(("mist", mist.get("status") or mist.get("token_state"),
-                          mist.get("wireless_clients")))
-            for q in payload.get("command_queue") or []:
-                q = q or {}
-                parts.append(("q", q.get("id") or q.get("cs_cmd_id"), q.get("status")))
-            # Per-site pool counts drive hub-side per-site quota apportionment —
-            # a shift in which sites a spoke serves must force a send so the hub
-            # re-apportions on the next push, not at the next heartbeat.
-            parts.append(("pool", tuple(sorted(
-                (str(k), str(v)) for k, v in (payload.get("pool_by_site") or {}).items()))))
-            parts.append(("drain", bool(payload.get("draining"))))
-            return hashlib.sha1(json.dumps(parts, sort_keys=True, default=str).encode()).hexdigest()
-        except Exception:
-            return None
-
-    async def _cs_telemetry_relay_loop(self, websocket) -> None:
-        """Re-emit a signed ``CS_TELEMETRY`` frame to the hub every
-        ``CS_TELEMETRY_INTERVAL_S`` (default 10s). The payload is
-        ``ProxmoxDeploy.relay_payload`` (per-host VM state + the ``provision``
-        diagnostic) with the ``central`` field overlaid from
-        ``CentralPoller`` and the command-queue snapshot inlined so the hub's
-        VM Server / Command Queue views read from cache. ``collect_dhcp_status``
-        is offloaded to a thread so its ``systemctl`` call can't stall the
-        shared event loop.
-
-        Backpressure: this is the spoke-side of the hub's throttling ladder. The
-        per-tick sleep is gated by ``self._bp_send_interval(interval)`` (bottom of
-        the loop), so an ``LM_BACKPRESSURE`` slow-down from the hub stretches the
-        send interval. Because each frame already carries the latest full snapshot,
-        sending less often is latest-wins coalescing done ON THE SPOKE — the hub
-        pushes the merge work down here rather than shedding our telemetry. See
-        lm/docs/backpressure-throttling.md §6 (spoke-side cooperation)."""
-        interval = 10
-        try:
-            interval = max(2, int(os.environ.get("CS_TELEMETRY_INTERVAL_S", "10")))
-        except Exception:
-            pass
-        # Conditional relay (default OFF: relay EVERY ingested frame). The
-        # hand-maintained content signature was incomplete (missed qt_state,
-        # reclone progress, per-client gateway_reachable/ip), so real state
-        # changes could be stranded up to the heartbeat while the sig also told
-        # the hub to skip its broadcast. Relaying every frame removes that strand
-        # class — the payload already carries all state, and the FAST/SLOW +
-        # heartbeat cadence and _relay_wake early-send are all preserved.
-        # Set CS_TELEMETRY_CONDITIONAL=1 to re-enable the old skip-unchanged gate.
-        _CONDITIONAL = (os.environ.get("CS_TELEMETRY_CONDITIONAL", "0") != "0")
-        _HEARTBEAT_S = 60
-        _FAST = min(interval, 3)      # a state change just happened → stay snappy
-        _SLOW = max(interval, 30)     # idle → back off (heartbeat still bounds it)
-        _last_sig: Optional[str] = None
-        _last_send_ts = 0.0
-        _force_send = True            # first tick after (re)connect always sends
-        # Wake event: an agent-frame ingest sets it so a state change relays
-        # immediately instead of waiting out the idle SLOW interval (created here
-        # so it binds to THIS running loop).
-        self._relay_wake = asyncio.Event()
-        # Stagger the first send so a freshly-ingested frame is more likely.
-        await asyncio.sleep(2)
-        while True:
-            try:
-                cs_mod = self.modules.get("cs")
-                deploy = getattr(cs_mod, "deploy", None) if cs_mod else None
-                if deploy is None:
-                    await asyncio.sleep(interval)
-                    continue
-                # collect_dhcp_status() runs a blocking `systemctl is-active`
-                # subprocess (up to 3s). Offload it so this 10s loop never stalls
-                # the shared event loop — that recurring stall backed up inline
-                # hub-command handling into 5s/30s Request Timeouts. Best-effort:
-                # on any failure fall back to letting relay_payload probe inline.
-                dhcp = None
-                try:
-                    try:
-                        from dhcp_status import collect_dhcp_status
-                    except ImportError:
-                        from .dhcp_status import collect_dhcp_status
-                    dhcp = await asyncio.to_thread(collect_dhcp_status)
-                except Exception:
-                    dhcp = None
-                payload = deploy.relay_payload(self.spoke_id, self.spoke_id, dhcp=dhcp)
-                # relay_payload's own "central" field is a placeholder ({}) —
-                # overlay this spoke's real CentralPoller output so a
-                # hub-connected deployment's Simulations tab gets live data too.
-                payload["central"] = getattr(cs_mod, "central_status", {}) or {}
-                # Central On-Prem twin: overlay this spoke's real on-prem
-                # CentralPoller output so a hub-connected deployment's Simulations
-                # tab gets live on-prem data too (same shape as the Central block
-                # above; the hub's data["central_on_prem"] read finds it).
-                payload["central_on_prem"] = getattr(cs_mod, "central_on_prem_status", {}) or {}
-                # Mist twin: overlay this spoke's real MistPoller output so a
-                # hub-connected deployment's Simulations tab gets live Mist
-                # data too (same shape as the Central block above).
-                payload["mist"] = getattr(cs_mod, "mist_status", {}) or {}
-                # Command queue → telemetry so the hub's VM Server → Command
-                # Queue view serves from its CS_TELEMETRY cache (instant) instead
-                # of a live 15s request_response that stalls when this spoke is
-                # busy. ≤10s staleness is fine for a queue view; mutations
-                # (Send/Delete/Clear) still hit the live spoke and the WebUI
-                # forces a live re-fetch afterward. Best-effort: never break
-                # telemetry over a queue read.
-                try:
-                    _q = getattr(cs_mod, "queue", None)
-                    if _q is not None:
-                        payload["command_queue"] = await _q.list_commands()
-                except Exception as e:  # noqa: BLE001
-                    logger.debug("command_queue telemetry overlay failed: %s", e)
-                # Client registry → telemetry so the hub's Simulations "Clients"
-                # tab shows this spoke's connected sim clients. The hub reads
-                # data["clients"] (service.get_clients_data); relay_payload never
-                # carried it, so the registry lived only on the spoke (local
-                # /api/clients showed clients but the hub view was always empty).
-                # Mirror local_ui_routes.aggregate_clients' row shape (online =
-                # seen within 300s) so the hub and local Clients views match.
-                registry = getattr(cs_mod, "registry", None)
-                if registry is not None:
-                    # Row shape + tier join + Site/PHY/Sim-ID resolution live in
-                    # the SHARED builder (client_rows.build_client_rows) so this
-                    # hub-telemetry path and the local dashboard
-                    # (local_ui_routes.aggregate_clients) can never diverge.
-                    clients, tier_updates = build_client_rows(cs_mod)
-                    payload["clients"] = clients
-                    if tier_updates:
-                        try:
-                            await registry.record_tiers_batch(tier_updates)
-                        except Exception as e:  # noqa: BLE001
-                            logger.debug("record_tiers_batch failed: %s", e)
-                # Dongle-quarantine per-host failed/total + per-bus failure for
-                # the hub's bulk/single-bus alarm engine (the spoke's detection
-                # sweep populates engine._qt_telemetry each reconcile).
-                _eng = getattr(cs_mod, "engine", None)
-                if _eng is not None:
-                    try:
-                        payload["qt_state"] = getattr(_eng, "_qt_telemetry", {}) or {}
-                    except Exception as e:  # noqa: BLE001
-                        logger.debug("qt_state telemetry overlay failed: %s", e)
-                # Quota-engine per-site pool → telemetry so the hub can apportion
-                # a site-scoped quota ONLY across spokes that actually hold
-                # clients for that site (per-site apportionment), instead of
-                # every bound cs spoke. The engine computes pool_counts() each
-                # reconcile anyway; surfacing by_site here lets the hub's push
-                # path read it from the CS_TELEMETRY cache with NO synchronous
-                # CS_GET_SIM_QUOTA_STATE forward per push. Best-effort: never
-                # break telemetry over a pool read.
-                _qe = getattr(cs_mod, "sim_quota_engine", None)
-                if _qe is not None:
-                    try:
-                        payload["pool_by_site"] = ((_qe.pool_counts() or {}).get("by_site") or {})
-                    except Exception as e:  # noqa: BLE001
-                        logger.debug("pool_by_site telemetry overlay failed: %s", e)
-                # Draining flag: True while a self-update is running (git pull +
-                # about to os._exit+relaunch). The hub reads this and, while set,
-                # queues CS_CONFIG_UPDATE (and other request/reply) pushes to the
-                # mailbox instead of firing a 5s request_response that would time
-                # out when we exit mid-reply. A fresh process starts False, so
-                # the first post-restart frame tells the hub to clear drain.
-                payload["draining"] = bool(getattr(self, "_draining", False))
-                # ── Conditional relay: send only on a state change, a forced
-                # reseed, or the heartbeat ceiling. A skipped tick sends NOTHING
-                # (the hub keeps the last frame, which is identical) — that's the
-                # transfer + hub-load saving. Any client/VM state transition
-                # changes _sig → sends immediately, so the Quota Engine/UI are
-                # never delayed. Next interval is FAST right after a change, SLOW
-                # when idle. ``draining`` must always get through, so treat it as
-                # a force.
-                _now = time.time()
-                _sig = self._relay_content_sig(payload)
-                _changed = (_sig is None) or (_sig != _last_sig)
-                _due_heartbeat = (_now - _last_send_ts) >= _HEARTBEAT_S
-                _draining_now = bool(payload.get("draining"))
-                _do_send = ((not _CONDITIONAL) or _force_send or _changed
-                            or _due_heartbeat or _draining_now)
-                if _do_send:
-                    # Carry the content sig ONLY when conditional relay is enabled,
-                    # so the HUB can skip its memo invalidation + browser broadcast
-                    # on an unchanged heartbeat frame (see main._handle_cs_telemetry).
-                    # With conditional relay OFF (the default) we relay every frame
-                    # AND omit the sig so the hub never suppresses its broadcast —
-                    # every ingested state change reflects immediately (no strand).
-                    if _CONDITIONAL:
-                        payload["_content_sig"] = _sig
-                    msg = {
-                        "header": {
-                            "message_id": str(uuid.uuid4()),
-                            "timestamp": time.time(),
-                            "sender_id": self.spoke_id,
-                            "destination_id": "hub",
-                        },
-                        "payload": {"type": "CS_TELEMETRY", "data": payload},
-                    }
-                    await websocket.send(self._encode_frame(msg))
-                    _last_sig = _sig
-                    _last_send_ts = _now
-                    _force_send = False
-                    interval = _FAST if _changed else _SLOW
-                else:
-                    interval = _SLOW
-            except asyncio.CancelledError:
-                raise
-            except Exception as e:
-                logger.debug("CS telemetry relay send failed: %s", e)
-            # Honor the hub's LM_BACKPRESSURE slow-down: send no faster than the
-            # requested interval (_bp_send_interval = max(base, _bp_min_interval),
-            # a no-op when not throttled). Stretching the interval slows our send
-            # cadence locally so the hub distributes the merge work down to the
-            # spoke rather than shedding our frames (see the loop docstring and
-            # lm/docs/backpressure-throttling.md §6).
-            # Interruptible sleep: wake early when an agent frame is ingested
-            # (a state change to relay) — else time out after the interval (the
-            # heartbeat/idle cadence). This is what makes a delete/reclone/stop
-            # reflect in ~0.1s instead of up to the SLOW interval.
-            try:
-                await asyncio.wait_for(self._relay_wake.wait(),
-                                       timeout=self._bp_send_interval(interval))
-            except asyncio.TimeoutError:
-                pass
-            self._relay_wake.clear()
+        cs_mod = self.modules.get("cs")
+        if cs_mod is None:
+            return []
+        return list(cs_mod.create_spoke_tasks(websocket) or [])
 
     def run_standalone_mode(self):
         """Standalone FastAPI server: the full client API surface on
