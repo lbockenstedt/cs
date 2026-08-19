@@ -376,6 +376,19 @@ if [[ "$DHCP_SKIP" != "1" ]]; then
         fi
         ok "Kea (kea-dhcp4-server + kea-ctrl-agent) installed"
 
+        # AppArmor only ENFORCES when the LSM is active (securityfs present at
+        # /sys/kernel/security/apparmor). On a host where AppArmor was never
+        # loaded — or where disable_apparmor() just unloaded it — the packaged
+        # kea profile FILE on disk is INERT, so the grant/complain/reload
+        # machinery below is unnecessary and its "apparmor_parser NOT FOUND …
+        # kea will serve no addresses" warning is a FALSE ALARM. Skip the whole
+        # block unless AppArmor is actually active (matches the note at the top
+        # of setup_sim_dhcp: with AppArmor off, none of this has to run). Keep
+        # AA_PARSER defined so the later verify/fallback is safe under `set -u`.
+        AA_PARSER=""
+        if [ ! -d /sys/kernel/security/apparmor ]; then
+            ok "AppArmor not active on this host — sim Kea runs unconfined; no profile grant needed"
+        else
         # ── AppArmor: allow the SIM instance's runtime files ──────────────────
         # Kea derives its PID file name from the CONFIG file name, so our
         # deliberately-renamed sim instance writes
@@ -585,6 +598,7 @@ AARULES
         elif [ -d /etc/apparmor.d ] && [ -f /etc/apparmor.d/usr.sbin.kea-dhcp4 ]; then
             warn "AppArmor profiles present but apparmor_parser did not reload — if kea-dhcp4-sim crash-loops with \"Unable to open PID file\", run: apparmor_parser -r /etc/apparmor.d/usr.sbin.kea-dhcp4"
         fi
+        fi  # end: AppArmor active-on-host guard
 
         # ── Static IP on the internal interface ───────────────────────────────
         IFACE_CFG="/etc/network/interfaces.d/${DHCP_IFACE}.conf"
