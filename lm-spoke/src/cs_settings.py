@@ -279,6 +279,12 @@ class CSSettings:
             "ignored_vidpids": _parse_json_list(self.get("usb_ignored_vidpids", "[]")),
             "t1_pci_vidpids": _parse_json_list(self.get("t1_pci_vidpids", "[]")),
             "t3_pci_vidpids": _parse_json_list(self.get("t3_pci_vidpids", "[]")),
+            # Per-host T1 opt-out (usb_provision._host_t1_excluded on the pxmx
+            # agent) — was normalized/stored correctly (local_store.py's
+            # _HUB_CONFIG_LIST_KEYS) but never actually emitted into this
+            # payload, so no agent ever received it: T1 Exclude Hosts silently
+            # did nothing for every host, on every topology.
+            "t1_exclude_hosts": _parse_json_list(self.get("t1_exclude_hosts", "[]")),
             "sim_pool": str(self.get("sim_pool", "") or "").strip(),
             "sim_phy": sim_phy,
             "reclone_concurrency": max(1, int(self.get("reclone_concurrency", 1) or 1)),

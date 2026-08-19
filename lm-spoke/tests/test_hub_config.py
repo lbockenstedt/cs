@@ -218,3 +218,24 @@ def test_usb_config_payload_missing_timeout_zero_disables_teardown(spoke_loop):
     spoke, loop = spoke_loop
     _run(loop, spoke.handle_command("CS_CONFIG_UPDATE", {"usb_missing_timeout": "0"}))
     assert spoke.settings.usb_config_payload()["missing_timeout"] == 0
+
+
+def test_usb_config_payload_emits_t1_exclude_hosts(spoke_loop):
+    """t1_exclude_hosts (per-host T1 opt-out, read by the pxmx agent's
+    usb_provision._host_t1_excluded) was normalized/stored correctly
+    (local_store._HUB_CONFIG_LIST_KEYS) but never emitted into the payload
+    the agent actually receives — every host's T1 exclusion silently did
+    nothing. Pins it in the payload alongside its sibling list fields."""
+    spoke, loop = spoke_loop
+    resp = _run(loop, spoke.handle_command("CS_CONFIG_UPDATE", {
+        "t1_exclude_hosts": json.dumps(["pxmx-cs-svr-06", "pxmx-cs-svr-07"]),
+    }))
+    assert resp["status"] == "SUCCESS"
+    assert "t1_exclude_hosts" in resp["applied"]
+    cfg = spoke.settings.usb_config_payload()
+    assert cfg["t1_exclude_hosts"] == ["pxmx-cs-svr-06", "pxmx-cs-svr-07"]
+
+
+def test_usb_config_payload_t1_exclude_hosts_defaults_empty(spoke_loop):
+    spoke, loop = spoke_loop
+    assert spoke.settings.usb_config_payload()["t1_exclude_hosts"] == []
