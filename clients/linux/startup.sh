@@ -177,16 +177,12 @@ fi
 #------------------------------------------------------------
 #Scheduling Reboot
 #------------------------------------------------------------
-# reboot_schedule is in MINUTES. Guard: if it's missing/non-numeric/<=0, skip
-# scheduling (an empty value used to eval as 0 → shutdown -r +0 = immediate
-# reboot). shutdown -r +N schedules N minutes from now (a bare N is seconds).
-if [[ "$reboot_schedule" =~ ^[0-9]+$ ]] && (( reboot_schedule > 0 )); then
-  rn=$(( reboot_schedule + RANDOM % 600 ))
-  echo Scheduling reboot $rn minutes | tee -a /usr/local/scripts/sim.log
-  shutdown -r +$rn
-else
-  echo "Skipping reboot schedule (reboot_schedule missing/invalid: '${reboot_schedule}')" | tee -a /usr/local/scripts/sim.log
-fi
+# The randomized auto-reboot is scheduled from the sim loop (simulation.sh,
+# once per boot via a /dev/shm stamp) using `sudo shutdown -r +N` — a delayed
+# shutdown is a privileged action the autologin sim user cannot perform
+# unprivileged, so the old bare `shutdown -r +N` here silently never scheduled.
+# reboot_schedule is still read above for logging/parity; the scheduling itself
+# now lives next to the loop that keeps the box alive between reboots.
 #Making sure eth0 and wlan0 are online
 echo Bringing up all interfaces online | tee -a /usr/local/scripts/sim.log
 #------------------------------------------------------------

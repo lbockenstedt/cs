@@ -206,6 +206,38 @@ while true; do
     _sim_reload=0
   fi
   init_simulation_context
+  #------------------------------------------------------------
+  # Randomized auto-reboot — schedule ONCE per boot.
+  # reboot_schedule ([simulation], MINUTES) is the base; add a uniform 0-599min
+  # jitter so 1000 clients don't reboot in lockstep. e.g. reboot_schedule=300 ->
+  # a reboot 300-899 min (5-15h) out; set 360 for a 6h base.
+  #
+  # MUST run with sudo: a DELAYED `shutdown -r +N` is a privileged/polkit
+  # schedule-shutdown action the autologin sim user can't perform unprivileged,
+  # so the old bare `shutdown` (in startup.sh) silently never scheduled and
+  # clients stopped auto-rebooting. Guarded by a boot-volatile stamp on /dev/shm
+  # (tmpfs, wiped every boot) so neither the outer loop's config re-parse NOR a
+  # self-re-exec reschedules — a fresh `shutdown -r +N` each pass would keep
+  # pushing the reboot into the future and it would never fire. On sudo failure
+  # we DON'T stamp, so it retries next cycle; on a missing/invalid value we stamp
+  # to avoid logging the skip every iteration.
+  #------------------------------------------------------------
+  _reboot_stamp=/dev/shm/client-sim-reboot-scheduled
+  if [[ ! -f "$_reboot_stamp" ]]; then
+    reboot_schedule=$(get_value 'simulation' 'reboot_schedule')
+    if [[ "$reboot_schedule" =~ ^[0-9]+$ ]] && (( reboot_schedule > 0 )); then
+      rn=$(( reboot_schedule + RANDOM % 600 ))
+      echo "Scheduling reboot in $rn minutes" | tee -a ${LOG_FILE}
+      if sudo shutdown -r +"$rn" 2>>${LOG_FILE}; then
+        : > "$_reboot_stamp" 2>/dev/null || true
+      else
+        echo "WARNING: failed to schedule reboot (sudo shutdown) — retrying next cycle" | tee -a ${LOG_FILE}
+      fi
+    else
+      echo "Skipping reboot schedule (reboot_schedule missing/invalid: '${reboot_schedule}')" | tee -a ${LOG_FILE}
+      : > "$_reboot_stamp" 2>/dev/null || true
+    fi
+  fi
 #------------------------------------------------------------
 #Finding adapter names and setting usable variables for interfaces
 #When using a physical piece of hardware we want to diable the
