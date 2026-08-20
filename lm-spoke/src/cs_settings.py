@@ -279,11 +279,12 @@ class CSSettings:
             "ignored_vidpids": _parse_json_list(self.get("usb_ignored_vidpids", "[]")),
             "t1_pci_vidpids": _parse_json_list(self.get("t1_pci_vidpids", "[]")),
             "t3_pci_vidpids": _parse_json_list(self.get("t3_pci_vidpids", "[]")),
-            # Per-host T1 opt-out (usb_provision._host_t1_excluded on the pxmx
-            # agent) — was normalized/stored correctly (local_store.py's
-            # _HUB_CONFIG_LIST_KEYS) but never actually emitted into this
-            # payload, so no agent ever received it: T1 Exclude Hosts silently
-            # did nothing for every host, on every topology.
+            # Per-host T1 opt-out. Consumed spoke-side in
+            # client_rows.build_client_rows (_host_t1_excluded): a client on a
+            # listed pxmx server that would classify as T1 (no USB dongle) is
+            # forced to T2, so an excluded host never deploys/renders T1. Still
+            # emitted here for the agent payload (future agent-side provisioning
+            # use); the spoke classifier is the authoritative enforcement point.
             "t1_exclude_hosts": _parse_json_list(self.get("t1_exclude_hosts", "[]")),
             "sim_pool": str(self.get("sim_pool", "") or "").strip(),
             "sim_phy": sim_phy,
