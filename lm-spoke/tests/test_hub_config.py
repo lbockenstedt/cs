@@ -239,3 +239,23 @@ def test_usb_config_payload_emits_t1_exclude_hosts(spoke_loop):
 def test_usb_config_payload_t1_exclude_hosts_defaults_empty(spoke_loop):
     spoke, loop = spoke_loop
     assert spoke.settings.usb_config_payload()["t1_exclude_hosts"] == []
+
+
+def test_usb_config_payload_emits_t3_exclude_hosts(spoke_loop):
+    """t3_exclude_hosts (per-host T3 opt-out), mirroring t1_exclude_hosts above.
+    Enforcement is spoke-side in client_rows._t3_exclude_hosts (see
+    test_t3_exclude_hosts.py) and agent-side in
+    usb_provision._host_t3_excluded."""
+    spoke, loop = spoke_loop
+    resp = _run(loop, spoke.handle_command("CS_CONFIG_UPDATE", {
+        "t3_exclude_hosts": json.dumps(["pxmx-cs-svr-06", "pxmx-cs-svr-07"]),
+    }))
+    assert resp["status"] == "SUCCESS"
+    assert "t3_exclude_hosts" in resp["applied"]
+    cfg = spoke.settings.usb_config_payload()
+    assert cfg["t3_exclude_hosts"] == ["pxmx-cs-svr-06", "pxmx-cs-svr-07"]
+
+
+def test_usb_config_payload_t3_exclude_hosts_defaults_empty(spoke_loop):
+    spoke, loop = spoke_loop
+    assert spoke.settings.usb_config_payload()["t3_exclude_hosts"] == []

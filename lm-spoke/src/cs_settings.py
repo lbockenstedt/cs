@@ -279,13 +279,15 @@ class CSSettings:
             "ignored_vidpids": _parse_json_list(self.get("usb_ignored_vidpids", "[]")),
             "t1_pci_vidpids": _parse_json_list(self.get("t1_pci_vidpids", "[]")),
             "t3_pci_vidpids": _parse_json_list(self.get("t3_pci_vidpids", "[]")),
-            # Per-host T1 opt-out. Consumed spoke-side in
-            # client_rows.build_client_rows (_host_t1_excluded): a client on a
-            # listed pxmx server that would classify as T1 (no USB dongle) is
-            # forced to T2, so an excluded host never deploys/renders T1. Still
-            # emitted here for the agent payload (future agent-side provisioning
-            # use); the spoke classifier is the authoritative enforcement point.
+            # Per-host T1/T3 opt-out. Consumed spoke-side in
+            # client_rows.build_client_rows (_host_t1_excluded/_host_t3_excluded): a
+            # client on a listed pxmx server that would classify as T1/T3 (no USB
+            # dongle) is forced to T2, so an excluded host never deploys/renders
+            # T1/T3. Also emitted here for the agent payload, where
+            # usb_provision._host_t1_excluded/_host_t3_excluded gate the actual PCI
+            # passthrough at provision time.
             "t1_exclude_hosts": _parse_json_list(self.get("t1_exclude_hosts", "[]")),
+            "t3_exclude_hosts": _parse_json_list(self.get("t3_exclude_hosts", "[]")),
             "sim_pool": str(self.get("sim_pool", "") or "").strip(),
             "sim_phy": sim_phy,
             "reclone_concurrency": max(1, int(self.get("reclone_concurrency", 1) or 1)),

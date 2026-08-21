@@ -60,6 +60,17 @@ def _host_t1_excluded(host: str, patterns: list) -> bool:
     return any(h == p or h.startswith(p) for p in patterns)
 
 
+def _t3_exclude_hosts(spoke) -> list:
+    """Same as ``_t1_exclude_hosts`` but for ``t3_exclude_hosts``."""
+    try:
+        ls = getattr(spoke, "local_store", None)
+        hc = ((ls.get_hub_config() or {}).get("hub_config") or {}) if ls else {}
+        return [str(x).strip().lower() for x in (hc.get("t3_exclude_hosts") or [])
+                if str(x).strip()]
+    except Exception:  # noqa: BLE001
+        return []
+
+
 def build_client_rows(spoke, now: float | None = None
                       ) -> Tuple[List[Dict[str, Any]], Dict[str, Dict[str, Any]]]:
     """Build the Clients-view rows for *spoke* (a ``CSSpoke``).
@@ -89,6 +100,7 @@ def build_client_rows(spoke, now: float | None = None
     # PCI-pass their T1 card, so their clients are USB/T2 and must never be
     # classified/deployed as T1. Only explicitly-excluded hosts are touched.
     excluded_t1_hosts = _t1_exclude_hosts(spoke)
+    excluded_t3_hosts = _t3_exclude_hosts(spoke)
 
     # Load the sim configs ONCE per call (mtime-cached) so each client's
     # authoritative Site/PHY/Sim-ID can be resolved from its hostname.
@@ -137,6 +149,14 @@ def build_client_rows(spoke, now: float | None = None
         if excluded_t1_hosts and tier not in ("t2", "t3") and not has_usb:
             _pmx_host = name_to_host.get(str(hostname).strip().lower())
             if _host_t1_excluded(_pmx_host, excluded_t1_hosts):
+                tier = "t2"
+                tier_updates[hostname] = {"tier": "t2", "has_usb": has_usb}
+        # Per-host T3 opt-out: mirrors T1 above. Unlike T1 (the ambiguous-default
+        # fallback), T3 is explicitly resolved via vm_tier_index/persisted tier, so
+        # guard directly on tier == "t3" rather than "not yet classified".
+        if excluded_t3_hosts and tier == "t3":
+            _pmx_host = name_to_host.get(str(hostname).strip().lower())
+            if _host_t1_excluded(_pmx_host, excluded_t3_hosts):
                 tier = "t2"
                 tier_updates[hostname] = {"tier": "t2", "has_usb": has_usb}
         rows.append({
