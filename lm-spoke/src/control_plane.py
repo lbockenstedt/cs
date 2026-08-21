@@ -126,6 +126,10 @@ class CSControlPlane(AgentHostingControlPlane):
         # backlogged link — the recurring cause of "provision loop not running"
         # after an agent restart. Complements the agent-side config persistence.
         self._agent_config_cache: Dict[str, Any] = {}
+        # Set by run() once CSSpoke exists — lets _repush_agent_config read the
+        # live CSSettings store at replay time (see there) instead of trusting
+        # a possibly stale _agent_config_cache entry. None outside run().
+        self._cs_spoke = None
         # Local webui (8080 uvicorn) TLS cert paths, set by _apply_local_cert
         # when a le-issued cert is delivered via INSTALL_CERT. None until then.
         self._api_app = None
@@ -324,6 +328,25 @@ class CSControlPlane(AgentHostingControlPlane):
             asyncio.create_task(self._repush_agent_config(agent_id, cfg))
 
     async def _repush_agent_config(self, agent_id: str, cfg: Dict[str, Any]) -> None:
+        """Regression: ``cfg`` is whatever ``_agent_config_cache`` last held from
+        the hub's most recent ``SET_AGENT_CONFIG`` — which can be arbitrarily
+        stale, since this cache is only ever refreshed BY a fresh hub push, not
+        by the passage of time or by an agent reconnect. A WS reconnect (network
+        blip, a local TLS cert rebind via ``_rebind_agent_server``, etc.)
+        requires no agent process restart and is invisible to the agent's own
+        systemd-level "hub config NOT confirmed" staleness guard — so a
+        `usb_auto_provision` value the hub pushed as "on" during, say, initial
+        setup/testing could sit cached here and get silently replayed as "on" on
+        every later reconnect, long after the operator toggled it off, until the
+        hub happens to push SET_AGENT_CONFIG again. Refresh the usb_config leaf
+        from the spoke's own live CSSettings store (always current — see
+        cs_settings.usb_config_payload) right before every replay so a
+        reconnect can never resurrect a stale auto-provision/exclusion value."""
+        settings = getattr(self._cs_spoke, "settings", None)
+        if settings is not None and isinstance(cfg.get("client_simulation"), dict):
+            cfg = dict(cfg)
+            cfg["client_simulation"] = dict(cfg["client_simulation"])
+            cfg["client_simulation"]["usb_config"] = settings.usb_config_payload()
         try:
             await self.send_to_agent("UPDATE_CONFIG", cfg, agent_id=agent_id)
             logger.info(f"Re-pushed cached client-sim config to agent '{agent_id}'")
@@ -367,6 +390,10 @@ class CSControlPlane(AgentHostingControlPlane):
         # handlers can reach connected_agents / approve_pending_agent / send_to_agent
         # (mirrors ProxmoxSpoke(control_plane=self)).
         cs_spoke.control_plane = self
+        # Back-reference so _repush_agent_config can read the spoke's live
+        # CSSettings at replay time instead of trusting a frozen cache entry —
+        # see _repush_agent_config.
+        self._cs_spoke = cs_spoke
         self.register_module("cs", cs_spoke)
         # Start the agent listener when LM_CS_AGENT_LISTENER=1. install_cs.sh
         # writes that env by DEFAULT (standalone cs accepts cs-dialed pxmx
