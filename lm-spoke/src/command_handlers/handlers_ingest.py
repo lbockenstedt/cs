@@ -142,6 +142,14 @@ class IngestCommandsMixin:
             if isinstance(_items, list) and _items:
                 results = []
                 errors = []
+                # Coalesce a multi-VM delete into ONE ``delete_vms`` per host: the
+                # agent tears the whole list down in a single self-paced long-op
+                # (per-VM progress + one terminal), instead of N ``delete_vm``
+                # commands each racing the relay ACCEPT window on a saturated host
+                # — the root of the mass-delete "only some got deleted" drop.
+                # Non-delete items (or a delete missing its vmid) enqueue as-is.
+                del_by_host: Dict[str, list] = {}
+                vm_count = 0
                 for it in _items:
                     if not isinstance(it, dict):
                         continue
@@ -150,10 +158,28 @@ class IngestCommandsMixin:
                     if not iact:
                         errors.append("missing 'action'")
                         continue
+                    if iact == "delete_vm":
+                        iargs = it.get("args") or {}
+                        _vid = iargs.get("vmid", iargs.get("vm_id"))
+                        if _vid is not None:
+                            del_by_host.setdefault(itgt, []).append(_vid)
+                            vm_count += 1
+                            continue
+                        # No vmid → fall through and enqueue as-is (the agent
+                        # fails it explicitly rather than silently dropping).
                     try:
                         res = await self.queue.enqueue(itgt, iact,
                                                        it.get("args") or {},
                                                        command_type=it.get("type"))
+                        results.append(res)
+                        vm_count += 1
+                    except ValueError as exc:
+                        errors.append(str(exc))
+                # One delete_vms per host carrying every requested vmid.
+                for _htgt, _vids in del_by_host.items():
+                    try:
+                        res = await self.queue.enqueue(_htgt, "delete_vms",
+                                                       {"vmids": _vids})
                         results.append(res)
                     except ValueError as exc:
                         errors.append(str(exc))
@@ -162,7 +188,8 @@ class IngestCommandsMixin:
                     await client_api.push_pending(self, _tgt)
                 return {"status": "SUCCESS",
                         "created": sum(1 for r in results if r.get("created")),
-                        "queued": len(results), "errors": errors}
+                        "commands": len(results),
+                        "queued": vm_count, "errors": errors}
             target = str(d.get("target") or "proxmox").strip() or "proxmox"
             action = str(d.get("action") or "").strip()
             if not action:

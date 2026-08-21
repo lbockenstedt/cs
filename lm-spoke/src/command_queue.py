@@ -112,7 +112,7 @@ STALE_DELIVERED_SECS = _env_int("CS_STALE_DELIVERED_SECS", 30, 5)
 DELETE_VERIFY_TIMEOUT_SECS = _env_int("CS_DELETE_VERIFY_TIMEOUT_S", 300, 30)
 DELETE_VERIFY_MAX_RETRIES = _env_int("CS_DELETE_MAX_RETRIES", 2, 1)
 # Actions covered by the verify-report net (the long teardown ops).
-_VERIFY_ACTIONS = {"delete_vm", "reclone_vm"}
+_VERIFY_ACTIONS = {"delete_vm", "delete_vms", "reclone_vm"}
 
 # Single-VM actions that take a ``vmid`` arg and must respect the sim range +
 # protected-VMID guard at enqueue time (defense-in-depth; the agent's cs_guard
