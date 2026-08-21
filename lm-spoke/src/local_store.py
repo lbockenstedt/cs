@@ -39,6 +39,7 @@ _HUB_CONFIG_LIST_KEYS = (
     "t1_pci_vidpids",        # list of "vid:pid"
     "t3_pci_vidpids",        # list of "vid:pid"
     "t1_exclude_hosts",      # list of str (hostname/prefix — per-host T1 opt-out / hub mode)
+    "t3_exclude_hosts",      # list of str (hostname/prefix — per-host T3 opt-out / hub mode)
     "ignored_hostnames",     # list of str
 )
 _HUB_CONFIG_VIDPID_OBJ_KEY = "usb_vidpids"  # list of {vidpid,type,label}
@@ -102,7 +103,7 @@ def _hub_config_list_value(key: str, raw: Any, stored_raw: Any = None) -> list:
                             "label": p["label"] if p else vp})
         return out
     items = _coerce_to_list(raw)
-    if key in ("ignored_hostnames", "t1_exclude_hosts"):
+    if key in ("ignored_hostnames", "t1_exclude_hosts", "t3_exclude_hosts"):
         # Plain hostname/prefix string lists — NOT vid:pid. Keep non-empty tokens
         # verbatim; must NOT fall through to the vidpid branch below (which drops
         # every hostname that fails _USB_VIDPID_RE).
