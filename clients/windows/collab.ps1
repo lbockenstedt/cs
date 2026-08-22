@@ -44,12 +44,32 @@ $collabServer = get_value 'address' 'collab_server'
 $collabApp    = get_value 'simulation' 'collab_app'
 $collabBw     = get_value 'simulation' 'collab_bw'
 $collabTime   = get_value 'simulation' 'collab_time'
+$collabPcapUrl = get_value 'address' 'collab_pcap_url'
+$serverUrl     = get_value 'server' 'server_url'
 
 $overrides = Get-SimOverrides
 if ($overrides.ContainsKey('collab_server')) { $collabServer = $overrides['collab_server'] }
 if ($overrides.ContainsKey('collab_app'))    { $collabApp    = $overrides['collab_app'] }
 if ($overrides.ContainsKey('collab_bw'))     { $collabBw     = $overrides['collab_bw'] }
 if ($overrides.ContainsKey('collab_time'))   { $collabTime   = $overrides['collab_time'] }
+if ($overrides.ContainsKey('collab_pcap_url')) { $collabPcapUrl = $overrides['collab_pcap_url'] }
+
+# Derive the pcap URL from server_url when not set explicitly (mirror collab.sh).
+if ([string]::IsNullOrWhiteSpace($collabPcapUrl) -and -not [string]::IsNullOrWhiteSpace($serverUrl)) {
+    $collabPcapUrl = ($serverUrl.TrimEnd('/')) + '/sim/collab/pcap'
+}
+
+# TODO(pcap-replay parity): the Linux sender (collab.py + collab_pcap.py) does
+# high-fidelity capture replay — it downloads $collabPcapUrl and replays the
+# capture's client->server frames while the hub sink replays server->client.
+# The stdlib pcap/pcapng parser is not yet ported to PowerShell, so Windows
+# still uses the synthetic random-payload UDP path below (same 5-tuples/ports,
+# so DPI still classifies the app). The knob is read here for config parity and
+# so the port is a drop-in when the PS parser lands. Do NOT remove the synthetic
+# fallback — it is the Windows default until the parser is ported.
+if (-not [string]::IsNullOrWhiteSpace($collabPcapUrl)) {
+    Write-SimLog "$(Get-Date) collab: pcap replay not yet implemented on Windows — using synthetic UDP (pcap=$collabPcapUrl)"
+}
 
 # No sink configured -> no-op cleanly (mirror collab.sh).
 if ([string]::IsNullOrWhiteSpace($collabServer)) {

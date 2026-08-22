@@ -120,6 +120,7 @@ dns_bad_record_2=172.31.202.2
 dns_bad_record_3=100.100.0.1
 iperf_server=172.31.201.135
 collab_server=                  # UDP sink for collab traffic; blank disables the leaf script
+collab_pcap_url=                # blank -> auto-derive <server_url>/sim/collab/pcap; capture the sim replays (falls back to synthetic UDP)
 syslog_server=169.253.1.5
 ```
 
@@ -168,7 +169,7 @@ sim_phy=wireless        # wireless or wired
 | `download`    | Downloads a file repeatedly (traffic generation)   | —                            |
 | `www_traffic` | Fetches web pages (traffic generation)             | —                            |
 | `iperf`       | Runs iPerf to `iperf_server` (bandwidth test)      | —                            |
-| `collab`      | Sends media-like UDP traffic to `collab_server`    | —                            |
+| `collab`      | Replays a Teams/Zoom/WebEx capture (or synthetic UDP) to `collab_server`; hub sink replays the server side back | — |
 
 #### How many clients does a simulation need to fire an alert?
 
