@@ -8,8 +8,12 @@ path, so its guardrails get direct coverage rather than narrative claims in
 a docstring:
   1. Running VM + client silent past the threshold -> reclone dispatched.
   2. Running VM + client silent but INSIDE the threshold -> not touched.
-  3. Running VM + client NEVER reported (no last_seen at all) -> not touched
-     (a different problem — hostname/rename mismatch, not this loop's job).
+  3. Running VM + client NEVER reported (no last_seen at all): the VM/client
+     gap. The clock starts on first sight; it is recloned only after the
+     (longer) grace window AND only when correlation is proven (some OTHER
+     VM's client IS reporting). Without correlation it is left alone.
+  3b. Never-reported reclone is capped per sweep and its per-vmid grace clock
+     persists across a restart (can't be reset to "act immediately").
   4. VM not running -> not touched, regardless of client staleness.
   5. Cooldown: a vmid already triggered recently is not re-triggered even if
      it's still stale on the next sweep (would otherwise loop forever on a
@@ -29,7 +33,10 @@ SRC = Path(__file__).resolve().parent.parent / "src"
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
-from stale_client_reclone import StaleClientReclone, _STALE_RECLONE_S, _RECLONE_COOLDOWN_S  # noqa: E402
+from stale_client_reclone import (  # noqa: E402
+    StaleClientReclone, _STALE_RECLONE_S, _RECLONE_COOLDOWN_S,
+    _NEVER_REPORTED_GRACE_S, _NEVER_REPORTED_MAX_PER_SWEEP,
+)
 
 
 def _run(coro):
@@ -102,14 +109,93 @@ def test_running_vm_silent_inside_threshold_not_touched(tmp_path):
     assert spoke.control_plane.sent == []
 
 
-def test_client_never_reported_is_not_touched(tmp_path):
-    # No last_seen at all -> a hostname/rename mismatch problem, not this
-    # loop's job (would otherwise reclone-loop a VM whose sim never started).
+def test_client_never_reported_starts_clock_but_not_immediate(tmp_path):
+    # No last_seen at all -> the VM/client gap. First sight only STARTS the
+    # per-vmid grace clock; nothing is recloned yet even though a reporting
+    # peer proves correlation.
+    states = {_STATES_ONE_VM_KEY: {"vms": [
+        _vm(90046, "qpeterson"),           # never reported
+        _vm(90047, "qhealthy"),            # reporting peer -> correlation proven
+    ]}}
+    clients = {"qpeterson": _client("qpeterson", None),
+              "qhealthy": _client("qhealthy", 60)}
+    spoke = _Spoke(states, clients, _AGENTS)
+    inst = _sweep(spoke, tmp_path)
+    assert spoke.control_plane.sent == []
+    assert "90046" in inst._missing_since, "grace clock must start on first sight"
+
+
+def test_never_reported_reclones_after_grace_when_correlated(tmp_path):
+    states = {_STATES_ONE_VM_KEY: {"vms": [
+        _vm(90046, "qpeterson"),           # never reported, past grace (seeded)
+        _vm(90047, "qhealthy"),            # reporting peer -> correlation proven
+    ]}}
+    clients = {"qpeterson": _client("qpeterson", None),
+              "qhealthy": _client("qhealthy", 60)}
+    spoke = _Spoke(states, clients, _AGENTS)
+    inst = StaleClientReclone(spoke, tmp_path)
+    # Simulate the grace window having already elapsed for the dead VM.
+    inst._missing_since["90046"] = time.time() - _NEVER_REPORTED_GRACE_S - 60
+    _run(inst._sweep())
+    assert spoke.control_plane.sent == [("reclone_vm", {"vmid": 90046}, "agent-1")]
+
+
+def test_never_reported_not_touched_without_correlation(tmp_path):
+    # NO VM anywhere is reporting -> correlation unproven (could be a fleet-wide
+    # telemetry glitch or a global name mismatch) -> never-reported VMs are left
+    # alone even past grace, so we can't mass-reclone the pool.
     states = {_STATES_ONE_VM_KEY: {"vms": [_vm(90046, "qpeterson")]}}
     clients = {"qpeterson": _client("qpeterson", None)}
     spoke = _Spoke(states, clients, _AGENTS)
-    _sweep(spoke, tmp_path)
+    inst = StaleClientReclone(spoke, tmp_path)
+    inst._missing_since["90046"] = time.time() - _NEVER_REPORTED_GRACE_S - 60
+    _run(inst._sweep())
     assert spoke.control_plane.sent == []
+
+
+def test_never_reported_reclone_capped_per_sweep(tmp_path):
+    # Many dead VMs all past grace + one reporting peer -> at most the cap is
+    # dispatched in a single sweep (bleed off slowly, never storm).
+    dead = [_vm(90100 + i, "qdead%d" % i) for i in range(_NEVER_REPORTED_MAX_PER_SWEEP + 3)]
+    states = {_STATES_ONE_VM_KEY: {"vms": dead + [_vm(90047, "qhealthy")]}}
+    clients = {"qhealthy": _client("qhealthy", 60)}
+    for v in dead:
+        clients[v["name"]] = _client(v["name"], None)
+    spoke = _Spoke(states, clients, _AGENTS)
+    inst = StaleClientReclone(spoke, tmp_path)
+    for v in dead:
+        inst._missing_since[str(v["vmid"])] = time.time() - _NEVER_REPORTED_GRACE_S - 60
+    _run(inst._sweep())
+    assert len(spoke.control_plane.sent) == _NEVER_REPORTED_MAX_PER_SWEEP
+
+
+def test_never_reported_grace_clock_persists_across_restart(tmp_path):
+    states = {_STATES_ONE_VM_KEY: {"vms": [
+        _vm(90046, "qpeterson"), _vm(90047, "qhealthy")]}}
+    clients = {"qpeterson": _client("qpeterson", None),
+              "qhealthy": _client("qhealthy", 60)}
+    spoke = _Spoke(states, clients, _AGENTS)
+    inst = _sweep(spoke, tmp_path)          # first sight -> clock started + saved
+    started = inst._missing_since.get("90046")
+    assert started is not None
+    # A brand-new instance (spoke restart) must LOAD the persisted clock rather
+    # than reset it to now (which would delay the reclone forever).
+    spoke2 = _Spoke(states, clients, _AGENTS)
+    inst2 = StaleClientReclone(spoke2, tmp_path)
+    assert inst2._missing_since.get("90046") == started
+
+
+def test_never_reported_clock_cleared_when_client_starts_reporting(tmp_path):
+    states = {_STATES_ONE_VM_KEY: {"vms": [_vm(90046, "qpeterson")]}}
+    # Client now reports fresh -> the stale missing-clock must be cleared so a
+    # later silence starts fresh, not from the old (already-elapsed) timestamp.
+    clients = {"qpeterson": _client("qpeterson", 60)}
+    spoke = _Spoke(states, clients, _AGENTS)
+    inst = StaleClientReclone(spoke, tmp_path)
+    inst._missing_since["90046"] = time.time() - _NEVER_REPORTED_GRACE_S - 60
+    _run(inst._sweep())
+    assert spoke.control_plane.sent == []
+    assert "90046" not in inst._missing_since
 
 
 def test_vm_not_running_is_not_touched_regardless_of_staleness(tmp_path):

@@ -33,11 +33,12 @@ every sweep. Per-vmid trigger timestamps are persisted to disk (survives a
 spoke restart, unlike an in-memory dict) so this can't reset to "act
 immediately" right after a restart mid-settle-window.
 
-Only acts on a client that HAS reported before and then went silent — a VM
-whose client has NEVER reported (no registry entry at all) is a DIFFERENT
-problem (see CS_GET_SIM_TAG_HEALTH's "no_client_matches_vm_name" — usually a
-hostname/clone-rename mismatch, which hostname_audit_and_restamp already
-owns) and must not be reclone-looped by this check too.
+Only acts on a client that HAS reported before and then went silent, AND on a
+VM whose client has NEVER reported once it has been running-yet-silent past the
+(longer) grace window — both are "the sim isn't running in this VM, rebuild it".
+The never-reported path is correlation-gated (it only fires when some OTHER VM's
+client IS reporting, proving the VM-name↔hostname match works) and rate-capped,
+so a fleet-wide telemetry hiccup or a global name-mismatch can't mass-reclone.
 """
 import asyncio
 import json
@@ -56,8 +57,22 @@ _RECLONE_COOLDOWN_S = 40 * 60.0   # after triggering, don't re-trigger the SAME
                                   # vmid for this long — covers auto-prov's own
                                   # post-clone settle+reboot window plus margin
                                   # for the fresh client's first heartbeat
+# A running sim VM whose client has NEVER checked into the API (no registry row,
+# or a row that never got a last_seen) is a DEAD clone — the sim never came up.
+# We reclone it too, but only after it has been observed running-yet-silent for
+# this GRACE window (longer than the silent-client threshold: a fresh clone gets
+# its full auto-prov settle+reboot window AND first-heartbeat margin before we
+# assume it's dead). Persisted per-vmid so a spoke restart can't reset the clock
+# to "act immediately". Gated on correlation working (some OTHER VM's client IS
+# reporting) so a fleet-wide telemetry/name-mismatch glitch can't mass-reclone.
+_NEVER_REPORTED_GRACE_S = 45 * 60.0
+# Safety cap: at most this many NEVER-reported VMs recloned per sweep, so even if
+# the correlation gate is somehow satisfied during a partial outage we bleed off
+# dead VMs slowly instead of destroying the whole pool in one tick.
+_NEVER_REPORTED_MAX_PER_SWEEP = 3
 _VMID_FLOOR = 90000
 _STATE_FILE = "stale_client_reclone.json"
+_MISSING_STATE_FILE = "stale_client_reclone_missing.json"
 
 
 class StaleClientReclone:
@@ -68,7 +83,10 @@ class StaleClientReclone:
     def __init__(self, spoke, data_dir: Path):
         self.spoke = spoke
         self._path = Path(data_dir) / _STATE_FILE
-        self._triggered: Dict[str, float] = self._load()
+        self._missing_path = Path(data_dir) / _MISSING_STATE_FILE
+        self._triggered: Dict[str, float] = self._load(self._path)
+        # {vmid: epoch we FIRST saw this running sim VM with no reporting client}
+        self._missing_since: Dict[str, float] = self._load(self._missing_path)
         self._task = None
 
     def start(self) -> None:
@@ -79,10 +97,10 @@ class StaleClientReclone:
         except RuntimeError:
             pass  # no current event loop
 
-    def _load(self) -> Dict[str, float]:
+    def _load(self, path: Path) -> Dict[str, float]:
         try:
-            if self._path.exists():
-                d = json.loads(self._path.read_text())
+            if path.exists():
+                d = json.loads(path.read_text())
                 if isinstance(d, dict):
                     return {str(k): float(v) for k, v in d.items()}
         except Exception:  # noqa: BLE001
@@ -94,6 +112,12 @@ class StaleClientReclone:
             self._path.write_text(json.dumps(self._triggered))
         except Exception as e:  # noqa: BLE001
             logger.debug("stale-client-reclone: state save failed: %s", e)
+
+    def _save_missing(self) -> None:
+        try:
+            self._missing_path.write_text(json.dumps(self._missing_since))
+        except Exception as e:  # noqa: BLE001
+            logger.debug("stale-client-reclone: missing-state save failed: %s", e)
 
     async def _loop(self) -> None:
         while True:
@@ -132,6 +156,14 @@ class StaleClientReclone:
             pass
         now = time.time()
         dirty = False
+        missing_dirty = False
+
+        # ── Pass 1: collect the running sim VMs on CONNECTED hosts. ──────────
+        # (vid, name, hn, agent_id, last_seen) per VM; also count how many have a
+        # client that HAS reported (ls>0) — proof the VM-name↔client-hostname
+        # correlation is working, which gates the never-reported reclone below.
+        candidates = []
+        reporting_count = 0
         for hn, st in states.items():
             agent_id = by_host.get(hn)
             if not agent_id:
@@ -153,27 +185,79 @@ class StaleClientReclone:
                     ls = float((cl or {}).get("last_seen") or 0)
                 except (TypeError, ValueError):
                     ls = 0.0
-                if not ls:
-                    continue  # never reported at all — a different problem
-                             # (hostname/rename mismatch), not this loop's job
-                age = now - ls
-                if age < _STALE_RECLONE_S:
-                    continue
+                if ls > 0:
+                    reporting_count += 1
+                candidates.append((vid, name, hn, agent_id, ls))
+
+        seen_vids = {str(v[0]) for v in candidates}
+
+        async def _reclone(vid, name, hn, agent_id, reason):
+            nonlocal dirty
+            self._triggered[str(vid)] = now
+            dirty = True
+            logger.warning("stale-client-reclone: VM %s (%s) on %s %s — reclone",
+                           vid, name, hn, reason)
+            try:
+                await cp.send_to_agent("reclone_vm", {"vmid": vid},
+                                       agent_id=agent_id, timeout=60.0)
+            except Exception as e:  # noqa: BLE001 — one failed dispatch must not
+                                     # stop the sweep covering other VMs
+                logger.warning("stale-client-reclone: reclone dispatch for "
+                               "VM %s failed: %s", vid, e)
+
+        # ── Pass 2a: clients that REPORTED then went silent (existing path). ─
+        never_reported = []
+        for vid, name, hn, agent_id, ls in candidates:
+            key = str(vid)
+            if ls <= 0:
+                never_reported.append((vid, name, hn, agent_id))
+                continue
+            # Reported at least once → not a "never checked in" case; clear any
+            # missing-clock it may have carried before its first heartbeat.
+            if key in self._missing_since:
+                self._missing_since.pop(key, None)
+                missing_dirty = True
+            age = now - ls
+            if age < _STALE_RECLONE_S:
+                continue
+            if (now - self._triggered.get(key, 0.0)) < _RECLONE_COOLDOWN_S:
+                continue
+            await _reclone(vid, name, hn, agent_id,
+                           "running but client silent %.0fs (> %.0fs)"
+                           % (age, _STALE_RECLONE_S))
+
+        # ── Pass 2b: VMs whose client NEVER checked in (the VM/client gap). ──
+        # Correlation gate: only act when SOME VM's client is reporting, so a
+        # fleet-wide telemetry glitch (every match fails at once) can't wipe the
+        # pool. Each dead VM must persist running-yet-silent for the grace window
+        # (tracked per-vmid, survives restart) before we assume it's dead.
+        if never_reported and reporting_count > 0:
+            fired = 0
+            for vid, name, hn, agent_id in never_reported:
                 key = str(vid)
-                last_trig = self._triggered.get(key, 0.0)
-                if (now - last_trig) < _RECLONE_COOLDOWN_S:
+                first = self._missing_since.get(key)
+                if first is None:
+                    self._missing_since[key] = now
+                    missing_dirty = True
+                    continue                       # start the clock; act later
+                if (now - first) < _NEVER_REPORTED_GRACE_S:
                     continue
-                logger.warning(
-                    "stale-client-reclone: VM %s (%s) on %s running but client "
-                    "silent %.0fs (> %.0fs) — reclone", vid, name, hn, age, _STALE_RECLONE_S)
-                self._triggered[key] = now
-                dirty = True
-                try:
-                    await cp.send_to_agent("reclone_vm", {"vmid": vid},
-                                           agent_id=agent_id, timeout=60.0)
-                except Exception as e:  # noqa: BLE001 — one failed dispatch must
-                                         # not stop the sweep covering other VMs
-                    logger.warning("stale-client-reclone: reclone dispatch for "
-                                   "VM %s failed: %s", vid, e)
+                if (now - self._triggered.get(key, 0.0)) < _RECLONE_COOLDOWN_S:
+                    continue
+                if fired >= _NEVER_REPORTED_MAX_PER_SWEEP:
+                    break                          # bleed off slowly, never storm
+                fired += 1
+                await _reclone(vid, name, hn, agent_id,
+                               "running but client NEVER checked in for %.0fs (> %.0fs)"
+                               % (now - first, _NEVER_REPORTED_GRACE_S))
+
+        # Prune missing-clocks for VMs no longer present (deleted/recloned/stopped)
+        # so the map can't grow without bound.
+        for gone in [k for k in self._missing_since if k not in seen_vids]:
+            self._missing_since.pop(gone, None)
+            missing_dirty = True
+
         if dirty:
             self._save()
+        if missing_dirty:
+            self._save_missing()
