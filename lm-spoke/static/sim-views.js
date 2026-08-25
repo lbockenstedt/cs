@@ -15,7 +15,7 @@
  * sim-views.js — Native Client-Sim (Simulations) views for the LM hub.
  *
  * Replaces the former <iframe src="/sim"> integration. The 7 Simulations
- * sub-nav tabs (Simulations / Clients / Central / VM Server / API Server /
+ * sub-nav tabs (Simulations / Clients / Central / VM Server /
  * Config / Setup) are rendered inline into #cs-content by loadCSData(), the
  * same way opnsense/ldap/netbox render into their #*-content containers.
  *
@@ -36,43 +36,6 @@
 /* ---------------------------------------------------------------------------
  * Shared helpers
  * ------------------------------------------------------------------------- */
-
-// ── pollManager fallback shim ───────────────────────────────────────────────
-// The lm hub defines pollManager in WebUI/main.js (visibility-aware recurring
-// timers: every registered poll suspends while the tab is hidden and resumes
-// with an immediate tick when it becomes visible again). The cs LOCAL
-// dashboard does not load lm's main.js, so provide a minimal compatible
-// implementation here; if a real pollManager already exists (hub context),
-// reuse it.
-const pollManager = window.pollManager || (() => {
-    const polls = new Map();   // id -> { fn, ms, timer }
-    let seq = 0;
-    const start = p => { if (p.timer == null) p.timer = setInterval(p.fn, p.ms); };
-    const stop = p => { if (p.timer != null) { clearInterval(p.timer); p.timer = null; } };
-    document.addEventListener('visibilitychange', () => {
-        if (document.hidden) {
-            polls.forEach(stop);
-        } else {
-            polls.forEach(p => {
-                try { p.fn(); } catch (e) { console.error('pollManager: resume tick failed', e); }
-                start(p);
-            });
-        }
-    });
-    return {
-        register(fn, ms) {
-            const id = ++seq;
-            const p = { fn, ms, timer: null };
-            polls.set(id, p);
-            if (!document.hidden) start(p);
-            return id;
-        },
-        unregister(id) {
-            const p = polls.get(id);
-            if (p) { stop(p); polls.delete(id); }
-        },
-    };
-})();
 
 function csEl(id) { return document.getElementById(id); }
 
@@ -213,6 +176,10 @@ async function csFetch(path, opts = {}) {
     const res = await fetch(url, { ...opts, headers });
     if (res.status === 401) { handleSessionExpired(); throw new Error('Session expired'); }
     if (res.status === 404) throw new Error('Not implemented (404)');
+    // Hub PROTECTING (503, /sim + /aggregate are shed under protect): serve the
+    // last-good cached response for this GET so the Simulations view shows STALE
+    // data instead of blanking with a "backing off" error. Reads only — a
+    // mutation still surfaces the 503 so the operator knows it didn't apply.
     const _method = (opts.method || 'GET').toUpperCase();
     if (res.status === 503 && _method === 'GET' && _csLastGood[url] !== undefined) {
         window.__csServingStale = true;
@@ -230,6 +197,8 @@ async function csFetch(path, opts = {}) {
     }
     const ct = res.headers.get('content-type') || '';
     const _data = ct.includes('application/json') ? await res.json() : await res.text();
+    // Cache successful GET reads so a subsequent protect-shed (503) can serve the
+    // last-good instead of blanking the view. Bounded by the (small) set of sim URLs.
     if (_method === 'GET') { _csLastGood[url] = _data; window.__csServingStale = false; }
     return _data;
 }
@@ -252,7 +221,6 @@ const SIM_ROUTES = {
     csRenderCentral:             { m: 'GET',    p: '/aggregate/central-status',                  api: 'get_central_status' },
     csRenderCentralAlerts:       { m: 'GET',    p: '/aggregate/central',                         api: 'get_central' },
     csRenderCentralClients:      { m: 'GET',    p: '/aggregate/central',                         api: 'get_central' },
-    csRenderApiServer:           { m: 'GET',    p: '/aggregate/api-server',                      api: 'get_api_server' },
     csRenderConfig:              { m: 'GET',    p: '/aggregate/proxmox',                         api: 'get_proxmox' },          // PVE info on Config tab
     csSaveConfigPush:            { m: 'POST',   p: '/aggregate/config-push',                     api: 'config_push' },
     csVmLoad:                    { m: 'GET',    p: '/aggregate/proxmox',                         api: 'get_proxmox' },
@@ -267,8 +235,7 @@ const SIM_ROUTES = {
     csSaveCentralSites:          { m: 'POST',   p: '/{tenant}/central-sites-config',             api: 'set_central_sites' },
     csTestCentral:               { m: 'POST',   p: '/{tenant}/test-central',                     api: 'test_central' },
 
-    // ── Mist (Setup → Mist API tab: status + sites / available / test) — MIRROR
-    //    of the Central Setup block, separate product/endpoints. ──
+    // ── Mist (Setup → Mist API tab: status + sites / available / test) — MIRROR ──
     csSimLoadMist:               { m: 'GET',    p: '/aggregate/mist',                            api: 'get_mist' },
     csRenderMist:                { m: 'GET',    p: '/aggregate/mist-status',                     api: 'get_mist_status' },
     csRenderMistAlerts:          { m: 'GET',    p: '/aggregate/mist',                            api: 'get_mist' },
@@ -328,6 +295,8 @@ const SIM_ROUTES = {
 
     // ── Fleet (reclone / auto-provision toggle / update-all) ──
     csFleetReclone:              { m: 'POST',   p: '/{tenant}/fleet-reclone',                    api: 'cs_fleet_reclone' },
+    csFleetRecloneStop:          { m: 'POST',   p: '/{tenant}/fleet-reclone-stop',               api: 'cs_fleet_reclone_stop' },
+    csFleetRecloneClear:         { m: 'POST',   p: '/{tenant}/fleet-reclone-clear',              api: 'cs_fleet_reclone_clear' },
     csToggleAutoProvision:       { m: 'POST',   p: '/{tenant}/toggle-auto-provision',            api: 'cs_toggle_auto_provision' },
     csUpdateAll:                 { m: 'POST',   p: '/{tenant}/update-all',                       api: 'cs_update_all' },
 
@@ -413,6 +382,47 @@ function csOnlineBadge(online) {
         : `<span class="inline-flex items-center gap-1 px-2 py-0.5 rounded-full bg-slate-100 text-slate-500 text-[10px] font-bold uppercase tracking-wider"><span class="w-1.5 h-1.5 rounded-full bg-slate-400"></span>Offline</span>`;
 }
 
+// Host state badge — driven by the host's OWN telemetry freshness (host_online /
+// host_stale / host_age_s, recomputed hub-side per request), not the parent
+// spoke's socket. A fresh agent frame means the whole agent→spoke→hub chain is
+// live, so:
+//   Online  — host_online (fresh frame within the stale window)
+//   Stale   — spoke up but this agent stopped reporting (shut down / hung); age shown
+//   Cached  — no fresh host frame but the spoke's cache is recent (warm-start)
+//   Offline — otherwise
+// Fixes both reported bugs: live hosts wrongly reading "Cached" (spoke_online
+// mis-keyed after a rename) and shut-down hosts stuck on "Online".
+function _csAgeLabel(secs) {
+    if (secs == null) return '';
+    if (secs < 60) return secs + 's';
+    if (secs < 3600) return Math.floor(secs / 60) + 'm';
+    return Math.floor(secs / 3600) + 'h';
+}
+function csHostStateBadge(h) {
+    if (!h) return csOnlineBadge(false);
+    if (h.host_online) {
+        // In contact (fresh frame), but the agent reused a snapshot this tick
+        // because its live collect is failing/timing out — flag the data as stale
+        // so it doesn't read as freshly-accurate (and so a busy/wedged host reads
+        // "online · stale", never "offline while still connected").
+        if (h.telemetry_stale) {
+            return `<span class="inline-flex items-center gap-1 px-2 py-0.5 rounded-full bg-amber-100 text-amber-700 text-[10px] font-bold uppercase tracking-wider" title="Connected — but the agent's live collect is failing/timing out, so VM/node data is a reused snapshot"><span class="w-1.5 h-1.5 rounded-full bg-amber-500"></span>Online · stale</span>`;
+        }
+        return csOnlineBadge(true);
+    }
+    // Spoke is up but this host's agent frame has gone stale → surface it
+    // distinctly (amber) with the age so a dead/hung agent is obvious.
+    if (h.host_stale && h.spoke_online) {
+        const age = _csAgeLabel(h.host_age_s);
+        return `<span class="inline-flex items-center gap-1 px-2 py-0.5 rounded-full bg-amber-100 text-amber-700 text-[10px] font-bold uppercase tracking-wider" title="Agent last reported ${age ? age + ' ago' : 'a while ago'} — spoke is up but this host stopped sending telemetry"><span class="w-1.5 h-1.5 rounded-full bg-amber-500"></span>Stale${age ? ' · ' + csEscape(age) : ''}</span>`;
+    }
+    if (h.cache_fresh) {
+        const age = (h.cache_age_s != null) ? Math.floor(h.cache_age_s / 60) + 'm' : '';
+        return `<span class="inline-flex items-center gap-1 px-2 py-0.5 rounded-full bg-sky-100 text-sky-700 text-[10px] font-bold uppercase tracking-wider" title="Live connection down — showing cached data ${age ? '(' + csEscape(String(age)) + ' old)' : ''}"><span class="w-1.5 h-1.5 rounded-full bg-sky-400"></span>Cached</span>`;
+    }
+    return csOnlineBadge(false);
+}
+
 // Backpressure badge for a spoke tile (and, contextually, the clients it owns).
 // Reads the hub's per-spoke throttle level from the shared status metrics stash
 // (window.__lmHubMetrics, populated by main.js updateStatus). Defensive: returns
@@ -422,8 +432,8 @@ function csThrottleBadge(spokeId) {
     try {
         const bp = (window.__lmHubMetrics || {}).backpressure || {};
         const lvl = (bp.spoke_levels || {})[spokeId] || 0;
-        if (lvl === 1) return `<span class="inline-flex items-center gap-1 px-2 py-0.5 rounded-full bg-red-100 text-red-700 text-[10px] font-bold uppercase tracking-wider animate-pulse" title="Offending — over its message rate; coalescing updates locally at the hub's request">\u26a0 Offending</span>`;
-        if (lvl >= 2) return `<span class="inline-flex items-center gap-1 px-2 py-0.5 rounded-full bg-orange-100 text-orange-700 text-[10px] font-bold uppercase tracking-wider" title="Throttled — fleet-wide slow-down active; coalescing updates locally">\u23f3 Throttled</span>`;
+        if (lvl === 1) return `<span class="inline-flex items-center gap-1 px-2 py-0.5 rounded-full bg-red-100 text-red-700 text-[10px] font-bold uppercase tracking-wider animate-pulse" title="Offending — over its message rate; coalescing updates locally at the hub's request">⚠ Offending</span>`;
+        if (lvl >= 2) return `<span class="inline-flex items-center gap-1 px-2 py-0.5 rounded-full bg-orange-100 text-orange-700 text-[10px] font-bold uppercase tracking-wider" title="Throttled — fleet-wide slow-down active; coalescing updates locally">⏳ Throttled</span>`;
     } catch (e) { /* metrics not available — no badge */ }
     return '';
 }
@@ -560,13 +570,15 @@ function csAutoRefreshControl() {
 const CS_NO_REFRESH = new Set([
     'Setup::Proxmox',   // Proxmox hypervisor config — manual Refresh only
     // Config form editors are manual-refresh only (a telemetry-driven rebuild
-    // would stomp a half-edited form). Listed per child so Config::Quota State
+    // would stomp a half-edited form). Listed per child so Config::Engine State
     // — a live ledger view, not a form — is NOT here and auto-refreshes.
-    'Config::Sim Quotas',    // Sim Quotas editor — manual Refresh only
-    'Config::PXMX Sites',    // PXMX site assignments — manual Refresh only
+    'Config::Engine',        // Engine Config (sim quotas) editor — manual Refresh only
+    'Config::Sites',         // PXMX site assignments — manual Refresh only
     'Config::Config Editor', // raw config editor — manual Refresh only
-    'Sim Quotas',       // spoke sibling tab (dashboard.html TAB_RENDERERS) — manual Refresh only (form-heavy).
-    'PXMX Sites',       // spoke sibling tab (dashboard.html TAB_RENDERERS) — manual Refresh only (form-heavy).
+    'VM Server::Command Queue', // loads serve from the cached CS_TELEMETRY
+                                // command_queue (instant); kept manual-refresh so
+                                // a busy spoke's live=1 re-fetch after a mutation
+                                // can't loop the telemetry auto-refresh.
 ]);
 
 function connectCSWebSocket() {
@@ -577,11 +589,107 @@ function connectCSWebSocket() {
         csWs = new WebSocket(`${proto}//${location.host}/sim/ws`);
         csWs.onmessage = (ev) => {
             let m; try { m = JSON.parse(ev.data); } catch (e) { console.error('connectCSWebSocket: non-JSON telemetry frame ignored', e); return; }
-            if (m && (m.type === 'telemetry' || m.type === 'aruba_update')) csWsRefresh();
+            if (m && m.type === 'cs_progress') { csHandleLiveOp(m.data || {}); return; }
+            if (m && (m.type === 'telemetry' || m.type === 'aruba_update')) {
+                // Warm-start: if VM Server was showing STALE cached data, a fresh
+                // telemetry frame means the spoke/agent reconnected — refresh once
+                // to swap in live data + clear the "cached data" notice, even when
+                // the auto-refresh knob is off (one-shot, not per-frame churn).
+                if (window._csVmHadStale && typeof currentSubView !== 'undefined' && currentSubView === 'VM Server') {
+                    window._csVmHadStale = false;
+                    csVmTableRefreshSoon();
+                }
+                csWsRefresh();
+            }
         };
         csWs.onclose = () => { csWs = null; scheduleCSReconnect(); };
         csWs.onerror = () => { try { csWs && csWs.close(); } catch (e) { console.error('connectCSWebSocket: error closing ws on onerror', e); } };
     } catch (e) { console.error('connectCSWebSocket: ws open failed, scheduling reconnect', e); csWs = null; scheduleCSReconnect(); }
+}
+
+// ── Realtime operations feed (per-VM reclone/provision/delete/clone phases) ──
+// Fed by CS_PROGRESS events broadcast over /sim/ws (hub main.py). Each event is
+// {cs_cmd_id, action, status, step, pct, vmid, message}. We keep a live map keyed
+// by VM and render a compact feed; entries auto-expire ~12s after their last
+// update (an op that finishes stops emitting progress), so no terminal is needed.
+window._csLiveOps = window._csLiveOps || {};
+const _CS_OP_LABEL = { reclone_vm: 'Recloning', delete_vm: 'Deleting', clone_lxc: 'Cloning CT', provision_unassigned: 'Provisioning', update_agent: 'Updating' };
+// Actions that change the VM inventory/state shown in the VM Server table — the
+// hub stamps prov_status / prunes a completed delete for exactly these (see
+// main.py _VM_ACTION_STATE). Others (update_agent, …) don't touch the table.
+const _CS_VM_OP_ACTIONS = new Set(['delete_vm', 'reclone_vm', 'clone_lxc', 'provision_unassigned']);
+// Debounced immediate re-fetch of the VM Server table so a live op is reflected
+// within a fetch RTT (the hub overlay already carries the transient state and
+// prunes a completed delete) instead of only on the ≤15s burst cadence. A burst
+// of progress frames coalesces into a single fetch.
+window._csVmRefreshSoonTimer = null;
+function csVmTableRefreshSoon() {
+    if (window._csVmRefreshSoonTimer) return;
+    window._csVmRefreshSoonTimer = setTimeout(async () => {
+        window._csVmRefreshSoonTimer = null;
+        if (typeof currentSubView === 'undefined' || currentSubView !== 'VM Server') return;
+        try { await loadCSData('VM Server', currentSubChild, true); }
+        catch (e) { /* the fast-refresh burst below covers the retry */ }
+    }, 350);
+}
+// Live refresh for the VM Server → Overview in-flight panels (Provisioning now /
+// Fleet Reclone), driven by cs_progress ws frames so the operations-in-flight
+// list stays current within ~1s while an auto-prov or reclone batch runs —
+// without rebuilding the whole Overview (no host-table churn / scroll reset).
+// Debounced to coalesce a burst of frames, and self-sustaining every ~2.5s while
+// work is still in flight (telemetry-driven reclone bars advance between frames).
+window._csOvLiveTimer = null;
+function csOverviewLiveRefresh() {
+    if (typeof currentSubView === 'undefined' || currentSubView !== 'VM Server') return;
+    if (!document.getElementById('cs-autoprov-live')) return;   // Overview not mounted
+    if (window._csOvLiveTimer) return;                          // coalesce frame burst
+    window._csOvLiveTimer = setTimeout(async () => {
+        window._csOvLiveTimer = null;
+        if (!document.getElementById('cs-autoprov-live')) return;
+        try { await csVmLoad(); } catch (e) { return; }
+        if (!document.getElementById('cs-autoprov-live')) return;   // navigated away mid-fetch
+        csAutoProvLivePanel();
+        csFleetRecloneProgress();
+        if (window._csLiveOps && Object.keys(window._csLiveOps).length) setTimeout(csOverviewLiveRefresh, 2500);
+    }, 800);
+}
+function csHandleLiveOp(d) {
+    const key = (d.vmid != null && d.vmid !== '') ? 'vm' + d.vmid : (d.cs_cmd_id || '');
+    if (!key) return;
+    const st = String(d.status || '').toLowerCase();
+    const terminal = (st === 'completed' || st === 'failed');
+    const wasActive = !!window._csLiveOps[key];
+    if (terminal) { delete window._csLiveOps[key]; }
+    else { window._csLiveOps[key] = { vmid: d.vmid, action: d.action, step: d.step, pct: d.pct, ts: Date.now() }; }
+    csRenderLiveOps();
+    if (!window._csLiveOpsTicker) window._csLiveOpsTicker = pollManager.register(csRenderLiveOps, 2000);
+    // Reflect VM-affecting ops in the VM Server TABLE (not just the live-ops
+    // feed): refresh now on a NEW op or a TERMINAL (so a completed delete's row
+    // drops immediately), and keep the sustained burst so intermediate telemetry
+    // keeps flowing while the op runs.
+    if (_CS_VM_OP_ACTIONS.has(d.action) && typeof currentSubView !== 'undefined' && currentSubView === 'VM Server') {
+        if (terminal || !wasActive) csVmTableRefreshSoon();
+        // On the Overview child, keep the in-flight panels (Provisioning now /
+        // Fleet Reclone) live per-frame with a cheap targeted refresh instead of
+        // the heavy full-page burst (which would churn the host table + reset the
+        // panel's scroll). The VM table child keeps the sustained burst.
+        if (document.getElementById('cs-autoprov-live')) csOverviewLiveRefresh();
+        else csVmOpFastRefresh();
+    }
+}
+function csRenderLiveOps() {
+    const el = document.getElementById('cs-live-ops');
+    if (!el) return;
+    const now = Date.now();
+    Object.keys(window._csLiveOps).forEach(k => { if (now - window._csLiveOps[k].ts > 12000) delete window._csLiveOps[k]; });
+    const ops = Object.values(window._csLiveOps).sort((a, b) => (Number(a.vmid) || 0) - (Number(b.vmid) || 0));
+    if (!ops.length) { el.innerHTML = ''; return; }
+    el.innerHTML = `<div class="hpe-card rounded-lg p-5 shadow-sm">
+      <p class="text-sm font-bold text-slate-500 uppercase tracking-wider mb-2">Live operations <span class="text-slate-400 font-normal normal-case">(${ops.length} active)</span></p>
+      <div class="space-y-1 max-h-48 overflow-y-auto">${ops.map(o => `<div class="flex items-center justify-between gap-2 text-xs py-0.5 border-b border-slate-100 last:border-0">
+        <span class="font-mono text-slate-600">${csEscape(_CS_OP_LABEL[o.action] || o.action || 'op')} · VM ${csEscape(String(o.vmid != null ? o.vmid : '—'))}</span>
+        <span class="px-2 py-0.5 rounded-full bg-sky-100 text-sky-700 font-bold uppercase tracking-wider text-[10px]"><span class="animate-spin inline-block w-2 h-2 rounded-full border-2 border-sky-500 border-t-transparent align-middle mr-1"></span>${csEscape(o.step || 'working')}${o.pct != null ? ' ' + o.pct + '%' : ''}</span>
+      </div>`).join('')}</div></div>`;
 }
 
 function scheduleCSReconnect() {
@@ -648,12 +756,12 @@ function csWsRefresh() {
         // page) — skip this cycle and let the next telemetry pulse (~10s
         // later, debounced above) retry once the user is done.
         if (csUserIsEditing()) return;
-        csLastAutoRefreshAt = Date.now();
         // Mark the refresh cycle in flight so csSet's innerHTML replace also
         // bails if the user focuses a field DURING a renderer's awaited fetch
         // (the pre-check above can't see that). Cleared in finally so a
         // thrown renderer still resets the gate.
         csRefreshInFlight = true;
+        csLastAutoRefreshAt = Date.now();
         loadCSData(currentSubView, currentSubChild, true).finally(
             () => { csRefreshInFlight = false; });
     }, 1500);
@@ -691,11 +799,11 @@ async function loadCSData(subMenu, child, force) {
                 case 'Central':     await csRenderCentral(force); break;
                 case 'Central On-Prem': await csRenderCentralOnPrem(force); break;
                 case 'Mist':        await csRenderMist(force); break;
-                case 'API Server':  await csRenderApiServer(force); break;
                 case 'Config':      await csRenderConfigSimulation(force); break;
                 case 'Setup':       await csRenderSetup(force); break;
                 case 'VM Server':   await csRenderVmServer(force); break;
                 case 'Spoke Management': await csRenderSpokeManagement(force); break;
+                case 'Assistant':   await csRenderAssistant(force); break;
                 default:            csSet(csEmpty('Unknown Simulations view.'));
             }
         }
@@ -719,7 +827,7 @@ function csChildPlaceholder(primary, child) {
     csSet(`<div class="max-w-2xl mx-auto mt-10">
         <div class="hpe-card rounded-lg p-8 shadow-sm text-center">
             <div class="text-3xl mb-3">🚧</div>
-            <h3 class="text-lg font-bold text-slate-700 mb-1">${csEscape(primary)} · ${csEscape(child)} ${helpIcon('cs', null, 'Simulations help')}</h3>
+            <h3 class="text-lg font-bold text-[#263040] mb-1">${csEscape(primary)} · ${csEscape(child)} ${helpIcon('cs', null, 'Simulations help')}</h3>
             <p class="text-sm text-slate-500">This section is part of the ongoing webui-hub → cs module port and will be populated in a coming wave. The structure is in place so the navigation matches the original.</p>
         </div>
     </div>`);
@@ -742,9 +850,9 @@ async function csSimLoadCentral() {
         'The /sim/api/aggregate/central endpoint is not wired in the backend yet (UI-first phase).')); return null; }
 }
 
-// Mist aggregate (MIRROR of csSimLoadCentral — separate product/endpoint). Used
-// by the dashboard tiles that read s.mist_status the way Central tiles read
-// s.central_status.
+// MIRROR of csSimLoadCentral — the Dashboard Checks/Hardware/Client-Count tiles
+// call this to read s.mist_status (the per-spoke Mist status block). Separate
+// product; never shares Central's fetch or cache.
 async function csSimLoadMist() {
     try { return await csFetch(`/aggregate/mist?tenant_id=${csTenant()}`) || {}; }
     catch (e) { console.error('csSimLoadMist: aggregate/mist fetch failed', e); return null; }
@@ -796,11 +904,21 @@ window.csKillSwitchMountChip = async function (elId) {
         el.innerHTML = `<span class="text-[10px] normal-case tracking-normal text-slate-400">Kill switch: spoke offline</span>`;
         return;
     }
-    el.innerHTML = ks
+    const ksBtn = ks
         ? `<button onclick="csToggleKillSwitch(false)" title="Simulations halted — click to resume"
              class="normal-case tracking-normal bg-red-600 hover:bg-red-700 text-white px-3 py-1 rounded-md text-xs font-bold">▶ Resume Sims</button>`
         : `<button onclick="csToggleKillSwitch(true)" title="Emergency stop all simulations on this tenant"
              class="normal-case tracking-normal bg-white hover:bg-red-50 text-red-600 border border-red-300 px-3 py-1 rounded-md text-xs font-bold">⛔ Emergency Stop</button>`;
+    // Purge Clients lives next to the Emergency Stop chip in this same strip,
+    // sized identically to it (px-3 py-1 rounded-md text-xs font-bold, outline
+    // red). Shown only on the Clients child strip — purge is client-specific.
+    // Moved here from the csRenderClients toolbar so the destructive action sits
+    // with the other emergency control at the top of the view.
+    const purgeBtn = (typeof currentSubView !== 'undefined' && currentSubView === 'Clients')
+        ? `<button id="cs-purge-clients-btn" onclick="csPurgeClients(this)" title="Remove all client records from memory and disk"
+             class="normal-case tracking-normal bg-white hover:bg-red-50 text-red-600 border border-red-300 px-3 py-1 rounded-md text-xs font-bold">🗑 Purge Clients</button>`
+        : '';
+    el.innerHTML = ksBtn + purgeBtn;
 };
 
 // (A) Alert / (I) Insight tag for a check row, from the tenant's monitored_checks
@@ -852,7 +970,7 @@ async function csRenderSimulations() {
     const ids = Array.from(checkIds).sort();
     csSetToolbar(`<input id="cs-sim-q" oninput="csSimChecksFilterKey()" placeholder="Filter by site or check…" class="bg-white border border-slate-300 rounded-md px-3 py-1.5 text-sm outline-none focus:ring-2 focus:ring-green-500 w-72">
       <select id="cs-sim-bucket" onchange="csSimChecksFilter()" class="bg-white border border-slate-300 rounded-md px-3 py-1.5 text-sm outline-none focus:ring-2 focus:ring-green-500">
-        <option value="">All buckets</option><option value="failing">Failing</option><option value="warning">Warning</option><option value="functional">Functional</option><option value="unknown">Unknown</option>
+        <option value="">All statuses</option><option value="failing">Failing</option><option value="warning">Warning</option><option value="functional">Functional</option><option value="unknown">Unknown</option>
       </select>`);
     const pills = csSummaryRow([[spokes.length, 'Spokes'], [ids.length, 'Checks'], [bf, 'Failing'], [bw, 'Warning']]);
     // Build a flat row per (spoke, site, check) for filtering.
@@ -917,7 +1035,11 @@ function csPct(v) {
     return `<span class="${col} font-semibold text-xs" title="${v}% of polls OK">${n}%</span>`;
 }
 
-// ── Per-check 30-day health strip (green/yellow/red), full-width thin bar ─────
+// ── Per-check 30-day health strip (green/yellow/red) ─────────────────────────
+// Full-width, thin daily bar rendered on its own row under each check. One
+// segment per day, colored by the WORST status seen that day; the per-day title
+// shows the green/yellow/red counts. Hovering a day pops the hourly breakdown
+// (lazy-fetched once per check). Data from GET /aggregate/central-health.
 // Share of FAILING probes in a bucket at or above which the segment goes red.
 // Below it a failure is a WARNING: one bad probe in a busy cycle is noise, and
 // painting the whole day red for it made the 30-day strip a wall of red that
@@ -966,7 +1088,10 @@ function csHealthBar(daily, site, check) {
         return `<div class="cs-hbar-seg" style="flex:1 1 0;background:${csHealthSegColor(d)};cursor:pointer"
                      data-day="${d.d}" title="${csEscape(t)}"></div>`;
     }).join('');
-    return `<div class="cs-hbar flex gap-px h-2 rounded overflow-hidden w-full" data-site="${csEscape(site)}" data-check="${csEscape(check)}" onmouseover="csHealthHover(event)" onmouseleave="csHealthHoverOut()" title="30-day health — hover a day for the hourly breakdown">${padHtml}${segs}</div>`;
+    return `<div class="cs-hbar flex gap-px h-2 rounded overflow-hidden w-full"
+                 data-site="${csEscape(site)}" data-check="${csEscape(check)}"
+                 onmouseover="csHealthHover(event)" onmouseleave="csHealthHoverOut()"
+                 title="30-day health — hover a day for the hourly breakdown">${padHtml}${segs}</div>`;
 }
 
 async function csHealthLoadHourly(site, check) {
@@ -1474,11 +1599,9 @@ function csLastSeenAgo(v) {
     if (isNaN(ms)) return { text: String(v), mins: null };
     if (ms < 1e11) ms *= 1000;
     const mins = Math.max(0, Math.floor((Date.now() - ms) / 60000));
-    let text;
-    if (mins < 1) text = 'just now';
-    else if (mins < 60) text = `${mins} min${mins === 1 ? '' : 's'} ago`;
-    else { const h = Math.floor(mins / 60), m = mins % 60; text = `${h}h${m ? ' ' + m + 'm' : ''} ago`; }
-    return { text, mins };
+    // Decimal hours (can be < 1, e.g. "0.23 hrs"); red when > 0.5 h (mins > 30).
+    const hrs = Math.max(0, (Date.now() - ms) / 3600000);
+    return { text: `${hrs.toFixed(2)} hrs`, mins };
 }
 
 // Compact inline stat row — "<b>N</b> Label <b>N</b> Label …" — the overview
@@ -1503,9 +1626,7 @@ let csClientTier = 'all'; // 'all' | 't1' | 't2' | 't3' | 'offline'
 // Instead of one flat table of every client, the Clients tab summarizes by
 // Simulation, then drills Simulation → Tier → Site → the client list, with a
 // name/IP/MAC search that works at any level. Each facet is a chip row whose
-// counts reflect the OTHER active facets (standard faceted counting). Ported
-// from lm/WebUI/sim-views.js — the spoke's own /aggregate/clients route
-// supports this the same way the hub's aggregation does.
+// counts reflect the OTHER active facets (standard faceted counting).
 let csFacet = { sim: null, tier: null, site: null, notWorking: null };
 
 // "Not working" = the Clients::Offline tab's filter. Matches _fleet_health's
@@ -1674,12 +1795,13 @@ function csRenderClientsFaceted() {
     csRenderClientRows(shown, 'cs-client-rows');
 }
 
-// Tier by PASSTHROUGH (authoritative, from the agent's compute_vm_tiers):
-// T2 = USB dongle passthrough; T1/T3 = PCI passthrough (T1=physical/1912:0015,
-// T3=configured PCI vid:pid). Prefer the agent-computed c.tier; fall back to the
-// has_usb signal (T2/T1) when the agent hasn't classified this VM.
+// T1 = no USB passthrough; T2 = USB dongle passthrough (reclone bus / has_usb).
+// Mirrors webui-hub classifyClient (app.js:2275). Falls back to t1 when no signal.
 function csClassifyClient(c) {
     if (!c) return 't1';
+    // Tier by PASSTHROUGH (authoritative, from the agent's compute_vm_tiers):
+    // T2 = USB dongle; T1/T3 = PCI passthrough. Prefer the agent-computed
+    // c.tier; fall back to has_usb (T2/T1) when the VM wasn't classified.
     if (c.tier === 't1' || c.tier === 't2' || c.tier === 't3') return c.tier;
     if (c.has_usb === true) return 't2';
     if (c.has_usb === false) return 't1';
@@ -1709,12 +1831,13 @@ async function csRenderClients(tier) {
       <select id="cs-client-status" onchange="csClientResetPage()" class="bg-white border border-slate-300 rounded-md px-3 py-1.5 text-sm outline-none focus:ring-2 focus:ring-green-500">
         <option value="">All</option><option value="online">Online</option><option value="offline">Offline</option>
       </select>
-      <button id="cs-purge-clients-btn" onclick="csPurgeClients(this)" title="Remove all client records from memory and disk" class="ml-auto bg-white border border-red-300 text-red-600 hover:bg-red-50 rounded-md px-3 py-1.5 text-sm font-semibold">🗑 Purge Clients</button>
-      <button id="cs-clear-all-overrides-btn" onclick="csClearAllOverrides(this)" title="Clear EVERY override layer /api/config bakes into [username] — the per-client registry overrides AND any active demo scenarios (the failure-flag source that survives a registry-only clear) — for every client, then re-fetch each client's local simulation.conf" class="bg-white border border-amber-300 text-amber-700 hover:bg-amber-50 rounded-md px-3 py-1.5 text-sm font-semibold">✕ Clear All Overrides</button>`);
+      <button id="cs-clear-all-overrides-btn" onclick="csClearAllOverrides(this)" title="Clear EVERY override layer /api/config bakes into [username] — the per-client registry overrides AND any active demo scenarios (the failure-flag source that survives a registry-only clear) — for every client, then re-fetch each client's local simulation.conf" class="ml-auto bg-white border border-amber-300 text-amber-700 hover:bg-amber-50 rounded-md px-3 py-1.5 text-sm font-semibold">✕ Clear All Overrides</button>`);
     // Initial load: fan out the clients fetch and the demo card together.
-    // /aggregate/clients is a fast spoke cache read, but csDemoCard() does two
-    // relay round-trips (/demo/active + /demo/scenarios) — running them serially
-    // after the cache read made the page feel slow on first access.
+    // /aggregate/clients is a fast hub cache read, but csDemoCard() does two
+    // relay round-trips to the spoke (/demo/active + /demo/scenarios) — running
+    // them serially after the cache read made the page feel slow on first
+    // access. Parallelizing cuts initial paint to max(fast read, relay) instead
+    // of their sum.
     const [data, demoCard] = await Promise.all([
         csFetch(`/aggregate/clients?tenant_id=${csTenant()}`),
         csDemoCard(),
@@ -1804,6 +1927,10 @@ window.csPurgeClients = async function (btn) {
         if (typeof showToast === 'function') showToast(`Purged ${n} client record(s)`, 'success');
         // Re-render the Clients tab so the now-empty list shows immediately.
         await csRenderClients(csClientTier);
+        // The Purge button now lives in the kill-switch chip (secondary nav),
+        // which csRenderClients doesn't touch — re-mount it so the button
+        // resets from its disabled "⏳ Purging…" state.
+        if (typeof window.csKillSwitchMountChip === 'function') window.csKillSwitchMountChip('cs-ks-chip');
     } catch (e) {
         console.error('csPurgeClients: purge failed', e);
         if (typeof showToast === 'function') showToast('Purge failed: ' + (e.message || e), 'error');
@@ -1876,7 +2003,7 @@ function csNormalizeClients(data) {
 // The Fleet Health badge counts RUNNING sim VMs whose client never checked into
 // the API as "not checking in" — but those VMs have NO client row (the payload
 // only carries clients that DID report), so the Clients/Offline view had nothing
-// to list and the count looked like a mystery gap (e.g. 78 shown vs 98 counted).
+// to list and the count looked like a mystery gap (78 shown vs 98 counted).
 // Synthesize a lightweight, clearly-flagged row for each such VM (from
 // fleet_health.not_reporting_names) so it's visible AND verifiable under Offline
 // (never_reported → !online → csClientNotWorking). Deduped against real rows: a
@@ -1902,12 +2029,25 @@ function csMergeNotReporting(rows, fh) {
 
 // Clients render as TWO rows each (ported from webui-hub's client + control-row
 // pair): a data row — no Spoke column — plus a second "sim bar" row of clickable
-// per-simulation override buttons. The original hid the override panel behind a
-// "Control" button; here the sim buttons are always visible inline on line 2,
-// each showing whether that sim is currently running and toggling a per-client
-// override on click. Columns: Hostname, Site, Sim-ID, PHY, OS, Status, Tier,
-// SSID, Last Seen, Errors, Demo.
-const CS_CLIENT_COLS = 11;
+// per-simulation override buttons. Columns: Hostname (with a status dot), Site,
+// SID, PHY, OS, Tier, SSID, Last Seen, Errors, Demo.
+const CS_CLIENT_COLS = 10;
+
+// Status dot shown next to the hostname (replaces the Status column):
+//   green  = online
+//   yellow = offline, last seen < 30 min ago (just dropped)
+//   red    = offline, last seen > 30 min ago (stale)
+function csClientStatusDot(c) {
+    if (c && c.never_reported) {
+        return `<span class="inline-block w-2 h-2 rounded-full bg-red-500 mr-1.5 align-middle" title="Running sim VM that has NEVER checked into the API — dead/silent, a reclone candidate"></span>`;
+    }
+    const ls = csLastSeenAgo(c.last_seen);
+    let color, label;
+    if (c.online) { color = 'bg-green-500'; label = 'Online'; }
+    else if (ls.mins != null && ls.mins > 30) { color = 'bg-red-500'; label = 'Offline > 30 min'; }
+    else { color = 'bg-amber-400'; label = 'Offline < 30 min'; }
+    return `<span class="inline-block w-2 h-2 rounded-full ${color} mr-1.5 align-middle" title="${csEscape(label)}"></span>`;
+}
 // In-guest dongle health flag (agent QGA probe → spoke → hub). Rendered inline
 // by the hostname so a dongle that is USB-present but NOT WORKING (no driver
 // bound, never associated, or associated-but-no-gateway) is visibly flagged —
@@ -1958,13 +2098,12 @@ function csRenderClientRows(rows, targetId) {
         const _demoOn = window._csDemoActive && window._csDemoActive[host];
         const _ls = csLastSeenAgo(c.last_seen);
         const line1 = `<tr class="border-t border-slate-100 ${_demoOn ? 'bg-amber-50' : ''}${c.never_reported ? ' bg-red-50/40' : ''}">
-          <td class="px-4 py-2 font-mono text-xs">${csEscape(host || '—')}${c.dns_ceiling ? `<span class="ml-1 text-[10px] font-semibold text-amber-600" title="Current DNS self-throttle rate (failures/min) the AIMD ratchet settled on for this dongle">DNS≤${csEscape(c.dns_ceiling)}/m</span>` : ''}${csHealthBadge(c)}${c.never_reported ? `<span class="ml-1 text-[10px] font-semibold text-red-600" title="This running sim VM has never checked into the API — dead/silent, a reclone candidate. It has no client record yet.">never checked in${c.vmid ? ` · vm ${csEscape(c.vmid)}` : ''}</span>` : ''}</td>
+          <td class="px-4 py-2 font-mono text-xs whitespace-nowrap">${csClientStatusDot(c)}${csEscape(host || '—')}${c.dns_ceiling ? `<span class="ml-1 text-[10px] font-semibold text-amber-600" title="Current DNS self-throttle rate (failures/min) the AIMD ratchet settled on for this dongle">DNS≤${csEscape(c.dns_ceiling)}/m</span>` : ''}${csHealthBadge(c)}${c.never_reported ? `<span class="ml-1 text-[10px] font-semibold text-red-600" title="This running sim VM has never checked into the API — dead/silent, a reclone candidate. It has no client record yet.">never checked in${c.vmid ? ` · vm ${csEscape(c.vmid)}` : ''}</span>` : ''}</td>
           <td class="px-4 py-2 text-slate-500">${csEscape(cfg.wsite || '—')}</td>
           <td class="px-4 py-2 font-mono text-xs text-slate-500">${csEscape(c.simulation_id || '—')}</td>
           <td class="px-4 py-2 text-slate-500">${csEscape(cfg.sim_phy || '—')}</td>
           <td class="px-4 py-2 text-slate-500">${csEscape(c.platform || c.hw_type || '—')}</td>
-          <td class="px-4 py-2">${csOnlineBadge(c.online)}</td>
-          <td class="px-4 py-2"><span class="text-[10px] font-bold px-2 py-0.5 rounded ${t === 't2' ? 'bg-purple-100 text-purple-700' : t === 't3' ? 'bg-amber-100 text-amber-700' : 'bg-slate-100 text-slate-600'}">${t.toUpperCase()}</span></td>
+          <td class="px-4 py-2 text-xs font-semibold text-slate-600">${t.toUpperCase()}</td>
           <td class="px-4 py-2 text-slate-500">${csEscape(c.connected_ssid || '—')}</td>
           <td class="px-4 py-2 ${c.never_reported ? 'text-red-600 font-bold' : (_ls.mins != null && _ls.mins > 30 ? 'text-red-600 font-bold' : 'text-slate-500')}" title="${csEscape(c.never_reported ? 'Never checked into the API' : csLastSeen(c.last_seen))}">${csEscape(c.never_reported ? 'never' : _ls.text)}</td>
           <td class="px-4 py-2 ${c.error_count > 0 ? 'text-amber-600 font-bold' : 'text-slate-400'}">${csEscape(c.error_count || 0)}</td>
@@ -1981,12 +2120,12 @@ function csRenderClientRows(rows, targetId) {
         return line1 + line2;
     }).join('');
     body.innerHTML = csTable(
-        ['Hostname', 'Site', 'Sim-ID', 'PHY', 'OS', 'Status', 'Tier', 'SSID', 'Last Seen', 'Errors', 'Demo'],
+        ['Name', 'Site', 'SID', 'PHY', 'OS', 'Tier', 'SSID', 'Last Seen', 'Err', 'Demo'],
         rowHtml,
-        // First-pass column widths — wide table (11 cols). Tunable: adjust
-        // these and the header order as needed.
-        { colWidths: ['190px', '90px', '70px', '80px', '90px', '80px', '60px',
-                      '130px', '110px', '70px', '230px'] }
+        // Column widths (10 cols — Status column dropped; status is now a dot by
+        // the hostname). Tunable: adjust these and the header order as needed.
+        { colWidths: ['200px', '90px', '70px', '80px', '90px', '60px',
+                      '216px', '132px', '35px', '300px'] }
     );
     csDemoStartTicker();
 }
@@ -2006,121 +2145,159 @@ function csSimBtnClass(on, isOverride) {
     // faint). The override object is pruned server-side when it matches the
     // bucket default (see ClientRegistry.set_overrides), so an override button
     // only appears for a REAL deviation from the bucket.
+    // HPE-navy (#263040) with a light fill + solid navy border (the "gradient"
+    // treatment, same as the left-menu active items): filled light-navy = default
+    // ON; navy border = override (bold=on / faint=off); slate = default OFF.
     if (isOverride) {
-        return 'px-2 py-0.5 rounded-md text-[11px] font-bold border transition-colors ' +
-            (on ? 'bg-white text-purple-700 border-2 border-purple-500 hover:bg-purple-50'
-                : 'bg-white text-purple-400 border-purple-200 hover:bg-purple-50');
+        return 'px-[0.152rem] py-[0.051rem] rounded text-[12px] font-bold border transition-colors ' +
+            (on ? 'bg-white text-[#263040] border-2 border-[#263040] hover:bg-[#263040]/5'
+                : 'bg-[#263040]/5 text-[#263040]/60 border-[#263040]/40 hover:bg-[#263040]/10');
     }
-    return 'px-2 py-0.5 rounded-md text-[11px] font-bold border transition-colors ' +
-        (on ? 'bg-purple-100 text-purple-700 border-purple-300'
+    return 'px-[0.152rem] py-[0.051rem] rounded text-[12px] font-bold border transition-colors ' +
+        (on ? 'bg-[#263040]/10 text-[#263040] border-[#263040]'
             : 'bg-white text-slate-400 border-slate-200 hover:bg-slate-100');
 }
 
 function csClientSimBar(c, host) {
     const cfg = c.effective_config || c.config || {};
-    const ov = c.overrides || {};
-    // A per-client override WINS (so a set override reflects + stays across
-    // refreshes); otherwise fall back to what the client is actually running.
-    const isOn = f => {
-        if (Object.prototype.hasOwnProperty.call(ov, f))
-            return ['on', 'true', '1'].includes(String(ov[f]).toLowerCase());
-        return ['on', 'true', '1'].includes(String(cfg[f] == null ? '' : cfg[f]).toLowerCase());  // enabled = resolved config (override wins), not active_simulations
-    };
-    // An override button exists iff the registry has an entry for this flag
-    // (the pruned-override object only carries REAL deviations from the bucket,
-    // so this is the signal to render border-only purple).
-    const isOv = f => Object.prototype.hasOwnProperty.call(ov, f);
-    // "Running now" = active_simulations (what the client is actually executing
-    // this cycle). In hub/engine mode ambient + quota sims are runtime-only and
-    // never land in the config, so the config-based on-state shows them OFF —
-    // surface a distinct pulsing-dot + emerald ring for what's live without
-    // changing the enabled=resolved-config button semantics.
-    const runSet = new Set((Array.isArray(c.active_simulations) ? c.active_simulations : [])
+    // "Running now" = the sim the client is ACTUALLY executing this cycle
+    // (active_simulations, from its heartbeat). In hub/engine-driven mode the
+    // ambient + quota-assigned sims are runtime-only (the weighted roll / engine
+    // pick is NEVER written back to the pushed config), so the config-based
+    // "enabled" state below shows them OFF — which is why every client read
+    // "no active simulations". Surface a distinct pulsing-dot + emerald ring for
+    // what's live, WITHOUT touching the deliberate enabled=resolved-config button
+    // semantics (a cleared override still drops off on the next frame).
+    const running = new Set((Array.isArray(c.active_simulations) ? c.active_simulations : [])
         .map(s => String(s).toLowerCase()));
+    // Model A: a button is "on" iff the client's RESOLVED config has the flag on.
+    // Per-user overrides (user-overrides.conf [username]) and the 2h demo are
+    // already folded into that resolved config by the spoke, so this single
+    // source matches exactly what the client is configured to run — a cleared
+    // override drops off as soon as the next telemetry frame lands. There is no
+    // separate registry-override layer to style anymore (isOv = false).
+    const isOn = f =>
+        ['on', 'true', '1'].includes(String(cfg[f] == null ? '' : cfg[f]).toLowerCase());
     const btns = CS_CONTROL_FLAGS.map(f => {
         const on = isOn(f);
-        const ovFlag = isOv(f);
-        const run = runSet.has(String(f).toLowerCase());
+        const ovFlag = false;
+        const run = running.has(String(f).toLowerCase());
         const runDot = run ? '<span class="inline-block w-1.5 h-1.5 rounded-full bg-emerald-500 animate-pulse mr-1 align-middle" title="running now"></span>' : '';
         return `<button data-cs-sim-host="${csEscape(host)}" data-cs-sim-flag="${csEscape(f)}" data-cs-sim-on="${on ? '1' : '0'}" data-cs-sim-ov="${ovFlag ? '1' : '0'}" data-cs-sim-running="${run ? '1' : '0'}"
-          onclick="csSimToggle(this)" title="${ovFlag ? 'Override' : 'Bucket'}: ${csEscape(f)} ${on ? 'on' : 'off'} on ${csEscape(host)}${run ? ' · RUNNING now' : ''} — click to ${on ? 'disable' : 'enable'}"
-          class="${csSimBtnClass(on, ovFlag)}${run ? ' ring-2 ring-emerald-400' : ''}">${runDot}${csEscape(f)}</button>`;
+          onclick="csSimToggle(this)" title="${ovFlag ? 'Override' : 'SID'}: ${csEscape(f)} ${on ? 'on' : 'off'} on ${csEscape(host)}${run ? ' · RUNNING now' : ''} — click to ${on ? 'disable' : 'enable'}"
+          class="${csSimBtnClass(on, ovFlag)}${run ? ' ring-2 ring-emerald-400' : ''} w-full text-center">${runDot}${csEscape(f)}</button>`;
     }).join('');
-    return `<div class="flex flex-wrap items-center gap-1.5">
-      ${btns}
-      <button data-cs-ctl-host="${csEscape(host)}" onclick="csCtlClear(this)"
-        class="ml-2 px-2 py-0.5 rounded-md text-[11px] font-bold bg-red-50 text-red-600 hover:bg-red-100 border border-red-200">Clear</button>
-      <span id="${csEscape(csCtlId(host, 'msg'))}" class="text-[11px] text-slate-400 ml-1"></span>
+    // Uniform-size sim knobs laid out in a 2-ROW grid (columns = half the flag
+    // count, rounded up) so every button is the same width and the set stays
+    // tidy as more simulations are added (it grows into more columns, still 2
+    // rows; overflow-x-auto scrolls if it ever gets very wide). Clear + status
+    // message sit on their own line below.
+    const _simCols = Math.max(1, Math.ceil(CS_CONTROL_FLAGS.length / 2));
+    return `<div class="space-y-1.5">
+      <div class="grid gap-1 overflow-x-auto pb-0.5" style="grid-template-columns: repeat(${_simCols}, minmax(46px, 1fr));">${btns}</div>
+      <div class="flex items-center gap-1.5">
+        <span id="${csEscape(csCtlId(host, 'msg'))}" class="text-[11px] text-slate-400"></span>
+      </div>
+      <div class="flex items-center gap-1.5 pt-1 border-t border-slate-100">
+        <span class="text-[10px] font-bold text-slate-400 uppercase tracking-wider">Debug</span>
+        <select id="${csEscape(csCtlId(host, 'dbglvl'))}" data-cs-debug-host="${csEscape(host)}"
+          class="border border-slate-200 rounded px-1 py-0.5 text-[11px]">
+          <option value="basic">basic</option>
+          <option value="advanced">advanced</option>
+        </select>
+        <button data-cs-debug-host="${csEscape(host)}" data-cs-debug-on="0" onclick="csDebugToggle(this)"
+          title="Stream this client's logs up to the hub for remote troubleshooting (30-min auto-off)"
+          class="bg-slate-100 hover:bg-slate-200 text-slate-600 px-2 py-0.5 rounded text-[11px] font-bold">Enable Debug</button>
+        <button data-cs-debug-host="${csEscape(host)}" onclick="csDebugLogs(this)"
+          title="Open the Client Debug log panel for this host"
+          class="bg-indigo-100 hover:bg-indigo-200 text-indigo-700 px-2 py-0.5 rounded text-[11px] font-bold">View Logs</button>
+      </div>
     </div>`;
 }
 
-// Persist a single flag override into the [username] section of
-// user-overrides.conf (single-flag write; the old csCtlSaveUO bulk panel it
-// mirrored has been removed) so Config/Simulations
-// "User Overrides" reflects the same change. Best-effort: a failure here must
-// NOT undo the runtime registry toggle already sent, so it logs + toasts and
-// never throws.
-async function csPersistFlagToUserOverrides(host, flag, value) {
-    const user = String(host || '').split('-')[0] || host;
-    if (!user) return;
-    try {
-        const cur = await csFetch(`/${csTenant()}/config/user-overrides-conf`);
-        const state = csParseIni((cur && cur.content) || '');
-        const merged = Object.assign({}, state[user] || {});
-        merged[flag] = value;
-        state[user] = merged;
-        let text = '';
-        for (const [u, kv] of Object.entries(state)) {
-            text += `[${u}]\n`;
-            for (const [k, v] of Object.entries(kv)) {
-                if (v === '' || v === null || v === undefined) continue;
-                text += `${k}=${v}\n`;
-            }
-            text += '\n';
-        }
-        await csFetch(`/${csTenant()}/config/user-overrides-conf`,
-            { method: 'PUT', body: JSON.stringify({ content: text.trim() }) });
-    } catch (e) {
-        console.error('csPersistFlagToUserOverrides failed', e);
-        if (typeof showToast === 'function') showToast(`user-overrides save failed: ${e.message || 'error'}`, 'error');
-    }
-}
-
+// ── Per-client sim toggle (model A: per-USER override in user-overrides.conf) ─
+// A single click toggles one sim for the client's USER (username = host minus
+// the trailing -N). The HUB owns the write: cs_set_client_control edits the
+// [username] section of user-overrides.conf, pushes it through the source-of-
+// truth flow, commits+pushes to GitHub when a token is configured, and clears
+// any legacy per-client registry override. No client-side user-overrides mirror
+// is needed here — the dashboard just flips the button and lets the next
+// telemetry frame confirm the resolved config.
 window.csSimToggle = async function (btn) {
     const host = btn.dataset.csSimHost, flag = btn.dataset.csSimFlag;
     if (!host || !flag) return;
     const next = btn.dataset.csSimOn === '1' ? 'off' : 'on';
-    // Set just THIS flag's override — the endpoint merges it into the client's
-    // persisted overrides (registry.set_overrides), so toggling one sim doesn't
-    // disturb the others. Also mirror the flag into user-overrides.conf so the
-    // Config/Simulations "User Overrides" card stays in sync. "Clear" drops all
-    // overrides for the client.
-    //
-    // The spoke PRUNES the override server-side when the new value matches the
-    // pure bucket default (so toggling OFF a sim that's already off by default
-    // reverts to the bucket instead of leaving flag:"off"). The spoke response
-    // carries the post-prune overrides, so we read it back: if `flag` is absent
-    // the override was pruned → the button reverts to the bucket-default style
-    // (border-only OFF / filled ON); if present it's a real override → border-
-    // only purple.
+    const user = String(host || '').split('-')[0] || host;
     csCtlMsg(host, `${next === 'on' ? 'Enabling' : 'Disabling'} ${flag}…`, true);
+    // Optimistic flip; cs_set_client_control patches the hub cache so the next
+    // render already reflects it, and the ~10s telemetry frame is authoritative.
+    const on = (next === 'on');
+    const prevOn = btn.dataset.csSimOn;
+    btn.dataset.csSimOn = on ? '1' : '0';
+    btn.className = csSimBtnClass(on, false) + ' w-full text-center';
     try {
-        const r = await csFetch(`/${csTenant()}/clients/${encodeURIComponent(host)}/control?tenant_id=${csTenant()}`,
+        await csFetch(`/${csTenant()}/clients/${encodeURIComponent(host)}/control?tenant_id=${csTenant()}`,
             { method: 'POST', body: JSON.stringify({ overrides: { [flag]: next } }) });
-        await csPersistFlagToUserOverrides(host, flag, next);
-        const newOv = (r && r.overrides) || {};
-        const isOv = Object.prototype.hasOwnProperty.call(newOv, flag);
-        // When pruned, the flag reverted to the bucket default = the value the
-        // user just chose (on/off), shown as a NON-override (bucket) button.
-        const on = isOv ? ['on', 'true', '1'].includes(String(newOv[flag]).toLowerCase())
-                        : (next === 'on');
-        btn.dataset.csSimOn = on ? '1' : '0';
-        btn.dataset.csSimOv = isOv ? '1' : '0';
-        btn.className = csSimBtnClass(on, isOv);
-        btn.title = `${isOv ? 'Override' : 'Bucket'}: ${flag} ${on ? 'on' : 'off'} on ${host} — click to ${on ? 'disable' : 'enable'}`;
-        csCtlMsg(host, `${flag} ${next}${isOv ? '' : ' (bucket)'}`, true);
-        if (typeof showToast === 'function') showToast(`${flag} ${next} on ${host}`, 'success');
-    } catch (e) { console.error('csSimToggle failed', e); csCtlMsg(host, e.message || 'failed', false); }
+        btn.title = `${flag} ${on ? 'on' : 'off'} for ${user} — click to ${on ? 'disable' : 'enable'}`;
+        csCtlMsg(host, `${flag} ${next} (user override)`, true);
+        if (typeof showToast === 'function') showToast(`${flag} ${next} for ${user} (user override)`, 'success');
+    } catch (e) {
+        // Revert the optimistic flip so the button matches the true state.
+        btn.dataset.csSimOn = prevOn;
+        btn.className = csSimBtnClass(prevOn === '1', false) + ' w-full text-center';
+        console.error('csSimToggle failed', e);
+        csCtlMsg(host, e.message || 'failed', false);
+        if (typeof showToast === 'function') showToast(`toggle failed: ${e.message || 'error'}`, 'error');
+    }
+};
+
+// ── Remote Client Debug Mode (per-client, immediate, non-persistent) ─────────
+// Flip one cs client into debug mode so its agent.sh tailer streams sim.log +
+// debug logs (advanced adds journal/dmesg) up to the hub's per-host ring buffer
+// (CS_DEBUG_LOG → hub._handle_cs_debug_log → GET /api/cs/clients/{host}/debug-
+// logs). 30-min auto-off both client-side (the flag deadline) and hub-side.
+// POST /api/cs/clients/{host}/debug rides the same CS_QUEUE_COMMAND path
+// kill_switch/reboot use. See .claude/plans/precious-napping-seahorse.md.
+window.csDebugToggle = async function (btn) {
+    const host = btn.dataset.csDebugHost;
+    if (!host) return;
+    const lvlEl = csEl(csCtlId(host, 'dbglvl'));
+    const level = (lvlEl && lvlEl.value) || 'basic';
+    const enabling = btn.dataset.csDebugOn !== '1';
+    const prev = btn.dataset.csDebugOn || '0';
+    csCtlMsg(host, enabling ? `Enabling debug (${level})…` : 'Stopping debug…', true);
+    btn.dataset.csDebugOn = enabling ? '1' : '0';
+    btn.textContent = enabling ? 'Stop Debug' : 'Enable Debug';
+    try {
+        // /api/cs/* (not /sim/api/*), so bypass csFetch (which prepends /sim/api)
+        // and fetch directly. ?tenant= is what routes/client_debug._resolve reads.
+        const res = await fetch(`/api/cs/clients/${encodeURIComponent(host)}/debug?tenant=${csTenant()}`,
+            { method: 'POST', headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ enabled: enabling, level }) });
+        if (res.status === 401) { if (typeof handleSessionExpired === 'function') handleSessionExpired(); throw new Error('Session expired'); }
+        if (!res.ok) {
+            let detail = ''; try { const j = await res.json(); detail = (j && (j.detail || j.message)) || ''; } catch (_e) {}
+            throw new Error(detail || `${res.status}`);
+        }
+        csCtlMsg(host, enabling ? `Debug ${level} on (30m auto-off)` : 'Debug stopped', true);
+        if (typeof showToast === 'function') showToast(`Debug ${enabling ? 'on' : 'off'} for ${host}`, 'success');
+    } catch (e) {
+        btn.dataset.csDebugOn = prev;
+        btn.textContent = prev === '1' ? 'Stop Debug' : 'Enable Debug';
+        console.error('csDebugToggle failed', e);
+        csCtlMsg(host, e.message || 'failed', false);
+        if (typeof showToast === 'function') showToast(`debug toggle failed: ${e.message || 'error'}`, 'error');
+    }
+};
+
+// Open the Client Debug log panel (lives in main.js — openModal/apiJson/
+// _renderGroupedLogs/pollManager are main.js globals this file already relies
+// on, e.g. showToast). Falls back to a toast if the panel helper isn't loaded.
+window.csDebugLogs = function (btn) {
+    const host = btn.dataset.csDebugHost;
+    if (!host) return;
+    if (typeof window.openClientDebugLog === 'function') window.openClientDebugLog(host, csTenantRaw());
+    else if (typeof showToast === 'function') showToast('Debug log panel unavailable', 'error');
 };
 
 // ── Demo scenarios (named per-client failure presets, 120-min TTL) ───────────
@@ -2147,7 +2324,7 @@ async function csDemoLoad() {
 
 function csDemoOptions(activeScenario) {
     const names = Object.keys(window._csDemoScenarios || {});
-    if (!names.length) names.push('normal', 'dns_fail', 'dns_latency', 'dhcp_fail', 'assoc_fail', 'auth_fail', 'ssidpw_fail', 'mac_auth_fail', 'port_flap', 'collab');
+    if (!names.length) names.push('normal', 'dns_fail', 'dns_latency', 'dhcp_fail', 'assoc_fail', 'auth_fail', 'ssidpw_fail', 'mac_auth_fail', 'port_flap');
     return names.map(n => `<option value="${csEscape(n)}" ${n === activeScenario ? 'selected' : ''}>${csEscape(n)}</option>`).join('');
 }
 
@@ -2187,7 +2364,9 @@ function csDemoCell(hostname) {
         ${csDemoOptions(a ? a.scenario : 'normal')}
       </select>
       <button data-cs-demo-host="${csEscape(hostname)}" onclick="csDemoTrigger(this)"
-        class="bg-blue-100 hover:bg-blue-200 text-blue-700 px-1.5 py-0.5 rounded-md text-[11px] font-bold">Go</button>
+        class="bg-[#01A982]/10 hover:bg-[#01A982]/20 text-[#01A982] border border-[#01A982] px-1.5 py-0.5 rounded-md text-[11px] font-bold">Go</button>
+      <button data-cs-ctl-host="${csEscape(hostname)}" onclick="csCtlClear(this)"
+        class="bg-red-50 hover:bg-red-100 text-red-600 border border-red-200 px-1.5 py-0.5 rounded-md text-[11px] font-bold" title="Clear this client's sim overrides">Clear</button>
     </td>`;
 }
 
@@ -2202,7 +2381,7 @@ async function csDemoCard() {
       <button data-cs-demo-host="${csEscape(a.hostname)}" onclick="csDemoClear(this)"
         class="bg-red-100 hover:bg-red-200 text-red-700 px-2 py-1 rounded-md text-[11px] font-bold">Clear</button>
     </div>`).join('');
-    return `<div class="hpe-card rounded-lg p-4 shadow-sm">
+    return `<div class="hpe-card rounded-lg p-5 shadow-sm">
       <p class="text-[11px] font-bold text-slate-400 uppercase tracking-wider mb-2">Active Demo Scenarios (${active.length})</p>
       ${rows}
     </div>`;
@@ -2235,9 +2414,10 @@ window.csDemoClear = async function (btn) {
 // PERSISTED registry overrides (sticky across reconnects/reboots). The panel
 // is an expandable row beneath each client; opening it fetches the host's
 // current overrides and seeds the toggles.
-const CS_CONTROL_FLAGS = ['kill_switch', 'dns_fail', 'dns_latency', 'iperf', 'download',
-    'www_traffic', 'ping_test', 'ssidpw_fail', 'auth_fail', 'mac_auth_fail', 'dhcp_fail',
-    'port_flap', 'assoc_fail', 'collab'];
+// Alphabetical so the sim knobs + the Simulation facet dropdown list in order.
+const CS_CONTROL_FLAGS = ['assoc_fail', 'auth_fail', 'dhcp_fail', 'dns_fail',
+    'dns_latency', 'download', 'iperf', 'kill_switch', 'mac_auth_fail', 'ping_test', 'port_flap',
+    'ssidpw_fail', 'www_traffic'];
 
 
 
@@ -2260,12 +2440,14 @@ window.csCtlClear = async function (btn) {
 
 
 
+// Back-compat alias — the faceted renderer is the single filter path now
+// (search + status + Simulation/Tier/Site facets). Any external caller still
+// invoking csClientFilter() gets a faceted re-render.
 window.csClientFilter = function () { csRenderClientsFaceted(); };
 
-// Keystroke-debounced entry point for the free-text search input (the status
-// <select> stays on the immediate onchange= above, via csClientResetPage). See
-// csDebounce. Resets to page 1 on each new search term, same as the status
-// filter, so the user isn't stranded on a now-empty page.
+// Keystroke-debounced entry point for the search input (the status <select>
+// re-renders immediately via its onchange=). Search matches name / IP / MAC /
+// SSID / Sim-ID and works at any drill level. Resets to page 1. See csDebounce.
 window.csClientFilterKey = csDebounce(function () { csClientResetPage(); }, 200);
 
 /* ===========================================================================
@@ -2275,8 +2457,9 @@ window.csClientFilterKey = csDebounce(function () { csClientResetPage(); }, 200)
  * ========================================================================= */
 
 // The Central Sites/Alerts/Clients tabs now pull the FULL Central inventory via
-// /aggregate/central-browse (spoke browse_all), independent of site_mappings.
-// Shared fetch with a short in-memory cache so switching tabs doesn't re-hit Central.
+// /aggregate/central-browse (hub forwards CS_CENTRAL_BROWSE → spoke browse_all),
+// independent of site_mappings. Shared fetch with a short in-memory cache so
+// switching tabs doesn't re-hit Central each time.
 let _csCentralBrowseCache = null, _csCentralBrowseAt = 0, _csCentralBrowseTenant = null;
 // ── client OS breakdown ──────────────────────────────────────────────────────
 // "500 Linux · 40 Windows · 10 Tesla" from a browse payload. The spoke already
@@ -2459,7 +2642,7 @@ function _csCentralTableBuild(id) {
     let bar = '';
     if (monOf) {
         const nMon = rows.filter(r => monOf(r)).length;
-        const mk = (val, label) => `<button onclick="csCentralFilter('${csEscape(id)}','${val}')" class="px-2.5 py-1 rounded-md text-xs font-bold border ${filter === val ? 'bg-purple-100 text-purple-700 border-purple-300' : 'bg-white text-slate-600 border-slate-200 hover:bg-slate-50'}">${label}</button>`;
+        const mk = (val, label) => `<button onclick="csCentralFilter('${csEscape(id)}','${val}')" class="px-2.5 py-1 rounded-md text-xs font-bold border ${filter === val ? 'bg-[#263040]/10 text-[#263040] border-[#263040]' : 'bg-white text-slate-600 border-slate-200 hover:bg-slate-50'}">${label}</button>`;
         bar = `<div class="flex items-center gap-2 mb-3">
             <span class="text-xs text-slate-500 font-semibold uppercase tracking-wider">Monitored:</span>
             ${mk('all', `All (${rows.length})`)}${mk('mon', `On (${nMon})`)}${mk('unmon', `Off (${rows.length - nMon})`)}
@@ -2523,7 +2706,7 @@ async function csRenderCentral() {
         { label: 'Insights', render: r => `<span class="${r.insights ? 'text-slate-600' : 'text-slate-400'}">${r.insights}</span>`, sort: r => r.insights },
         { label: 'Monitor',  render: r => r.btn, sort: r => r.monitored ? 1 : 0 },
     ];
-    csSet(`<div class="space-y-4">${warn}<div class="hpe-card rounded-lg p-4 shadow-sm">${csCentralTable('central-sites', siteCols, rows, { monitorOf: r => r.monitored, caption: `${sites.length} site(s) — Monitor a site to track its client count for change on the dashboard` })}</div></div>`);
+    csSet(`<div class="space-y-4">${warn}<div class="hpe-card rounded-lg p-5 shadow-sm">${csCentralTable('central-sites', siteCols, rows, { monitorOf: r => r.monitored, caption: `${sites.length} site(s) — Monitor a site to track its client count for change on the dashboard` })}</div></div>`);
 }
 
 // Open the Monitor dialog for a Central site. Enrolls/stops client-count
@@ -2531,8 +2714,7 @@ async function csRenderCentral() {
 // count drops below the floor the poller raises a "Minimum Client Threshold"
 // error check on the dashboard, IN ADDITION to the existing % drop check.
 // ``rerender`` is 'clients' when opened from the Clients view so the save
-// re-renders the right pane. Ported from lm/WebUI/sim-views.js — the spoke's
-// own /central-sites-config route supports this the same way the hub does.
+// re-renders the right pane.
 window.csMonitorSiteModal = async function (siteName, rerender) {
     const existing = document.getElementById('cs-monitor-site-modal');
     if (existing) { existing.remove(); return; }
@@ -2696,7 +2878,7 @@ async function csRenderCentralAlerts() {
     ];
     const _active = rows.filter(r => r.status === 'active').length;
     const _notFiring = rows.filter(r => r.status === 'not_firing').length;
-    csSet(`<div class="space-y-4">${warn}<div class="hpe-card rounded-lg p-4 shadow-sm">${csCentralFreshnessBadge(data)}${csCentralTable('central-alerts', alertCols, rows, { monitorOf: r => r.monitored, caption: `${alerts.length} alert(s) from Central — ${_active} active, ${alerts.length - _active} closed${_notFiring ? ` · ${_notFiring} monitored but not firing` : ''}` })}</div></div>`);
+    csSet(`<div class="space-y-4">${warn}<div class="hpe-card rounded-lg p-5 shadow-sm">${csCentralFreshnessBadge(data)}${csCentralTable('central-alerts', alertCols, rows, { monitorOf: r => r.monitored, caption: `${alerts.length} alert(s) from Central — ${_active} active, ${alerts.length - _active} closed${_notFiring ? ` · ${_notFiring} monitored but not firing` : ''}` })}</div></div>`);
 }
 
 // ── Central → Insights (live AI insights, with Monitor toggle) ───────────────
@@ -2756,7 +2938,7 @@ async function csRenderCentralInsights() {
         { label: 'Monitor',  render: r => r.btn, sort: r => r.monitored ? 1 : 0 },
     ];
     const _notFiring = rows.filter(r => !r.firing).length;
-    csSet(`<div class="space-y-4">${warn}<div class="hpe-card rounded-lg p-4 shadow-sm">${csCentralFreshnessBadge(data)}${csCentralTable('central-insights', insightCols, rows, { monitorOf: r => r.monitored, caption: `${insights.length} insight(s) from Central${_notFiring ? ` · ${_notFiring} monitored but not firing` : ''}` })}</div></div>`);
+    csSet(`<div class="space-y-4">${warn}<div class="hpe-card rounded-lg p-5 shadow-sm">${csCentralFreshnessBadge(data)}${csCentralTable('central-insights', insightCols, rows, { monitorOf: r => r.monitored, caption: `${insights.length} insight(s) from Central${_notFiring ? ` · ${_notFiring} monitored but not firing` : ''}` })}</div></div>`);
 }
 
 // Toggle an insight (or alert) TYPE in central_sites_config.monitored_checks
@@ -2817,7 +2999,7 @@ async function csRenderCentralClients() {
         csCentralLiveCol(data),
         { label: 'Monitor', render: r => r.btn, sort: r => r.monitored ? 1 : 0 },
     ];
-    csSet(`<div class="space-y-4">${warn}<div class="hpe-card rounded-lg p-4 shadow-sm">
+    csSet(`<div class="space-y-4">${warn}<div class="hpe-card rounded-lg p-5 shadow-sm">
         ${csCentralFreshnessBadge(data)}
         <div class="mb-3">${csOsChipsHtml(data)}</div>
         ${csCentralTable('central-clients', clientCols, rows, { monitorOf: r => r.monitored, caption: `${clients.length} client(s)` })}</div></div>`);
@@ -2863,7 +3045,7 @@ async function csRenderCentralHardware() {
         { label: 'Status',  render: r => csStatusBadge(r.status), sort: r => String(r.status || '') },
         { label: 'Monitor', render: r => r.btn, sort: r => r.monitored ? 1 : 0 },
     ];
-    csSet(`<div class="space-y-4">${warn}<div class="hpe-card rounded-lg p-4 shadow-sm">${csCentralTable('central-hardware', hwCols, rows, { monitorOf: r => r.monitored, caption: `${devices.length} device(s) — Monitor a switch / AP / gateway to track it on the dashboard` })}</div></div>`);
+    csSet(`<div class="space-y-4">${warn}<div class="hpe-card rounded-lg p-5 shadow-sm">${csCentralTable('central-hardware', hwCols, rows, { monitorOf: r => r.monitored, caption: `${devices.length} device(s) — Monitor a switch / AP / gateway to track it on the dashboard` })}</div></div>`);
 }
 
 // Toggle a hardware check in central_sites_config.hardware_checks (keyed by id),
@@ -3368,8 +3550,7 @@ window.csToggleMonitorOnPremHardware = async function (id, name, deviceType, sit
         console.error('csToggleMonitorOnPremHardware failed', e);
         if (typeof showToast === 'function') showToast(e.message, 'error');
     }
-};
-// Copy text to the clipboard (async API with a legacy execCommand fallback for
+};// Copy text to the clipboard (async API with a legacy execCommand fallback for
 // non-secure contexts), flashing the button label on success.
 function csCopyText(text, btn) {
     const done = () => { if (btn) { const o = btn.textContent; btn.textContent = '✓ Copied'; setTimeout(() => { btn.textContent = o; }, 1500); } };
@@ -3399,8 +3580,8 @@ async function csRenderCentralOnPremDiagnostic() { return _csRenderDiag('central
 // Steady Client Count debug breakdown (per-series thresholds/averages/peaks +
 // which rule fired, this cycle) — added so "why is this check red" reads off
 // the numbers directly instead of someone reproducing the arithmetic by hand
-// against the config. See central_poller.py ClientCountTracker.entry's
-// `triggered` field for what populates this (mirror of lm's hub twin).
+// against the config. See central_hub_poller.py ClientCountTracker.entry's
+// `triggered` field for what populates this.
 function _csFormatCcDebug(debug) {
     if (!debug || typeof debug !== 'object') return '';
     const series = ['total', 'wired', 'wireless'].filter(k => debug[k]);
@@ -3567,19 +3748,18 @@ window.CS_CHILD_RENDERERS['Central On-Prem::Clients']    = csRenderCentralOnPrem
 window.CS_CHILD_RENDERERS['Central On-Prem::Hardware']   = csRenderCentralOnPremHardware;
 window.CS_CHILD_RENDERERS['Central On-Prem::Diagnostic'] = csRenderCentralOnPremDiagnostic;
 
-// ===========================================================================
-// 3b. Mist — Juniper Mist org inventory (MIRROR of Central, separate product).
-//     Mist is NOT Aruba Central: separate creds (static API token + org_id +
-//     region host), separate config (mist_sites_config), separate browse cache.
-//     Per "mirror not share," every helper below is Mist-namespaced and never
-//     touches Central's caches/config. Reads /aggregate/mist-browse (spoke
-//     browse_all for Mist) + /{T}/mist-sites-config. Site/alert/insight/hardware
-//     Monitor toggles write mist_sites_config only.
-// ===========================================================================
+/* ===========================================================================
+ * 4b. Mist — Juniper Mist cloud (MIRROR of Central, separate product)
+ *    Central and Mist are separate products: these renderers DUPLICATE the
+ *    Central patterns against /mist endpoints — they do not import or share
+ *    Central state. The Central:/Mist: prefix on a sim-quota row's alert_id is
+ *    the only seam (Phase 4); the dashboard Mist tiles read s.mist_status.
+ * ========================================================================= */
 
-// /aggregate/mist-browse (spoke browse_all for Mist), independent of
-// site_mappings. Shared fetch with a short in-memory cache so switching tabs
-// doesn't re-hit Mist. MIRROR of csCentralBrowse — separate cache, never shared.
+// Full Mist inventory via /aggregate/mist-browse (hub forwards CS_MIST_BROWSE →
+// spoke, or the centralized MistHubPoller answers directly). Shared fetch with
+// a short in-memory cache so switching tabs doesn't re-hit Mist each time.
+// MIRROR of csCentralBrowse — separate cache, never shared with Central.
 let _csMistBrowseCache = null, _csMistBrowseAt = 0, _csMistBrowseTenant = null;
 async function csMistBrowse() {
     const t = csTenant();
@@ -3635,7 +3815,7 @@ function _csMistTableBuild(id) {
     let bar = '';
     if (monOf) {
         const nMon = rows.filter(r => monOf(r)).length;
-        const mk = (val, label) => `<button onclick="csMistFilter('${csEscape(id)}','${val}')" class="px-2.5 py-1 rounded-md text-xs font-bold border ${filter === val ? 'bg-purple-100 text-purple-700 border-purple-300' : 'bg-white text-slate-600 border-slate-200 hover:bg-slate-50'}">${label}</button>`;
+        const mk = (val, label) => `<button onclick="csMistFilter('${csEscape(id)}','${val}')" class="px-2.5 py-1 rounded-md text-xs font-bold border ${filter === val ? 'bg-[#263040]/10 text-[#263040] border-[#263040]' : 'bg-white text-slate-600 border-slate-200 hover:bg-slate-50'}">${label}</button>`;
         bar = `<div class="flex items-center gap-2 mb-3">
             <span class="text-xs text-slate-500 font-semibold uppercase tracking-wider">Monitored:</span>
             ${mk('all', `All (${rows.length})`)}${mk('mon', `On (${nMon})`)}${mk('unmon', `Off (${rows.length - nMon})`)}
@@ -3670,6 +3850,7 @@ async function csRenderMist() {
     if (!sites.length) { csSet(`${warn}${csEmpty('No Mist sites returned.', 'Verify the Mist API token + org_id in Setup → Mist API and that the org has sites.')}`); return; }
     const sm = (sitesCfg && sitesCfg.site_mappings && typeof sitesCfg.site_mappings === 'object') ? sitesCfg.site_mappings : {};
     const monitored = new Set(Object.values(sm).map(v => String(v)));
+    const minBySite = (sitesCfg && sitesCfg.site_min_clients && typeof sitesCfg.site_min_clients === 'object') ? sitesCfg.site_min_clients : {};
     const alertsBySite = {}, insightsBySite = {}; let globalInsights = 0;
     ((data && data.alerts) || []).forEach(a => { const s = a.site || '—'; alertsBySite[s] = (alertsBySite[s] || 0) + 1; });
     ((data && data.insights) || []).forEach(i => { const s = i.site || '—'; if (s === 'All Sites') globalInsights++; else insightsBySite[s] = (insightsBySite[s] || 0) + 1; });
@@ -3678,9 +3859,10 @@ async function csRenderMist() {
         const isMon = monitored.has(String(name));
         const nAlerts = alertsBySite[name] || 0;
         const nInsights = (insightsBySite[name] || 0) + globalInsights;
+        const _minLbl = minBySite[name] ? ` · min ${csEscape(String(minBySite[name]))}` : '';
         const btn = isMon
-            ? `<button onclick="csToggleMistSite(${csEscape(JSON.stringify(name))}, false)" class="bg-emerald-50 text-emerald-700 border border-emerald-200 px-2.5 py-1 rounded-md text-xs font-bold hover:bg-emerald-100" title="Stop monitoring this site's client count">✓ Monitored</button>`
-            : `<button onclick="csToggleMistSite(${csEscape(JSON.stringify(name))}, true)" class="bg-slate-100 text-slate-700 border border-slate-200 px-2.5 py-1 rounded-md text-xs font-bold hover:bg-slate-200" title="Monitor this site's client count for change (shows on the dashboard)">Monitor</button>`;
+            ? `<button onclick="csMonitorMistSiteModal(${csEscape(JSON.stringify(name))})" class="bg-emerald-50 text-emerald-700 border border-emerald-200 px-2.5 py-1 rounded-md text-xs font-bold hover:bg-emerald-100" title="Edit monitoring / min-client threshold">✓ Monitored${_minLbl}</button>`
+            : `<button onclick="csMonitorMistSiteModal(${csEscape(JSON.stringify(name))})" class="bg-slate-100 text-slate-700 border border-slate-200 px-2.5 py-1 rounded-md text-xs font-bold hover:bg-slate-200" title="Monitor this site's client count (set a min-client floor)">Monitor</button>`;
         return { name, health: st.health_score, clients: st.wireless_clients != null ? st.wireless_clients : 0,
                  alerts: nAlerts, insights: nInsights, monitored: isMon, btn: name ? btn : '' };
     });
@@ -3692,39 +3874,106 @@ async function csRenderMist() {
         { label: 'Insights', render: r => `<span class="${r.insights ? 'text-slate-600' : 'text-slate-400'}">${r.insights}</span>`, sort: r => r.insights },
         { label: 'Monitor',  render: r => r.btn, sort: r => r.monitored ? 1 : 0 },
     ];
-    csSet(`<div class="space-y-4">${warn}<div class="hpe-card rounded-lg p-4 shadow-sm">${csMistTable('mist-sites', siteCols, rows, { monitorOf: r => r.monitored, caption: `${sites.length} site(s) — Monitor a site to track its client count for change on the dashboard` })}</div></div>`);
+    csSet(`<div class="space-y-4">${warn}<div class="hpe-card rounded-lg p-5 shadow-sm">${csMistTable('mist-sites', siteCols, rows, { monitorOf: r => r.monitored, caption: `${sites.length} site(s) — Monitor a site to track its client count for change on the dashboard` })}</div></div>`);
 }
 
-// Enroll / un-enroll a Mist site for client-count monitoring by toggling it in
-// mist_sites_config.site_mappings (key=value=Mist site name), preserving the
-// monitored alert/insight + hardware checks. Direct toggle (no min-client
-// floor modal — Mist keeps the simpler flow Central's csMonitorSiteModal
-// superseded), writing to mist-sites-config, never Central's config.
-window.csToggleMistSite = async function (siteName, monitor, rerender) {
+// Open the Monitor dialog for a Mist site (MIRROR of csMonitorSiteModal). Writes
+// site_mappings + site_min_clients into mist_sites_config.
+window.csMonitorMistSiteModal = async function (siteName, rerender) {
+    const existing = document.getElementById('cs-monitor-mist-site-modal');
+    if (existing) { existing.remove(); return; }
+    let cfg = {};
+    try { cfg = await csFetch(`/${csTenant()}/mist-sites-config?tenant_id=${csTenant()}`) || {}; } catch (e) { /* tolerate */ }
+    const sm = (cfg.site_mappings && typeof cfg.site_mappings === 'object') ? cfg.site_mappings : {};
+    const isMon = Object.values(sm).some(v => String(v) === String(siteName));
+    const minBySite = (cfg.site_min_clients && typeof cfg.site_min_clients === 'object') ? cfg.site_min_clients : {};
+    const curMin = minBySite[siteName] || '';
+    const rr = rerender === 'clients' ? 'clients' : 'sites';
+    const esc = csEscape;
+    const modal = document.createElement('div');
+    modal.id = 'cs-monitor-mist-site-modal';
+    modal.dataset.rerender = rr;
+    modal.className = 'fixed inset-0 z-50 flex items-center justify-center bg-black bg-opacity-50 backdrop-blur-sm p-4';
+    modal.innerHTML = `
+        <div class="bg-white rounded-xl shadow-2xl w-full max-w-md overflow-hidden">
+            <div class="px-6 py-4 border-b border-slate-200 flex justify-between items-center bg-slate-50">
+                <h3 class="text-lg font-bold text-[#263040]">${isMon ? 'Monitored' : 'Monitor'} — ${esc(siteName)}</h3>
+                <button onclick="this.closest('#cs-monitor-mist-site-modal').remove()" class="text-slate-400 hover:text-slate-600 transition-colors">
+                    <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"></path></svg>
+                </button>
+            </div>
+            <div class="p-6 space-y-4">
+                <div class="space-y-2">
+                    <label class="text-xs text-slate-500 uppercase font-bold">Minimum clients <span class="font-normal normal-case text-slate-400">(optional floor)</span></label>
+                    <input id="cs-monitor-mist-min" type="number" min="0" step="1" value="${esc(curMin)}" placeholder="blank = no floor (drop-based only)" class="w-full bg-white border border-slate-300 rounded-md px-4 py-2 text-sm outline-none focus:ring-2 focus:ring-green-500">
+                    <p class="text-[11px] text-slate-400 leading-relaxed">If this site's live client count drops below this number, an error is raised on the dashboard — in addition to the existing % drop check. Leave blank to monitor for change only.</p>
+                </div>
+                <div id="cs-monitor-mist-status" class="text-xs text-slate-500 hidden"></div>
+                <div class="pt-2 flex justify-between gap-3">
+                    ${isMon ? `<button onclick="csSaveMistMonitorSite(${csEscape(JSON.stringify(siteName))}, false, null)" class="px-4 py-2 text-sm font-medium text-rose-600 hover:text-rose-800 border border-rose-200 rounded-md">Stop monitoring</button>` : `<span></span>`}
+                    <div class="flex gap-3">
+                        <button onclick="this.closest('#cs-monitor-mist-site-modal').remove()" class="px-4 py-2 text-sm font-medium text-slate-600 hover:text-slate-800">Cancel</button>
+                        <button id="cs-monitor-mist-save" class="bg-emerald-100 hover:bg-emerald-200 text-emerald-800 border border-emerald-300 px-6 py-2 rounded-md text-sm font-bold transition-all shadow-sm">${isMon ? 'Save' : 'Start monitoring'}</button>
+                    </div>
+                </div>
+            </div>
+        </div>`;
+    document.body.appendChild(modal);
+    const inp = document.getElementById('cs-monitor-mist-min');
+    if (inp) { inp.focus(); inp.select(); }
+    const saveBtn = document.getElementById('cs-monitor-mist-save');
+    if (saveBtn) saveBtn.addEventListener('click', () => {
+        const raw = ((inp || {}).value || '').trim();
+        const n = raw === '' ? 0 : parseInt(raw, 10);
+        if (raw !== '' && (!Number.isFinite(n) || n < 0)) {
+            if (typeof showToast === 'function') showToast('Minimum clients must be a non-negative integer', 'error');
+            return;
+        }
+        csSaveMistMonitorSite(siteName, true, n);
+    });
+};
+
+// Worker: writes site_mappings (+ site_min_clients) into mist_sites_config,
+// preserving monitored_checks + hardware_checks. MIRROR of csSaveMonitorSite.
+window.csSaveMistMonitorSite = async function (siteName, monitor, minClients) {
+    const modal = document.getElementById('cs-monitor-mist-site-modal');
+    const statusEl = modal ? modal.querySelector('#cs-monitor-mist-status') : null;
+    const saveBtn = modal ? modal.querySelector('#cs-monitor-mist-save') : null;
+    if (saveBtn) { saveBtn.disabled = true; saveBtn.classList.add('opacity-50', 'cursor-not-allowed'); }
+    if (statusEl) { statusEl.textContent = 'Saving…'; statusEl.classList.remove('hidden'); }
     try {
         const cfg = await csFetch(`/${csTenant()}/mist-sites-config?tenant_id=${csTenant()}`) || {};
         const sm = (cfg.site_mappings && typeof cfg.site_mappings === 'object') ? { ...cfg.site_mappings } : {};
+        const minBySite = (cfg.site_min_clients && typeof cfg.site_min_clients === 'object') ? { ...cfg.site_min_clients } : {};
         if (monitor) {
             sm[siteName] = siteName;
+            if (minClients === null) { /* keep existing floor */ }
+            else if (minClients > 0) { minBySite[siteName] = minClients; }
+            else { delete minBySite[siteName]; }
         } else {
             Object.keys(sm).forEach(k => { if (String(sm[k]) === String(siteName) || k === siteName) delete sm[k]; });
+            delete minBySite[siteName];
         }
         const body = {
             site_mappings: sm,
+            site_min_clients: minBySite,
             monitored_checks: Array.isArray(cfg.monitored_checks) ? cfg.monitored_checks : [],
             hardware_checks: Array.isArray(cfg.hardware_checks) ? cfg.hardware_checks : [],
         };
         const r = await csFetch(`/${csTenant()}/mist-sites-config?tenant_id=${csTenant()}`, { method: 'POST', body: JSON.stringify(body) });
         if (typeof csPushToast === 'function') csPushToast(r, monitor ? `Monitoring ${siteName}` : `Stopped monitoring ${siteName}`);
         else if (typeof showToast === 'function') showToast(monitor ? `Monitoring ${siteName}` : `Stopped monitoring ${siteName}`, 'success');
-        (rerender === 'clients' ? csRenderMistClients : csRenderMist)();
+        if (modal) modal.remove();
+        ((modal && modal.dataset.rerender) === 'clients' ? csRenderMistClients : csRenderMist)();
     } catch (e) {
-        console.error('csToggleMistSite failed', e);
+        console.error('csSaveMistMonitorSite failed', e);
         if (typeof showToast === 'function') showToast(e.message, 'error');
+        if (statusEl) { statusEl.textContent = (e.message || 'Save failed'); statusEl.classList.remove('hidden'); }
+        if (saveBtn) { saveBtn.disabled = false; saveBtn.classList.remove('opacity-50', 'cursor-not-allowed'); }
     }
 };
 
-// ── Mist → Alerts (live active alerts from the Mist org inventory) ───────────
+// ── Mist → Alerts ───────────────────────────────────────────────────────────
 async function csRenderMistAlerts() {
     csSetToolbar('');
     const [data, sitesCfg] = await Promise.all([
@@ -3760,10 +4009,10 @@ async function csRenderMistAlerts() {
         { label: 'Monitor',  render: r => r.btn, sort: r => r.monitored ? 1 : 0 },
     ];
     const _active = rows.filter(r => r.status !== 'cleared').length;
-    csSet(`<div class="space-y-4">${warn}<div class="hpe-card rounded-lg p-4 shadow-sm">${csMistTable('mist-alerts', alertCols, rows, { monitorOf: r => r.monitored, caption: `${alerts.length} alert(s) — ${_active} active, ${alerts.length - _active} closed` })}</div></div>`);
+    csSet(`<div class="space-y-4">${warn}<div class="hpe-card rounded-lg p-5 shadow-sm">${csMistTable('mist-alerts', alertCols, rows, { monitorOf: r => r.monitored, caption: `${alerts.length} alert(s) — ${_active} active, ${alerts.length - _active} closed` })}</div></div>`);
 }
 
-// ── Mist → Insights (live AI insights, with Monitor toggle) ─────────────────
+// ── Mist → Insights ─────────────────────────────────────────────────────────
 async function csRenderMistInsights() {
     csSetToolbar('');
     const [data, sitesCfg] = await Promise.all([
@@ -3792,11 +4041,10 @@ async function csRenderMistInsights() {
         { label: 'Site',     render: r => `<span class="text-slate-500">${csEscape(r.site)}</span>`, sort: r => r.site },
         { label: 'Monitor',  render: r => r.btn, sort: r => r.monitored ? 1 : 0 },
     ];
-    csSet(`<div class="space-y-4">${warn}<div class="hpe-card rounded-lg p-4 shadow-sm">${csMistTable('mist-insights', insightCols, rows, { monitorOf: r => r.monitored, caption: `${insights.length} insight(s)` })}</div></div>`);
+    csSet(`<div class="space-y-4">${warn}<div class="hpe-card rounded-lg p-5 shadow-sm">${csMistTable('mist-insights', insightCols, rows, { monitorOf: r => r.monitored, caption: `${insights.length} insight(s)` })}</div></div>`);
 }
 
-// Toggle an insight (or alert) TYPE in mist_sites_config.monitored_checks
-// (keyed type:id), preserving site_mappings + hardware_checks. MIRROR of
+// Toggle an insight/alert TYPE in mist_sites_config.monitored_checks. MIRROR of
 // csToggleMonitorCheck — writes to mist-sites-config, never Central's config.
 window.csToggleMistMonitorCheck = async function (type, id, name, monitor, site) {
     try {
@@ -3832,12 +4080,14 @@ async function csRenderMistClients() {
     if (!clients.length) { csSet(`${warn}${csEmpty('No Mist clients returned.')}`); return; }
     const sm = (sitesCfg && sitesCfg.site_mappings && typeof sitesCfg.site_mappings === 'object') ? sitesCfg.site_mappings : {};
     const monitored = new Set(Object.values(sm).map(v => String(v)));
+    const minBySite = (sitesCfg && sitesCfg.site_min_clients && typeof sitesCfg.site_min_clients === 'object') ? sitesCfg.site_min_clients : {};
     const rows = clients.map(cl => {
         const site = cl.site || '';
         const isMon = site && monitored.has(String(site));
+        const _minLbl = site && minBySite[site] ? ` · min ${csEscape(String(minBySite[site]))}` : '';
         const btn = !site ? '—' : (isMon
-            ? `<button onclick="csToggleMistSite(${csEscape(JSON.stringify(site))}, false, 'clients')" class="bg-emerald-50 text-emerald-700 border border-emerald-200 px-2.5 py-1 rounded-md text-xs font-bold hover:bg-emerald-100" title="Stop monitoring this client's site">✓ Site monitored</button>`
-            : `<button onclick="csToggleMistSite(${csEscape(JSON.stringify(site))}, true, 'clients')" class="bg-slate-100 text-slate-700 border border-slate-200 px-2.5 py-1 rounded-md text-xs font-bold hover:bg-slate-200" title="Monitor this client's site (client-count on the dashboard)">Monitor</button>`);
+            ? `<button onclick="csMonitorMistSiteModal(${csEscape(JSON.stringify(site))}, 'clients')" class="bg-emerald-50 text-emerald-700 border border-emerald-200 px-2.5 py-1 rounded-md text-xs font-bold hover:bg-emerald-100" title="Edit monitoring / min-client threshold">✓ Site monitored${_minLbl}</button>`
+            : `<button onclick="csMonitorMistSiteModal(${csEscape(JSON.stringify(site))}, 'clients')" class="bg-slate-100 text-slate-700 border border-slate-200 px-2.5 py-1 rounded-md text-xs font-bold hover:bg-slate-200" title="Monitor this client's site (set a min-client floor)">Monitor</button>`);
         return { host: cl.hostname || cl.mac || '—', ip: cl.ip || '—', mac: cl.mac || '—',
                  site: cl.site || '—', os: cl.os || '—', status: cl.status || 'unknown',
                  monitored: !!isMon, btn };
@@ -3851,16 +4101,12 @@ async function csRenderMistClients() {
         { label: 'Status',  render: r => csStatusBadge(r.status), sort: r => String(r.status || '') },
         { label: 'Monitor', render: r => r.btn, sort: r => r.monitored ? 1 : 0 },
     ];
-    csSet(`<div class="space-y-4">${warn}<div class="hpe-card rounded-lg p-4 shadow-sm">
+    csSet(`<div class="space-y-4">${warn}<div class="hpe-card rounded-lg p-5 shadow-sm">
         <div class="mb-3">${csOsChipsHtml(data)}</div>
         ${csMistTable('mist-clients', clientCols, rows, { monitorOf: r => r.monitored, caption: `${clients.length} client(s)` })}</div></div>`);
 }
 
-// ── Mist → Hardware (device-down check types) ───────────────────────────────
-// Lists the monitorable hardware checks (AP/Switch/Gateway Down) from the
-// available-checks catalog with a Monitor toggle -> mist_sites_config
-// .hardware_checks (SEPARATE from monitored_checks). MIRROR of
-// csRenderCentralHardware — devices come from the Mist browse inventory.
+// ── Mist → Hardware (device-down checks) ────────────────────────────────────
 
 async function csRenderMistHardware() {
     csSetToolbar('');
@@ -3894,12 +4140,11 @@ async function csRenderMistHardware() {
         { label: 'Status',  render: r => csStatusBadge(r.status), sort: r => String(r.status || '') },
         { label: 'Monitor', render: r => r.btn, sort: r => r.monitored ? 1 : 0 },
     ];
-    csSet(`<div class="space-y-4">${warn}<div class="hpe-card rounded-lg p-4 shadow-sm">${csMistTable('mist-hardware', hwCols, rows, { monitorOf: r => r.monitored, caption: `${devices.length} device(s) — Monitor a switch / AP / gateway to track it on the dashboard` })}</div></div>`);
+    csSet(`<div class="space-y-4">${warn}<div class="hpe-card rounded-lg p-5 shadow-sm">${csMistTable('mist-hardware', hwCols, rows, { monitorOf: r => r.monitored, caption: `${devices.length} device(s) — Monitor a switch / AP / gateway to track it on the dashboard` })}</div></div>`);
 }
 
-// Toggle a hardware check in mist_sites_config.hardware_checks (keyed by id),
-// preserving site_mappings + monitored_checks. MIRROR of csToggleMonitorHardware
-// — writes to mist-sites-config.
+// Toggle a hardware check in mist_sites_config.hardware_checks. MIRROR of
+// csToggleMonitorHardware — writes to mist-sites-config.
 window.csToggleMistMonitorHardware = async function (id, name, deviceType, site, monitor) {
     try {
         const cfg = await csFetch(`/${csTenant()}/mist-sites-config?tenant_id=${csTenant()}`) || {};
@@ -3930,54 +4175,6 @@ window.CS_CHILD_RENDERERS['Mist::Hardware']   = csRenderMistHardware;
 window.CS_CHILD_RENDERERS['Mist::Diagnostic'] = csRenderMistDiagnostic;
 
 /* ===========================================================================
- * 4. API Server — read-only per-spoke cards
- *    GET /sim/api/aggregate/api-server?tenant_id={T}
- * ========================================================================= */
-
-async function csRenderApiServer() {
-    csSetToolbar('');
-    let data = null;
-    try { data = await csFetch(`/aggregate/api-server?tenant_id=${csTenant()}`); }
-    catch (e) { console.error('csRenderApiServer: aggregate/api-server fetch failed', e); csSet(csEmpty('No API server data yet.',
-        'The /sim/api/aggregate/api-server endpoint is not wired in the backend yet (UI-first phase).')); return; }
-    const spokes = (data && data.spokes) || [];
-    if (spokes.length === 0) { csSet(csEmpty('No API server data yet.')); return; }
-    const cards = spokes.map(sp => {
-        const a = sp.api_server || {};
-        const h = a.health || {};
-        const services = a.services || {};
-        const svcRows = Object.keys(services).map(k => `<tr>
-          <td class="px-3 py-1.5 font-mono text-xs">${csEscape(k)}</td>
-          <td class="px-3 py-1.5">${csStatusBadge(typeof services[k] === 'string' ? services[k] : (services[k] && services[k].status) || 'unknown')}</td>
-        </tr>`).join('');
-        return `<details class="hpe-card rounded-lg p-0 shadow-sm overflow-hidden">
-          <summary class="flex items-center justify-between px-5 py-3 cursor-pointer hover:bg-slate-50">
-            <span class="font-bold text-slate-700">${csEscape(sp.spoke_name || sp.spoke_hostname || sp.spoke_id)}</span>
-            <span class="flex items-center gap-2">${csOnlineBadge(sp.spoke_online)}<span class="text-xs text-slate-400">${csEscape(h.version || a.version || '—')}</span></span>
-          </summary>
-          <div class="px-5 pb-5 border-t border-slate-100 space-y-3">
-            <div class="grid grid-cols-2 md:grid-cols-4 gap-3 pt-3">
-              ${csStat('Status', h.status || a.status || '—')}${csStat('Clients', h.clients != null ? h.clients : '—')}
-              ${csStat('Repo Synced', h.repo_synced === undefined ? '—' : (h.repo_synced ? 'Yes' : 'No'))}${csStat('Version', h.version || a.version || '—')}
-            </div>
-            ${h.repo ? (() => { const rp = h.repo, rs = rp.scripts || {}; return `
-            <div class="grid grid-cols-2 md:grid-cols-4 gap-3 pt-1 border-t border-slate-100">
-              ${csStat('Branch', rp.configured_branch || '—')}${csStat('Deploy VERSION', rp.served_version || '—')}
-              ${csStat('simulation.sh', rs['simulation.sh'] || '—')}${csStat('dns_latency.sh', rp.dns_latency_present ? (rs['dns_latency.sh'] || 'yes') : 'MISSING')}
-            </div>
-            ${(rp.configured_branch && rp.configured_branch !== 'main') ? `<p class="text-xs text-amber-600">⚠️ Tracks branch <b>${csEscape(rp.configured_branch)}</b>, not <b>main</b> — main pushes won't reach this spoke.</p>` : ''}
-            ${!rp.dns_latency_present ? `<p class="text-xs text-red-500">⚠️ dns_latency.sh missing — serving pre-split scripts.</p>` : ''}
-            <p class="text-[11px] text-slate-400 font-mono">head ${csEscape(rp.head || '?')} · checked-out ${csEscape(rp.checked_out_branch || '?')} · source ${csEscape(rp.source_of_truth || '?')} · dns_fail ${csEscape(rs['dns_fail.sh'] || '?')}</p>`; })() : ''}
-            ${h.repo_error ? `<p class="text-xs text-red-500">Repo error: ${csEscape(h.repo_error)}</p>` : ''}
-            <div><p class="text-[11px] font-bold text-slate-400 uppercase tracking-wider mb-1">Services</p>${csTable(['Service', 'Status'], svcRows)}</div>
-            <details class="text-xs"><summary class="cursor-pointer text-slate-400">Raw payload</summary>${csJsonDump(sp)}</details>
-          </div>
-        </details>`;
-    }).join('');
-    csSet(`<div class="space-y-3">${cards}</div>`);
-}
-
-/* ===========================================================================
  * 5. Config — config-push + simulation-conf editor + hub-config
  * ========================================================================= */
 
@@ -3988,7 +4185,7 @@ async function csRenderConfig() {
       <h3 class="text-sm font-bold text-slate-500 uppercase tracking-wider mb-2">API Config Push ${helpIcon('cs', null, 'Simulations help')}</h3>
       <p class="text-xs text-slate-400 mb-2">Paste a JSON config object to push to all spokes (unwrapped at the spoke's <code>_apply_hub_config</code>).</p>
       <textarea id="cs-configpush" rows="10" class="w-full bg-white border border-slate-300 rounded-md px-3 py-2 text-xs font-mono outline-none focus:ring-2 focus:ring-green-500" placeholder='{ "key": "value" }'></textarea>
-      <button onclick="csSaveConfigPush()" class="mt-3 bg-[#01A982] hover:bg-[#008c6a] text-white px-5 py-2 rounded-md text-sm font-bold shadow-sm">Push Config</button>
+      <div class="mt-3 flex justify-end"><button onclick="csSaveConfigPush()" class="bg-[#01A982]/10 hover:bg-[#01A982]/20 text-[#01A982] border border-[#01A982] px-5 py-2 rounded-md text-sm font-bold shadow-sm">Push Config</button></div>
     </div>`;
 
     // per-spoke config state (desired vs applied) — best-effort read from cache.
@@ -4046,7 +4243,7 @@ const CS_ONOFF_KEYS = new Set([
     'kill_switch', 'rapid_update', 'github_repo', 'smb_repo', 'site_based_ssid',
     'ssidpw_fail', 'auth_fail', 'mac_auth_fail', 'syslog', 'web_server',
     'dhcp_fail', 'dns_fail', 'dns_latency', 'assoc_fail', 'port_flap', 'ping_test',
-    'download', 'www_traffic', 'iperf', 'collab',
+    'download', 'www_traffic', 'iperf',
 ]);
 
 // Ordered field schema per section → [{key, label}]. Drives the labeled-input
@@ -4071,9 +4268,6 @@ const CS_SIM_SECTION_FIELDS = {
         ['dns_latency_duration', 'DNS Latency Duration (s)'],
         ['dns_latency_threshold_ms', 'DNS Latency Threshold (ms)'],
         ['dns_latency_recheck_s', 'DNS Latency Recheck (s)'],
-        ['collab_app', 'Collab App'],
-        ['collab_bw', 'Collab Bandwidth'],
-        ['collab_time', 'Collab Duration (s; 0 = until stopped)'],
         ['dns_max_inflight', 'DNS Max In-Flight Digs'],
         ['gw_ping_timeout_s', 'Gateway Ping Timeout'],
     ],
@@ -4085,7 +4279,7 @@ const CS_SIM_SECTION_FIELDS = {
         ['dns_bad_ip_3', 'Dns Bad Ip 3'],
         ['dns_bad_record_1', 'Dns Bad Record 1'], ['dns_bad_record_2', 'Dns Bad Record 2'],
         ['dns_bad_record_3', 'Dns Bad Record 3'],
-        ['iperf_server', 'Iperf Server'], ['collab_server', 'Collab Server'], ['syslog_server', 'Syslog Server'],
+        ['iperf_server', 'Iperf Server'], ['syslog_server', 'Syslog Server'],
         ['mac_auth_fail_mac', 'Mac Auth Fail Mac (deny-listed MAC — pre-configure this exact MAC as a RADIUS/ClearPass MAC-Auth deny entry)'],
     ],
 };
@@ -4095,7 +4289,7 @@ const CS_SIM_BUCKET_FIELDS = [
     ['dhcp_fail', 'Dhcp Fail'], ['dns_fail', 'Dns Fail'], ['dns_latency', 'Dns Latency'],
     ['assoc_fail', 'Assoc Fail'], ['port_flap', 'Port Flap'],
     ['ping_test', 'Ping Test'], ['download', 'Download'],
-    ['www_traffic', 'Www Traffic'], ['iperf', 'Iperf'], ['collab', 'Collab'],
+    ['www_traffic', 'Www Traffic'], ['iperf', 'Iperf'],
     ['sim_phy', 'Sim Phy'], ['l1', 'L1'],
 ];
 const CS_SIM_BUCKETS = ['s0', 's1', 's2', 's3', 's4', 's5', 's6', 's7', 's8', 's9'];
@@ -4136,8 +4330,10 @@ function csSimField(section, key, label, value, type) {
     if (CS_ONOFF_KEYS.has(key)) {
         const lc = v.toLowerCase();
         const on = lc === 'on', off = lc === 'off';
-        // Unset shows "— default —" (empty → serializer skips it), never a silent
-        // "off" — the bug that flipped web_server off and disabled clients.
+        // A missing/empty value shows "— default —" (empty), NOT "off" — so a
+        // field absent from the source is never silently saved as off (which had
+        // been flipping web_server off and disabling clients). Empty serializes
+        // to nothing, so the client keeps its base/bucket value.
         return `<div class="flex flex-col gap-1">
           <label class="text-[10px] text-slate-500 uppercase font-bold tracking-wider">${csEscape(label)}</label>
           <select id="${id}" data-cs-section="${csEscape(section)}" data-cs-key="${csEscape(key)}"
@@ -4241,10 +4437,10 @@ async function csRenderConfigSimulation() {
           </div>
           ${webServerOn
             ? `<div class="border border-slate-200 rounded-lg p-3 bg-slate-50/60">
-                 <p class="text-[11px] font-bold text-slate-400 uppercase tracking-wider mb-1">Per-bucket profiles [s0]–[s9]</p>
-                 <p class="text-xs text-slate-500 leading-snug">This deployment runs in <span class="font-semibold">hub / engine mode</span> (<code>web_server=on</code>), so the engine drives placement and ambient distribution and the <span class="font-semibold">s0–s9 buckets are ignored</span> (and stripped from the served config). Sim distribution is configured centrally in the hub's <span class="font-semibold">Sim Quotas → Pool &amp; SSID</span>. The buckets only apply to standalone (GitHub-synced) deployments with <code>web_server=off</code>.</p>
+                 <p class="text-[11px] font-bold text-slate-400 uppercase tracking-wider mb-1">Per-simulation profiles [s0]–[s9]</p>
+                 <p class="text-xs text-slate-500 leading-snug">This deployment runs in <span class="font-semibold">hub / engine mode</span> (<code>web_server=on</code>), so the engine drives placement and ambient distribution and the <span class="font-semibold">s0–s9 buckets are ignored</span>. Configure how sims spread across the fleet in <span class="font-semibold">Config → Engine → Pool &amp; SSID → Simulation distribution</span>. The buckets only apply to standalone (GitHub-synced) deployments with <code>web_server=off</code>.</p>
                </div>`
-            : `<p class="text-[11px] font-bold text-slate-400 uppercase tracking-wider mb-2">Per-bucket profiles [s0]–[s9]</p>
+            : `<p class="text-[11px] font-bold text-slate-400 uppercase tracking-wider mb-2">Per-simulation profiles [s0]–[s9]</p>
           ${bucketCards}`}
           ${extras.length ? `<p class="text-[11px] font-bold text-slate-400 uppercase tracking-wider mt-3 mb-2">Extra sections</p>${extraBlocks}` : ''}
           <details class="mt-3 text-xs"><summary class="cursor-pointer text-slate-400">Raw merged simulation.conf</summary><pre class="mt-2 p-2 bg-slate-50 rounded font-mono text-[11px] whitespace-pre-wrap break-all">${csEscape(raw)}</pre></details>`;
@@ -4269,7 +4465,7 @@ async function csRenderConfigSimulation() {
       <p class="text-xs text-slate-400 mb-3">Edit the labeled fields. Saved as the hub-managed <code>sim_conf_override</code> INI and pushed to the spoke (merged on top of the repo's simulation.conf). Clearing a field reverts it to the repo default.</p>
       <div id="cs-ini-sections">${simBody}</div>
       <div class="flex justify-end items-center gap-3 mt-4">
-        <button onclick="csSaveSimConfStructured()" class="bg-[#01A982] hover:bg-[#018a6c] text-white px-5 py-2 rounded-md text-sm font-bold shadow-sm">Save</button>
+        <button onclick="csSaveSimConfStructured()" class="bg-[#01A982]/10 hover:bg-[#01A982]/20 text-[#01A982] border border-[#01A982] px-5 py-2 rounded-md text-sm font-bold shadow-sm">Save</button>
         <button onclick="csRenderConfigSimulation()" class="bg-slate-100 hover:bg-slate-200 text-slate-600 px-4 py-2 rounded-md text-sm font-bold">Refresh</button>
       </div>
     </div>`;
@@ -4291,15 +4487,14 @@ async function csRenderConfigSimulation() {
     csSet(`<div class="space-y-4">${sotCard}${roBanner}<div class="${roWrap} space-y-4">${simCard}${uoCard}</div>${hubCard}</div>`);
 }
 
-// ── Config → Sim Quotas sub-tab ────────────────────────────────────────────
+// ── Config → Engine sub-tab (sim quotas + pool/SSID) ─────────────────
 // Declares alert/insight → simulation linkage + the per-site client quota
 // the SimQuotaEngine (Chunk 2) keeps filled from the online pool. Renders
-// against the spoke's /sim-quota-catalog (sims + sites derived from this
-// spoke's simulation.conf + the global suggested linkage). Save is a
+// against the cs spoke's /sim-quota-catalog (sims + sites derived from this
+// tenant's simulation.conf + the global suggested linkage). Save is a
 // GET-merge-POST on central-sites-config so site_mappings / monitored_checks /
 // hardware_checks are preserved (mirrors csToggleMonitorCheck). The server
 // re-validates + dedups and returns the cleaned rows, which we adopt.
-// Mirrored from lm/WebUI/sim-views.js per the two-copy rule; single-tenant here.
 let csSimQuotaCatalog = null;       // {sims, sites, suggested, meta}
 let csSimQuotaRows = [];            // working set of quota rows
 let csSimQuotaMonitored = [];       // monitored_checks → {type,id,name,site} for the ID dropdown
@@ -4321,14 +4516,6 @@ async function csRenderConfigSimQuotas() {
             (typeof csCentralBrowse === 'function' ? csCentralBrowse() : Promise.resolve(null)).catch(() => null),
             (typeof csMistBrowse === 'function' ? csMistBrowse() : Promise.resolve(null)).catch(() => null),
         ]);
-        const _cat = cat || { sims: [], sites: [], suggested: {}, meta: {} };
-        // Augment the catalog's site list with Mist site_mappings so a Mist row's
-        // Site selector can target a Mist site (the engine resolves via the row's
-        // source's alias groups).
-        const _mistSites = [];
-        Object.entries((mcfg && mcfg.site_mappings) || {}).forEach(([k, v]) => { if (k) _mistSites.push(k); if (v) _mistSites.push(String(v)); });
-        if (_mistSites.length) _cat.sites = Array.from(new Set(((_cat.sites) || []).concat(_mistSites))).sort();
-        csSimQuotaCatalog = _cat;
         // Full alert/insight universe (active AND closed) from BOTH products, ids
         // PREFIXED so the picker offers Central: / Mist: ids and a new row's
         // alert_id carries its source. cat.alerts/insights are already prefixed
@@ -4353,6 +4540,14 @@ async function csRenderConfigSimQuotas() {
         ((cat && cat.alerts) || []).forEach(a => { if (a && a.id) _av.push({ type: 'alert', id: a.id, name: a.name || a.id, site: a.site || '' }); });
         ((cat && cat.insights) || []).forEach(i => { if (i && i.id) _av.push({ type: 'insight', id: i.id, name: i.name || i.id, site: i.site || '' }); });
         csSimQuotaAvailable = _av;
+        // Augment the catalog's site list with Mist site_mappings so a Mist row's
+        // Site selector can target a Mist site (the engine resolves via the row's
+        // source's alias groups).
+        const _cat = cat || { sims: [], sites: [], suggested: {}, meta: {} };
+        const _mistSites = [];
+        Object.entries((mcfg && mcfg.site_mappings) || {}).forEach(([k, v]) => { if (k) _mistSites.push(k); if (v) _mistSites.push(String(v)); });
+        if (_mistSites.length) _cat.sites = Array.from(new Set(((_cat.sites) || []).concat(_mistSites))).sort();
+        csSimQuotaCatalog = _cat;
         // Monitored checks from BOTH configs, ids PREFIXED (the picker's first
         // section — alerts/insights the tenant explicitly watches).
         const _mon = [];
@@ -4363,6 +4558,33 @@ async function csRenderConfigSimQuotas() {
             if (c && c.id) _mon.push({ type: c.type || 'alert', id: _csPrefixId('mist', String(c.id)), name: c.name || c.id, site: c.site || '' });
         });
         csSimQuotaMonitored = _mon;
+        window._csIgnoreGlobalQuotas = !!(cfg && cfg.ignore_global_quotas);
+        // Site Links (name↔wsite) — the site selectors below route on the wsite
+        // (the value), shown by the link Name, so every site field lines up.
+        window._csSiteLinks = Array.isArray(cfg && cfg.site_links) ? cfg.site_links : [];
+        // Pool / SSID config (design doc §4-5) — edited by the Pool & SSID card.
+        window._csPoolCfg = {
+            site_source: (cfg && cfg.site_source) || 'pxmx',
+            randomizable_sims: Array.isArray(cfg && cfg.randomizable_sims) ? cfg.randomizable_sims.slice()
+                : ['ping_test', 'download', 'www_traffic', 'iperf'],
+            random_pool: (cfg && cfg.random_pool && typeof cfg.random_pool === 'object') ? { ...cfg.random_pool } : {},
+            ssid_matrix: Array.isArray(cfg && cfg.ssid_matrix) ? cfg.ssid_matrix.map(c => ({ ...c })) : [],
+            ssid_placement: (cfg && cfg.ssid_placement && typeof cfg.ssid_placement === 'object') ? JSON.parse(JSON.stringify(cfg.ssid_placement)) : {},
+            ssid_weights: Array.isArray(cfg && cfg.ssid_weights) ? cfg.ssid_weights.map(w => ({ ...w })) : [],
+            // Ambient distribution (HUB mode). ambient_pct = the automatic uniform
+            // weight; ambient_control=on unlocks per-sim ambient_weights so the
+            // operator can hand some sims a bigger share of the fleet.
+            ambient_pct: (cfg && cfg.ambient_pct != null) ? Number(cfg.ambient_pct) : 50,
+            ambient_control: !!(cfg && cfg.ambient_control),
+            ambient_weights: (cfg && cfg.ambient_weights && typeof cfg.ambient_weights === 'object') ? { ...cfg.ambient_weights } : {},
+            // Per-site load multiplier (100 = normal). Higher = more random load.
+            ambient_site_weights: (cfg && cfg.ambient_site_weights && typeof cfg.ambient_site_weights === 'object') ? { ...cfg.ambient_site_weights } : {},
+            // Tier priority: T1 = dedicated PCI radios (reliable → run the
+            // issue-generating quota sims), T2 = USB dongles (background noise,
+            // fill quotas only when the T1s run out). Sets the default tier for
+            // quotas that don't pin one. Default t1_first (historical).
+            tier_priority: (cfg && ['t1_first', 't2_first', 't1_only', 't2_only'].indexOf(cfg.tier_priority) >= 0) ? cfg.tier_priority : 't1_first',
+        };
         // UNION the tenant's Central + Mist sim-quota rows. Each row's alert_id
         // is normalized to prefixed form by csSimQuotaRowFromServer, so Central:
         // and Mist: rows are distinct dedup keys (independent learning + separate
@@ -4373,7 +4595,7 @@ async function csRenderConfigSimQuotas() {
         csRenderSimQuotaEditor();
     } catch (e) {
         console.error('csRenderConfigSimQuotas: load failed', e);
-        csSet(csErrorBox('Could not load Sim Quotas', e));
+        csSet(csErrorBox('Could not load Engine Config', e));
     }
 }
 
@@ -4399,7 +4621,8 @@ function csSimQuotaRowFromServer(q) {
         tied: !!(q.sim_id && q.alert_id),
         // Learning lab toggle (design §9): ON = the LAB — full thermostat (ramps
         // up AND down to find the floor) + tunes the sim's config knobs + publishes
-        // the learned count + knobs. Default OFF.
+        // the learned count + knobs so production goes straight to learned + 20%.
+        // Default OFF.
         learning: !!q.learning,
         // Adaptive (keep firing) = the production CONSUMER — up-only, seeded from
         // the learned op + knobs, CAPPED at Max. Mutually exclusive with Learning:
@@ -4432,6 +4655,50 @@ function csSimQuotaSelect(selected, items, placeholder) {
         items.map(it => `<option value="${csEscape(it)}" ${it === selected ? 'selected' : ''}>${csEscape(it)}</option>`).join('');
 }
 
+// Site options driven by the Site Links (Config → Sites): each option shows
+// the link NAME but its VALUE is the link's wsite — the single key the engine
+// routes on (pxmx server assignment, SSID cell, quota site all match on it). A
+// currently-saved site with no matching link is still shown so it isn't lost.
+function csLinkSiteOptions(sel, placeholder) {
+    const links = (window._csSiteLinks || []).filter(l => l && l.wsite);
+    let out = `<option value="">${csEscape(placeholder || '— all sites —')}</option>`;
+    out += links.map(l => `<option value="${csEscape(l.wsite)}" ${l.wsite === sel ? 'selected' : ''}>${csEscape(l.name || l.wsite)}</option>`).join('');
+    if (sel && !links.some(l => l.wsite === sel)) {
+        out += `<option value="${csEscape(sel)}" selected>${csEscape(sel)} (unlinked)</option>`;
+    }
+    return out;
+}
+
+// Options for a QUOTA's target: a whole Site (from the links) OR a specific SSID
+// cell (from the Pool & SSID matrix, e.g. MIA-PSK). A cell-scoped quota homes its
+// clients to that cell's site AND sets their SSID — so MIA-PSK and MIA-ACD are
+// separate quota targets that can each hold clients.
+function csSsidCellOptions(sel, placeholder) {
+    // One combined item per SSID cell, shown as "MIA/PSK" (site/ssid) — the VALUE
+    // stays the cell name the engine keys on. Bare sites aren't listed; a quota
+    // targets a specific cell. Falls back to the site links only when no cells
+    // are defined yet, so the field still works.
+    const cells = ((window._csPoolCfg || {}).ssid_matrix || [])
+        .filter(c => c && (c.name || (c.site && c.ssid)));
+    let out = `<option value="">${csEscape(placeholder || '— all sites —')}</option>`;
+    const known = [];
+    out += cells.map(c => {
+        const val = c.name || `${c.site}-${c.ssid}`;
+        known.push(val);
+        const label = (c.site && c.ssid) ? `${c.site}/${c.ssid}` : val;
+        return `<option value="${csEscape(val)}" ${val === sel ? 'selected' : ''}>${csEscape(label)}</option>`;
+    }).join('');
+    const links = (window._csSiteLinks || []).filter(l => l && l.wsite);
+    if (!cells.length) {
+        out += links.map(l =>
+            `<option value="${csEscape(l.wsite)}" ${l.wsite === sel ? 'selected' : ''}>${csEscape(l.name || l.wsite)}</option>`).join('');
+    }
+    if (sel && known.indexOf(sel) < 0 && !links.some(l => l.wsite === sel)) {
+        out += `<option value="${csEscape(sel)}" selected>${csEscape(sel)}</option>`;
+    }
+    return out;
+}
+
 // Simulation dropdown options for a quota row: a leading "(Clients Associated)"
 // PRESENCE option (value "") — homes N clients to the site, runs no sim — then
 // the runnable sim primitives. Selecting presence hides the row's Type / Alert
@@ -4451,6 +4718,9 @@ function csSimQuotaSimOptions(selected, simIds) {
 function csSimQuotaAlertIdOptions(alertType, selectedId) {
     const opts = [];
     const seen = new Set();
+    // Monitored checks first (the tenant explicitly watches these), then the full
+    // Central universe (active + closed) so a quota can link to any reported
+    // alert/insight — closed ones are labelled so the operator knows the state.
     (csSimQuotaMonitored || []).forEach(c => {
         if (c.type !== alertType || !c.id || seen.has(c.id)) return;
         seen.add(c.id);
@@ -4500,7 +4770,7 @@ function _csLearnedOpForRow(r) {
 // Published-knob floor for a consumer row that inherits the learned value:
 // learned + 20% margin (production runs comfortably past the bare minimum
 // that fires), capped at DOUBLE the learned value as a safety rail against a
-// disproportionate jump for small integer knobs (e.g. learned=1 -> 1*1.2 ceils
+// disproportionate jump on small integer knobs (e.g. learned=1 -> 1*1.2 ceils
 // to 2, which IS already the double-cap; the cap protects the general case,
 // not just that edge). Mirrors _learned_knob_floor in sim_quota.py — keep
 // both in sync if this formula changes.
@@ -4526,7 +4796,6 @@ function _csKnobInheritCheckbox(r) {
 // the recommendation" flag the operator asked for), grey/placeholder when
 // left blank (falls back to the computed floor for that one key even in
 // override mode — see _knob_overrides_for_tenant's per-key fallback).
-//
 // Returns just the per-knob rows (no wrapper) — the caller groups this with
 // the learned-op footer line into one bottom-of-tile block (see
 // csRenderSimQuotaEditor).
@@ -4596,7 +4865,7 @@ function csRenderSimQuotaEditor() {
         // tile (see the knob-rows block below). Set inside the Min/Max IIFE.
         let _learnedOpFooter = '';
         const simOpts = csSimQuotaSimOptions(r.sim_id, simIds);
-        const siteOpts = csSimQuotaSelect(r.site, sites, '— all sites —');
+        const siteOpts = csSsidCellOptions(r.site, '— all sites —');
         const idOpts = csSimQuotaAlertIdOptions(r.alert_type, r.alert_id);
         // Source badge (Phase 4): Central vs Mist, derived from the row's alert_id
         // prefix (presence / untethered rows default to Central). The prefix is the
@@ -4642,11 +4911,11 @@ function csRenderSimQuotaEditor() {
             ? (() => {
                 // Consumer row (Adaptive, not Learning) with a published floor:
                 // BEHAVIOR CHANGE — min/max are DYNAMICALLY derived from the
-                // learned value each controller tick (see the hub's
-                // adaptive_step docstring), not the stored min/max, when
-                // inherit_learned_count is ON (default). The checkbox itself
-                // lives in the shared Adaptive/Learning/Re-home/Enabled row
-                // below; this cell just renders the resulting Min/Max values.
+                // learned value each controller tick (see adaptive_step's
+                // docstring), not the stored min/max, when inherit_learned_count
+                // is ON (default). The checkbox itself lives in the shared
+                // Adaptive/Learning/Re-home/Enabled row below; this cell just
+                // renders the resulting Min/Max values.
                 if (_consumerLearnedCount) {
                     const _inheritCount = r.inherit_learned_count !== false;   // default ON
                     const _floorVal = Number(_lv.floor);
@@ -4717,7 +4986,7 @@ function csRenderSimQuotaEditor() {
     </div>`;
           })()}
         </div>`;
-    }).join('')
+    }).join('');
     const suggestHtml = Object.keys(suggested).length ? `
         <details class="text-xs text-slate-500 mt-2">
           <summary class="cursor-pointer">Suggested alert → sim linkage</summary>
@@ -4728,18 +4997,314 @@ function csRenderSimQuotaEditor() {
     csSet(`<div class="space-y-4">
       <div class="hpe-card rounded-lg p-5 shadow-sm">
         <div class="flex flex-wrap items-center justify-between gap-2 mb-2">
-          <h3 class="text-sm font-bold text-slate-500 uppercase tracking-wider">Sim Quotas ${helpIcon('cs', null, 'Simulations help')}${helpIcon('alert-generation', null, 'How to generate each alert (negative sims): config + quota settings')}</h3>
-          <div class="flex gap-2">
+          <h3 class="text-sm font-bold text-slate-500 uppercase tracking-wider">Engine Config ${helpIcon('cs', null, 'Simulations help')}${helpIcon('alert-generation', null, 'How to generate each alert (negative sims): config + quota settings')}</h3>
+          <div class="flex justify-end gap-2">
+            ${window._csIgnoreGlobalQuotas
+              ? `<button onclick="csToggleIgnoreGlobalQuotas()" title="This tenant ignores the platform-wide Sim Quota defaults — only its own rows apply. Click to use global defaults again." class="bg-amber-50 hover:bg-amber-100 text-amber-700 border border-amber-300 px-4 py-1.5 rounded-md text-sm font-bold shadow-sm">Global Defaults: Ignored</button>`
+              : `<button onclick="csToggleIgnoreGlobalQuotas()" title="This tenant inherits the platform-wide Sim Quota defaults, merged with its own rows. Click to ignore them." class="bg-[#01A982]/10 hover:bg-[#01A982]/20 text-[#01A982] border border-[#01A982] px-4 py-1.5 rounded-md text-sm font-bold shadow-sm">Global Defaults: On</button>`}
             <button onclick="csSimQuotaAdd()" class="bg-[#01A982]/10 hover:bg-[#01A982]/20 text-[#01A982] border border-[#01A982] px-4 py-1.5 rounded-md text-sm font-bold shadow-sm">+ Add Quota</button>
             <button onclick="csSimQuotaSave()" class="bg-[#01A982]/10 hover:bg-[#01A982]/20 text-[#01A982] border border-[#01A982] px-4 py-1.5 rounded-md text-sm font-bold shadow-sm">Save Quotas</button>
           </div>
         </div>
-        <p class="text-xs text-slate-500 mb-2">Link a monitored alert or insight (Central → Alerts/Insights → Monitor) to the simulation that produces it, then set how many online clients the engine keeps running that sim in the chosen site. The engine auto-selects from the online pool and self-heals when a runner dies. <span class="font-semibold">Re-home</span> lets it borrow runners from other sites (re-homing their <span class="font-mono">wsite</span>) when this site's pool can't fill the count. Sims + sites come from this spoke's <span class="font-semibold">Config Editor</span> (simulation.conf) and Central site mappings.</p>
+        <p class="text-xs text-slate-500 mb-2">Link a monitored alert or insight (Central → Alerts/Insights → Monitor) to the simulation that produces it, then set how many online clients the engine keeps running that sim in the chosen site. The engine auto-selects from the online pool and self-heals when a runner dies. <span class="font-semibold">Re-home</span> lets it borrow runners from other sites (re-homing their <span class="font-mono">wsite</span>) when this site's pool can't fill the count. Sims + sites come from this tenant's <span class="font-semibold">Config Editor</span> (simulation.conf) and Central site mappings.</p>
         ${suggestHtml}
         <div class="space-y-2 mt-2" id="cs-sq-rows">${rowHtml || '<div class="text-xs text-slate-400 italic">No quotas defined. Add one or pick a suggested linkage above.</div>'}</div>
       </div>
+      ${csPoolConfigCardHtml()}
     </div>`);
 }
+
+// ── Pool & SSID config card (design doc §4-5) ────────────────────────────────
+// Site source, randomizable-sim set, the SSID matrix (site × auth cells with
+// weight + hold-N placement) and per-site random-pool/remainder. Saved into
+// central_sites_config alongside the quotas.
+// Simulation Distribution (Auto / hub mode). TWO-STEP model:
+//  1. LEVEL — "Ambient level" is a true PERCENT: the share of the fleet that is
+//     ambient-active (doing benign traffic) at any time. 40 ≈ 40% of clients.
+//  2. SPLIT — relative WEIGHTS divide those active clients across sims/sites.
+//     A weight of 3 gets 3× the clients of a weight of 1 (same rule as the SSID
+//     placement weights). An active client runs exactly ONE randomizable sim,
+//     chosen by weighted random pick; a site's weight scales its level.
+// Automatic (default): every sim/site weight is 1 → active clients split evenly.
+// Weight control: the operator opts in and the per-sim + per-site weight inputs
+// appear (weights are relative integers, default 1).
+function csAmbientDistHtml() {
+    const pc = window._csPoolCfg || {};
+    const esc = csEscape;  // shared escaper (escapes &<>"')
+    const pct = (pc.ambient_pct != null) ? pc.ambient_pct : 50;
+    const control = !!pc.ambient_control;
+    const tier = pc.tier_priority || 't1_first';
+    const rsims = pc.randomizable_sims || [];
+    const w = pc.ambient_weights || {};
+    const sw = pc.ambient_site_weights || {};
+    // Distinct sites to weight: the sites defined in the SSID matrix (fall back to
+    // the Site Links). Only these get a load-weight row.
+    const matrix = pc.ssid_matrix || [];
+    let sites = matrix.map(c => (c.site || '')).filter(Boolean);
+    if (!sites.length) sites = (window._csSiteLinks || []).map(l => (l.wsite || l.site || '')).filter(Boolean);
+    sites = Array.from(new Set(sites));
+    // Show a site by its Site-Link display name when it has one, else the raw wsite.
+    const siteLabel = st => {
+        const link = (window._csSiteLinks || []).find(l => l && l.wsite === st);
+        return (link && link.name) ? link.name : st;
+    };
+    // Per-sim weight inputs (relative split — which sims the active clients run).
+    const simGrid = !control ? '' : `
+          <div class="text-[11px] font-semibold text-slate-500 mt-2 mb-1">Per-sim — weight <span class="font-normal text-slate-400">(relative · 3 = 3× the clients of 1)</span></div>
+          <div class="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-4 gap-2">
+            ${rsims.length ? rsims.map(s => `
+              <label class="text-xs text-slate-500 flex items-center justify-between gap-2 bg-white border border-slate-200 rounded-md px-2 py-1">
+                <span class="truncate">${esc(s)}</span>
+                <input data-cs-ambient-w="${esc(s)}" type="number" min="0"
+                       value="${esc(w[s] != null ? w[s] : 1)}"
+                       class="w-16 bg-white border border-slate-300 rounded-md px-1 py-0.5 text-sm text-right">
+              </label>`).join('')
+              : '<div class="text-xs text-slate-400 italic">Select randomizable sims above to weight them.</div>'}
+          </div>`;
+    // Per-site load-weight inputs (relative — how much of the level each site gets).
+    const siteGrid = !control ? '' : `
+          <div class="text-[11px] font-semibold text-slate-500 mt-3 mb-1">Per-site — load weight <span class="font-normal text-slate-400">(relative · 3 = 3× the random load of 1)</span></div>
+          <div class="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-4 gap-2">
+            ${sites.length ? sites.map(st => `
+              <label class="text-xs text-slate-500 flex items-center justify-between gap-2 bg-white border border-slate-200 rounded-md px-2 py-1">
+                <span class="truncate">${esc(siteLabel(st))}</span>
+                <input data-cs-ambient-site="${esc(st)}" type="number" min="0"
+                       value="${esc(sw[st] != null ? sw[st] : 1)}"
+                       class="w-16 bg-white border border-slate-300 rounded-md px-1 py-0.5 text-sm text-right">
+              </label>`).join('')
+              : '<div class="text-xs text-slate-400 italic">Define SSIDs (with sites) above to weight sites.</div>'}
+          </div>`;
+    return `<div class="mb-3">
+          <div class="text-[11px] font-bold text-slate-500 uppercase tracking-wider mb-1">Simulation distribution <span class="text-slate-400 normal-case font-normal">(engine / Auto mode)</span></div>
+          <p class="text-[11px] text-slate-400 mb-1 leading-tight"><span class="font-semibold">Ambient level</span> is the % of the fleet doing benign traffic at once (<code>40</code> ≈ 40% of clients). Those active clients are split by relative <span class="font-semibold">weights</span> — a sim or site weighted <code>3</code> gets 3× the clients of one weighted <code>1</code>. By default every weight is 1 (even split). Turn on <span class="font-semibold">weight control</span> to steer the per-sim and per-site split.</p>
+          <div class="flex flex-wrap items-center gap-4">
+            <label class="text-xs text-slate-500 flex items-center gap-2">Ambient level % <span class="text-slate-400">(of fleet active)</span>
+              <input data-cs-ambient="pct" type="number" min="0" max="100" value="${esc(pct)}"
+                     class="w-16 bg-white border border-slate-300 rounded-md px-2 py-1 text-sm text-right">
+            </label>
+            <label class="text-xs text-slate-500 flex items-center gap-2">
+              <input data-cs-ambient="control" type="checkbox" ${control ? 'checked' : ''} onchange="csAmbientControlToggle()">
+              Control distribution by weight
+            </label>
+            <label class="text-xs text-slate-500 flex items-center gap-2">Tier priority <span class="text-slate-400">(T1 = PCI radio, T2 = USB dongle)</span>
+              <select data-cs-ambient="tier" class="bg-white border border-slate-300 rounded-md px-2 py-1 text-sm">
+                ${[['t1_first', 'T1 first, then T2'], ['t2_first', 'T2 first, then T1'],
+                   ['t1_only', 'T1 only'], ['t2_only', 'T2 only']].map(([v, lbl]) =>
+                     `<option value="${v}" ${tier === v ? 'selected' : ''}>${esc(lbl)}</option>`).join('')}
+              </select>
+            </label>
+          </div>
+          <p class="text-[11px] text-slate-400 mt-1 leading-tight"><span class="font-semibold">Tier priority</span> decides which radio a quota gets. T1 (PCI) clients are the more reliable ones, so by default quotas fill with T1 first and only reach for T2 dongles once the T1s run out — if the T1s cover every quota, no T2 is used for one. <span class="font-semibold">Every spare client still does background work</span>, T1 included; nothing sits idle. When a quota needs a T1 that is running background traffic, it is <span class="font-semibold">harvested into the quota</span> — displacing a T2 already in it if necessary. A quota that pins its own tier always wins over this setting. <code>T1/T2 only</code> makes unpinned quotas use that tier exclusively, underfilling rather than degrading.</p>
+          ${simGrid}
+          ${siteGrid}
+        </div>`;
+}
+
+// Toggling weight control re-renders the card so the per-sim weight inputs
+// appear/disappear. Sync current edits first so nothing is lost on re-render.
+window.csAmbientControlToggle = function () {
+    csSimQuotaSyncFromDom();
+    csPoolSyncFromDom();
+    csRenderSimQuotaEditor();
+};
+
+function csPoolConfigCardHtml() {
+    const pc = window._csPoolCfg || {};
+    const src = pc.site_source || 'pxmx';
+    const rsims = pc.randomizable_sims || [];
+    const matrix = pc.ssid_matrix || [];
+    const placement = pc.ssid_placement || {};
+    const randPool = pc.random_pool || {};
+    const flags = (typeof CS_CONTROL_FLAGS !== 'undefined' ? CS_CONTROL_FLAGS : []);
+    const esc = csEscape;  // shared escaper (escapes &<>"')
+    const simChecks = flags.map(f =>
+        `<label class="flex items-center gap-1 text-xs"><input type="checkbox" data-cs-rand="${esc(f)}" ${rsims.indexOf(f) >= 0 ? 'checked' : ''}> ${esc(f)}</label>`).join('');
+    // SSID matrix = cell DEFINITIONS only: Site, SSID/Auth, Password.
+    const matrixRows = matrix.map((c, i) => {
+        return `<div class="grid grid-cols-2 sm:grid-cols-4 gap-2 items-end bg-white border border-slate-200 rounded-md p-2" data-cs-cell="${i}">
+          <label class="text-xs text-slate-500">Site<select data-cs-cell-k="site" class="w-full bg-white border border-slate-300 rounded-md px-2 py-1 text-sm mt-1">${csLinkSiteOptions(c.site, '— site —')}</select></label>
+          <label class="text-xs text-slate-500">SSID / Auth<input data-cs-cell-k="ssid" value="${esc(c.ssid)}" placeholder="PSK / 1X" class="w-full bg-white border border-slate-300 rounded-md px-2 py-1 text-sm mt-1"></label>
+          <label class="text-xs text-slate-500">Password<input data-cs-cell-k="ssidpw" value="${esc(c.ssidpw)}" class="w-full bg-white border border-slate-300 rounded-md px-2 py-1 text-sm mt-1"></label>
+          <button onclick="csPoolCellDel(${i})" class="text-red-600 hover:text-red-800 text-xs font-bold py-1">Remove</button>
+        </div>`;
+    }).join('');
+    // Weighted random rules: spread the SPARE (unaccounted) pool across SSID
+    // cells. Each rule picks a cell + weight; weight 0 = none; All = soak the
+    // balance. The cell name (MIA-PSK) carries its site.
+    const cellNames = matrix.map(c => c.name || `${c.site}-${c.ssid}`).filter(Boolean);
+    const cellOpts = (sel) => '<option value="">— SSID —</option>' +
+        cellNames.map(nm => `<option value="${esc(nm)}" ${nm === sel ? 'selected' : ''}>${esc(nm)}</option>`).join('');
+    const weights = pc.ssid_weights || [];
+    const weightRows = weights.map((w, i) => {
+        return `<div class="grid grid-cols-4 gap-2 items-end bg-white border border-slate-200 rounded-md p-2" data-cs-wt="${i}">
+          <label class="text-xs text-slate-500">SSID<select data-cs-wt-k="ssid" class="w-full bg-white border border-slate-300 rounded-md px-2 py-1 text-sm mt-1">${cellOpts(w.ssid || w.cell || '')}</select></label>
+          <label class="text-xs text-slate-500">Weight<input data-cs-wt-k="weight" type="number" min="0" value="${esc(w.weight != null ? w.weight : 1)}" class="w-full bg-white border border-slate-300 rounded-md px-2 py-1 text-sm mt-1"></label>
+          <label class="flex items-center gap-1 text-xs text-slate-500 pb-2">All<input data-cs-wt-k="all" type="checkbox" ${w.all ? 'checked' : ''}> <span class="text-slate-400">balance</span></label>
+          <button onclick="csPoolWeightDel(${i})" class="text-red-600 hover:text-red-800 text-xs font-bold py-1">Remove</button>
+        </div>`;
+    }).join('');
+    return `<div class="hpe-card rounded-lg p-5 shadow-sm">
+        <div class="flex flex-wrap items-center justify-between gap-2 mb-2">
+          <h3 class="text-sm font-bold text-slate-500 uppercase tracking-wider">Pool &amp; SSID</h3>
+          <div class="flex justify-end gap-2">
+            <button onclick="csPoolCellAdd()" class="bg-[#01A982]/10 hover:bg-[#01A982]/20 text-[#01A982] border border-[#01A982] px-4 py-1.5 rounded-md text-sm font-bold shadow-sm">+ Add SSID</button>
+            <button onclick="csSavePoolConfig()" class="bg-[#01A982]/10 hover:bg-[#01A982]/20 text-[#01A982] border border-[#01A982] px-4 py-1.5 rounded-md text-sm font-bold shadow-sm">Save Pool</button>
+          </div>
+        </div>
+        <p class="text-xs text-slate-500 mb-3">The SSID matrix just <span class="font-semibold">defines</span> your SSIDs (site, auth, password). <span class="font-semibold">Sim Quotas</span> attach an exact (accounted) count of clients to a cell for an alert. The <span class="font-semibold">weighted rules</span> below spread the rest of the pool (random, unaccounted) across a site's SSIDs by weight. Whether a PXMX server is site-bound (RF chamber) or assignable is set in <span class="font-semibold">Config → Sites</span>.</p>
+        <div class="mb-3">
+          <div class="text-[11px] font-bold text-slate-500 uppercase tracking-wider mb-1">Randomizable (ambient) sims</div>
+          <div class="grid grid-cols-2 sm:grid-cols-4 lg:grid-cols-6 gap-x-4 gap-y-1">${simChecks}</div>
+        </div>
+        ${csAmbientDistHtml()}
+        <div class="mb-3">
+          <div class="text-[11px] font-bold text-slate-500 uppercase tracking-wider mb-1">SSID matrix</div>
+          <div class="space-y-2">${matrixRows || '<div class="text-xs text-slate-400 italic">No SSIDs. Click + Add SSID.</div>'}</div>
+        </div>
+        <div>
+          <div class="flex items-center justify-between mb-1">
+            <div class="text-[11px] font-bold text-slate-500 uppercase tracking-wider">Weighted random distribution</div>
+            <button onclick="csPoolWeightAdd()" class="text-[#01A982] hover:underline text-xs font-bold">+ Add rule</button>
+          </div>
+          <p class="text-[11px] text-slate-400 mb-1 leading-tight">Spreads the spare pool across a site's SSIDs. Weight 5 vs 1 = 5× the clients; weight 0 = none; <span class="font-semibold">All</span> = balance of the pool goes to that SSID.</p>
+          <div class="space-y-2">${weightRows || '<div class="text-xs text-slate-400 italic">No weighted rules. Click + Add rule.</div>'}</div>
+        </div>
+      </div>`;
+}
+
+function csPoolSyncFromDom() {
+    const pc = window._csPoolCfg || (window._csPoolCfg = {});
+    const src = document.querySelector('[data-cs-pool="site_source"]');
+    if (src) pc.site_source = src.value;
+    pc.randomizable_sims = Array.from(document.querySelectorAll('[data-cs-rand]'))
+        .filter(el => el.checked).map(el => el.getAttribute('data-cs-rand'));
+    const matrix = [];
+    document.querySelectorAll('[data-cs-cell]').forEach(el => {
+        const get = k => { const i = el.querySelector(`[data-cs-cell-k="${k}"]`); return i ? String(i.value).trim() : ''; };
+        const site = get('site'), ssid = get('ssid');
+        if (!site && !ssid) return;
+        matrix.push({ name: `${site}-${ssid}`, site, ssid, ssidpw: get('ssidpw'), enabled: true });
+    });
+    pc.ssid_matrix = matrix;
+    // Weighted random rules → {site, ssid(cell), weight, all}. The cell name
+    // carries its site (derive it from the matrix). weight 0 = that cell takes
+    // none; All = soak the balance. random_pool is derived on for any site with a
+    // rule so its spare clients run ambient (randomizable) sims.
+    const cellSite = {};
+    matrix.forEach(c => { cellSite[c.name] = c.site; });
+    const weights = [];
+    const randPool = {};
+    document.querySelectorAll('[data-cs-wt]').forEach(el => {
+        const q = k => el.querySelector(`[data-cs-wt-k="${k}"]`);
+        const cell = q('ssid') ? String(q('ssid').value).trim() : '';
+        if (!cell) return;
+        const site = cellSite[cell] || '';
+        weights.push({
+            site, ssid: cell,
+            weight: parseFloat(q('weight') ? q('weight').value : '1') || 0,
+            all: !!(q('all') && q('all').checked),
+        });
+        if (site) randPool[site] = true;
+    });
+    pc.ssid_weights = weights;
+    pc.random_pool = randPool;
+    pc.ssid_placement = {};   // deprecated — weighted rules replace hold-N/remainder
+    // Ambient distribution: base %, control toggle, and (when control is on) the
+    // per-sim weights. Weights are only collected for sims still checked as
+    // randomizable so a de-selected sim doesn't leave a stale weight behind.
+    const pctEl = document.querySelector('[data-cs-ambient="pct"]');
+    if (pctEl) {
+        let p = parseInt(pctEl.value, 10);
+        if (isNaN(p)) p = 50;
+        pc.ambient_pct = Math.max(0, Math.min(100, p));
+    }
+    const ctrlEl = document.querySelector('[data-cs-ambient="control"]');
+    if (ctrlEl) pc.ambient_control = !!ctrlEl.checked;
+    // Tier priority is independent of weight control — it applies in every mode.
+    const tierEl = document.querySelector('[data-cs-ambient="tier"]');
+    if (tierEl && ['t1_first', 't2_first', 't1_only', 't2_only'].indexOf(tierEl.value) >= 0) {
+        pc.tier_priority = tierEl.value;
+    }
+    if (pc.ambient_control) {
+        // Per-sim relative weights (default 1). Keep only non-default entries so a
+        // config with an even split stays clean.
+        const aw = {};
+        (pc.randomizable_sims || []).forEach(s => {
+            const el = document.querySelector(`[data-cs-ambient-w="${s}"]`);
+            if (!el) return;
+            let v = parseInt(el.value, 10);
+            if (isNaN(v)) v = 1;
+            v = Math.max(0, v);
+            if (v !== 1) aw[s] = v;
+        });
+        pc.ambient_weights = aw;
+        // Per-site relative load weights (default 1). Keep only non-default entries.
+        const asw = {};
+        document.querySelectorAll('[data-cs-ambient-site]').forEach(el => {
+            const st = el.getAttribute('data-cs-ambient-site');
+            let v = parseInt(el.value, 10);
+            if (isNaN(v)) v = 1;
+            v = Math.max(0, v);
+            if (st && v !== 1) asw[st] = v;
+        });
+        pc.ambient_site_weights = asw;
+    }
+    return pc;
+}
+
+window.csPoolWeightAdd = function () {
+    csSimQuotaSyncFromDom(); csPoolSyncFromDom();
+    (window._csPoolCfg.ssid_weights = window._csPoolCfg.ssid_weights || [])
+        .push({ site: '', ssid: '', weight: 1, all: false });
+    csRenderSimQuotaEditor();
+};
+
+window.csPoolWeightDel = function (i) {
+    csSimQuotaSyncFromDom(); csPoolSyncFromDom();
+    (window._csPoolCfg.ssid_weights || []).splice(i, 1);
+    csRenderSimQuotaEditor();
+};
+
+window.csPoolCellAdd = function () {
+    csSimQuotaSyncFromDom(); csPoolSyncFromDom();
+    (window._csPoolCfg.ssid_matrix = window._csPoolCfg.ssid_matrix || [])
+        .push({ name: '', site: '', ssid: '', ssidpw: '', weight: 1, enabled: true });
+    csRenderSimQuotaEditor();
+};
+window.csPoolCellDel = function (i) {
+    csSimQuotaSyncFromDom(); csPoolSyncFromDom();
+    (window._csPoolCfg.ssid_matrix || []).splice(i, 1);
+    csRenderSimQuotaEditor();
+};
+window.csSavePoolConfig = async function () {
+    csPoolSyncFromDom();
+    const pc = window._csPoolCfg || {};
+    try {
+        const cfg = await csFetch(`/${csTenant()}/central-sites-config?tenant_id=${csTenant()}`) || {};
+        const body = {
+            site_mappings: (cfg.site_mappings && typeof cfg.site_mappings === 'object') ? cfg.site_mappings : {},
+            monitored_checks: Array.isArray(cfg.monitored_checks) ? cfg.monitored_checks : [],
+            hardware_checks: Array.isArray(cfg.hardware_checks) ? cfg.hardware_checks : [],
+            sim_quotas: Array.isArray(cfg.sim_quotas) ? cfg.sim_quotas : [],
+            ignore_global_quotas: !!cfg.ignore_global_quotas,
+            site_source: pc.site_source || 'pxmx',
+            randomizable_sims: pc.randomizable_sims || [],
+            random_pool: pc.random_pool || {},
+            ssid_matrix: pc.ssid_matrix || [],
+            ssid_placement: pc.ssid_placement || {},
+            ssid_weights: pc.ssid_weights || [],
+            ambient_pct: (pc.ambient_pct != null ? pc.ambient_pct : 50),
+            ambient_control: !!pc.ambient_control,
+            ambient_weights: pc.ambient_control ? (pc.ambient_weights || {}) : {},
+            ambient_site_weights: pc.ambient_control ? (pc.ambient_site_weights || {}) : {},
+            tier_priority: pc.tier_priority || 't1_first',
+        };
+        await csFetch(`/${csTenant()}/central-sites-config?tenant_id=${csTenant()}`, { method: 'POST', body: JSON.stringify(body) });
+        showToast('Pool & SSID config saved.', 'success');
+    } catch (e) {
+        showToast((e && e.message) || 'Save failed', 'error');
+    }
+};
 
 // Read the working rows back from the DOM so Add/Remove/Suggest keep current
 // edits without forcing a save first.
@@ -4763,6 +5328,7 @@ function csSimQuotaSyncFromDom() {
         const learning = tied ? _learningChecked : false;
         const row = {
             alert_type: (g('alert_type') || {}).value || 'alert',
+            // An untethered row (not tied) carries no alert_id.
             alert_id: tied ? ((g('alert_id') || {}).value || '').trim() : '',
             sim_id,
             site: g('site').value,
@@ -4791,8 +5357,9 @@ function csSimQuotaSyncFromDom() {
             // Adaptive/Learning rows use Min/Max; count is the floor the controller
             // ramps from. ONLY read min/max when the fields are actually rendered —
             // when the user just ticked the box they aren't yet, and reading absent
-            // fields as 1/1 would make min==max so the row saves as NON-adaptive.
-            // Leave min/max for the toggle handler's seed when the fields are absent.
+            // fields as 1/1 would make min==max so the row saves as NON-adaptive (the
+            // "Adaptive unchecks on save" bug). Leave min/max for the toggle
+            // handler's seed (min=count, max=count*2) when the fields are absent.
             const minEl = g('min'), maxEl = g('max');
             if (minEl && maxEl) {
                 const mn = parseInt(minEl.value || '1', 10) || 1;
@@ -4815,7 +5382,11 @@ function csSimQuotaSyncFromDom() {
     return rows;
 }
 
-// Toggling a row's "Tied to alert/insight" flips whether Type / Alert ID show.
+// Simulation Sharing (Stacking) moved to Setup → Simulations → Sim Quotas
+// (main.js) as a GLOBAL, all-tenant authoritative map — no longer edited here.
+
+// Toggling a row's "Tied to alert/insight" flips whether the Type / Alert ID
+// controls show; sync current edits first so nothing is lost on re-render.
 window.csSimQuotaOnTiedChange = function (cb) {
     csSimQuotaSyncFromDom();
     const row = cb && cb.closest('[data-cs-sqrow]');
@@ -4828,7 +5399,7 @@ window.csSimQuotaOnTiedChange = function (cb) {
 
 // Toggling "Adaptive" (the production consumer) swaps Clients for Min/Max and
 // is MUTUALLY EXCLUSIVE with Learning (the lab) — checking Adaptive unchecks
-// Learning. The controller ramps between Min/Max to keep the alert firing,
+// Learning. The hub controller ramps between Min/Max to keep the alert firing,
 // capped at Max. Sync first so nothing is lost.
 window.csSimQuotaOnAdaptiveChange = function (cb) {
     csSimQuotaSyncFromDom();
@@ -4951,6 +5522,43 @@ window.csSimQuotaDel = function (i) {
     csRenderSimQuotaEditor();
 };
 
+// Toggle whether this tenant IGNORES the platform-wide Sim Quota defaults.
+// Persists ignore_global_quotas on central-sites-config (preserving the other
+// fields + current row edits) and re-renders so the button + engine reflect it.
+window.csToggleIgnoreGlobalQuotas = async function () {
+    const next = !window._csIgnoreGlobalQuotas;
+    try {
+        // Send ONLY the toggle boolean. The server MERGES this into the existing
+        // central_sites_config, so the tenant's sim_quotas (and every other
+        // field — site_mappings, monitored_checks, hardware_checks) are preserved
+        // untouched. Enabling global defaults then ADDS the platform defaults on
+        // top via the effective-quota merge (_effective_sim_quotas unions global
+        // defaults with the tenant's own rows — the tenant's rows still apply for
+        // alerts it has declared; global fills the rest). Never re-send the
+        // editor's sim_quotas here: a load race (empty rows) previously REPLACED
+        // the stored table with [] on this toggle, stripping the tenant's
+        // settings. Use Save Quotas to edit rows; this toggle only flips the flag.
+        const r = await csFetch(`/${csTenant()}/central-sites-config?tenant_id=${csTenant()}`,
+            { method: 'POST', body: JSON.stringify({ ignore_global_quotas: next }) });
+        window._csIgnoreGlobalQuotas = next;
+        // Anti-blast backstop: even a boolean-only save re-validates the merged
+        // sim_quotas, so a stale simulation.conf could still drop them — the
+        // server guard refuses that wipe and returns the preserved rows. Re-adopt
+        // them so the editor doesn't desync to empty.
+        if (r && r.sim_quotas_wipe_blocked && Array.isArray(r.sim_quotas) && r.sim_quotas.length) {
+            csSimQuotaRows = r.sim_quotas.map(csSimQuotaRowFromServer);
+            csRenderSimQuotaEditor();
+            showToast('⚠️ Quota wipe blocked — existing sim quotas preserved '
+                + '(stale simulation.conf). Toggle applied; quotas kept.', 'error');
+        } else {
+            csRenderSimQuotaEditor();
+            showToast(next ? 'Now ignoring global quota defaults.' : 'Now using global quota defaults.', 'success');
+        }
+    } catch (e) {
+        showToast((e && e.message) || 'Save failed', 'error');
+    }
+};
+
 window.csSimQuotaSave = async function () {
     const rows = csSimQuotaSyncFromDom();
     // Source-aware split-save (Phase 4): each row's alert_id carries a Central:/
@@ -4970,6 +5578,7 @@ window.csSimQuotaSave = async function () {
                 monitored_checks: Array.isArray(cfg.monitored_checks) ? cfg.monitored_checks : [],
                 hardware_checks: Array.isArray(cfg.hardware_checks) ? cfg.hardware_checks : [],
                 sim_quotas: centralRows,
+                ignore_global_quotas: !!cfg.ignore_global_quotas,
             };
             const r = await csFetch(`/${csTenant()}/central-sites-config?tenant_id=${csTenant()}`, { method: 'POST', body: JSON.stringify(body) });
             cleanRows.push(...(Array.isArray(r && r.sim_quotas) ? r.sim_quotas : centralRows));
@@ -5008,7 +5617,67 @@ window.csSimQuotaSave = async function () {
     }
 };
 
-// ── Quota State: live SimQuotaEngine ledger (Config → Quota State) ──────────
+// Reset & Reshuffle: clear the engine ledger + engine-set overrides on every
+// bound spoke and reconcile fresh — flushes stale assignments (a client stuck in
+// two quotas, an ignored host lingering) after config/engine changes.
+window.csResetSimQuota = async function () {
+    if (typeof confirm === 'function' &&
+        !confirm('Clear ALL engine assignments and re-shuffle every client from scratch?')) return;
+    try {
+        const r = await csFetch(`/${csTenant()}/sim-quota-reset?tenant_id=${csTenant()}`, { method: 'POST' });
+        if (typeof showToast === 'function') showToast(`Reset ${(r && r.reset_spokes) || 0} spoke(s) — reshuffling…`, 'success');
+        setTimeout(csRenderSimQuotaState, 2000);
+    } catch (e) {
+        console.error('csResetSimQuota: reset failed', e);
+        if (typeof showToast === 'function') showToast('Reset failed: ' + (e.message || e), 'error');
+    }
+};
+
+// seconds → compact "Xs" / "Ym" / "Zh Ym" (known-good time_to_stable_s human
+// formatter). csFmtDuration renders mm:ss under an hour, which reads oddly for a
+// "stable in" phrase, so we use this word form here.
+function csDurShort(s) {
+    s = Math.max(0, Math.round(Number(s) || 0));
+    if (s < 60) return `${s}s`;
+    const h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60);
+    if (h > 0) return m > 0 ? `${h}h ${m}m` : `${h}h`;
+    return `${m}m`;
+}
+
+// Reset to known-good: restore the engine to the last recorded stable operating
+// point (client count + config knobs that reliably fired the alert). The backend
+// holds that point for hold_seconds, then resumes adaptive learning. alertKey
+// omitted / empty → reset ALL alerts with a known-good point. Best-effort:
+// surfaces no_known_good / no_match statuses as informative toasts.
+window.csResetToKnownGood = async function (alertKey) {
+    const ak = alertKey || '';
+    const scope = ak ? 'this alert' : 'ALL alerts';
+    if (typeof confirm === 'function' &&
+        !confirm(`Reset ${scope} to the known-good operating point? The engine holds it for ~1h, then resumes learning.`)) return;
+    try {
+        const body = JSON.stringify(ak ? { alert_key: ak } : {});
+        const r = await csFetch(`/${csTenant()}/sim-quota/reset-to-known-good`, { method: 'POST', body }) || {};
+        const status = r.status || '';
+        if (status === 'no_known_good') {
+            if (typeof showToast === 'function') showToast('No known-good operating point recorded yet.', 'info');
+            return;
+        }
+        if (status === 'no_match') {
+            if (typeof showToast === 'function') showToast('No known-good point matches that alert.', 'info');
+            return;
+        }
+        const n = Array.isArray(r.restored_alerts) ? r.restored_alerts.length : 0;
+        const hold = r.hold_seconds ? csDurShort(r.hold_seconds) : '1h';
+        const label = n ? `Reset ${n} alert${n === 1 ? '' : 's'} to known-good` : 'Reset to known-good';
+        if (typeof showToast === 'function') showToast(`${label} — holding ${hold} then resuming learning`, 'success');
+        setTimeout(csRenderSimQuotaState, 1500);
+    } catch (e) {
+        console.error('csResetToKnownGood: reset failed', e);
+        if (typeof showToast === 'function') showToast('Reset to known-good failed: ' + (e.message || e), 'error');
+    }
+};
+
+// ── Engine State: live SimQuotaEngine ledger (Config → Engine State) ────────
 // Read-only view of which clients the engine currently has assigned to each
 // effective quota, the target vs. assigned count, and the multi_capable /
 // rehome flags. Manual-refresh under Config (shares the Config primary's
@@ -5033,9 +5702,10 @@ async function csRenderSimQuotaState() {
         // presence quota (sim_id empty — "Clients Associated") is keyed by site
         // alone (presence::MIA), not alert_type:alert_id:site, so it joins the
         // ledger's presence entry instead of a phantom alert row.
-        // Mirror the engine's _quota_key EXACTLY, incl. the UNTETHERED sim case
-        // (sim set, no alert → sim:<sim>:<site>); without it an untethered sim
-        // quota showed 0/N and its ledger entry fell into "RELEASING".
+        // Mirror the engine's _quota_key EXACTLY, including the UNTETHERED sim
+        // case (sim set, no alert → sim:<sim>:<site>). Missing that made every
+        // untethered sim quota key to alert::<site>, so its row showed 0/N and
+        // its real ledger entry landed in "RELEASING" as a phantom.
         const keyOf = (q) => !q.sim_id
             ? `presence::${q.site || ''}`
             : (!q.alert_id
@@ -5050,13 +5720,14 @@ async function csRenderSimQuotaState() {
             const hit = mc.find(c => c && String(c.id) === i && (c.type || 'alert') === t);
             return hit && hit.name ? hit.name : '';
         };
-        // Live per-check firing status from the Central poller, reused from the
-        // sim-quota-state payload (NO extra API query). SAME indicator as the
-        // dashboard Checks table: csAlertBadge(status). INVERTED semantics:
-        // status "ok" == the expected error IS present == firing (green OK);
-        // "error" == the sim stopped producing it (red FAILED). Empty when
-        // Central isn't configured / no poll has run, or for presence /
-        // untethered rows.
+        // Live per-check firing status from the spoke's Central poller, reused
+        // from the sim-quota-state payload (NO extra API query). This is the
+        // SAME {site: {check_id: {status, message}}} the dashboard Checks table
+        // renders — so the indicator here is identical to the dashboard check:
+        // csAlertBadge(status). INVERTED semantics: status "ok" == the expected
+        // error IS present == the alert/insight IS firing (green OK); "error"
+        // == the sim stopped producing it (red FAILED). Empty when Central isn't
+        // configured / no poll has run, or for presence / untethered rows.
         const checkStatus = (st.check_status && typeof st.check_status === 'object') ? st.check_status : {};
         const firingOf = (q) => {
             if (!q.alert_id) return '';  // presence / untethered — no alert to fire
@@ -5101,7 +5772,6 @@ async function csRenderSimQuotaState() {
             const blocked = (d.blocked && typeof d.blocked === 'object') ? d.blocked : {};
             const bparts = Object.keys(blocked).sort((a, b) => blocked[b] - blocked[a])
                 .map(r => `${blocked[r]} ${REASON_LBL[r] || r}`);
-            // Only surface when it matters: underfilled, or something blocked.
             if (d.assigned >= target && !bparts.length) return '';
             const bits = [`<b>${d.eligible_free || 0}</b> free-eligible`];
             if (bparts.length) bits.push(`blocked: ${csEscape(bparts.join(', '))}`);
@@ -5135,12 +5805,36 @@ async function csRenderSimQuotaState() {
             const e = ledger[k] || {};
             const clients = Array.isArray(e.clients) ? e.clients : [];
             const target = q.count != null ? q.count : 0;
-            const fill = clients.length >= target
+            const _as = (st.adaptive_state || {})[`${q.alert_type || 'alert'}:${q.alert_id || ''}:${q.site || ''}`];
+            // Adaptive controller indicator (design §9): 🔄 Learning / ✅ Stable ·
+            // floor N / ⚠️ At max / ⚠️ Underfilled. "min" = the learned floor, "max"
+            // = the controller's ramp target. A quota BETWEEN floor and target is
+            // filling by design — NOT a warning. ⚠️ Underfilled fires ONLY when the
+            // engine can't reach the minimum (assigned < floor); ⚠️ At max ONLY
+            // when the engine actually filled to the target (assigned >= target)
+            // and the controller is parked at its ceiling (mode at_max) yet the
+            // alert still isn't firing. The count is amber only below the floor.
+            const _fl = _as ? _as.floor : null;
+            const _belowFloor = (_fl != null && _fl > 0) && clients.length < _fl;
+            let fill = (clients.length >= target || !_belowFloor)
                 ? `<span class="text-[#01A982] font-semibold">${clients.length}/${target}</span>`
                 : `<span class="text-amber-600 font-semibold">${clients.length}/${target}</span>`;
+            if (_as) {
+                const _m = _as.mode || 'learning';
+                const _op = _as.learned_op != null ? _as.learned_op : null;
+                const _atMaxCount = target > 0 && clients.length >= target;
+                fill += ' ' + (_belowFloor
+                    ? `<span class="text-[10px] font-semibold text-amber-700 bg-amber-50 border border-amber-200 px-1.5 py-0.5 rounded-full" title="Underfilled ${clients.length}/${target} — below the learned floor ${_fl}. The engine can't fill to the floor from the online pool, so the alert may not fire reliably.">⚠️ Underfilled</span>`
+                    : (_atMaxCount && _m === 'at_max')
+                    ? `<span class="text-[10px] font-semibold text-amber-700 bg-amber-50 border border-amber-200 px-1.5 py-0.5 rounded-full" title="At max, alert not firing">⚠️ At max</span>`
+                    : _m === 'stable'
+                    ? `<span class="text-[10px] font-semibold text-emerald-700 bg-emerald-50 border border-emerald-200 px-1.5 py-0.5 rounded-full" title="Learned the firing floor; holding at floor + 20% (the operating point the admin approves and production sites maintain).">✅ Learned ${_fl != null ? _fl : '—'}${_op != null ? ' · +20% → ' + _op + ' per design' : ''}</span>`
+                    : `<span class="text-[10px] font-semibold text-slate-600 bg-slate-100 border border-slate-200 px-1.5 py-0.5 rounded-full" title="Probing down to find/confirm the minimum count that fires the alert.">🔄 Learning</span>`);
+            }
             const fname = nameOf(q.alert_type, q.alert_id);
             const isPresence = !q.sim_id;
-            // A sim quota with no alert/insight is untethered — shown as Presence.
+            // A sim quota with no alert/insight is untethered — shown as Presence
+            // (it just keeps N clients on the sim, no alert trigger).
             const untethered = !isPresence && !q.alert_id;
             const idCell = isPresence
                 ? `<span class="text-slate-700 italic">Clients Associated</span>`
@@ -5153,16 +5847,23 @@ async function csRenderSimQuotaState() {
             const simCell = isPresence
                 ? `<span class="italic text-slate-400">— none —</span>`
                 : `<span class="font-mono">${csEscape(q.sim_id || '')}</span>`;
+            // Two rows per quota: the data row, then the clients wrapped full-width
+            // underneath (the chips can be long, so they get their own line).
             return `<tr class="border-t border-slate-100">
-              <td class="px-2 py-1.5 text-xs capitalize">${csEscape(typeCell)}</td>
-              <td class="px-2 py-1.5 text-xs">${idCell}</td>
-              <td class="px-2 py-1.5 text-xs text-center">${firingOf(q) || '<span class="text-slate-300">—</span>'}</td>
-              <td class="px-2 py-1.5 text-xs">${simCell}</td>
-              <td class="px-2 py-1.5 text-xs">${csEscape(q.site || '<all>')}</td>
-              <td class="px-2 py-1.5 text-xs text-center">${fill}</td>
-              <td class="px-2 py-1.5 text-xs text-center" title="Shareable (stacks onto other sims) — set globally in Setup → Simulations Sharing">${(diagByKey[k] ? diagByKey[k].multi : q.multi_capable) ? '✓' : '—'}</td>
-              <td class="px-2 py-1.5 text-xs text-center">${q.rehome ? '✓' : '—'}</td>
-              <td class="px-2 py-1.5 text-xs">${chips(clients) || '<span class="text-slate-400 italic">none</span>'}${kgLine(q)}${diagLine(q, k)}</td>
+              <td class="px-2 pt-1.5 pb-0.5 text-xs capitalize">${csEscape(typeCell)}</td>
+              <td class="px-2 pt-1.5 pb-0.5 text-xs">${idCell}</td>
+              <td class="px-2 pt-1.5 pb-0.5 text-xs text-center">${firingOf(q) || '<span class="text-slate-300">—</span>'}</td>
+              <td class="px-2 pt-1.5 pb-0.5 text-xs">${simCell}</td>
+              <td class="px-2 pt-1.5 pb-0.5 text-xs">${csEscape(q.site || '<all>')}</td>
+              <td class="px-2 pt-1.5 pb-0.5 text-xs text-center">${fill}</td>
+              <td class="px-2 pt-1.5 pb-0.5 text-xs text-center" title="Shareable (stacks onto other sims) — set globally in Setup → Simulations Sharing">${(diagByKey[k] ? diagByKey[k].multi : q.multi_capable) ? '✓' : '—'}</td>
+              <td class="px-2 pt-1.5 pb-0.5 text-xs text-center">${q.rehome ? '✓' : '—'}</td>
+            </tr>
+            <tr>
+              <td class="px-2 pt-0 pb-2 text-xs align-top" colspan="8">
+                <span class="text-[10px] text-slate-400 uppercase tracking-wider mr-1.5">Clients</span>${chips(clients) || '<span class="text-slate-400 italic">none</span>'}
+                ${kgLine(q)}${diagLine(q, k)}
+              </td>
             </tr>`;
         }).join('');
         // Ledger entries no longer in the effective set (quota removed but
@@ -5171,7 +5872,7 @@ async function csRenderSimQuotaState() {
         const orphans = Object.entries(ledger).filter(([k]) => !effKeys.has(k));
         const orphanHtml = orphans.length ? `
             <div class="mt-4">
-              <p class="text-xs font-bold text-slate-500 uppercase tracking-wider mb-1">Releasing (no longer effective)</p>
+              <p class="text-xs font-bold text-slate-500 uppercase tracking-wider mb-2">Releasing (no longer effective)</p>
               ${orphans.map(([k, e]) => {
                   const parts = k.split(':');
                   const on = nameOf(parts[0], parts[1]);
@@ -5179,40 +5880,140 @@ async function csRenderSimQuotaState() {
                   return `<p class="text-xs text-slate-500 mb-1">${lbl} → ${chips(e.clients)}</p>`;
               }).join('')}
             </div>` : '';
+        // Warnings: adaptive quotas pinned at max + still not firing, and SSID
+        // placement cells that couldn't reach their floor (pool too small).
+        const _warns = [];
+        Object.entries((st.adaptive_state || {})).forEach(([k, v]) => {
+            if (!v) return;
+            const _lk = ledger[k] || {};
+            const assigned = Array.isArray(_lk.clients) ? _lk.clients.length : 0;
+            const tgt = (v.target != null) ? v.target : 0;
+            const fl = (v.floor != null) ? v.floor : null;
+            const atMaxCount = tgt > 0 && assigned >= tgt;
+            // ⚠️ Underfilled ONLY when below the learned minimum (floor) — a quota
+            // BETWEEN floor and target is filling by design, NOT a warning. ⚠️ At
+            // max ONLY when the engine filled to the target (assigned >= target)
+            // and the controller is parked at its ceiling (mode at_max) yet still
+            // not firing.
+            if (fl != null && fl > 0 && assigned < fl) {
+                _warns.push(`Adaptive quota <span class="font-mono">${csEscape(k)}</span> is underfilled (${assigned}/${tgt}) — below the learned minimum (floor ${csEscape(String(fl))}); the engine can't reach the minimum from the online pool, so the alert may not fire.`);
+            } else if (atMaxCount && v.mode === 'at_max') {
+                _warns.push(`Adaptive quota <span class="font-mono">${csEscape(k)}</span> is at max (${csEscape(String(tgt))}) and still not firing.`);
+            }
+        });
+        (Array.isArray(st.placement_warnings) ? st.placement_warnings : []).forEach(w => {
+            _warns.push(`SSID <span class="font-mono">${csEscape(w.cell || '')}</span> under min (${csEscape(String(w.have))}/${csEscape(String(w.want))}) — not enough online clients at ${csEscape(w.site || '')}.`);
+        });
+        (Array.isArray(st.stale_push) ? st.stale_push : []).forEach(s => {
+            if (s.missing) {
+                _warns.push(`Quota <span class="font-mono">${csEscape(s.key || '')}</span> is <b>missing from the spoke</b> (hub target ${csEscape(String(s.hub_count))}) — the engine never tries to fill it, so it reads 0 with no eligibility explanation. The effective-quota push hasn't landed; Reset &amp; Reshuffle (or the next adaptive push) re-pushes it.`);
+            } else {
+                _warns.push(`Quota <span class="font-mono">${csEscape(s.key || '')}</span> tenant count (${csEscape(String(s.spoke_count))}) lags hub target (${csEscape(String(s.hub_count))}) — a cs spoke is offline or hasn't adopted its apportioned share of the latest push. The self-heal re-pushes every 45s (Reset &amp; Reshuffle forces it).`);
+            }
+        });
+        const warnBanner = _warns.length
+            ? `<div class="bg-amber-50 border border-amber-200 rounded-md p-3 mb-3 text-xs text-amber-800">
+                 <div class="font-bold mb-1">⚠️ ${_warns.length} warning${_warns.length === 1 ? '' : 's'}</div>
+                 ${_warns.map(w => `<div>• ${w}</div>`).join('')}
+               </div>` : '';
+        // Adaptive Controllers panel (design §9) — prominent per-quota learning
+        // state so it's discoverable even before you look at the row badge.
+        const _adEntries = Object.entries(st.adaptive_state || {});
+        const _adRow = ([k, v]) => {
+            const p = String(k).split(':');  // alert_type:alert_id:site
+            const label = `${p[1] || '(sim)'} @ ${p[2] || 'all sites'}`;
+            const m = (v && v.mode) || 'learning';
+            const tgt = (v && v.target != null) ? v.target : 0;
+            const isLab = !!(v && v.learning);
+            const phase = (v && v.phase) || '';
+            const labTag = isLab
+                ? `<span class="text-violet-700" title="Learning lab: runs the full thermostat (ratchets down to find the floor) and records a publishable learned value. Phase: ${csEscape(phase)}">🧪 Lab${phase ? `·${csEscape(phase)}` : ''}</span>`
+                : `<span class="text-slate-400" title="Consumer: up-only — seeds/lifts from the learned value, never down-ratchets.">📥 Consumer</span>`;
+            // Join the live ledger to show the ACTUAL runner count, not just the
+            // controller's target. "At max" means the controller's target hit the
+            // configured ceiling — but if the engine only filled 4 of 15 (pool too
+            // small / clients claimed by exclusive sims), "at max" is misleading:
+            // the alert isn't firing because the engine can't fill, not because max
+            // runners are running and still not firing. Surface that honestly.
+            const _lk = ledger[k] || {};
+            const assigned = Array.isArray(_lk.clients) ? _lk.clients.length : 0;
+            const fl = (v && v.floor != null) ? v.floor : null;
+            const atMaxCount = tgt > 0 && assigned >= tgt;
+            // ⚠️ Underfilled ONLY below the learned minimum (floor); between floor
+            // and target is filling by design (no warning); ⚠️ At max ONLY when
+            // filled to target AND the controller is parked at its ceiling.
+            const underfilled = (fl != null && fl > 0) && assigned < fl;
+            const badge = underfilled
+                ? `<span class="text-amber-700">⚠️ Underfilled ${assigned}/${tgt}</span>`
+                : ((atMaxCount && m === 'at_max')
+                    ? '<span class="text-amber-700">⚠️ At max</span>'
+                    : m === 'stable' ? '<span class="text-emerald-700">✅ Stable</span>'
+                    : '<span class="text-slate-600">🔄 Learning</span>');
+            return `<div class="flex flex-wrap items-center gap-3 text-xs py-0.5">
+              <span class="w-96 max-w-full font-mono text-slate-600 truncate" title="${csEscape(label)}">${csEscape(label)}</span>
+              <span class="font-semibold">${badge}</span>
+              ${labTag}
+              ${(v && v.floor != null) ? `<span class="text-slate-400">floor ${csEscape(String(v.floor))}</span>` : ''}
+              ${(v && v.learned_op != null) ? `<span class="text-slate-400">learned ${csEscape(String(v.learned_op))}</span>` : ''}
+              <span class="text-slate-400">target ${csEscape(String((v && v.target != null) ? v.target : '—'))}</span>
+            </div>`;
+        };
+        const adaptivePanel = `<div class="hpe-card rounded-lg p-5 shadow-sm">
+            <h3 class="text-sm font-bold text-slate-500 uppercase tracking-wider mb-2">Adaptive Controllers</h3>
+            ${_adEntries.length
+              ? `<p class="text-xs text-slate-500 mb-2">Each adaptive quota ramps its runner count to keep its alert firing, then settles at the learned floor + 20%. 🧪 Lab rows run the full thermostat and record a publishable learned value; 📥 Consumer rows seed/lift from it (up-only, never down-ratchet). 🔄 learning · ✅ stable · ⚠️ at max / underfilled.</p>
+                 <div class="space-y-0.5">${_adEntries.map(_adRow).join('')}</div>`
+              : `<p class="text-xs text-slate-400 italic">No adaptive quotas yet. In <span class="font-semibold">Config → Engine</span>, tie a quota to an alert/insight and check <span class="font-semibold">Adaptive (keep firing)</span> — its Clients field becomes Min/Max and the learning state shows here.</p>`}
+          </div>`;
+        // Cheap pool count (no accounting): total harvestable clients, tenant-pool
+        // assignable, and per physical site — so you can see the pool size at a glance.
+        const _pool = st.pool || {};
+        const _bysite = Object.entries(_pool.by_site || {})
+            .map(([s, n]) => `${csEscape(s)} ${n}`).join(' · ');
+        const poolLine = (_pool.online != null) ? `<div class="text-xs text-slate-600 mb-3 flex flex-wrap gap-x-4 gap-y-1">
+              <span><span class="font-semibold text-slate-500">Pool:</span> <b>${_pool.online || 0}</b> online</span>
+              ${_pool.tenant_pool ? `<span><b>${_pool.tenant_pool}</b> assignable</span>` : ''}
+              ${_bysite ? `<span class="text-slate-400">site-bound: ${_bysite}</span>` : ''}
+            </div>` : '';
         csSet(`<div class="space-y-4">
+          ${adaptivePanel}
           <div class="hpe-card rounded-lg p-5 shadow-sm">
+            ${warnBanner}
             <div class="flex flex-wrap items-center justify-between gap-2 mb-2">
-              <h3 class="text-sm font-bold text-slate-500 uppercase tracking-wider">Quota State ${helpIcon('cs', null, 'Simulations help')}</h3>
+              <h3 class="text-sm font-bold text-slate-500 uppercase tracking-wider">Engine State ${helpIcon('cs', null, 'Simulations help')}</h3>
               <div class="flex gap-2">
                 ${kgCount ? `<button onclick="csResetToKnownGood('')" class="bg-[#01A982]/10 hover:bg-[#01A982]/20 text-[#01A982] border border-[#01A982] px-3 py-1.5 rounded-md text-sm font-bold shadow-sm" title="Restore every alert with a recorded known-good operating point, then hold ~1h before resuming learning">✅ Reset ALL to known-good</button>` : ''}
+                <button onclick="csResetSimQuota()" class="bg-red-50 hover:bg-red-100 text-red-700 border border-red-300 px-3 py-1.5 rounded-md text-sm font-bold shadow-sm" title="Clear ALL engine assignments and re-shuffle every client from scratch">↻ Reset &amp; Reshuffle</button>
                 <button onclick="csRenderSimQuotaState()" class="bg-[#01A982]/10 hover:bg-[#01A982]/20 text-[#01A982] border border-[#01A982] px-3 py-1.5 rounded-md text-sm font-bold shadow-sm">↻ Refresh</button>
               </div>
             </div>
             <p class="text-xs text-slate-500 mb-3">Live SimQuotaEngine ledger — which clients are currently assigned to each effective quota. The engine tops up to the target count from the online pool each 60s sweep; amber = under-filled.</p>
+            ${poolLine}
             ${eff.length ? `<table class="w-full text-left">
               <thead><tr class="text-[11px] text-slate-400 uppercase tracking-wider">
                 <th class="px-2 py-1">Type</th><th class="px-2 py-1">Alert / Insight ID</th>
                 <th class="px-2 py-1 text-center">Alert</th>
                 <th class="px-2 py-1">Sim</th><th class="px-2 py-1">SSID</th>
                 <th class="px-2 py-1 text-center">Assigned</th><th class="px-2 py-1 text-center">Multi</th>
-                <th class="px-2 py-1 text-center">Re-home</th><th class="px-2 py-1">Clients</th>
+                <th class="px-2 py-1 text-center">Re-home</th>
               </tr></thead>
               <tbody>${rows}</tbody>
-            </table>` : '<p class="text-xs text-slate-400 italic">No effective sim quotas. Define some in Config → Sim Quotas.</p>'}
+            </table>` : '<p class="text-xs text-slate-400 italic">No effective sim quotas. Define some in Config → Engine.</p>'}
             ${orphanHtml}
           </div>
         </div>`);
     } catch (e) {
         console.error('csRenderSimQuotaState: load failed', e);
-        csSet(csErrorBox('Could not load Quota State', e));
+        csSet(csErrorBox('Could not load Engine State', e));
     }
 }
 
 // ── Engine Diagnostic: WHY quotas fill / under-fill (Config → Engine Diagnostic) ─
 // Read-only deep view of the SimQuotaEngine's LAST-sweep candidate analysis: the
 // harvestable pool (online / tenant-pool / per-site) plus, per quota, how many
-// pool clients are free-and-eligible vs blocked and by what reason. Mirror of the
-// hub copy.
+// pool clients are free-and-eligible vs blocked and by what reason. Answers
+// "0/N underfilled — why?" without log-diving. Data from the sim-quota-state
+// payload (pool + diagnostics). Mirrored in both sim-views.js copies.
 window.CS_ENGINE_DIAG_REASONS = {
     packed_other_quota: 'already serving another quota',
     exclusive_bucket_default: 'running an exclusive bucket-default sim',
@@ -5291,52 +6092,13 @@ async function csRenderEngineDiag() {
     }
 }
 
-// seconds → compact "Xs" / "Ym" / "Zh Ym" (known-good time_to_stable_s human
-// formatter). csFmtDuration renders mm:ss under an hour, which reads oddly for a
-// "stable in" phrase, so we use this word form here.
-function csDurShort(s) {
-    s = Math.max(0, Math.round(Number(s) || 0));
-    if (s < 60) return `${s}s`;
-    const h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60);
-    if (h > 0) return m > 0 ? `${h}h ${m}m` : `${h}h`;
-    return `${m}m`;
-}
 
-// Reset to known-good: restore the engine to the last recorded stable operating
-// point (client count + config knobs that reliably fired the alert). The backend
-// holds that point for hold_seconds, then resumes adaptive learning. alertKey
-// omitted / empty → reset ALL alerts with a known-good point. Best-effort:
-// surfaces no_known_good / no_match statuses as informative toasts. Degrades
-// gracefully if the spoke-local backend lacks the route.
-window.csResetToKnownGood = async function (alertKey) {
-    const ak = alertKey || '';
-    const scope = ak ? 'this alert' : 'ALL alerts';
-    if (typeof confirm === 'function' &&
-        !confirm(`Reset ${scope} to the known-good operating point? The engine holds it for ~1h, then resumes learning.`)) return;
-    try {
-        const body = JSON.stringify(ak ? { alert_key: ak } : {});
-        const r = await csFetch(`/${csTenant()}/sim-quota/reset-to-known-good`, { method: 'POST', body }) || {};
-        const status = r.status || '';
-        if (status === 'no_known_good') {
-            if (typeof showToast === 'function') showToast('No known-good operating point recorded yet.', 'info');
-            return;
-        }
-        if (status === 'no_match') {
-            if (typeof showToast === 'function') showToast('No known-good point matches that alert.', 'info');
-            return;
-        }
-        const n = Array.isArray(r.restored_alerts) ? r.restored_alerts.length : 0;
-        const hold = r.hold_seconds ? csDurShort(r.hold_seconds) : '1h';
-        const label = n ? `Reset ${n} alert${n === 1 ? '' : 's'} to known-good` : 'Reset to known-good';
-        if (typeof showToast === 'function') showToast(`${label} — holding ${hold} then resuming learning`, 'success');
-        setTimeout(csRenderSimQuotaState, 1500);
-    } catch (e) {
-        console.error('csResetToKnownGood: reset failed', e);
-        if (typeof showToast === 'function') showToast('Reset to known-good failed: ' + (e.message || e), 'error');
-    }
-};
-
-
+// ── Sim DHCP (Kea) health ────────────────────────────────────────────────────
+// Answers "why is the sim network not handing out IPs" without ssh. Built from
+// a live incident where the config was valid and the NIC correct, but AppArmor
+// denied Kea its runtime files so it crash-looped with no lease file — five
+// round trips, because each signal lived somewhere different (systemctl, the
+// journal, dmesg, the conf, ip addr). All of them are here, per cs spoke.
 // ── sim-tag health ───────────────────────────────────────────────────────────
 // "Why does this Proxmox server show no / stale / wrong sim- tags." Three field
 // faults look IDENTICAL in Proxmox and are only separable here: the host was
@@ -5349,11 +6111,38 @@ window.csRenderSimTagHealth = async function () {
     el.innerHTML = '<p class="text-slate-400 italic text-xs">Loading…</p>';
     let d;
     try { d = await csFetch(`/${csTenant()}/sim-tag-health?tenant_id=${csTenant()}`); }
-    catch (e) { el.innerHTML = csErrorBox('Sim-tag health unavailable', e); return; }
+    catch (e) {
+        el.innerHTML = csErrorBox('Sim-tag health unavailable', e);
+        csDiagSummary('cs-sim-tag-health', 'bad', 'unavailable');
+        return;
+    }
     const spokes = (d && d.spokes) || [];
-    if (!spokes.length) { el.innerHTML = '<p class="text-xs text-slate-400 italic">No Client-Sim spokes connected.</p>'; return; }
+    if (!spokes.length) {
+        el.innerHTML = '<p class="text-xs text-slate-400 italic">No Client-Sim spokes connected.</p>';
+        csDiagSummary('cs-sim-tag-health', 'idle', 'no Client-Sim spokes connected');
+        return;
+    }
     const esc = csEscape;
     window._csSimTagHealth = d;
+    (window._csDiagData = window._csDiagData || {}).tagHealth = d;   // page-level Copy
+    // Verdict: an unreachable spoke outranks tag drift — you can't trust a drift
+    // count from a spoke that didn't answer.
+    const _unreach = spokes.filter(s => s.unreachable).length;
+    const _sum = k => spokes.reduce((n, s) => n + (s.hosts || [])
+        .reduce((m, h) => m + Number(h[k] || 0), 0), 0);
+    const _drift = _sum('drift_count');
+    // UNLABELED is not drift: the VM matches no live client, so no tags were
+    // ever computed and desired==actual==[] reads as "in sync". Counting only
+    // drift reported a host full of untagged VMs as perfectly healthy.
+    const _unlab = _sum('unlabeled_count');
+    csDiagSummary('cs-sim-tag-health',
+        _unreach ? 'bad' : ((_drift || _unlab) ? 'warn' : 'ok'),
+        (_unreach ? `${_unreach} spoke(s) unreachable · ` : '')
+        + ((_drift || _unlab)
+            ? [_drift ? `${_drift} with tag drift` : '',
+               _unlab ? `${_unlab} unlabeled (no client match)` : ''].filter(Boolean).join(' · ')
+            : 'all tags in sync')
+        + ` · ${spokes.length} spoke(s)`);
     el.innerHTML = spokes.map(sp => {
         const title = esc(sp.spoke_name || sp.spoke_id || 'spoke');
         if (sp.unreachable) {
@@ -5412,10 +6201,13 @@ window.csRenderSimTagHealth = async function () {
     }).join('');
 };
 
-window.csCopySimTagHealth = function (btn) {
-    const d = window._csSimTagHealth;
-    if (!d) return;
-    const lines = [];
+// Flatten the sim-tag panel to plain text. Extracted from csCopySimTagHealth so
+// the page-level "Copy all diagnostics" can reuse it verbatim rather than
+// duplicating the format (two formats drift, and the pasted report is the thing
+// people actually read).
+function _csSimTagHealthText(d) {
+    if (!d) return 'SIM LABEL (TAG) HEALTH: no data';
+    const lines = ['SIM LABEL (TAG) HEALTH'];
     (d.spokes || []).forEach(sp => {
         const _s = sp.spoke_self || {};
         lines.push(`SPOKE ${sp.spoke_name || sp.spoke_id}` +
@@ -5439,17 +6231,14 @@ window.csCopySimTagHealth = function (btn) {
             });
         });
     });
-    const txt = lines.join('\n') || 'no data';
-    if (navigator.clipboard) navigator.clipboard.writeText(txt);
-    if (btn) { const o = btn.textContent; btn.textContent = '✓ Copied'; setTimeout(() => { btn.textContent = o; }, 1500); }
+    return lines.join('\n');
+}
+
+window.csCopySimTagHealth = function (btn) {
+    csCopyText(_csSimTagHealthText(window._csSimTagHealth), btn);
 };
 
-// ── Sim DHCP (Kea) health ────────────────────────────────────────────────────
-// Answers "why is the sim network not handing out IPs" without ssh. Built from
-// a live incident where the config was valid and the NIC correct, but AppArmor
-// denied Kea its runtime files so it crash-looped with no lease file — five
-// round trips, because each signal lived somewhere different (systemctl, the
-// journal, dmesg, the conf, ip addr). All of them are here, per cs spoke.
+
 async function csRenderDhcpHealth() {
     const el = document.getElementById('cs-dhcp-health');
     if (!el) return;
@@ -5462,8 +6251,22 @@ async function csRenderDhcpHealth() {
         d._fetched_at = new Date().toLocaleTimeString();
         window._csDhcpLast = d;
         el.innerHTML = _csDhcpHealthHtml(d);
+        // Verdict for the collapsed header. "Serving" needs the unit active AND
+        // the NIC present AND a lease DB, so any of those failing is a fault —
+        // a crash-looping Kea must not read as healthy just because the spoke is.
+        const _sp = (d && d.spokes) || [];
+        const _bad = _sp.filter(s => s.unreachable
+            || String((((s.units || {})['kea-dhcp4-sim']) || {}).ActiveState || '') !== 'active'
+            || (s.interface_missing || []).length
+            || !((s.lease_db || {}).exists)
+            || ((s.config_test || {}).ok === false)).length;
+        csDiagSummary('cs-dhcp-health', _bad ? 'bad' : (_sp.length ? 'ok' : 'idle'),
+            _sp.length ? (_bad ? `${_bad} of ${_sp.length} spoke(s) not serving`
+                               : `${_sp.length} spoke(s) serving`)
+                       : 'no spokes reported');
     } catch (e) {
         el.innerHTML = csErrorBox('Could not load sim DHCP health', e);
+        csDiagSummary('cs-dhcp-health', 'bad', 'unavailable');
     }
 }
 window.csRenderDhcpHealth = csRenderDhcpHealth;
@@ -5629,7 +6432,7 @@ function _csDhcpHealthHtml(d) {
     }).join('');
 }
 
-// ── PXMX Sites: assign each connected pxmx server (agent host) to a site ──────
+// ── Sites: assign each connected pxmx server (agent host) to a site ───────────
 // The SimQuotaEngine resolves a client's site via its hosting server's entry
 // here (after a per-client wsite override, before the bucket-default wsite), so
 // a site-specific quota ("10 DNS-fail in MIA") fills from clients whose hosting
@@ -5638,16 +6441,26 @@ let csPxmxSiteMap = {};
 let csPxmxAgents = [];
 let csSites = [];
 
+let csSiteLinks = [];        // [{name, wsite, central_site}] — wsite↔Central links
+let csCentralSitesList = []; // Central site names for the link editor dropdown
 async function csRenderPxmxSiteMap() {
     csSetToolbar('');
     try {
-        const [mapRes, cat] = await Promise.all([
+        const [mapRes, cat, cfg, browse] = await Promise.all([
             csFetch(`/${csTenant()}/pxmx-site-map?tenant_id=${csTenant()}`).catch(() => null),
             csFetch(`/${csTenant()}/sim-quota-catalog?tenant_id=${csTenant()}`).catch(() => null),
+            csFetch(`/${csTenant()}/central-sites-config?tenant_id=${csTenant()}`).catch(() => ({})),
+            (typeof csCentralBrowse === 'function' ? csCentralBrowse() : Promise.resolve(null)).catch(() => null),
         ]);
         csPxmxSiteMap = (mapRes && mapRes.pxmx_site_map) || {};
         csPxmxAgents = Array.isArray(mapRes && mapRes.agents) ? mapRes.agents : [];
         csSites = (cat && cat.sites) || [];
+        csSiteLinks = Array.isArray(cfg && cfg.site_links) ? cfg.site_links.map(l => ({ ...l })) : [];
+        // Central site names: from browse (sites/alerts) + the configured mappings.
+        const cs = new Set();
+        ((browse && browse.sites) || []).forEach(s => { const n = (s && (s.name || s.site)) || s; if (n) cs.add(String(n)); });
+        Object.values((cfg && cfg.site_mappings) || {}).forEach(v => { if (v) cs.add(String(v)); });
+        csCentralSitesList = [...cs].sort();
         csRenderPxmxSiteMapEditor();
     } catch (e) {
         console.error('csRenderPxmxSiteMap: load failed', e);
@@ -5674,9 +6487,19 @@ function csRenderPxmxSiteMapEditor() {
         if (!seen.has(h)) rows.push({ host: h, connected: false, last_seen: 0 });
     });
     rows.sort((a, b) => a.host.localeCompare(b.host));
+    // Dropdown = the Tenant-Wide Pool + each Site Link (shown by its NAME, value =
+    // its wsite so the engine's site match still works). Only the links defined
+    // above are offered — not the raw simulation.conf / Central site lists. A
+    // currently-assigned value with no matching link is still shown so it isn't
+    // silently lost.
+    const linked = new Set(csSiteLinks.filter(l => l.wsite).map(l => l.wsite));
     const siteOpts = (sel) =>
-        `<option value="" ${(!sel) ? 'selected' : ''}>— unassigned —</option>` +
-        csSites.map(s => `<option value="${csEscape(s)}" ${s === sel ? 'selected' : ''}>${csEscape(s)}</option>`).join('');
+        `<option value="" ${(!sel) ? 'selected' : ''}>— choose a pool —</option>` +
+        `<option value="Tenant-Wide Pool" ${sel === 'Tenant-Wide Pool' ? 'selected' : ''}>Tenant-Wide Pool (site-based SSID)</option>` +
+        csSiteLinks.filter(l => l.wsite).map(l =>
+            `<option value="${csEscape(l.wsite)}" ${l.wsite === sel ? 'selected' : ''}>${csEscape(l.name || l.wsite)} (site pool)</option>`).join('') +
+        ((sel && sel !== 'Tenant-Wide Pool' && !linked.has(sel))
+            ? `<option value="${csEscape(sel)}" selected>${csEscape(sel)} (unlinked)</option>` : '');
     const rowHtml = rows.map((r, i) => {
         const sel = csPxmxSiteMap[r.host] || '';
         const badge = r.connected
@@ -5689,16 +6512,85 @@ function csRenderPxmxSiteMapEditor() {
         </div>`;
     }).join('');
     csSet(`<div class="space-y-4">
+      ${csSiteLinksCardHtml()}
       <div class="hpe-card rounded-lg p-5 shadow-sm">
         <div class="flex flex-wrap items-center justify-between gap-2 mb-2">
-          <h3 class="text-sm font-bold text-slate-500 uppercase tracking-wider">PXMX Site Assignments ${helpIcon('cs', null, 'Simulations help')}</h3>
+          <h3 class="text-sm font-bold text-slate-500 uppercase tracking-wider">Server to Site Assignments ${helpIcon('cs', null, 'Simulations help')}</h3>
           <button onclick="csPxmxSiteSave()" class="bg-[#01A982]/10 hover:bg-[#01A982]/20 text-[#01A982] border border-[#01A982] px-4 py-1.5 rounded-md text-sm font-bold shadow-sm">Save Assignments</button>
         </div>
-        <p class="text-xs text-slate-500 mb-2">Assign each pxmx server (the agent host) to a site. The Sim Quota engine fills a site-specific quota from clients whose <span class="font-semibold">hosting server</span> is in that site — e.g. a "MIA" quota draws from clients on MIA-assigned servers. A client's own wsite override still wins; the bucket-default wsite is the fallback. Sites come from <span class="font-semibold">Config Editor</span> (simulation.conf) and Central site mappings.</p>
+        <p class="text-xs text-slate-500 mb-2">Assign <span class="font-semibold">every</span> pxmx server to a pool: a <span class="font-semibold">Site Pool</span> (RF chamber — its clients are physically at that site and only run that site's SSID) or the <span class="font-semibold">Tenant-Wide Pool</span> (site-based SSID — its clients are assignable to any site/SSID by the Pool &amp; SSID placement). A deployment can mix both. Pools are always per-tenant. A client's own wsite override still wins; the bucket-default wsite is the fallback.</p>
         <div class="space-y-2 mt-2" id="cs-px-rows">${rowHtml || '<div class="text-xs text-slate-400 italic">No pxmx servers connected and no assignments saved. A server appears here once its agent connects to this spoke.</div>'}</div>
       </div>
     </div>`);
 }
+
+// ── Site Links (wsite ↔ Central site) — Config → Sites ───────────────────────
+// Tie a simulation wsite (the SSID prefix, e.g. MIA) to its Central site name
+// (e.g. Miami). The link's Name shows in the PXMX assignment dropdown; the link
+// lets alert-driven quotas match where the alert actually fires in Central.
+function csSiteLinksCardHtml() {
+    const esc = csEscape;  // shared escaper (escapes &<>"')
+    // wsite is DEFINED here (typed, e.g. "MIA") — the Site Links are the source of
+    // truth for wsites. It used to be a dropdown sourced from the sim-quota catalog
+    // sites list, which merged simulation.conf wsites WITH Central site names; once
+    // simulation.conf's wsite entries went away that list held only Central names
+    // (Miami), so links/SSID cells came out as "Miami-PSK" instead of "MIA-PSK".
+    const centralOpts = (sel) => {
+        const list = csCentralSitesList.slice();
+        if (sel && list.indexOf(sel) < 0) list.push(sel);
+        return `<option value="">— Central site —</option>` +
+            list.map(s => `<option value="${esc(s)}" ${s === sel ? 'selected' : ''}>${esc(s)}</option>`).join('');
+    };
+    const rows = csSiteLinks.map((l, i) =>
+        `<div class="grid grid-cols-1 sm:grid-cols-4 gap-2 items-end bg-white border border-slate-200 rounded-md p-2" data-cs-link="${i}">
+          <label class="text-xs text-slate-500">Name<input data-cs-link-k="name" value="${esc(l.name)}" placeholder="Miami" class="w-full bg-white border border-slate-300 rounded-md px-2 py-1 text-sm mt-1"></label>
+          <label class="text-xs text-slate-500">wsite (SSID prefix)<input data-cs-link-k="wsite" value="${esc(l.wsite)}" placeholder="MIA" class="w-full bg-white border border-slate-300 rounded-md px-2 py-1 text-sm mt-1"></label>
+          <label class="text-xs text-slate-500">Central site<select data-cs-link-k="central_site" class="w-full bg-white border border-slate-300 rounded-md px-2 py-1 text-sm mt-1">${centralOpts(l.central_site)}</select></label>
+          <button onclick="csSiteLinkDel(${i})" class="text-red-600 hover:text-red-800 text-xs font-bold py-1 justify-self-end">Remove</button>
+        </div>`).join('');
+    return `<div class="hpe-card rounded-lg p-5 shadow-sm">
+        <div class="flex flex-wrap items-center justify-between gap-2 mb-2">
+          <h3 class="text-sm font-bold text-slate-500 uppercase tracking-wider">Site Links (wsite ↔ Central)</h3>
+          <div class="flex justify-end gap-2">
+            <button onclick="csSiteLinkAdd()" class="bg-[#01A982]/10 hover:bg-[#01A982]/20 text-[#01A982] border border-[#01A982] px-4 py-1.5 rounded-md text-sm font-bold shadow-sm">+ Add Link</button>
+            <button onclick="csSiteLinkSave()" class="bg-[#01A982]/10 hover:bg-[#01A982]/20 text-[#01A982] border border-[#01A982] px-4 py-1.5 rounded-md text-sm font-bold shadow-sm">Save Links</button>
+          </div>
+        </div>
+        <p class="text-xs text-slate-500 mb-3">Tie a simulation <b>wsite</b> (the SSID prefix, e.g. <span class="font-mono">MIA</span>) to its <b>Central site</b> (e.g. <span class="font-mono">Miami</span>). The link <b>Name</b> is what shows in the assignment dropdown below, and it lets an alert-driven quota at that site match where the alert fires in Central.</p>
+        <div class="space-y-2">${rows || '<div class="text-xs text-slate-400 italic">No links. Add one to name your sites.</div>'}</div>
+      </div>`;
+}
+
+function csSiteLinksSyncFromDom() {
+    const out = [];
+    document.querySelectorAll('[data-cs-link]').forEach(el => {
+        const g = k => { const i = el.querySelector(`[data-cs-link-k="${k}"]`); return i ? String(i.value).trim() : ''; };
+        const name = g('name'), wsite = g('wsite'), central_site = g('central_site');
+        if (name || wsite || central_site) out.push({ name, wsite, central_site });
+    });
+    csSiteLinks = out;
+    return out;
+}
+window.csSiteLinkAdd = function () { csSiteLinksSyncFromDom(); csSiteLinks.push({ name: '', wsite: '', central_site: '' }); csRenderPxmxSiteMapEditor(); };
+window.csSiteLinkDel = function (i) { csSiteLinksSyncFromDom(); csSiteLinks.splice(i, 1); csRenderPxmxSiteMapEditor(); };
+window.csSiteLinkSave = async function () {
+    csSiteLinksSyncFromDom();
+    try {
+        const cfg = await csFetch(`/${csTenant()}/central-sites-config?tenant_id=${csTenant()}`) || {};
+        const body = {
+            site_mappings: (cfg.site_mappings && typeof cfg.site_mappings === 'object') ? cfg.site_mappings : {},
+            monitored_checks: Array.isArray(cfg.monitored_checks) ? cfg.monitored_checks : [],
+            hardware_checks: Array.isArray(cfg.hardware_checks) ? cfg.hardware_checks : [],
+            sim_quotas: Array.isArray(cfg.sim_quotas) ? cfg.sim_quotas : [],
+            site_links: csSiteLinks,
+        };
+        await csFetch(`/${csTenant()}/central-sites-config?tenant_id=${csTenant()}`, { method: 'POST', body: JSON.stringify(body) });
+        showToast('Site links saved.', 'success');
+        csRenderPxmxSiteMapEditor();
+    } catch (e) {
+        showToast((e && e.message) || 'Save failed', 'error');
+    }
+};
 
 window.csPxmxSiteClear = function (host) {
     // Reflect the clear in the DOM select so the subsequent save picks it up.
@@ -5737,8 +6629,7 @@ window.csPxmxSiteSave = async function () {
     }
 };
 
-// Source of Truth toggle card (top of the Config screen). Mirrored from the hub
-// WebUI (lm/WebUI/sim-views.js) per the two-copy rule; single-tenant here.
+// Source of Truth toggle card (top of the Config screen).
 function csConfigSourceCard(source, cfg) {
     cfg = cfg || {};
     const isHub = source === 'hub';
@@ -5884,20 +6775,37 @@ function csUORenderCards() {
         const kv = csUserOverridesState[u] || {};
         const fields = Object.keys(kv).map(k => csUOField(u, k, kv[k])).join('');
         const cnt = Object.keys(kv).length;
-        return `<div class="border border-slate-200 rounded-lg p-3 mb-3">
-          <div class="flex items-center justify-between mb-2">
-            <span class="text-sm font-bold text-slate-700">👤 ${csEscape(u)}</span>
-            <div class="flex gap-2">
+        // Collapsible per-user card (the list gets long) — click the header to
+        // expand/collapse; default collapsed so the page stays compact. The
+        // action buttons stopPropagation so clicking them doesn't toggle.
+        return `<div class="border border-slate-200 rounded-lg mb-3">
+          <div class="flex items-center justify-between p-3 cursor-pointer select-none" onclick="csUOToggle(this)">
+            <span class="text-sm font-bold text-slate-700 flex items-center gap-1.5">
+              <span class="cs-uo-chev text-slate-400 inline-block w-3">▸</span>👤 ${csEscape(u)}
+              <span class="text-[10px] font-normal text-slate-400">(${cnt} override${cnt === 1 ? '' : 's'})</span>
+            </span>
+            <div class="flex gap-2" onclick="event.stopPropagation()">
               <button data-uo-user="${csEscape(u)}" onclick="csUODownload(this)"
                       class="bg-slate-100 hover:bg-slate-200 text-slate-600 px-2 py-1 rounded-md text-[11px] font-bold">Download</button>
               <button data-uo-user="${csEscape(u)}" onclick="csUORemove(this)"
                       class="bg-red-100 hover:bg-red-200 text-red-700 px-2 py-1 rounded-md text-[11px] font-bold">✕ Remove</button>
             </div>
           </div>
-          <div class="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-4 gap-3">${fields || '<p class="text-xs text-slate-400 italic col-span-full">No fields found in this override.</p>'}</div>
+          <div class="cs-uo-body hidden px-3 pb-3">
+            <div class="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-4 gap-3">${fields || '<p class="text-xs text-slate-400 italic col-span-full">No fields found in this override.</p>'}</div>
+          </div>
         </div>`;
     }).join('');
 }
+
+// Toggle a per-user override card open/closed (collapsible list).
+window.csUOToggle = function (headerEl) {
+    const body = headerEl.nextElementSibling;
+    if (!body) return;
+    body.classList.toggle('hidden');
+    const chev = headerEl.querySelector('.cs-uo-chev');
+    if (chev) chev.textContent = body.classList.contains('hidden') ? '▸' : '▾';
+};
 
 function csRenderUserOverridesCard(uo, uoErr) {
     if (uoErr) {
@@ -5911,10 +6819,10 @@ function csRenderUserOverridesCard(uo, uoErr) {
         <h3 class="text-sm font-bold text-slate-500 uppercase tracking-wider">User Overrides ${helpIcon('cs', null, 'Simulations help')}</h3>
         <span class="text-[10px] text-slate-400">Last fetched: ${csEscape(csUserOverridesFetched)}</span>
       </div>
-      <p class="text-xs text-slate-400 mb-3">Per-user simulation overrides — pin a hostname to specific sim settings (a <code>[username]</code> section overrides the bucket profile for that user).</p>
-      <div class="flex items-center gap-3 mb-3">
-        <button onclick="csUOAdd()" class="bg-[#01A982] hover:bg-[#018a6c] text-white px-4 py-1.5 rounded-md text-sm font-bold">＋ Add User</button>
-        <button onclick="csUOSave()" class="bg-[#01A982] hover:bg-[#018a6c] text-white px-4 py-1.5 rounded-md text-sm font-bold">Save</button>
+      <p class="text-xs text-slate-400 mb-3">Per-user simulation overrides — pin a hostname to specific sim settings (a <code>[username]</code> section overrides the simulation profile for that user).</p>
+      <div class="flex justify-end items-center gap-3 mb-3">
+        <button onclick="csUOAdd()" class="bg-[#01A982]/10 hover:bg-[#01A982]/20 text-[#01A982] border border-[#01A982] px-4 py-1.5 rounded-md text-sm font-bold">＋ Add User</button>
+        <button onclick="csUOSave()" class="bg-[#01A982]/10 hover:bg-[#01A982]/20 text-[#01A982] border border-[#01A982] px-4 py-1.5 rounded-md text-sm font-bold">Save</button>
       </div>
       <div id="cs-uo-cards">${csUORenderCards()}</div>
       <div class="flex justify-end mt-3">
@@ -6079,11 +6987,11 @@ const CS_HUB_CONFIG_FIELDS = [
     { key: 'guest_agent_reboot_after_minutes',      label: 'GA Reboot After (min)',   type: 'number', ph: '10', min: 1 },
     { key: 'guest_agent_reclone_after_minutes',     label: 'GA Reclone After (min)',  type: 'number', ph: '30', min: 1 },
     { key: 'watchdog_reboot_enabled',               label: 'Watchdog Reboot',         type: 'onoff' },
-    // ── List fields: comma- or space-delimited in the UI; the cs spoke
-    // normalizes to a list in LocalStore.set_hub_config (see local_store.py).
-    // No raw JSON to paste. usb_vidpids is a list of {vidpid,type,label}; only
-    // the vidpid is needed here — type/label already stored for a vidpid are
-    // preserved on save.
+    // ── List fields: comma- or space-delimited in the UI; the hub normalizes
+    // to a list before storing/pushing (see normalize_hub_config_lists in
+    // core/src/simulations/routes.py). No raw JSON to paste. usb_vidpids is a
+    // list of {vidpid,type,label}; only the vidpid is needed here — type/label
+    // already stored for a vidpid are preserved on save.
     { key: 'usb_vidpids',                 label: 'USB Certified VID:PIDs',  type: 'list', obj: true, ph: '1a2b:3c4d, 5678:9abc  (comma or space separated)', full: true },
     { key: 'usb_ignored_vidpids',         label: 'USB Ignored VID:PIDs', type: 'list', ph: '1a2b:3c4d, 5678:9abc  (comma or space separated)', full: true },
     { key: 't1_pci_vidpids',              label: 'T1 PCI VID:PIDs (VM whose PCI passthrough matches → T1)', type: 'list', ph: '1912:0015, 168c:0034  (comma or space separated)', full: true },
@@ -6153,7 +7061,7 @@ function _csBranchSelect(id, currentVal, branches, onChangeFn) {
 // string) as a comma-separated display string for the Setup/Proxmox list inputs.
 // usb_vidpids (obj=true) is a list of {vidpid,type,label} — only vidpid is shown
 // (type/label are preserved on save by the backend). The user edits the
-// comma/space-delimited text; the cs spoke normalizes it back to a list.
+// comma/space-delimited text; the hub normalizes it back to a list.
 function _csListDisplay(valRaw, isObj) {
     let arr = valRaw;
     if (typeof valRaw === 'string') {
@@ -6194,14 +7102,14 @@ async function csHubConfigCard(path) {
         else if (col.type === 'branch') input = _csBranchSelect('cs-hc-' + col.key, valStr, branchMap[col.repo], 'csSaveHubConfig');
         else if (col.type === 'number') input = `<input id="cs-hc-${col.key}" type="number" value="${csEscape(valStr)}" ${col.min != null ? `min="${col.min}"` : ''} ${col.max != null ? `max="${col.max}"` : ''} placeholder="${csEscape(col.ph || '')}" onblur="csSaveHubConfig()" class="w-full bg-white border border-slate-300 rounded-md px-3 py-2 text-sm mt-1">`;
         else if (col.type === 'list') {
-            // Comma/space-delimited text; LocalStore.set_hub_config converts to a list.
+            // Comma/space-delimited text; backend normalize_hub_config_lists converts to a list.
             const disp = _csListDisplay(valRaw, !!col.obj);
             input = `<input id="cs-hc-${col.key}" type="text" value="${csEscape(disp)}" placeholder="${csEscape(col.ph || '')}" onblur="csSaveHubConfig()" class="w-full bg-white border border-slate-300 rounded-md px-3 py-2 text-sm mt-1">`;
         } else input = `<input id="cs-hc-${col.key}" type="text" value="${csEscape(valStr)}" placeholder="${csEscape(col.ph || '')}" onblur="csSaveHubConfig()" class="w-full bg-white border border-slate-300 rounded-md px-3 py-2 text-sm mt-1">`;
         return `${label}${input}</label>`;
     }).join('');
     return `<div class="hpe-card rounded-lg p-5 shadow-sm">
-      <h3 class="text-sm font-bold text-slate-500 uppercase tracking-wider mb-3">Hub Config ${helpIcon('cs', null, 'Simulations help')}</h3>
+      <h3 class="text-sm font-bold text-slate-500 uppercase tracking-wider mb-2">Hub Config ${helpIcon('cs', null, 'Simulations help')}</h3>
       <p class="text-xs text-slate-400 mb-3">Changes save automatically — a select/checkbox saves on change, a text/number field saves when you click or tab away from it.</p>
       <label class="flex items-center gap-2 text-xs text-slate-600 mb-3"><input id="cs-hc-enabled" type="checkbox" ${enabled ? 'checked' : ''} onchange="csHcToggleEnabled(this.checked)"> Enable hub as source of truth</label>
       <div id="cs-hc-fields" class="${enabled ? '' : 'hidden'} grid grid-cols-1 md:grid-cols-3 gap-3">
@@ -6218,9 +7126,9 @@ window.csHcToggleEnabled = function (checked) {
 
 window.csSaveHubConfig = async function () {
     // Mirror webui-hub saveHubConfig: skip empty fields; list fields are sent as
-    // the raw comma/space-delimited string and the cs spoke normalizes them to
-    // lists (LocalStore.set_hub_config); scalars (incl. numbers) are sent as
-    // strings — the spoke stores them as-is and normalizes the on/off keys via
+    // the raw comma/space-delimited string and the hub normalizes them to lists
+    // (normalize_hub_config_lists); scalars (incl. numbers) are sent as strings —
+    // the spoke stores them as-is and normalizes the on/off keys via
     // _normalize_relay_enabled.
     const config = {};
     CS_HUB_CONFIG_FIELDS.forEach(col => {
@@ -6392,7 +7300,7 @@ async function csSetupAutoProvConfigCard() {
     const note = enabled ? '<span class="text-slate-400">Hub-owned knobs; saved automatically as you edit (a select/checkbox on change, a text/number field when you click or tab away). Turning Auto-Provision VMs On also enables hub config (mirrors the Overview/USB toggle).</span>'
         : '<span class="text-amber-600">Hub config is not enabled — auto-save pushes to spokes only when Auto-Provision VMs is On (which enables hub config) or after you enable it in the Hub Config card below.</span>';
     return `<div class="hpe-card rounded-lg p-5 shadow-sm">
-      <h3 class="text-sm font-bold text-slate-500 uppercase tracking-wider mb-1">VM Auto-Provisioning ${helpIcon('cs', null, 'Simulations help')}</h3>
+      <h3 class="text-sm font-bold text-slate-500 uppercase tracking-wider mb-2">VM Auto-Provisioning ${helpIcon('cs', null, 'Simulations help')}</h3>
       <p class="text-xs text-slate-400 mb-3">${note}</p>
       <div class="grid grid-cols-1 md:grid-cols-3 gap-3">${rows}</div>
     </div>`;
@@ -6545,9 +7453,9 @@ async function csProcessingModesCard() {
       <select id="cs-pm-${k}" class="w-full bg-white border border-slate-300 rounded-md px-3 py-2 text-sm mt-1">${opts(modes[k])}</select>
     </label>`).join('');
     return `<div class="hpe-card rounded-lg p-5 shadow-sm">
-      <h3 class="text-sm font-bold text-slate-500 uppercase tracking-wider mb-3">Processing Modes ${helpIcon('cs', null, 'Simulations help')}</h3>
+      <h3 class="text-sm font-bold text-slate-500 uppercase tracking-wider mb-2">Processing Modes ${helpIcon('cs', null, 'Simulations help')}</h3>
       <div class="grid grid-cols-1 md:grid-cols-3 gap-3">${fields}</div>
-      <button onclick="csSaveProcessingModes()" class="mt-4 bg-[#01A982] hover:bg-[#008c6a] text-white px-5 py-2 rounded-md text-sm font-bold shadow-sm">Save Modes</button>
+      <div class="flex justify-end mt-4"><button onclick="csSaveProcessingModes()" class="bg-[#01A982]/10 hover:bg-[#01A982]/20 text-[#01A982] border border-[#01A982] px-5 py-2 rounded-md text-sm font-bold shadow-sm">Save Modes</button></div>
     </div>`;
 }
 
@@ -6565,34 +7473,23 @@ window.csSaveProcessingModes = async function () {
 async function csNotificationsCard() {
     const data = await csFetch('/' + csTenant() + '/settings');
     const n = (data && data.notifications) || {};
-    const f = (id, label, val, type) => `<label class="text-xs text-slate-500">${csEscape(label)}
-      <input id="${id}" ${type === 'checkbox' ? 'type="checkbox" ' + (val ? 'checked' : '') : `value="${csEscape(val != null ? val : '')}"`} class="w-full bg-white border border-slate-300 rounded-md px-3 py-2 text-sm mt-1">
+    const f = (id, label, val) => `<label class="text-xs text-slate-500">${csEscape(label)}
+      <input id="${id}" value="${csEscape(val != null ? val : '')}" class="w-full bg-white border border-slate-300 rounded-md px-3 py-2 text-sm mt-1">
     </label>`;
     return `<div class="hpe-card rounded-lg p-5 shadow-sm">
-      <h3 class="text-sm font-bold text-slate-500 uppercase tracking-wider mb-3">Notifications ${helpIcon('cs', null, 'Simulations help')}</h3>
-      <label class="flex items-center gap-2 text-xs text-slate-600 mb-3"><input id="cs-notif-enabled" type="checkbox" ${n.enabled ? 'checked' : ''}> Notifications enabled</label>
-      <div class="grid grid-cols-1 md:grid-cols-2 gap-3">
-        ${f('cs-notif-host', 'SMTP Host', n.smtp_host)}${f('cs-notif-port', 'SMTP Port', n.smtp_port, 'number')}
-        ${f('cs-notif-user', 'SMTP User', n.smtp_user)}${f('cs-notif-pass', 'SMTP Password (new)', '', 'password')}
-        ${f('cs-notif-teams', 'Teams Webhook URL (new)', '', 'password')}
+      <h3 class="text-sm font-bold text-slate-500 uppercase tracking-wider mb-2">Notifications ${helpIcon('cs', null, 'Simulations help')}</h3>
+      <p class="text-[11px] text-slate-400 mb-3">The hub sends this tenant's spoke out-of-contact alerts using the hub's configured email provider (Hub → Setup → Notifications). Just enter where this tenant's alerts should go.</p>
+      <div class="grid grid-cols-1 gap-3">
         ${f('cs-notif-emails', 'To Emails (comma-separated)', Array.isArray(n.to_emails) ? n.to_emails.join(', ') : (n.to_emails || ''))}
       </div>
-      <button onclick="csSaveNotifications()" class="mt-4 bg-[#01A982] hover:bg-[#008c6a] text-white px-5 py-2 rounded-md text-sm font-bold shadow-sm">Save Notifications</button>
+      <div class="mt-4 flex justify-end"><button onclick="csSaveNotifications()" class="bg-[#01A982]/10 hover:bg-[#01A982]/20 text-[#01A982] border border-[#01A982] px-5 py-2 rounded-md text-sm font-bold shadow-sm">Save Notifications</button></div>
     </div>`;
 }
 
 window.csSaveNotifications = async function () {
     const body = {
-        enabled: !!(csEl('cs-notif-enabled') && csEl('cs-notif-enabled').checked),
-        smtp_host: csEl('cs-notif-host') && csEl('cs-notif-host').value,
-        smtp_port: parseInt((csEl('cs-notif-port') && csEl('cs-notif-port').value) || '0', 10),
-        smtp_user: csEl('cs-notif-user') && csEl('cs-notif-user').value,
         to_emails: csEl('cs-notif-emails') && csEl('cs-notif-emails').value
     };
-    const pass = csEl('cs-notif-pass') && csEl('cs-notif-pass').value;
-    const teams = csEl('cs-notif-teams') && csEl('cs-notif-teams').value;
-    if (pass) body.smtp_pass = pass;
-    if (teams) body.teams_webhook_url = teams;
     try {
         await csFetch('/' + csTenant() + '/settings/notifications', { method: 'POST', body: JSON.stringify(body) });
         showToast('Saved.', 'success');
@@ -6622,7 +7519,7 @@ async function csSetupAutoProvCard() {
         unknown = (hosts || []).reduce((n, h) => n + csUnknownUsbCount(h), 0);
     } catch (e) { console.error('csSetupAutoProvCard: vm load for USB counts failed, defaulting to 0', e); }
     return `<div class="hpe-card rounded-lg p-5 shadow-sm">
-      <h3 class="text-sm font-bold text-slate-500 uppercase tracking-wider mb-3">Dongle / Auto-Provisioning ${helpIcon('cs', null, 'Simulations help')}</h3>
+      <h3 class="text-sm font-bold text-slate-500 uppercase tracking-wider mb-2">Dongle / Auto-Provisioning ${helpIcon('cs', null, 'Simulations help')}</h3>
       <div class="grid grid-cols-3 gap-3 mb-3">${csStat('Auto-Provision', on ? 'On' : 'Off')}${csStat('Present USB', present)}${csStat('Unknown USB', unknown)}</div>
       <label class="flex items-center gap-2 text-sm text-slate-600">
         <input id="cs-setup-autoprov" type="checkbox" ${on ? 'checked' : ''} onchange="csToggleAutoProvision(this.checked)"/>
@@ -6693,7 +7590,7 @@ async function csRenderSetupCentralApi() {
     </label>`;
 
     const connCard = `<div class="hpe-card rounded-lg p-5 shadow-sm">
-      <h3 class="text-sm font-bold text-slate-500 uppercase tracking-wider mb-3">Central API Connection ${helpIcon('cs', null, 'Simulations help')}</h3>
+      <h3 class="text-sm font-bold text-slate-500 uppercase tracking-wider mb-2">Central API Connection ${helpIcon('cs', null, 'Simulations help')}</h3>
       <p class="text-xs text-slate-400 mb-3">Aruba Central cluster credentials. Pushed to the spoke as <code>central_config</code>; the spoke sentinel-merges them — secrets only overwrite when non-empty.</p>
       <div class="grid grid-cols-1 md:grid-cols-2 gap-3">
         <label class="text-xs text-slate-500">Mode${modeSel}</label>
@@ -6703,6 +7600,10 @@ async function csRenderSetupCentralApi() {
         ${f('cs-csc-clientsecret', 'Client Secret', hc.client_secret, 'password')}
         ${f('cs-csc-accesstoken', 'Access Token (classic)', hc.access_token, 'password')}
         ${f('cs-csc-refreshtoken', 'Refresh Token (classic)', hc.refresh_token, 'password')}
+        <label class="text-xs text-slate-500">Poll interval (minutes)
+          <input id="cs-csc-pollmin" type="number" min="1" step="1" value="${Math.max(1, Math.round((Number(hc.poll_interval_s) || 300) / 60))}" class="w-full bg-white border border-slate-300 rounded-md px-3 py-2 text-sm mt-1">
+          <span class="block text-[11px] text-slate-400 mt-1">How often the hub polls Aruba Central for this tenant (default 5, minimum 1).</span>
+        </label>
         <div class="md:col-span-2 mt-1 pt-3 border-t border-slate-200">
           <p class="text-xs font-bold text-slate-500 uppercase tracking-wider mb-1">Client-count check thresholds</p>
           <p class="text-[11px] text-slate-400 mb-2">Controls how the <b>Steady Client Count</b> dashboard check colours a site. Two independent rules: a drop vs the recent hourly average, and a sustained fall below the site's historical peak.</p>
@@ -6724,8 +7625,8 @@ async function csRenderSetupCentralApi() {
           <span class="block text-[11px] text-slate-400 mt-1">Only arm die-off when the peak is at least this many clients, so a quiet site can't false-trigger (default 5).</span>
         </label>
       </div>
-      <div class="flex gap-2 mt-4">
-        <button onclick="csSaveCentralConn()" class="bg-[#01A982] hover:bg-[#018a6c] text-white px-4 py-2 rounded-md text-sm font-bold">Save Connection</button>
+      <div class="flex justify-end gap-2 mt-4">
+        <button onclick="csSaveCentralConn()" class="bg-[#01A982]/10 hover:bg-[#01A982]/20 text-[#01A982] border border-[#01A982] px-4 py-2 rounded-md text-sm font-bold">Save Connection</button>
         <button onclick="csTestCentral()" class="bg-slate-200 text-slate-700 px-4 py-2 rounded-md text-sm font-bold">Test Central</button>
       </div>
       <div id="cs-csc-test" class="mt-3 text-xs text-slate-500"></div>
@@ -6737,7 +7638,7 @@ async function csRenderSetupCentralApi() {
         : '<p class="text-xs text-slate-400 italic">None configured. Load the available-checks catalog to pick Aruba Central alerts/insights.</p>';
 
     const sitesCard = `<div class="hpe-card rounded-lg p-5 shadow-sm">
-      <h3 class="text-sm font-bold text-slate-500 uppercase tracking-wider mb-3">Sites &amp; Checks ${helpIcon('cs', null, 'Simulations help')}</h3>
+      <h3 class="text-sm font-bold text-slate-500 uppercase tracking-wider mb-2">Sites &amp; Checks ${helpIcon('cs', null, 'Simulations help')}</h3>
       <p class="text-xs text-slate-400 mb-3">Hub-owned site mappings + Aruba Central sim/hardware monitors. Pushed to the spoke as <code>central_sites_config</code> and applied to the spoke's runtime monitoring when hub-managed.</p>
 
       <div class="flex items-center gap-2 mb-2">
@@ -6757,8 +7658,8 @@ async function csRenderSetupCentralApi() {
       <div id="cs-csc-hw-rows" class="space-y-2">${hwRows || '<p class="text-xs text-slate-400 italic">No hardware checks.</p>'}</div>
       <button onclick="csCscAddHw()" class="mt-2 text-xs text-[#01A982] font-bold hover:underline">+ Add hardware check</button>
 
-      <div class="flex gap-2 mt-4">
-        <button onclick="csSaveCentralSites()" class="bg-[#01A982] hover:bg-[#018a6c] text-white px-4 py-2 rounded-md text-sm font-bold">Save Sites &amp; Checks</button>
+      <div class="flex justify-end gap-2 mt-4">
+        <button onclick="csSaveCentralSites()" class="bg-[#01A982]/10 hover:bg-[#01A982]/20 text-[#01A982] border border-[#01A982] px-4 py-2 rounded-md text-sm font-bold">Save Sites &amp; Checks</button>
       </div>
     </div>`;
 
@@ -6895,6 +7796,9 @@ window.csSaveCentralConn = async function () {
     if (v('cs-csc-clientsecret')) hub_central_config.client_secret = v('cs-csc-clientsecret');
     if (v('cs-csc-accesstoken'))  hub_central_config.access_token  = v('cs-csc-accesstoken');
     if (v('cs-csc-refreshtoken')) hub_central_config.refresh_token = v('cs-csc-refreshtoken');
+    // Central poll interval (minutes in the UI → seconds stored; the hub floors at 60s).
+    const _pm = parseInt(v('cs-csc-pollmin'), 10);
+    if (!isNaN(_pm) && _pm > 0) hub_central_config.poll_interval_s = Math.max(60, _pm * 60);
     // Client-count check thresholds → central_config.cc_thresholds. Sent as-is;
     // the hub coerces + clamps (warn/error 0-100, error≥warn, die-off 0-100, peak≥1).
     const _ccNum = (id, dflt) => { const n = parseFloat(v(id)); return isNaN(n) ? dflt : n; };
@@ -6938,6 +7842,7 @@ window.csTestCentral = async function () {
         if (out) out.innerHTML = rows || '<i>No spokes reporting central state.</i>';
     } catch (e) { console.error('csTestCentral: test-central failed', e); if (out) out.textContent = 'Test failed: ' + (e.message || e); }
 };
+
 // ── Central On-Prem API ─────────────────────────────────────────────────────────────
 async function csRenderSetupCentralOnPremApi() {
     csSetToolbar('');
@@ -7258,8 +8163,7 @@ window.csTestCentralOnPrem = async function () {
 // OAuth client_id/secret/cluster_url. Creds live in mist_config (surfaced via
 // the mist-status aggregate); sites/checks live in mist_sites_config. Pushed to
 // the spoke as mist_config / mist_sites_config. DOM ids are Mist-namespaced
-// (cs-msc-*) so the Central and Mist Setup forms never collide. The cs local
-// copy keeps Central's simpler form (no poll-interval field).
+// (cs-msc-*) so the Central and Mist Setup forms never collide.
 async function csRenderSetupMistApi() {
     csSetToolbar('');
     let conn = {}, sites = {};
@@ -7294,12 +8198,16 @@ async function csRenderSetupMistApi() {
     </select>`;
 
     const connCard = `<div class="hpe-card rounded-lg p-5 shadow-sm">
-      <h3 class="text-sm font-bold text-slate-500 uppercase tracking-wider mb-3">Mist API Connection ${helpIcon('mist', null, 'Mist help')}</h3>
+      <h3 class="text-sm font-bold text-slate-500 uppercase tracking-wider mb-2">Mist API Connection ${helpIcon('mist', null, 'Mist help')}</h3>
       <p class="text-xs text-slate-400 mb-3">Juniper Mist org credentials. Pushed to the spoke as <code>mist_config</code>; the spoke sentinel-merges them — the token only overwrites when non-empty.</p>
       <div class="grid grid-cols-1 md:grid-cols-2 gap-3">
         ${f('cs-msc-token', 'API Token', hc.api_token, 'password')}
         ${f('cs-msc-orgid', 'Org ID', hc.org_id)}
         <label class="text-xs text-slate-500">Region / API host${hostSel}</label>
+        <label class="text-xs text-slate-500">Poll interval (minutes)
+          <input id="cs-msc-pollmin" type="number" min="1" step="1" value="${Math.max(1, Math.round((Number(hc.poll_interval_s) || 300) / 60))}" class="w-full bg-white border border-slate-300 rounded-md px-3 py-2 text-sm mt-1">
+          <span class="block text-[11px] text-slate-400 mt-1">How often the hub polls Mist for this tenant (default 5, minimum 1).</span>
+        </label>
         <div class="md:col-span-2 mt-1 pt-3 border-t border-slate-200">
           <p class="text-xs font-bold text-slate-500 uppercase tracking-wider mb-1">Client-count check thresholds</p>
           <p class="text-[11px] text-slate-400 mb-2">Controls how the <b>Steady Client Count</b> dashboard check colours a site. Two independent rules: a drop vs the recent hourly average, and a sustained fall below the site's historical peak.</p>
@@ -7314,15 +8222,15 @@ async function csRenderSetupMistApi() {
         </label>
         <label class="text-xs text-slate-500">Sustained die-off — % of peak
           <input id="cs-msc-cc-dieoff" type="number" min="0" max="100" step="1" value="${(hc.cc_thresholds && hc.cc_thresholds.die_off_pct != null) ? hc.cc_thresholds.die_off_pct : 20}" class="w-full bg-white border border-slate-300 rounded-md px-3 py-2 text-sm mt-1">
-          <span class="block text-[11px] text-slate-400 mt-1">Red when the hourly average falls below this % of the 7/30-day peak, even without a fresh drop (default 20). <b>Set 0 to disable</b> — this is the rule that reddens sites sitting well below their peak.</span>
+          <span class="block text-[11px] text-slate-400 mt-1">Red when the hourly average falls below this % of the 7/30-day peak (default 20). <b>Set 0 to disable.</b></span>
         </label>
         <label class="text-xs text-slate-500">Die-off — minimum peak (clients)
           <input id="cs-msc-cc-minpeak" type="number" min="1" step="1" value="${(hc.cc_thresholds && hc.cc_thresholds.min_peak != null) ? hc.cc_thresholds.min_peak : 5}" class="w-full bg-white border border-slate-300 rounded-md px-3 py-2 text-sm mt-1">
-          <span class="block text-[11px] text-slate-400 mt-1">Only arm die-off when the peak is at least this many clients, so a quiet site can't false-trigger (default 5).</span>
+          <span class="block text-[11px] text-slate-400 mt-1">Only arm die-off when the peak is at least this many clients (default 5).</span>
         </label>
       </div>
-      <div class="flex gap-2 mt-4">
-        <button onclick="csSaveMistConn()" class="bg-[#01A982] hover:bg-[#018a6c] text-white px-4 py-2 rounded-md text-sm font-bold">Save Connection</button>
+      <div class="flex justify-end gap-2 mt-4">
+        <button onclick="csSaveMistConn()" class="bg-[#01A982]/10 hover:bg-[#01A982]/20 text-[#01A982] border border-[#01A982] px-4 py-2 rounded-md text-sm font-bold">Save Connection</button>
         <button onclick="csTestMist()" class="bg-slate-200 text-slate-700 px-4 py-2 rounded-md text-sm font-bold">Test Mist</button>
       </div>
       <div id="cs-msc-test" class="mt-3 text-xs text-slate-500"></div>
@@ -7334,7 +8242,7 @@ async function csRenderSetupMistApi() {
         : '<p class="text-xs text-slate-400 italic">None configured. Load the available-checks catalog to pick Mist alerts/insights.</p>';
 
     const sitesCard = `<div class="hpe-card rounded-lg p-5 shadow-sm">
-      <h3 class="text-sm font-bold text-slate-500 uppercase tracking-wider mb-3">Sites &amp; Checks ${helpIcon('mist', null, 'Mist help')}</h3>
+      <h3 class="text-sm font-bold text-slate-500 uppercase tracking-wider mb-2">Sites &amp; Checks ${helpIcon('mist', null, 'Mist help')}</h3>
       <p class="text-xs text-slate-400 mb-3">Hub-owned site mappings + Mist sim/hardware monitors. Pushed to the spoke as <code>mist_sites_config</code> and applied to the spoke's runtime monitoring when hub-managed.</p>
 
       <div class="flex items-center gap-2 mb-2">
@@ -7354,15 +8262,12 @@ async function csRenderSetupMistApi() {
       <div id="cs-msc-hw-rows" class="space-y-2">${hwRows || '<p class="text-xs text-slate-400 italic">No hardware checks.</p>'}</div>
       <button onclick="csMscAddHw()" class="mt-2 text-xs text-[#01A982] font-bold hover:underline">+ Add hardware check</button>
 
-      <div class="flex gap-2 mt-4">
-        <button onclick="csSaveMistSites()" class="bg-[#01A982] hover:bg-[#018a6c] text-white px-4 py-2 rounded-md text-sm font-bold">Save Sites &amp; Checks</button>
+      <div class="flex justify-end gap-2 mt-4">
+        <button onclick="csSaveMistSites()" class="bg-[#01A982]/10 hover:bg-[#01A982]/20 text-[#01A982] border border-[#01A982] px-4 py-2 rounded-md text-sm font-bold">Save Sites &amp; Checks</button>
       </div>
     </div>`;
 
     csSet(`<div class="max-w-4xl space-y-4">${connCard}${sitesCard}</div>`);
-    // Refresh the site-mapping <select> options AFTER render (MIRROR of
-    // _csRefreshSiteSelects): wireless sites from /aggregate/clients, Mist sites
-    // from csMistBrowse(). Rewrites each row's options in place (no re-render).
     _csRefreshMistSiteSelects();
 }
 
@@ -7402,6 +8307,9 @@ window.csMscAddHw = function () {
     c.appendChild(wrap.firstElementChild);
 };
 
+// Refresh the Mist site-mapping <select> options AFTER render (MIRROR of
+// _csRefreshSiteSelects): wireless sites from /aggregate/clients, Mist sites
+// from csMistBrowse(). Rewrites each row's options in place.
 async function _csRefreshMistSiteSelects() {
     try {
         const cl = await csFetch(`/aggregate/clients?tenant_id=${csTenant()}`) || {};
@@ -7463,6 +8371,8 @@ window.csSaveMistConn = async function () {
     // Token: include only when non-empty so the spoke's sentinel merge doesn't
     // wipe an existing token with a blank field.
     if (v('cs-msc-token')) hub_mist_config.api_token = v('cs-msc-token');
+    const _pm = parseInt(v('cs-msc-pollmin'), 10);
+    if (!isNaN(_pm) && _pm > 0) hub_mist_config.poll_interval_s = Math.max(60, _pm * 60);
     const _ccNum = (id, dflt) => { const n = parseFloat(v(id)); return isNaN(n) ? dflt : n; };
     hub_mist_config.cc_thresholds = {
         warn_pct: _ccNum('cs-msc-cc-warn', 20),
@@ -7521,12 +8431,12 @@ async function csRenderSetupProxmox() {
         let autoProv = '';
         try { autoProv = await csSetupAutoProvConfigCard(); } catch (e) { console.error('csRenderSetupProxmox: auto-prov card load failed', e); autoProv = `<div class="hpe-card rounded-lg p-5 shadow-sm">${csErrorBox('VM Auto-Provisioning', e).replace('py-10', 'py-6')}</div>`; }
         const card = await csHubConfigCard('/tenant/' + csTenant() + '/hub-config');
-        const resetBar = `<div class="hpe-card rounded-lg p-4 shadow-sm flex items-center justify-between gap-3">
+        const resetBar = `<div class="hpe-card rounded-lg p-5 shadow-sm flex items-center justify-between gap-3">
           <p class="text-xs text-slate-500">Reset every knob on this page to factory defaults. Certified/ignored USB devices + ignored hostnames are preserved (manage those on the USB page).</p>
           <button onclick="csResetHubConfig()" class="shrink-0 bg-red-100 hover:bg-red-200 text-red-700 px-4 py-2 rounded-md text-sm font-bold">Reset to Default</button>
         </div>`;
         csSet(`<div class="space-y-4">${autoProv}<div class="hpe-card rounded-lg p-5 shadow-sm">
-          <h3 class="text-sm font-bold text-slate-500 uppercase tracking-wider mb-1">Hub Config ${helpIcon('cs', null, 'Simulations help')}</h3>
+          <h3 class="text-sm font-bold text-slate-500 uppercase tracking-wider mb-2">Hub Config ${helpIcon('cs', null, 'Simulations help')}</h3>
           <p class="text-xs text-slate-400 mb-3">Remaining hub-owned knobs (reclone schedule, VMID range, VLANs, USB VID/PID lists, watchdog group). Pushed to the spoke on save.</p>
         </div>${card}${resetBar}</div>`);
     } catch (e) { console.error('csRenderSetupProxmox: proxmox config load failed', e); csSet(csErrorBox('Could not load Proxmox config', e)); }
@@ -7563,13 +8473,13 @@ async function csRenderSetupGithub() {
         _csBranchSelect('cs-gh-branch', cfg.repo_branch, branches, null)}</label>`;
     csSet(`<div class="max-w-2xl space-y-4">
       <div class="hpe-card rounded-lg p-5 shadow-sm">
-        <h3 class="text-sm font-bold text-slate-500 uppercase tracking-wider mb-3">GitHub ${helpIcon('cs', null, 'Simulations help')}</h3>
+        <h3 class="text-sm font-bold text-slate-500 uppercase tracking-wider mb-2">GitHub ${helpIcon('cs', null, 'Simulations help')}</h3>
         <div class="grid grid-cols-1 gap-3">
           ${f('cs-gh-url', 'Repo URL', cfg.repo_url)}${branchField}
           ${f('cs-gh-token', 'GitHub Token ' + (cfg.has_token ? '(set — leave blank to keep)' : '(new)'), '', 'password')}
         </div>
-        <div class="flex gap-2 mt-4">
-          <button onclick="csSaveGithub()" class="bg-[#01A982] hover:bg-[#018a6c] text-white px-4 py-2 rounded-md text-sm font-bold">Save</button>
+        <div class="flex justify-end gap-2 mt-4">
+          <button onclick="csSaveGithub()" class="bg-[#01A982]/10 hover:bg-[#01A982]/20 text-[#01A982] border border-[#01A982] px-4 py-2 rounded-md text-sm font-bold">Save</button>
           <button onclick="csClearGithub()" class="bg-red-100 text-red-700 px-4 py-2 rounded-md text-sm font-bold">Clear</button>
         </div>
       </div></div>`);
@@ -7606,13 +8516,13 @@ async function csRenderSetupSecurity() {
       <input id="${id}" value="${csEscape(val != null ? val : '')}" class="w-full bg-white border border-slate-300 rounded-md px-3 py-2 text-sm mt-1"></label>`;
     csSet(`<div class="max-w-2xl space-y-4">
       <div class="hpe-card rounded-lg p-5 shadow-sm">
-        <h3 class="text-sm font-bold text-slate-500 uppercase tracking-wider mb-3">Security ${helpIcon('cs', null, 'Simulations help')}</h3>
+        <h3 class="text-sm font-bold text-slate-500 uppercase tracking-wider mb-2">Security ${helpIcon('cs', null, 'Simulations help')}</h3>
         <p class="text-xs text-slate-400 mb-3">Governs the spoke's local dashboard auth. LM hub auth is managed separately in LM settings.</p>
         <div class="grid grid-cols-1 md:grid-cols-2 gap-3">
           ${f('cs-sec-timeout', 'Session Timeout (minutes)', cfg.session_timeout_minutes)}
           ${f('cs-sec-provider', 'Auth Provider', cfg.auth_provider)}
         </div>
-        <button onclick="csSaveSecurity()" class="mt-4 bg-[#01A982] hover:bg-[#018a6c] text-white px-4 py-2 rounded-md text-sm font-bold">Save</button>
+        <div class="mt-4 flex justify-end"><button onclick="csSaveSecurity()" class="bg-[#01A982]/10 hover:bg-[#01A982]/20 text-[#01A982] border border-[#01A982] px-4 py-2 rounded-md text-sm font-bold">Save</button></div>
       </div></div>`);
 }
 
@@ -7634,14 +8544,15 @@ async function csRenderSetupNotifications() {
     catch (e) { console.error('csRenderSetupNotifications: notifications load failed', e); csSet(csErrorBox('Could not load Notifications', e)); }
 }
 
-// ── Register Config children (mirror parity with the hub) ──────────────────
-// The spoke exposes these via dashboard.html TAB_RENDERERS ('Config' → Raw
-// Config, 'Sim Quotas' → Sim Quotas) since its nav is a flat top-level strip,
-// not the hub's two-tier primary/child strip. Registered here too so the two
-// files' CS_CHILD_RENDERERS blocks stay in sync.
-window.CS_CHILD_RENDERERS['Config::Sim Quotas']    = csRenderConfigSimQuotas;
-window.CS_CHILD_RENDERERS['Config::PXMX Sites']    = csRenderPxmxSiteMap;
-window.CS_CHILD_RENDERERS['Config::Quota State']   = csRenderSimQuotaState;
+// ── Register Config children ───────────────────────────────────────────────
+// Config is now two sub-tabs: "Sim Quotas" (alert→sim linkage + per-site
+// client quotas the engine keeps filled) and "Config Editor" (the former flat
+// Config view — Source of Truth + simulation.conf + user-overrides + hub
+// config). VIEW_CHILDREN.cs.Config (main.js) lists both; the existing
+// case 'Config' dispatch is the no-children fallback and stays as a safety net.
+window.CS_CHILD_RENDERERS['Config::Engine']        = csRenderConfigSimQuotas;
+window.CS_CHILD_RENDERERS['Config::Sites']         = csRenderPxmxSiteMap;
+window.CS_CHILD_RENDERERS['Config::Engine State']  = csRenderSimQuotaState;
 window.CS_CHILD_RENDERERS['Config::Engine Diagnostic'] = csRenderEngineDiag;
 window.CS_CHILD_RENDERERS['Config::Config Editor']    = csRenderConfigSimulation;
 
@@ -7667,6 +8578,14 @@ window.CS_CHILD_RENDERERS['Setup::Proxmox']        = csRenderSetupProxmox;
 window.CS_CHILD_RENDERERS['Setup::GitHub']         = csRenderSetupGithub;
 window.CS_CHILD_RENDERERS['Setup::Security']       = csRenderSetupSecurity;
 window.CS_CHILD_RENDERERS['Setup::Notifications']  = csRenderSetupNotifications;
+window.CS_CHILD_RENDERERS['Setup::Diagnostics']    = csRenderSetupDiagnostics;
+// Belt-and-braces global. The declaration is already top-level in a CLASSIC
+// script, so it is a global by language rule — but a reported
+// "Can't find variable: csRenderSetupDiagnostics" from the page's inline
+// "↻ Refresh all" onclick means something (a stale cached copy of this file, or
+// a load-order edge) broke that assumption in practice. The explicit assignment
+// costs nothing and matches how every other handler on this page is exported.
+window.csRenderSetupDiagnostics = csRenderSetupDiagnostics;
 
 /* ===========================================================================
  * 1. VM Server — fleet overview + per-spoke drill-in children
@@ -7929,27 +8848,46 @@ async function csRenderVmServer() {
     try { hosts = await csVmLoad(); }
     catch (e) { console.error('csRenderVmServer: fleet load failed', e); csSet(csErrorBox('Could not load VM Server fleet', e)); return; }
     if (!hosts.length) { csSet(csEmpty('No VM servers reporting yet.')); return; }
-    const online = hosts.filter(h => h.spoke_online).length;
+    // Online = hosts whose OWN agent frame is fresh (host_online), not merely
+    // whose parent spoke's socket is up — so a shut-down agent drops out of the
+    // count. Falls back to spoke_online when host_online is absent (old cache).
+    const online = hosts.filter(h => (h.host_online != null ? h.host_online : h.spoke_online)).length;
     const vms = hosts.reduce((n, h) => n + csSimVmCount(h), 0);
     const usbs = hosts.reduce((n, h) => n + csUsbCount(h), 0);
-    const recloneRunning = hosts.filter(h => h.reclone_state && h.reclone_state.status === 'running').length;
+    // Count VMs the agents report as actively recloning (prov_status stamped
+    // from reclone_vmids) — the reclone_state placeholder was always empty.
+    const recloneRunning = hosts.reduce((n, h) =>
+        n + (csHostVms(h).filter(v => String(v.prov_status || '').toLowerCase() === 'recloning').length), 0);
+    // Staleness notice (upper-right): hosts whose own agent frame has gone stale
+    // (host_stale) — a shut-down/hung agent OR a >5-min-old cache. host_stale is
+    // recomputed per request hub-side, so this advances even with no new frame.
+    const staleHosts = hosts.filter(h => h.host_stale || (!h.spoke_online && h.cache_stale));
+    // Remember we're showing stale cache so the /sim/ws telemetry handler can
+    // force a one-shot refresh the moment the spoke/agent reconnect.
+    window._csVmHadStale = staleHosts.length > 0;
+    const staleNotice = staleHosts.length
+        ? `<span class="ml-auto inline-flex items-center gap-1.5 px-3 py-1 rounded-full bg-amber-100 text-amber-800 border border-amber-300 text-[11px] font-bold" title="${csEscape(staleHosts.map(h => (h.spoke_name || h.spoke_hostname || h.spoke_id) + (h.cache_age_s != null ? ' · ' + Math.floor(h.cache_age_s / 60) + 'm old' : '')).join('; '))}"><span class="w-1.5 h-1.5 rounded-full bg-amber-500 animate-pulse"></span>Showing cached data (&gt;5 min old) — check Spoke &amp; Agent</span>`
+        : '';
     const summary = `<div class="flex flex-wrap items-center gap-x-4 gap-y-1 mb-3 text-xs text-slate-500">
       <span><b class="text-sm text-slate-700">${hosts.length}</b> Hosts</span>
       <span><b class="text-sm text-slate-700">${online}</b> Online</span>
       <span><b class="text-sm text-slate-700">${recloneRunning}</b> Recloning</span>
       <span><b class="text-sm text-slate-700">${usbs}</b> USB</span>
       <span><b class="text-sm text-slate-700">${vms}</b> VMs</span>
+      ${staleNotice}
     </div>`;
 
     const fleetCards = `<div class="grid grid-cols-1 md:grid-cols-2 gap-4 mb-5">
-      <div class="hpe-card rounded-lg p-4 shadow-sm">
+      <div class="hpe-card rounded-lg p-5 shadow-sm">
         <p class="text-[11px] font-bold text-slate-400 uppercase tracking-wider mb-2">Fleet Reclone</p>
         <div class="flex items-center gap-2">
-          <button onclick="csFleetReclone()" class="bg-[#01A982] hover:bg-[#018a6c] text-white px-3 py-1.5 rounded-md text-xs font-bold">Reclone All</button>
+          <button onclick="csFleetReclone()" class="bg-[#01A982]/10 hover:bg-[#01A982]/20 text-[#01A982] border border-[#01A982] px-3 py-1.5 rounded-md text-xs font-bold" title="Destroy and re-clone every VM in the fleet from its template — all in-VM state is lost">Reclone All</button>
+          <button id="cs-fleet-reclone-stop" onclick="csFleetRecloneStop()" class="hidden bg-red-50 hover:bg-red-100 text-red-700 border border-red-300 px-3 py-1.5 rounded-md text-xs font-bold" title="Stop the running fleet reclone — VMs already in progress finish, the rest are skipped">Stop</button>
+          <button id="cs-fleet-reclone-clear" onclick="csFleetRecloneClear()" class="hidden bg-white hover:bg-slate-50 text-slate-600 border border-slate-300 px-3 py-1.5 rounded-md text-xs font-bold" title="Clear the finished reclone's errors and per-VM log. Refused while a batch is running — stop it first.">Clear errors</button>
         </div>
         <div id="cs-fleet-reclone-progress" class="mt-2 text-[11px] text-slate-500 space-y-1">No reclone in progress.</div>
       </div>
-      <div class="hpe-card rounded-lg p-4 shadow-sm flex flex-col">
+      <div class="hpe-card rounded-lg p-5 shadow-sm flex flex-col">
         <div class="flex items-center justify-between mb-2">
           <p class="text-[11px] font-bold text-slate-400 uppercase tracking-wider">Auto-Provisioning</p>
           <button id="cs-autoprov-enable-btn" onclick="csToggleAutoProvision()" class="px-3 py-1 rounded-md text-xs font-bold border">Enable</button>
@@ -7981,8 +8919,9 @@ async function csRenderVmServer() {
         const qtPill = qtList.length ? `<span class="ml-1 inline-flex items-center gap-0.5 px-1.5 py-0.5 rounded bg-red-100 text-red-700 text-[9px] font-bold uppercase tracking-wider" title="${csEscape(qtList.map(q => q.bus_path + ': ' + (q.reason || '')).join('; '))}">🚫 ${qtList.length} QT</span>` : '';
         const selCls = csVmHostId(h) === sel ? 'bg-green-50 ring-1 ring-green-300' : 'hover:bg-slate-50';
         return `<tr class="border-b border-slate-100 cursor-pointer ${selCls}" onclick="csVmSelectHost('${csEscape(csVmHostId(h))}','VMs')">
+          <td class="px-4 py-2 text-center" onclick="event.stopPropagation()"><input type="checkbox" class="cs-host-sel" data-host="${csEscape((px.node && px.node.hostname) || csVmHostId(h))}" data-spoke="${csEscape(h.spoke_id || '')}" data-name="${csEscape(h.spoke_name || h.spoke_hostname || h.spoke_id || '')}"></td>
           <td class="px-4 py-2"><span class="font-medium text-slate-700">${csEscape(String(h.spoke_name || h.spoke_hostname || h.spoke_id || '').toUpperCase())}</span>${csClusterBadge(csHostClustered(h))}</td>
-          <td class="px-4 py-2 text-center">${csOnlineBadge(h.spoke_online)}</td>
+          <td class="px-4 py-2 text-center">${csHostStateBadge(h)}</td>
           <td class="px-4 py-2 text-center">${vmN}</td>
           <td class="px-4 py-2 text-center">${usbN}${qtPill}</td>
           <td class="px-4 py-2 text-center">${csDongleTriplet(csDongleCounts(h))}</td>
@@ -8003,16 +8942,33 @@ async function csRenderVmServer() {
                        'Class': 'T1 / T2 / T3 simulation VMs (+ unclassified when nonzero)' };
     const ths = ['Host', 'Online', 'VMs', 'USB', 'Dongles', 'Class', 'CPU 1h', 'Mem 1h', 'Auto-Prov']
         .map((c, i) => `<th class="px-4 py-2 ${i >= 1 && i <= 8 ? 'text-center' : 'text-left'} font-medium"${_thTitle[c] ? ` title="${_thTitle[c]}"` : ''}>${c}</th>`).join('');
+    const selTh = `<th class="px-4 py-2 text-center"><input type="checkbox" onclick="csFleetSelectAll(this)" title="Select all hosts"></th>`;
     const table = `<div class="overflow-x-auto"><table class="w-full text-sm">
-      <thead class="bg-slate-50 text-xs text-slate-500 uppercase"><tr>${ths}</tr></thead>
+      <thead class="bg-slate-50 text-xs text-slate-500 uppercase"><tr>${selTh}${ths}</tr></thead>
       <tbody>${rows}</tbody>
     </table></div>`;
 
-    csSet(`<div class="space-y-4">${summary}${fleetCards}${table}</div>`);
+    // Fleet template refresh — SEED-AND-DISTRIBUTE: push a hub Template Repo
+    // backup (the seed) onto the selected target hosts. Tenant-admin (own
+    // hosts) + Global Admin.
+    const _canRefresh = (typeof isAdmin === 'function' && isAdmin())
+        || (typeof isTenantAdmin === 'function' && isTenantAdmin());
+    const bulkBar = _canRefresh
+        ? `<div class="flex items-center gap-2 flex-wrap">
+             <button onclick="csFleetRefreshTemplates()" class="bg-amber-100 hover:bg-amber-200 text-amber-800 border border-amber-300 px-3 py-1.5 rounded-md text-xs font-bold" title="Distribute a seed template backup from the hub onto the selected host(s): pause auto-provisioning, delete each host's sim VMs + template, qmrestore the seed backup, then resume auto-provisioning.">↻ Refresh Template(s)</button>
+             <button onclick="csUploadTemplate()" class="bg-slate-100 hover:bg-slate-200 text-slate-600 border border-slate-200 px-3 py-1.5 rounded-md text-xs font-bold" title="Upload a vzdump template archive (.vma.zst) from your browser straight into the hub Template Repo — for when the source Proxmox host is offline or you only have the archive as a file. Stamped to the current tenant.">⬆ Upload template</button>
+             <span class="text-[11px] text-slate-400">Select target host(s), then push a seed template backup from the hub onto them. This wipes each target's sim VMs.</span>
+             <span id="cs-refresh-status-chip" class="hidden text-[11px] font-bold px-2 py-1 rounded-full border"></span>
+           </div>`
+        : '';
+
+    csSet(`<div class="space-y-4">${summary}<div id="cs-live-ops"></div>${fleetCards}${bulkBar}${table}</div>`);
+    csRenderLiveOps();
     // populate auto-provision status + the live panels (host data from csVmLoad).
     csRefreshAutoProvStatus();
     csAutoProvLivePanel();
     csFleetRecloneProgress();
+    csRefreshStatusTick();   // template-refresh status chip (polls refresh_status)
 }
 
 // ── Fleet Reclone / Auto-Provisioning live progress panels ───────────────────
@@ -8022,12 +8978,90 @@ async function csRenderVmServer() {
 // read data that already rides the per-host relay payload (reclone_state /
 // usb_devices[].prov_status), so they refresh with the VM Server auto-refresh.
 
+// Template-refresh status chip — polls the hub's per-host refresh registry
+// (/tenant/templates/refresh-status) and shows, per target host: the current
+// step (pausing/killing/downloading/restoring/resuming → complete/failed) +
+// download progress (bytes/total). The agent reports host/agent_id/vmid/bytes/
+// total in each progress post, so the chip names WHICH host is at WHICH step
+// (the old template-scoped refresh_status was shared across concurrent hosts
+// and couldn't).
+let _csRefreshStatusTimer = null;
+const _CS_REFRESH_ACTIVE = new Set(['pending', 'pausing', 'killing', 'downloading', 'restoring', 'resuming']);
+const _CS_REFRESH_LABEL = {
+    pending: 'Queued', pausing: 'Pausing auto-prov', killing: 'Wiping sim VMs',
+    downloading: 'Downloading', restoring: 'Restoring template',
+    resuming: 'Resuming auto-prov', complete: 'Complete', failed: 'Failed'
+};
+function _csFmtBytes(n) {
+    n = Number(n) || 0;
+    if (n >= 1073741824) return (n / 1073741824).toFixed(1) + ' GB';
+    if (n >= 1048576) return (n / 1048576).toFixed(0) + ' MB';
+    return Math.round(n / 1024) + ' KB';
+}
+async function csRefreshStatusTick() {
+    if (_csRefreshStatusTimer) { clearTimeout(_csRefreshStatusTimer); _csRefreshStatusTimer = null; }
+    const chip = document.getElementById('cs-refresh-status-chip');
+    if (!chip) { return; }
+    let hosts = [];
+    try {
+        const r = await fetch('/tenant/templates/refresh-status', { credentials: 'same-origin' });
+        const d = await r.json().catch(() => ({}));
+        hosts = (d && d.hosts) || [];
+    } catch (e) { /* keep last chip state; retry next tick */ }
+
+    const active = hosts.filter(h => _CS_REFRESH_ACTIVE.has(String(h.status || '').toLowerCase()));
+    const failed = hosts.filter(h => String(h.status || '').toLowerCase() === 'failed');
+
+    if (active.length) {
+        const lines = active.map(h => {
+            const st = String(h.status || '').toLowerCase();
+            const label = _CS_REFRESH_LABEL[st] || st;
+            const who = csEscape(h.host || h.agent_id || 'host') + (h.vmid != null ? ' · vmid ' + csEscape(String(h.vmid)) : '');
+            const prog = (h.total && h.bytes != null) ? ' · ' + _csFmtBytes(h.bytes) + ' / ' + _csFmtBytes(h.total) : '';
+            return `${who} — ${csEscape(label)}${prog}`;
+        }).join('  |  ');
+        chip.className = 'text-[11px] font-bold px-2 py-1 rounded-full border bg-amber-50 text-amber-700 border-amber-300';
+        chip.innerHTML = `<span class="animate-spin inline-block w-3 h-3 rounded-full border-2 border-amber-500 border-t-transparent align-middle mr-1"></span>${lines}`;
+        chip.title = '';
+        chip.classList.remove('hidden');
+    } else if (failed.length) {
+        const lines = failed.map(h => csEscape(h.host || 'host') + ': ' + csEscape(h.error || 'failed')).join('; ');
+        chip.className = 'text-[11px] font-bold px-2 py-1 rounded-full border bg-red-50 text-red-700 border-red-300';
+        chip.title = lines;
+        chip.textContent = '↻ Refresh failed on ' + (failed.length > 1 ? failed.length + ' hosts' : (failed[0].host || 'host')) + ' — see Template Repo';
+        chip.classList.remove('hidden');
+    } else {
+        chip.classList.add('hidden');
+        chip.innerHTML = '';
+    }
+    // Poll 4s while anything is active; 15s when idle (a refresh started
+    // elsewhere still surfaces). Stop if the chip left the DOM (view changed).
+    const stillActive = !!(active.length || failed.length);
+    _csRefreshStatusTimer = setTimeout(csRefreshStatusTick, stillActive ? 4000 : 15000);
+}
+
 function csFleetRecloneProgress() {
     const el = csEl('cs-fleet-reclone-progress');
     if (!el) return;
     // Per-host reclone_state; only hosts with a non-idle/non-empty state are "running".
     const active = (csVmHosts || []).map(h => ({ h, rs: h.reclone_state || {} }))
         .filter(x => x.rs.status === 'running' || (x.rs.status && x.rs.status !== 'idle' && Object.keys(x.rs).length));
+    // Show the Stop button only while a batch is actually running on some server.
+    const stopBtn = csEl('cs-fleet-reclone-stop');
+    const running = active.some(x => x.rs.status === 'running');
+    if (stopBtn) stopBtn.classList.toggle('hidden', !running);
+    // "Clear errors" appears only when a FINISHED batch left something to clear —
+    // failures or a per-VM log. Hidden while running: clearing then would blank
+    // the progress view and lose the record of what just failed (the agent
+    // refuses it too, this just keeps the button honest).
+    const clearBtn = csEl('cs-fleet-reclone-clear');
+    if (clearBtn) {
+        const clearable = !running && (csVmHosts || []).some(h => {
+            const rs = h.reclone_state || {};
+            return Number(rs.failed || 0) > 0 || (rs.log || []).length > 0;
+        });
+        clearBtn.classList.toggle('hidden', !clearable);
+    }
     if (!active.length) { el.textContent = 'No reclone in progress.'; return; }
     el.innerHTML = active.map(({ h, rs }) => {
         const total = Number(rs.total || 0);
@@ -8104,16 +9138,258 @@ function csAutoProvLivePanel() {
     }).join('');
 }
 
+window.csFleetSelectAll = function (cb) {
+    document.querySelectorAll('.cs-host-sel').forEach(x => { x.checked = cb.checked; });
+};
+
+// Fleet template refresh — SEED-AND-DISTRIBUTE. One PXMX host is the seed (its
+// template is prepped + backed up to the hub Template Repo); the operator selects
+// the OTHER target hosts here and a seed backup is pushed onto each: pause
+// auto-prov → wipe the target's sim VMs + template → qmrestore the seed backup at
+// the target's VMID → re-mark template → resume auto-prov. Destructive.
+window.csFleetRefreshTemplates = async function () {
+    const boxes = Array.from(document.querySelectorAll('.cs-host-sel:checked'));
+    // Key on the per-HOST id (agent OS hostname), NOT the shared spoke_id —
+    // several pxmx hosts share one cs spoke.
+    const hostIds = boxes.map(b => b.getAttribute('data-host')).filter(Boolean);
+    const names = boxes.map(b => b.getAttribute('data-name') || b.getAttribute('data-host'));
+    if (!hostIds.length) { if (typeof showToast === 'function') showToast('Select one or more hosts first', 'error'); return; }
+
+    // One modal at a time.
+    const existing = document.getElementById('cs-refresh-tpl-modal');
+    if (existing) { existing.remove(); return; }
+
+    // Load the caller's COMPLETE template backups (the seed candidates).
+    let templates = [];
+    try {
+        const r = await fetch('/tenant/templates', { credentials: 'same-origin' });
+        const d = await r.json().catch(() => ({}));
+        templates = (d.templates || []).filter(t => (t.status || '').toLowerCase() === 'complete')
+            .sort((a, b) => String(b.created_at || '').localeCompare(String(a.created_at || '')));
+    } catch (e) { /* leave empty; modal explains */ }
+
+    const esc = csEscape;  // shared escaper (escapes &<>"')
+    const fmtWhen = s => s ? new Date(s).toLocaleString() : '';
+    const srcOpt = t => `<option value="${esc(t.id)}">${esc(t.name || t.id)} · ${esc(t.source_node || '—')} · vmid ${esc(String(t.source_vmid == null ? '—' : t.source_vmid))} · ${esc(fmtWhen(t.created_at))}</option>`;
+    const none = !templates.length;
+    const srcOpts = none ? `<option value="" disabled>(no completed backups — back one up first)</option>` : templates.map(srcOpt).join('');
+
+    const modal = document.createElement('div');
+    modal.id = 'cs-refresh-tpl-modal';
+    modal.className = 'fixed inset-0 z-50 flex items-center justify-center bg-black bg-opacity-50 backdrop-blur-sm p-4';
+    modal.innerHTML = `
+        <div class="bg-white rounded-xl shadow-2xl w-full max-w-lg overflow-hidden">
+            <div class="px-6 py-4 border-b border-slate-200 flex justify-between items-center bg-slate-50">
+                <h3 class="text-lg font-bold text-[#263040]">↻ Refresh Template(s) — distribute seed</h3>
+                <button onclick="this.closest('#cs-refresh-tpl-modal').remove()" class="text-slate-400 hover:text-slate-600 transition-colors">
+                    <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"></path></svg>
+                </button>
+            </div>
+            <div class="p-6 space-y-4">
+                <div class="space-y-2">
+                    <label class="text-xs text-slate-500 uppercase font-bold">Seed backup (from Template Repo)</label>
+                    <select id="cs-refresh-src" class="w-full bg-white border border-slate-300 rounded-md px-4 py-2 text-sm outline-none focus:ring-2 focus:ring-green-500">${srcOpts}</select>
+                    <p class="text-[11px] text-slate-400 leading-relaxed">The selected backup is restored onto every target host below. Default = newest completed backup.</p>
+                </div>
+                <div class="space-y-2">
+                    <label class="text-xs text-slate-500 uppercase font-bold">Target VMID <span class="font-normal normal-case text-slate-400">(optional)</span></label>
+                    <input id="cs-refresh-vmid" type="number" min="1" placeholder="blank = each host's configured template VMID (VM Image 1)" class="w-full bg-white border border-slate-300 rounded-md px-4 py-2 text-sm outline-none focus:ring-2 focus:ring-green-500">
+                    <p class="text-[11px] text-slate-400 leading-relaxed">Override the VMID the backup is restored to on each host (e.g. backup is vmid 100, restore to 200). Leave blank to use each host's own configured template VMID.</p>
+                </div>
+                <div class="space-y-1">
+                    <label class="text-xs text-slate-500 uppercase font-bold">Target host(s) — ${hostIds.length}</label>
+                    <div class="bg-slate-50 border border-slate-200 rounded-md p-2 text-xs text-slate-600 max-h-24 overflow-y-auto">${esc(names.join(', '))}</div>
+                </div>
+                <p class="text-[11px] text-amber-700 bg-amber-50 border border-amber-200 rounded-md p-2 leading-relaxed">⚠ Destructive: this PAUSES auto-provisioning, DELETES each target host's sim VMs + template, restores the seed backup, then resumes. Existing sim clients on the targets are wiped.</p>
+                <div id="cs-refresh-status" class="text-xs text-slate-500 hidden"></div>
+                <div class="pt-2 flex justify-end gap-3">
+                    <button onclick="this.closest('#cs-refresh-tpl-modal').remove()" class="px-4 py-2 text-sm font-medium text-slate-600 hover:text-slate-800">Cancel</button>
+                    <button id="cs-refresh-go" class="bg-amber-100 hover:bg-amber-200 text-amber-800 border border-amber-300 px-6 py-2 rounded-md text-sm font-bold transition-all shadow-sm ${none ? 'opacity-50 cursor-not-allowed' : ''}" ${none ? 'disabled' : ''}>Refresh</button>
+                </div>
+            </div>
+        </div>`;
+    document.body.appendChild(modal);
+
+    if (none) {
+        if (typeof showToast === 'function') showToast('No completed backups in the Template Repo — back one up first (Setup → Hypervisors → ⬆ Back up to Hub)', 'error');
+        return;
+    }
+
+    modal.querySelector('#cs-refresh-go').addEventListener('click', async () => {
+        const template_id = (document.getElementById('cs-refresh-src') || {}).value || '';
+        const rawVmid = ((document.getElementById('cs-refresh-vmid') || {}).value || '').trim();
+        const target_vmid = rawVmid ? parseInt(rawVmid, 10) : null;
+        if (rawVmid && (!Number.isFinite(target_vmid) || target_vmid <= 0)) { if (typeof showToast === 'function') showToast('Target VMID must be a positive integer', 'error'); return; }
+        if (!template_id) { if (typeof showToast === 'function') showToast('Pick a seed backup first', 'error'); return; }
+        const goBtn = document.getElementById('cs-refresh-go');
+        const statusEl = document.getElementById('cs-refresh-status');
+        if (goBtn) { goBtn.disabled = true; goBtn.classList.add('opacity-50', 'cursor-not-allowed'); }
+        if (statusEl) { statusEl.textContent = 'Queuing refresh…'; statusEl.classList.remove('hidden'); }
+        try {
+            const body = { host_ids: hostIds, template_id };
+            if (target_vmid != null) body.target_vmid = target_vmid;
+            const r = await fetch('/tenant/templates/refresh-hosts', {
+                method: 'POST', credentials: 'same-origin',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(body)
+            });
+            const d = await r.json().catch(() => ({}));
+            if (!r.ok) { if (typeof showToast === 'function') showToast(d.detail || 'Refresh failed', 'error'); if (goBtn) { goBtn.disabled = false; goBtn.classList.remove('opacity-50', 'cursor-not-allowed'); } if (statusEl) statusEl.classList.add('hidden'); return; }
+            // Surface per-host skips/errors, then a summary.
+            (d.results || []).filter(x => x.status !== 'SUCCESS').forEach(x => {
+                if (typeof showToast === 'function') showToast(`${x.host || x.name || x.spoke_id}: ${x.message || x.status}`, 'error');
+            });
+            const ok = d.refreshed || 0, total = d.total || hostIds.length;
+            if (typeof showToast === 'function') showToast(`Refresh queued on ${ok}/${total} host(s).`, ok ? 'success' : 'error');
+            modal.remove();
+            if (typeof csRenderVmServer === 'function') csRenderVmServer();
+        } catch (e) {
+            if (typeof showToast === 'function') showToast('Refresh failed: ' + (e.message || e), 'error');
+            if (goBtn) { goBtn.disabled = false; goBtn.classList.remove('opacity-50', 'cursor-not-allowed'); }
+            if (statusEl) statusEl.classList.add('hidden');
+        }
+    });
+};
+
+// ── Manual template upload (tenant-admin / admin) ────────────────────────────
+// Two-step: POST /tenant/templates/upload-init (session-authed, stamped to the
+// current sim tenant, mints a pending record + one-time upload token) → PUT the
+// raw File to the returned upload_url with the x-upload-token header (that route
+// is token-authed / middleware-exempt, so NO session goes on the PUT). Uses
+// XMLHttpRequest for the PUT so it can surface upload progress % — the archives
+// are large. Mirrors csFleetRefreshTemplates' modal pattern.
+window.csUploadTemplate = async function () {
+    const _canRefresh = (typeof isAdmin === 'function' && isAdmin())
+        || (typeof isTenantAdmin === 'function' && isTenantAdmin());
+    if (!_canRefresh) { if (typeof showToast === 'function') showToast('Not permitted', 'error'); return; }
+
+    // One modal at a time.
+    const existing = document.getElementById('cs-upload-tpl-modal');
+    if (existing) { existing.remove(); return; }
+
+    const esc = csEscape;  // shared escaper (escapes &<>"')
+    const modal = document.createElement('div');
+    modal.id = 'cs-upload-tpl-modal';
+    modal.className = 'fixed inset-0 z-50 flex items-center justify-center bg-black bg-opacity-50 backdrop-blur-sm p-4';
+    modal.innerHTML = `
+        <div class="bg-white rounded-xl shadow-2xl w-full max-w-lg overflow-hidden">
+            <div class="px-6 py-4 border-b border-slate-200 flex justify-between items-center bg-slate-50">
+                <h3 class="text-lg font-bold text-[#263040]">⬆ Upload template to hub</h3>
+                <button onclick="this.closest('#cs-upload-tpl-modal').remove()" class="text-slate-400 hover:text-slate-600 transition-colors">
+                    <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"></path></svg>
+                </button>
+            </div>
+            <div class="p-6 space-y-4">
+                <p class="text-[11px] text-slate-400 leading-relaxed">Upload a vzdump archive (.vma.zst / .vma / .gz / .lzo) straight into the hub Template Repo — the offline alternative to “⬆ Back up to Hub” when the source Proxmox host is unavailable. Stamped to tenant <span class="font-mono text-slate-500">${esc(csTenant())}</span>.</p>
+                <div class="space-y-2">
+                    <label class="text-xs text-slate-500 uppercase font-bold">Archive file</label>
+                    <input id="cs-up-file" type="file" accept=".zst,.vma,.vma.zst,.gz,.lzo" class="w-full bg-white border border-slate-300 rounded-md px-4 py-2 text-sm outline-none focus:ring-2 focus:ring-green-500">
+                </div>
+                <div class="space-y-2">
+                    <label class="text-xs text-slate-500 uppercase font-bold">Name <span class="text-red-500">*</span></label>
+                    <input id="cs-up-name" placeholder="t2-golden…" class="w-full bg-white border border-slate-300 rounded-md px-4 py-2 text-sm outline-none focus:ring-2 focus:ring-green-500">
+                </div>
+                <div class="grid grid-cols-2 gap-3">
+                    <div class="space-y-2">
+                        <label class="text-xs text-slate-500 uppercase font-bold">OS</label>
+                        <input id="cs-up-os" placeholder="Debian 12, Windows 11…" class="w-full bg-white border border-slate-300 rounded-md px-4 py-2 text-sm outline-none focus:ring-2 focus:ring-green-500">
+                    </div>
+                    <div class="space-y-2">
+                        <label class="text-xs text-slate-500 uppercase font-bold">Version</label>
+                        <input id="cs-up-version" placeholder="v3, 2026-07 golden…" class="w-full bg-white border border-slate-300 rounded-md px-4 py-2 text-sm outline-none focus:ring-2 focus:ring-green-500">
+                    </div>
+                </div>
+                <div class="space-y-2">
+                    <label class="text-xs text-slate-500 uppercase font-bold">Purpose</label>
+                    <textarea id="cs-up-purpose" rows="2" class="w-full bg-white border border-slate-300 rounded-md px-4 py-2 text-sm outline-none focus:ring-2 focus:ring-green-500"></textarea>
+                </div>
+                <div id="cs-up-status" class="text-xs text-slate-500 font-mono hidden"></div>
+                <div class="pt-2 flex justify-end gap-3">
+                    <button onclick="this.closest('#cs-upload-tpl-modal').remove()" class="px-4 py-2 text-sm font-medium text-slate-600 hover:text-slate-800">Cancel</button>
+                    <button id="cs-up-go" class="bg-[#01A982]/10 hover:bg-[#01A982]/20 text-[#01A982] border border-[#01A982] px-6 py-2 rounded-md text-sm font-bold transition-all shadow-sm">Upload</button>
+                </div>
+            </div>
+        </div>`;
+    document.body.appendChild(modal);
+
+    modal.querySelector('#cs-up-go').addEventListener('click', async () => {
+        const g = i => (document.getElementById(i) || {}).value || '';
+        const fileEl = document.getElementById('cs-up-file');
+        const file = fileEl && fileEl.files && fileEl.files[0];
+        const name = g('cs-up-name').trim();
+        if (!file) { if (typeof showToast === 'function') showToast('Choose an archive file first', 'error'); return; }
+        if (!name) { if (typeof showToast === 'function') showToast('A template name is required', 'error'); return; }
+        const goBtn = document.getElementById('cs-up-go');
+        const statusEl = document.getElementById('cs-up-status');
+        const setBusy = b => { if (goBtn) { goBtn.disabled = b; goBtn.classList.toggle('opacity-50', b); goBtn.classList.toggle('cursor-not-allowed', b); } };
+        setBusy(true);
+        if (statusEl) { statusEl.classList.remove('hidden'); statusEl.textContent = 'Registering upload…'; }
+        // Step 1 — mint a pending record + one-time upload token, stamped to the
+        // caller's current sim tenant (session-authed).
+        let init;
+        try {
+            const r = await fetch('/tenant/templates/upload-init', {
+                method: 'POST', credentials: 'same-origin',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    name, tenant_id: csTenant(),
+                    os: g('cs-up-os'), version: g('cs-up-version'), purpose: g('cs-up-purpose')
+                })
+            });
+            init = await r.json().catch(() => ({}));
+            if (!r.ok || init.status !== 'SUCCESS') {
+                if (typeof showToast === 'function') showToast(init.detail || init.message || 'Could not start upload', 'error');
+                setBusy(false); if (statusEl) statusEl.classList.add('hidden'); return;
+            }
+        } catch (e) {
+            if (typeof showToast === 'function') showToast('Could not start upload: ' + (e.message || e), 'error');
+            setBusy(false); if (statusEl) statusEl.classList.add('hidden'); return;
+        }
+        // Step 2 — PUT the raw File to the token-authed upload endpoint. Plain XHR
+        // (NOT csFetch) so this stays session-less and can report progress %.
+        try {
+            await new Promise((resolve, reject) => {
+                const xhr = new XMLHttpRequest();
+                xhr.open('PUT', init.upload_url, true);
+                xhr.setRequestHeader('x-upload-token', init.upload_token);
+                xhr.upload.onprogress = e => {
+                    if (statusEl && e.lengthComputable) {
+                        const pct = Math.floor((e.loaded / e.total) * 100);
+                        statusEl.textContent = `Uploading… ${pct}%`;
+                    }
+                };
+                xhr.onload = () => {
+                    if (xhr.status >= 200 && xhr.status < 300) resolve();
+                    else {
+                        let msg = `upload failed (HTTP ${xhr.status})`;
+                        try { const j = JSON.parse(xhr.responseText || '{}'); if (j.detail) msg = j.detail; } catch (_e) { }
+                        reject(new Error(msg));
+                    }
+                };
+                xhr.onerror = () => reject(new Error('network error during upload'));
+                xhr.send(file);
+            });
+        } catch (e) {
+            if (typeof showToast === 'function') showToast('Upload failed: ' + (e.message || e), 'error');
+            setBusy(false); if (statusEl) statusEl.textContent = 'Upload failed.'; return;
+        }
+        if (typeof showToast === 'function') showToast('Template uploaded', 'success');
+        modal.remove();
+        if (typeof csRenderVmServer === 'function') csRenderVmServer();
+    });
+};
+
 async function csRefreshAutoProvStatus() {
     const st = csEl('cs-autoprov-status');
     try {
         const s = await csFetch(`/${csTenant()}/usb-provisioning-status?tenant_id=${csTenant()}`);
         const on = String(s.usb_auto_provision || 'off').toLowerCase() === 'on';
         csAutoProvOn = on;
-        // ENABLE button reflects on/off (green when enabled, grey when disabled).
+        // Button reflects STATE (green "Enabled" when on, grey "Disabled" when
+        // off); still clickable when off to enable.
         const btn = csEl('cs-autoprov-enable-btn');
         if (btn) {
-            btn.textContent = on ? 'Enabled' : 'Enable';
+            btn.textContent = on ? 'Enabled' : 'Disabled';
             btn.className = on
                 ? 'px-3 py-1 rounded-md text-xs font-bold border bg-[#01A982]/10 text-[#01A982] border-[#01A982]'
                 : 'px-3 py-1 rounded-md text-xs font-bold border bg-slate-100 text-slate-500 border-slate-300';
@@ -8155,6 +9431,33 @@ window.csFleetReclone = async function () {
         if (typeof showToast === 'function') showToast('Fleet reclone started.', 'success');
         csRenderVmServer();
     } catch (e) { console.error('csFleetReclone: fleet reclone failed', e); if (typeof showToast === 'function') showToast('Fleet reclone failed: ' + (e.message || e), 'error'); }
+};
+
+window.csFleetRecloneClear = async function () {
+    try {
+        // csApi() never existed — this called a helper that was never written,
+        // so "Clear errors" threw ReferenceError on every click. Its route IS
+        // registered (csFleetRecloneClear in the table above); use csFetch the
+        // way csFleetReclone and csFleetRecloneStop do.
+        const d = await csFetch(`/${csTenant()}/fleet-reclone-clear?tenant_id=${csTenant()}`,
+                                { method: 'POST' });
+        const msg = (d && d.refused)
+            ? `Cleared ${d.cleared}/${d.servers} — ${d.refused} still running (stop first)`
+            : `Cleared reclone errors on ${(d && d.cleared) || 0} server(s)`;
+        if (typeof showToast === 'function') showToast(msg, d && d.refused ? 'error' : 'success');
+        if (typeof loadCSData === 'function') loadCSData(true);
+    } catch (e) {
+        console.error('csFleetRecloneClear: clear failed', e);
+        if (typeof showToast === 'function') showToast('Clear failed: ' + (e.message || e), 'error');
+    }
+};
+
+window.csFleetRecloneStop = async function () {
+    try {
+        await csFetch(`/${csTenant()}/fleet-reclone-stop?tenant_id=${csTenant()}`, { method: 'POST' });
+        if (typeof showToast === 'function') showToast('Stopping fleet reclone — in-flight VMs finish, the rest are skipped.', 'success');
+        csRenderVmServer();
+    } catch (e) { console.error('csFleetRecloneStop: stop failed', e); if (typeof showToast === 'function') showToast('Stop failed: ' + (e.message || e), 'error'); }
 };
 
 window.csToggleAutoProvision = async function (enabled) {
@@ -8352,7 +9655,7 @@ async function csRenderVmServerVms() {
     const cats = ['Simulation Clients', 'Other', 'Containers', 'Templates'];
     const grouped = {};
     cats.forEach(c => grouped[c] = vms.filter(v => csVmCategory(v) === c));
-    const tabs = cats.map((c, i) => `<button onclick="csVmVmsTab('${c}')" id="cs-vmtab-${csEscape(c)}" class="px-3 py-1.5 rounded-md text-xs font-bold ${i === 0 ? 'bg-[#01A982] text-white' : 'bg-slate-100 text-slate-600 hover:bg-slate-200'}">${csEscape(c)} <span class="opacity-60">(${grouped[c].length})</span></button>`).join('');
+    const tabs = cats.map((c, i) => `<button onclick="csVmVmsTab('${c}')" id="cs-vmtab-${csEscape(c)}" class="px-3 py-1.5 rounded-md text-xs font-bold ${i === 0 ? 'bg-[#01A982]/10 text-[#01A982] border border-[#01A982]' : 'bg-white text-slate-600 border border-slate-200 hover:bg-slate-50'}">${csEscape(c)} <span class="opacity-60">(${grouped[c].length})</span></button>`).join('');
     csVmPage = 1;
     const _initList = grouped['Simulation Clients'] || [];
     const rows = csVmRenderRows(_initList);
@@ -8363,8 +9666,8 @@ async function csRenderVmServerVms() {
         <button onclick="csVmBulk('start_vm')" class="bg-green-100 text-green-700 px-2 py-1 rounded font-bold">Start</button>
         <button onclick="csVmBulk('stop_vm')" class="bg-amber-100 text-amber-700 px-2 py-1 rounded font-bold">Stop</button>
         <button onclick="csVmBulk('reboot_vm')" class="bg-slate-200 text-slate-700 px-2 py-1 rounded font-bold">Reboot</button>
-        <button onclick="csVmBulk('reclone_vm')" class="bg-blue-100 text-blue-700 px-2 py-1 rounded font-bold">Reclone</button>
-        <button onclick="csVmBulk('delete_vm')" class="bg-red-100 text-red-700 px-2 py-1 rounded font-bold">Delete</button>
+        <button onclick="csVmBulk('reclone_vm')" class="bg-blue-100 text-blue-700 px-2 py-1 rounded font-bold" title="Wipe and re-clone the selected VMs from template (discards current disk state)">Reclone</button>
+        <button onclick="csVmBulk('delete_vm')" class="bg-red-100 text-red-700 px-2 py-1 rounded font-bold" title="Permanently delete the selected VMs from Proxmox">Delete</button>
         ${moreQueued > 0 ? `<span class="text-slate-400" title="Auto-provisioning has more VMs queued than are shown yet">· ${moreQueued} more queued</span>` : ''}
       </div>
       <div id="cs-vm-list">${csVmTable(rows)}${csVmPager(_initList.length)}</div>
@@ -8509,9 +9812,6 @@ function csRebootBadge(v) {
 // auto-recovery that clears it (a still-plugged dongle gets retried; if the
 // kernel errors persist it re-quarantines next pass). A failed clone NEVER
 // quarantines the dongle, so this is the sole "sidelined dongle" signal.
-// The optional spoke/target enable a per-bus "Remove from QT" button (admin
-// un-quarantines a dongle once the issue is fixed) that dispatches the agent's
-// clear_usb_quarantine CS_COMMAND; omitted on the fleet summary pill.
 // Physical location chip for a PROBLEM dongle (quarantined / recovering /
 // excluded). The agent stamps `location` only on those, falling back to the
 // position recorded while the dongle was still present -- a sidelined dongle is
@@ -8522,22 +9822,18 @@ function _csLoc(x) {
     return l ? ` · <span class="font-bold not-italic">${csEscape(l)}</span>` : '';
 }
 
-function csQtBadge(q, spoke, target) {
+function csQtBadge(q) {
     if (!q || !q.bus_path) return '';
     const at = Number(q.recovers_at);
     const secs = isFinite(at) ? at - Date.now() / 1000 : NaN;
     const reason = String(q.reason || 'quarantined');
     const present = q.present === false ? ' (absent)' : '';
-    const perm = q.permanent ? ' · PERMANENT' : (q.strikes ? ` · strike ${q.strikes}/5` : '');
-    const title = `Quarantined — ${reason}${present}.${perm} Auto-recovers after 1h; re-quarantines if kernel USB errors persist. Remove only once the issue is fixed.`;
+    const title = `Quarantined — ${reason}${present}. Auto-recovers after 1h; re-quarantines if kernel USB errors persist.`;
     const cnt = (isFinite(secs) && secs > 0)
         ? `<span class="cs-qt-countdown" data-qt-at="${at}">${csFmtDuration(secs)}</span>`
-        : (q.permanent ? 'never' : 'now');
-    const rm = (spoke && target)
-        ? `<button onclick="event.stopPropagation(); csClearQt('${csEscape(spoke)}','${csEscape(target)}','${csEscape(q.bus_path)}')" title="Remove this dongle from quarantine (clears its strike history)" class="ml-1 px-1 py-0.5 rounded bg-red-600 hover:bg-red-700 text-white text-[9px] font-bold normal-case">✕ Remove</button>`
-        : '';
+        : 'now';
     return `<span class="inline-flex items-center gap-1 px-2 py-0.5 rounded text-[10px] font-bold uppercase tracking-wider bg-red-100 text-red-700" title="${csEscape(title)}">`
-        + `<span class="w-1.5 h-1.5 rounded-full bg-red-500 animate-pulse"></span>🚫 QT ${csEscape(q.bus_path)}${_csLoc(q)} · ${csEscape(reason)}${perm} · clears in ${cnt}${rm}</span>`;
+        + `<span class="w-1.5 h-1.5 rounded-full bg-red-500 animate-pulse"></span>🚫 QT ${csEscape(q.bus_path)}${_csLoc(q)} · ${csEscape(reason)} · clears in ${cnt}</span>`;
 }
 
 // Badge for a dongle the agent is actively RECOVERING (usb_state[].recovery) —
@@ -8635,7 +9931,7 @@ function csReconcileVmInflight(freshVms) {
 }
 // Re-render just the current category tab's rows into #cs-vm-list so an optimistic
 // badge shows instantly (synchronous — no telemetry fetch). The next telemetry
-// pulse rebuilds from fresh data and reconciles.
+// pulse (csVmOpFastRefresh burst) rebuilds from fresh data and reconciles.
 function csVmRerenderInflight() {
     try {
         if (!window._csVmGrouped) return;
@@ -8746,7 +10042,7 @@ function csAutoProvPanel(h) {
     // Idle + nothing deleting → compact pill + last-pass reason only.
     if (!active && !deleting.length) {
         const reason = prov.reason ? `<span class="text-xs text-slate-400 truncate">${csEscape(prov.reason)}</span>` : '';
-        return `<div class="hpe-card rounded-lg p-3 mb-3 flex items-center justify-between gap-3">${pill}${reason}</div>`;
+        return `<div class="hpe-card rounded-lg p-5 mb-3 flex items-center justify-between gap-3">${pill}${reason}</div>`;
     }
 
     const pct = run.total > 0 ? Math.round((Math.min(run.completed, run.total) / run.total) * 100) : 0;
@@ -8769,7 +10065,7 @@ function csAutoProvPanel(h) {
         ? `<div class="text-[11px] text-amber-600 mt-2">⏸ Paused — ${csEscape(halt.reason)} (CPU ${halt.cpu_pct}% ≥ ${halt.cpu_threshold}%, Mem ${halt.mem_pct}% ≥ ${halt.mem_threshold}%)</div>`
         : '';
 
-    return `<div class="hpe-card rounded-lg p-4 mb-3">
+    return `<div class="hpe-card rounded-lg p-5 mb-3">
         <div class="flex items-center justify-between gap-3 mb-2">
             <h3 class="text-sm font-bold text-slate-500 uppercase tracking-wider">VM Auto-Provisioning</h3>
             ${pill}
@@ -8938,7 +10234,7 @@ window.csVmVmsTab = function (cat) {
     if (list) list.innerHTML = csVmTable(rows) + csVmPager(_list.length);
     ['Simulation Clients','Other','Containers','Templates'].forEach(c => {
         const b = csEl('cs-vmtab-' + c);
-        if (b) b.className = 'px-3 py-1.5 rounded-md text-xs font-bold ' + (c === cat ? 'bg-[#01A982] text-white' : 'bg-slate-100 text-slate-600 hover:bg-slate-200');
+        if (b) b.className = 'px-3 py-1.5 rounded-md text-xs font-bold ' + (c === cat ? 'bg-[#01A982]/10 text-[#01A982] border border-[#01A982]' : 'bg-white text-slate-600 border border-slate-200 hover:bg-slate-50');
     });
 };
 
@@ -8959,21 +10255,31 @@ const CS_VM_ACTION_LABEL = {
 };
 function csVmActionLabel(a) { return CS_VM_ACTION_LABEL[a] || a; }
 
-// Remove a single dongle from quarantine (admin un-QT once the issue is fixed).
-// Dispatches the agent's clear_usb_quarantine CS_COMMAND with the bus_path;
-// the agent pops the bus's quarantine entry (strike history reset). Refreshes
-// the USB card so the badge clears.
-window.csClearQt = async function (spoke, target, busPath) {
-    if (!spoke || !target || !busPath) return;
-    if (!confirm(`Remove dongle ${busPath} from quarantine on ${target}?\n\nThis clears its strike history — only do this once the underlying issue is fixed, or it will re-quarantine on the next kernel USB error.`)) return;
-    const sid = encodeURIComponent(spoke);
-    try {
-        await csFetch(`/${csTenant()}/spokes/${sid}/proxmox-command?tenant_id=${csTenant()}`,
-            { method: 'POST', body: JSON.stringify({ action: 'clear_usb_quarantine', args: { bus_path: busPath }, target }) });
-        if (typeof showToast === 'function') showToast(`Removing ${busPath} from QT…`, 'info');
-        setTimeout(() => loadCSData('VM Server', currentSubChild, true), 800);
-    } catch (e) { console.error('csClearQt failed', e); if (typeof showToast === 'function') showToast('Remove from QT failed: ' + (e.message || e), 'error'); }
-};
+// Operation-gated fast refresh. After a VM op (clone / delete / restart / …) the
+// table should visibly update as the VMs change or disappear, instead of waiting
+// for the ~15s telemetry cadence. This bursts loadCSData('VM Server') every 15s
+// (matching the telemetry cadence — a faster tick just re-renders stale data
+// between pulses) for a bounded window, extended while operations are still in
+// flight (window._csLiveOps has entries). It fires REGARDLESS of the Auto-refresh
+// setting — so an operator who sets Auto-refresh = Off gets a stable table that
+// only refreshes right after they act (refresh gated on an operation).
+// Idempotent: a second op just extends the window, it never stacks tickers.
+window._csVmOpUntil = 0;
+function csVmOpFastRefresh(windowMs) {
+    window._csVmOpUntil = Date.now() + (windowMs || 60000);
+    if (window._csVmOpTicker) return;   // already bursting — window extended above
+    const stop = () => {
+        if (window._csVmOpTicker) { pollManager.unregister(window._csVmOpTicker); window._csVmOpTicker = null; }
+    };
+    const tick = async () => {
+        if (currentSubView !== 'VM Server') { stop(); return; }   // operator left the page
+        try { await loadCSData('VM Server', currentSubChild, true); } catch (e) { /* keep bursting */ }
+        const opsActive = !!(window._csLiveOps && Object.keys(window._csLiveOps).length);
+        if (Date.now() > window._csVmOpUntil && !opsActive) stop();  // settled → stop
+    };
+    window._csVmOpTicker = pollManager.register(tick, 15000);
+    tick();   // fire immediately so the first update is prompt
+}
 
 window.csVmAction = async function (key, action) {
     // key is the composite spoke|host|vmid (routes to the VM's OWN host); tolerate
@@ -8996,7 +10302,7 @@ window.csVmAction = async function (key, action) {
         await csFetch(`/${csTenant()}/spokes/${sid}/proxmox-command?tenant_id=${csTenant()}`,
             { method: 'POST', body: JSON.stringify({ action, args, target }) });
         csVmFlash(action + ' queued');
-        setTimeout(() => loadCSData('VM Server', currentSubChild, true), 800);
+        csVmOpFastRefresh();   // burst-refresh so the VM's state visibly updates
     } catch (e) { console.error('csVmAction: ' + action + ' failed', e); if (typeof showToast === 'function') showToast(action + ' failed: ' + (e.message || e), 'error'); }
 };
 
@@ -9032,10 +10338,10 @@ window.csVmBulk = async function (action) {
     // the first batch is still in flight would cancel it (the "have to try a few
     // times" churn). Idempotent destroy makes an overlapping re-click safe.
     // Bulk enqueue — group the selected VMs by their OWNING spoke and send ONE
-    // request per spoke carrying the whole item list (the spoke coalesces a
-    // delete into a single delete_vms batch per host). Replaces the old
-    // one-POST-per-VM 250ms-paced loop that raced the relay ACCEPT window on a
-    // saturated host and silently dropped some deletes.
+    // request per spoke carrying the whole item list, instead of one request (and
+    // one hub→spoke WS round-trip) per VM. Each item keeps its own target so VMs
+    // route to their own host. The spoke enqueues them locally in a single handler
+    // call, so there's no WS flood (the reason the old path paced sends at 250ms).
     const bySpoke = {};
     items.forEach(v => {
         const sp = v._spoke || csVmSelectedSpoke;
@@ -9058,16 +10364,20 @@ window.csVmBulk = async function (action) {
     // The bulk selection has been consumed — clear it. Leaving boxes checked
     // pins csUserIsEditing() true (a checked .cs-vm-sel is its "pending
     // selection" signal), which makes csRenderVmServerVms bail before
-    // re-rendering on the refresh below — so the page would never reflect the
-    // delete/reclone. Clearing unlocks the refresh; the re-render rebuilds the
-    // table from fresh data anyway.
+    // re-rendering on every burst-refresh tick below — so the page would never
+    // reflect the delete/reclone (the stale checked boxes block the very
+    // refresh meant to show them draining). Clearing unlocks the next tick;
+    // the re-render then rebuilds the table from fresh data anyway.
     document.querySelectorAll('.cs-vm-sel').forEach(cb => { cb.checked = false; });
     const _sa = document.getElementById('cs-vm-selectall'); if (_sa) _sa.checked = false;
-    setTimeout(() => loadCSData('VM Server', currentSubChild, true), 1000);
+    // Burst-refresh so the batch visibly drains. Scale the window to the batch
+    // size (a 48-VM delete takes a while), capped at 5min; live-op events extend
+    // it further while any teardown is still running.
+    csVmOpFastRefresh(Math.min(300000, 45000 + items.length * 4000));
 };
 
-// Best-effort expiry of in-flight commands for a proxmox host before a VM
-// teardown. Swallowed on failure — the delete still proceeds.
+// Best-effort expiry of in-flight commands for the selected proxmox host before
+// a VM teardown. Swallowed on failure — the delete still proceeds.
 async function csExpirePendingForTarget(target) {
     const host = target || csVmTarget() || 'proxmox';
     try {
@@ -9083,71 +10393,32 @@ function csVmFlash(msg) {
 // ── Terminal — xterm.js root shell on the pxmx host, over the hub relay ─────
 // POST /api/pxmx/shell mints a session; the agent spawns a PTY bash on the host
 // and the browser drives it over /ws/console-shell/{id}. Gated hub-side (opt-in
-// toggle + Global/Tenant admin + audit). xterm via the shared _consoleLoadXterm().
-// One xterm session per in-scope host, keyed by host id. The Terminal tab
-// renders a tab strip (one tab per host) and does NOT auto-connect when
-// several hosts are in scope — the user clicks a tab to open that shell.
-// Single-host scope keeps the old convenient auto-connect.
-let _csVmShell = {};                 // hostId → {term, ws}
-let _csVmShellActiveHost = '';
+// toggle + Global/Tenant admin + audit). xterm is loaded via the shared
+// _consoleLoadXterm() (same CDN import the serial console uses).
+let _csVmShell = null;
 async function csRenderVmServerTerminal() {
     csSetToolbar('');
-    csVmShellClose();
-    const hosts = csVmSelectedHosts();
-    if (!hosts.length) { csSet(csEmpty('No host selected.')); return; }
-    const single = hosts.length === 1;
-    const tabs = hosts.map(h => {
-        const id = csVmHostId(h);
-        const label = h.hostname || id || 'pxmx host';
-        return `<button data-cs-term-host="${csEscape(id)}" onclick="csVmShellTab('${csEscape(id)}')"
-            class="cs-term-tab flex items-center gap-1.5 px-3 py-1.5 text-xs font-mono border-b-2 border-transparent text-slate-400 hover:text-slate-200 whitespace-nowrap">
-            ${csOnlineDot(h.spoke_online)}${csEscape(label)}</button>`;
-    }).join('');
-    const bodies = hosts.map(h =>
-        `<div id="cs-vm-term-body-${csEscape(csVmHostId(h))}" class="cs-term-body hidden" style="height:60vh"></div>`
-    ).join('');
+    const h = csVmSelectedHost();
+    if (!h) { csSet(csEmpty('No host selected.')); return; }
+    const agentId = h.agent_id || '';
+    const hostLabel = h.hostname || csVmHostId(h) || 'pxmx host';
     csSet(`<div>${csVmHostBanner()}
       <div class="hpe-card rounded-lg overflow-hidden shadow-sm" style="background:#1e1e1e">
-        <div class="flex flex-wrap items-center justify-between bg-[#2d2d2d]">
-          <div class="flex flex-wrap items-center gap-1 px-1">${tabs}</div>
-          <div class="flex items-center gap-2 px-3 py-1.5">
-            <span id="cs-vm-term-status" class="text-[11px] text-slate-400 font-mono">${single ? 'Connecting…' : 'Select a host to connect.'}</span>
-            <button onclick="csVmShellReconnect()" class="text-[11px] px-2 py-1 rounded bg-[#01A982]/10 hover:bg-[#01A982]/20 text-[#01A982] border border-[#01A982] font-bold">↻ Reconnect</button>
-          </div>
+        <div class="px-4 py-2 flex justify-between items-center bg-[#2d2d2d] text-slate-200">
+          <div class="text-sm font-mono">⌨️ ${csEscape(hostLabel)} — root shell ${helpIcon('cs', null, 'Simulations help')}</div>
+          <button onclick="csVmShellReconnect()" class="text-[11px] px-2 py-1 rounded bg-[#01A982]/10 hover:bg-[#01A982]/20 text-[#01A982] border border-[#01A982] font-bold">↻ Reconnect</button>
         </div>
-        <div class="p-1">${bodies}</div>
+        <div id="cs-vm-term-body" style="height:60vh" class="p-1"></div>
+        <div id="cs-vm-term-status" class="px-4 py-1 text-[11px] text-slate-400 bg-[#2d2d2d] font-mono">Connecting…</div>
       </div></div>`);
-    if (single) { await csVmShellTab(csVmHostId(hosts[0])); }
+    window.__csVmShellCtx = { agentId };
+    await csVmShellConnect(agentId);
 }
 
-// Activate a host tab: highlight it, reveal its body, and connect if not
-// already live. Switching tabs does NOT tear down the others — each open
-// shell keeps its PTY so you can hop between hosts without reconnecting.
-window.csVmShellTab = async function (hostId) {
-    _csVmShellActiveHost = hostId;
-    document.querySelectorAll('.cs-term-tab').forEach(b => {
-        const on = b.getAttribute('data-cs-term-host') === hostId;
-        b.classList.toggle('border-[#01A982]', on);
-        b.classList.toggle('text-slate-200', on);
-        b.classList.toggle('text-slate-400', !on);
-    });
-    document.querySelectorAll('.cs-term-body').forEach(el => {
-        el.classList.toggle('hidden', el.id !== 'cs-vm-term-body-' + hostId);
-    });
-    const live = _csVmShell[hostId];
-    if (live && live.ws && live.ws.readyState === 1) {
-        try { live.term.focus(); } catch (e) {}
-        return;
-    }
-    const h = csVmSelectedHosts().find(x => csVmHostId(x) === hostId);
-    if (h) await csVmShellConnect(h.agent_id || '', hostId);
-};
-
-async function csVmShellConnect(agentId, hostId) {
-    if (!hostId) return;
-    csVmShellClose(hostId);
-    const body = document.getElementById('cs-vm-term-body-' + hostId);
+async function csVmShellConnect(agentId) {
+    csVmShellClose();
     const statusEl = document.getElementById('cs-vm-term-status');
+    const body = document.getElementById('cs-vm-term-body');
     if (!body) return;
     const setStatus = (t) => { if (statusEl) statusEl.textContent = t; };
     const mod = (typeof _consoleLoadXterm === 'function') ? await _consoleLoadXterm() : null;
@@ -9174,23 +10445,17 @@ async function csVmShellConnect(agentId, hostId) {
     ws.onclose = (ev) => { setStatus('Disconnected' + (ev.reason ? ': ' + ev.reason : '') + ' — click Reconnect'); try { term.write('\r\n\x1b[33m[disconnected]\x1b[0m\r\n'); } catch (e) {} };
     term.onData(d => { if (ws.readyState === 1) ws.send(d); });
     if (term.onResize) term.onResize(() => sendResize());
-    _csVmShell[hostId] = { term, ws };
+    _csVmShell = { term, ws };
 }
 
-function csVmShellClose(hostId) {
-    const closeOne = (id) => {
-        const s = _csVmShell[id];
-        if (s) { try { s.ws.close(); } catch (e) {} try { s.term.dispose(); } catch (e) {} delete _csVmShell[id]; }
-    };
-    if (hostId) closeOne(hostId);
-    else { Object.keys(_csVmShell).forEach(closeOne); _csVmShell = {}; _csVmShellActiveHost = ''; }
+function csVmShellClose() {
+    if (_csVmShell) {
+        try { _csVmShell.ws.close(); } catch (e) {}
+        try { _csVmShell.term.dispose(); } catch (e) {}
+        _csVmShell = null;
+    }
 }
-function csVmShellReconnect() {
-    const id = _csVmShellActiveHost;
-    if (!id) return;
-    const h = csVmSelectedHosts().find(x => csVmHostId(x) === id);
-    if (h) csVmShellConnect(h.agent_id || '', id);
-}
+function csVmShellReconnect() { csVmShellConnect((window.__csVmShellCtx || {}).agentId); }
 
 // ── USB (certified / uncertified + certify-ignore) ───────────────────────────
 // The cs-spoke relay payload carries each dongle as {vidpid:"vid:pid", name|product,
@@ -9303,8 +10568,6 @@ async function csRenderVmServerUsb() {
     // auto-recovery. Surfaced here (the dongle-management surface) so an admin
     // sees WHY a dongle is sidelined and that it self-clears.
     const qt = quarantine.filter(q => q && q.bus_path);
-    const _qtSpoke = (h && h.spoke_id) || '';
-    const _qtTarget = (h && (h.hostname || h.spoke_hostname || h.spoke_id)) || '';
     // Card-level correlation across EVERY sidelined dongle on this host --
     // quarantined, excluded, and mid-recovery. Grouping only the quarantine
     // list would miss a card whose ports are spread across the three states,
@@ -9317,14 +10580,14 @@ async function csRenderVmServerUsb() {
     const qtBox = qt.length ? `<div class="mb-4 border border-red-200 bg-red-50 rounded-lg p-3">
       ${_cardBanner}
       <p class="text-[11px] font-bold text-red-700 uppercase tracking-wider mb-2">Quarantined dongles (${qt.length}) — sidelined by kernel USB errors</p>
-      <div class="flex flex-wrap gap-2">${qt.map(q => csQtBadge(q, _qtSpoke, _qtTarget)).join('')}</div>
-      <p class="text-[10px] text-red-600/80 mt-2">Each auto-recovers after 1h and gets retried; re-quarantines if the kernel errors persist. A failed clone never quarantines a dongle. Use <b>✕ Remove</b> only once the issue is fixed (clears the bus's strike history).</p>
+      <div class="flex flex-wrap gap-2">${qt.map(csQtBadge).join('')}</div>
+      <p class="text-[10px] text-red-600/80 mt-2">Each auto-recovers after 1h and gets retried; re-quarantines if the kernel errors persist. A failed clone never quarantines a dongle.</p>
     </div>` : '';
     // Recovering dongles: an assigned dongle the agent is actively trying to
     // restore (usb_state[].recovery, set while it climbs the recovery ladder)
-    // BEFORE it would quarantine — the "why is this VM recloning + which dongle
-    // is bad" surface. guest_blind = attached host-side but the guest can't see
-    // it; detached = passthrough keeps dropping (reclone strikes).
+    // BEFORE it would quarantine — this is the "why is this VM recloning + which
+    // dongle is bad" surface. guest_blind = attached host-side but the guest
+    // can't see it; detached = passthrough keeps dropping (reclone strikes).
     const recovering = usbState.filter(e => e && e.recovery);
     const recBox = recovering.length ? `<div class="mb-4 border border-amber-200 bg-amber-50 rounded-lg p-3">
       <p class="text-[11px] font-bold text-amber-700 uppercase tracking-wider mb-2">Recovering dongles (${recovering.length}) — trying to restore before quarantine</p>
@@ -9420,11 +10683,11 @@ async function csRenderVmServerUsb() {
     // Start the live countdown ticker so the QT badges' "clears in" timer ticks
     // between telemetry pulses (idempotent — one interval for the whole page).
     csStartShedTicker();
-    // Two release actions; both also force-unbind driver-bound dongles from the
-    // host driver (agent side). They differ only in which state store they clear.
-    const _usbHost0 = (typeof csVmSelectedHost === 'function' ? csVmSelectedHost() : null) || {};
-    const _usbSid = csEscape(String(_usbHost0.spoke_id || ''));
-    const _usbHost = csEscape(String(_usbHost0.hostname || _usbHost0.spoke_hostname || _usbHost0.spoke_id || ''));
+    // Two release actions (the USB page is the dongle-management surface). Both
+    // ALSO force-unbind driver-bound dongles from the host driver (no reboot); they
+    // differ only in which state store they clear, so the operator can keep one.
+    const _usbSid = csEscape(String((h && h.spoke_id) || ''));
+    const _usbHost = csEscape(String((h && (h.hostname || h.spoke_hostname || h.spoke_id)) || ''));
     const _btnCls = 'text-[11px] font-bold px-3 py-1.5 rounded-md border border-amber-300 bg-amber-50 text-amber-700 hover:bg-amber-100 whitespace-nowrap';
     const _clearQtBtn = `<button onclick="csClearUsbQuarantine('${_usbSid}','${_usbHost}')" title="Clear the dmesg quarantine list (incl. the 5-strike permanent flag) + force-release driver-bound dongles on this host. Leaves the exclusion list intact." class="${_btnCls}">Clear Quarantine</button>`;
     const _clearExclBtn = `<button onclick="csClearUsbExclusions('${_usbSid}','${_usbHost}')" title="Clear the destroy-fail bus exclusions (repeated spin-up/down trips these) + force-release driver-bound dongles on this host. Leaves the quarantine list intact." class="${_btnCls}">Clear Exclusion List</button>`;
@@ -9567,7 +10830,8 @@ async function csRenderVmServerQueue(live) {
     const _filtered = csVmSelectedHostIds.length ? cmds.filter(c => _scopeHosts.has(c.target)) : cmds;
     // Newest on top: sort by created_at desc (fall back to age_secs asc when
     // created_at is absent — smaller age = newer). A mass-delete dump is far
-    // easier to triage when the freshest commands sit at the top.
+    // easier to triage when the freshest commands (the ones still running /
+    // just failed) sit at the top instead of scrolling past 30 stale rows.
     const shown = _filtered.slice().sort((a, b) => {
         const ca = Number(a.created_at || 0), cb = Number(b.created_at || 0);
         if (ca && cb) return cb - ca;
@@ -9577,7 +10841,8 @@ async function csRenderVmServerQueue(live) {
     });
     const rows = shown.map(c => {
         // Second row: the command string (action + args JSON) so an operator
-        // can see WHAT a queued command will do, e.g. `delete_vm {"vmid":90075}`.
+        // can see WHAT a queued command will do without cross-referencing the
+        // Send form — e.g. `delete_vm {"vmid":90075}`. Collapsed under the row.
         const _argsStr = (() => { try { return c.args ? JSON.stringify(c.args) : ''; } catch (e) { return ''; } })();
         const _cmdStr = `${c.action || ''}${_argsStr ? ' ' + _argsStr : ''}`;
         return `<tr>
@@ -9593,7 +10858,7 @@ async function csRenderVmServerQueue(live) {
       <td colspan="7" class="px-3 pb-2 pt-0 font-mono text-[11px] text-slate-500 break-all">${csEscape(_cmdStr || '—')}</td>
     </tr>`;
     }).join('');
-    const sendForm = `<div class="hpe-card rounded-lg p-4 shadow-sm mb-4">
+    const sendForm = `<div class="hpe-card rounded-lg p-5 shadow-sm mb-4">
       <p class="text-[11px] font-bold text-slate-400 uppercase tracking-wider mb-2">Send Proxmox Command</p>
       <div class="flex flex-wrap gap-2 items-end text-sm">
         <div><label class="text-xs text-slate-400">Action</label>
@@ -9604,7 +10869,7 @@ async function csRenderVmServerQueue(live) {
           <input id="cs-cmd-target" value="${csVmSelectedHostIds.length === 1 ? csEscape([..._scopeHosts][0] || '') : ''}" class="border border-slate-200 rounded-md px-2 py-1 w-40" placeholder="proxmox"/></div>
         <div><label class="text-xs text-slate-400">Args JSON</label>
           <input id="cs-cmd-args" class="border border-slate-200 rounded-md px-2 py-1 w-56" placeholder='{"vmid":90050}'/></div>
-        <button onclick="csSendCommand()" class="bg-[#01A982] hover:bg-[#018a6c] text-white px-3 py-1.5 rounded-md text-xs font-bold">Send</button>
+        <button onclick="csSendCommand()" class="bg-[#01A982]/10 hover:bg-[#01A982]/20 text-[#01A982] border border-[#01A982] px-3 py-1.5 rounded-md text-xs font-bold">Send</button>
         <button onclick="csClearCommands()" class="bg-red-100 text-red-700 px-3 py-1.5 rounded-md text-xs font-bold">Clear Queue</button>
       </div></div>`;
     csSet(`<div>${csVmHostBanner()}${sendForm}
@@ -9635,6 +10900,7 @@ window.csClearCommands = async function () {
 
 // Two dongle-release actions. Both force-unbind driver-bound dongles from the
 // host driver (agent side); they differ only in which state store they clear.
+// Sent via the same command path as the maintenance ops.
 // allSpokes: the USB quarantine / exclusion lists are PER-HOST state and each cs
 // spoke owns its own host(s), so clearing them is only meaningful fleet-wide.
 // Without the flag the hub enqueued to whichever spoke it happened to pick, which
@@ -9657,6 +10923,37 @@ async function _csUsbClearCmd(host, action, doneMsg, allSpokes) {
         else if (typeof showToast === 'function') showToast(doneMsg, 'success');
     } catch (e) { console.error(action + ' failed', e); if (typeof showToast === 'function') showToast(action + ' failed: ' + (e.message || e), 'error'); }
 }
+// Purge the missing-dongle HISTORY (presence roster + boot baseline) on every
+// spoke. For after a deliberate hardware change — dongles moved, ports rewired,
+// a controller card pulled — where the recorded history describes a machine
+// that no longer exists and would keep reporting phantom losses. Does NOT touch
+// quarantine or the exclusion list; it only forgets what USED to be attached.
+// UNLIKE clear_usb_quarantine / clear_usb_exclusions (which self-repair from live
+// faults on the next pass), this is genuinely DESTRUCTIVE: the roster rebuilds
+// only from what is CURRENTLY ATTACHED, so a genuinely-missing dongle — exactly
+// what this panel exists to surface — is forgotten for good, not re-learned. It
+// also runs FLEET-WIDE (every host), not just the one on screen. So it confirms
+// first — the old "cheap and self-repairing, no confirm" rationale held for the
+// quarantine/exclusion clears but never for this one.
+window.csClearUsbHistory = async function (host) {
+    if (!confirm('Purge missing-dongle history on ALL hosts (fleet-wide)?\n\n'
+               + 'This forgets every recorded dongle. Genuinely-missing dongles '
+               + 'will disappear from this panel and will NOT return on their own '
+               + '— only currently-attached dongles are re-learned. Use this only '
+               + 'after a deliberate hardware change (dongles moved / ports '
+               + 'rewired / a controller card pulled).')) return;
+    await _csUsbClearCmd(host, 'clear_usb_history', 'Dongle history purged on all spokes — missing counts rebuild from what is attached now', true);
+    // The purge is ENQUEUED to each cs spoke; the pxmx agent runs it on its next
+    // inbox poll (a few seconds later) and only then scrubs its telemetry. A
+    // re-render now would still show the pre-purge roster, so refresh the panel
+    // a couple of times as the agents catch up (csRenderDongleDiag no-ops if the
+    // operator has since navigated away).
+    if (typeof csRenderDongleDiag === 'function') {
+        setTimeout(() => csRenderDongleDiag(), 5000);
+        setTimeout(() => csRenderDongleDiag(), 15000);
+    }
+};
+
 // No confirm dialog: the action is cheap and self-repairing — a dongle that is
 // still genuinely faulty re-quarantines on the next pass, so a mis-click costs
 // one provision cycle, not data. The button tooltip carries the explanation and
@@ -9667,23 +10964,6 @@ window.csClearUsbQuarantine = async function (spokeId, host) {
 // Same reasoning as csClearUsbQuarantine: self-repairing, so no confirm.
 window.csClearUsbExclusions = async function (spokeId, host) {
     _csUsbClearCmd(host, 'clear_usb_exclusions', 'Exclusion list cleared on all spokes + driver-bound dongles released — available on the next provision pass', true);
-};
-// Clear the missing-dongle HISTORY (presence roster + boot baseline) FLEET-WIDE
-// (all_spokes: the history is per-host state and each cs spoke owns its own
-// host(s), so it's only meaningful cleared fleet-wide — same reasoning as the
-// two functions above). Backend action: pxmx agent `clear_usb_history` →
-// usb_diagnostics.purge_history(). UNLIKE the quarantine/exclusion clears above
-// (which self-repair from live faults), this is genuinely DESTRUCTIVE: the
-// roster rebuilds only from what is CURRENTLY ATTACHED, so a genuinely-missing
-// dongle is forgotten for good, not re-learned — so it confirms first.
-window.csClearUsbHistory = async function (host) {
-    if (!confirm('Purge missing-dongle history on ALL hosts (fleet-wide)?\n\n'
-               + 'This forgets every recorded dongle. Genuinely-missing dongles '
-               + 'will disappear from this panel and will NOT return on their own '
-               + '— only currently-attached dongles are re-learned. Use this only '
-               + 'after a deliberate hardware change (dongles moved / ports '
-               + 'rewired / a controller card pulled).')) return;
-    _csUsbClearCmd(host, 'clear_usb_history', 'Missing-dongle history cleared on all hosts — presence roster + boot baseline purged; missing counts rebuild on the next pass', true);
 };
 
 window.csCmdDelete = async function (btn) {
@@ -9697,11 +10977,12 @@ window.csCmdDelete = async function (btn) {
 };
 
 // ── Details (node header + headline stats + telemetry tile grid + raw dump) ─
-// Telemetry-freshness diagnostic panel (mirrors the hub sim-views.js). Renders
-// the per-HOP age chain (agent built the frame → cs spoke ingested → hub cached
-// → now) + the agent's per-phase collect timings + effective cadence, from the
-// per-request ``h.freshness`` block. Degrades to em-dashes when the backend
-// hasn't supplied freshness (older cache / standalone-spoke path not yet wired).
+// Telemetry-freshness diagnostic panel for the per-server Details page. Renders
+// the per-HOP age chain (agent built the frame → cs spoke ingested → hub cached →
+// now) plus the agent's per-phase collect timings (the pvesh calls that stall on
+// a loaded host) and the effective tick cadence. This is the "where is the delay"
+// tool: a large agent-generated age with small phase times points at the spoke→hub
+// relay; a large get_vm_list/get_node_stats points at an agent pvesh stall.
 function csFreshnessPanel(h) {
     const f = (h && h.freshness) || {};
     const ph = f.phase_ms || {};
@@ -10304,222 +11585,6 @@ async function csFillLinkApproval(h) {
     const el = document.getElementById('cs-link-agent');
     if (el) el.innerHTML = `<span class="text-slate-400">Agent link:</span> ` + html;
 }
-// ── Diagnostic tile primitives (ported from the hub WebUI copy) ───────────
-// ── Tile primitives, matching the Telemetry Freshness panel ──────────────────
-// Same treatment as csFreshnessPanel: bordered white tile, micro-caps label,
-// mono value, optional hint — laid out on a responsive grid that FILLS the
-// width. The point is that the numbers you scan for sit in fixed-width tiles
-// across the screen instead of wrapping inside a paragraph.
-function csDiagTile(label, val, hint, tone) {
-    const v = tone === 'bad' ? 'text-red-600'
-        : tone === 'warn' ? 'text-amber-600'
-        : tone === 'good' ? 'text-[#01A982]' : 'text-slate-700';
-    return `<div class="rounded-md border border-slate-200 bg-white px-3 py-2">
-        <div class="text-[10px] uppercase tracking-wider text-slate-400">${csEscape(label)}</div>
-        <div class="text-sm font-mono font-bold ${v} truncate" title="${csEscape(val)}">${csEscape(val)}</div>
-        ${hint ? `<div class="text-[10px] text-slate-400 truncate" title="${csEscape(hint)}">${csEscape(hint)}</div>` : ''}</div>`;
-}
-
-// Default 5-up on large screens, matching the freshness grid.
-function csDiagTiles(tiles, cols) {
-    return `<div class="grid grid-cols-2 sm:grid-cols-3 ${cols || 'lg:grid-cols-5'} gap-2 mb-3">${tiles.join('')}</div>`;
-}
-
-// Group label inside a section (freshness's "Agent collect phase — last tick").
-function csDiagSub(text, right) {
-    return `<div class="flex items-center justify-between mb-2 flex-wrap gap-2 mt-3">
-      <p class="text-[11px] font-bold text-slate-400 uppercase tracking-wider">${csEscape(text)}</p>
-      ${right ? `<span class="text-xs text-slate-500">${right}</span>` : ''}</div>`;
-}
-
-// Footer note, freshness's closing-paragraph treatment.
-function csDiagNote(html) {
-    return `<div class="text-[10px] text-slate-400 mt-2">${html}</div>`;
-}
-
-// ── USB dongle diagnostics panel (ported from the hub WebUI copy) ─────────
-// The hub's full Setup->Diagnostics view is hub-only; the spoke needs just
-// this per-host panel, which VM Server -> Details renders.
-const _CS_CAUSE_STYLE = {
-    high:    'border-red-200 bg-red-50 text-red-700',
-    medium:  'border-amber-200 bg-amber-50 text-amber-700',
-    low:     'border-slate-200 bg-slate-50 text-slate-600',
-    unknown: 'border-slate-200 bg-slate-50 text-slate-500',
-};
-
-// uhubctl verdict badge — the answer to "can we take the power-cycle path?".
-// Three distinct states: supported (PPPS hub present), installed-but-no-PPPS
-// (the common on-board-controller case), and not installed.
-function csUhubctlBadge(u) {
-    if (!u || typeof u !== 'object') return '<span class="text-[10px] text-slate-400">uhubctl: unknown</span>';
-    if (u.supported) {
-        const hubs = (u.ppps_hubs || []).map(h => h.hub).join(', ');
-        return `<span class="px-1.5 py-0.5 rounded text-[10px] font-bold bg-green-100 text-green-700" title="${csEscape('PPPS-capable hub(s): ' + hubs + '. Power-cycle with: uhubctl -a cycle')}">uhubctl ✓ ${csEscape(String((u.ppps_hubs || []).length))} PPPS hub(s)</span>`;
-    }
-    if (u.installed) {
-        return `<span class="px-1.5 py-0.5 rounded text-[10px] font-bold bg-amber-100 text-amber-700" title="${csEscape(u.error || 'no per-port-power-switching hub found')}">uhubctl installed · no PPPS hub</span>`;
-    }
-    return `<span class="px-1.5 py-0.5 rounded text-[10px] font-bold bg-slate-100 text-slate-500" title="${csEscape((u.error || 'not installed') + ' — install: ' + (u.install_hint || 'apt-get install -y uhubctl'))}">uhubctl not installed</span>`;
-}
-
-function _csDongleDiagHost(h) {
-    const px = h.proxmox || {};
-    const d = px.usb_diagnostics;
-    const name = csEscape(h.spoke_name || h.spoke_hostname || h.spoke_id || '?');
-    if (!d || !d.generated_at) {
-        return `<div class="border border-slate-200 rounded-lg p-3 mb-3">
-          <div class="flex items-center justify-between mb-1">
-            <span class="font-mono text-xs font-bold text-slate-600">${name}</span>
-            <span class="text-[10px] text-slate-400">no diagnostic reported</span>
-          </div>
-          <p class="text-[11px] text-slate-500">This host's agent has not sent a dongle diagnostic. That is <b>not</b> the same as "no dongles missing" — it usually means the agent predates this feature and needs an update.</p>
-        </div>`;
-    }
-    const missing = Array.isArray(d.missing) ? d.missing : [];
-    // Absent BY DESIGN: their PCI controller was handed to a VM (T1/T3
-    // passthrough), so the host correctly stops seeing them — ~4 per host. Kept
-    // out of the "missing" count so that number only ever means "lost".
-    const passed = Array.isArray(d.passed_through) ? d.passed_through : [];
-    // Boot-anchored losses: present at boot, gone now, excluding controllers
-    // handed to VMs and dongles too briefly attached to be inventory. This is
-    // the authoritative "what should be here and is not".
-    const lost = Array.isArray(d.lost_since_boot) ? d.lost_since_boot : [];
-    const bootPt = Array.isArray(d.boot_passthrough) ? d.boot_passthrough : [];
-    const transient = (Array.isArray(d.lost_transient) ? d.lost_transient : [])
-        .concat(Array.isArray(d.missing_transient) ? d.missing_transient : []);
-    const bb = d.boot_baseline || {};
-    const causes = Array.isArray(d.causes) ? d.causes : [];
-    const kernel = d.kernel || {};
-    const power = Array.isArray(d.power) ? d.power : [];
-    const autoN = power.filter(p => p && p.autosuspend_enabled).length;
-    const ctrls = Array.isArray(d.controllers) ? d.controllers : [];
-    const nowS = Date.now() / 1000;
-    const age = d.generated_at ? csAgeShort(nowS - d.generated_at) + ' ago' : '—';
-
-    // Physical location, recorded by the agent while the dongle was still
-    // present. "0000:80:14.0" means nothing at the rack; "PCIe slot 1 · port 3"
-    // is the whole point of the field. Older agents don't send it -> em dash.
-    const missRows = missing.map(m => `<tr>
-      <td class="px-3 py-1.5 font-mono text-xs">${csEscape(m.bus_path || '—')}</td>
-      <td class="px-3 py-1.5 text-xs text-slate-600">${csEscape(m.location || '—')}</td>
-      <td class="px-3 py-1.5 text-xs text-slate-600">${csEscape(m.product || '—')}</td>
-      <td class="px-3 py-1.5 font-mono text-[11px] text-slate-500">${csEscape(m.vidpid || '—')}</td>
-      <td class="px-3 py-1.5 text-xs text-slate-500">${csEscape(m.last_seen ? csAgeShort(nowS - m.last_seen) + ' ago' : '—')}</td>
-      <td class="px-3 py-1.5 text-xs ${m.missing_for_s > 86400 ? 'text-red-600 font-bold' : 'text-amber-600'}">${m.missing_for_s != null ? csEscape(csAgeShort(m.missing_for_s)) : '—'}</td>
-    </tr>`).join('');
-
-    const causeCards = causes.map(c => {
-        const cls = _CS_CAUSE_STYLE[c.confidence] || _CS_CAUSE_STYLE.low;
-        return `<div class="border rounded-md p-2 mb-1.5 ${cls}">
-          <div class="flex items-center gap-2 mb-0.5">
-            <span class="text-xs font-bold">${csEscape(c.cause || '—')}</span>
-            <span class="text-[9px] uppercase tracking-wider opacity-70">${csEscape(c.confidence || '')}</span>
-          </div>
-          <p class="text-[11px] opacity-90">${csEscape(c.detail || '')}</p>
-          ${c.remedy ? `<p class="text-[11px] mt-1"><b>Fix:</b> ${csEscape(c.remedy)}</p>` : ''}
-        </div>`;
-    }).join('');
-
-    // Guest-agent watchdog last sweep, as a tile: an automatic VM reset or power
-    // cycle should be attributable at a glance, not buried in raw telemetry.
-    const gw = px.guest_watchdog || {};
-    const gwActs = (gw.reset || []).length + (gw.power_cycled || []).length + (gw.started || []).length;
-    const gwTile = !gw.ran_at
-        ? { val: '—', hint: 'no sweep reported', tone: null }
-        : { val: `${gw.responding ?? '?'}/${gw.checked ?? '?'}`,
-            hint: gwActs ? `${(gw.reset || []).length} reset · ${(gw.power_cycled || []).length} cycled · ${(gw.started || []).length} started`
-                         : 'guests responding, no action taken',
-            tone: gwActs ? 'warn' : 'good' };
-
-    const kTotals = Object.entries(kernel.totals || {});
-    // Who caused these? The recovery ladder's usb_reset writes authorized 0/1,
-    // which the kernel logs as a disconnect -- a category counted as evidence.
-    // Without the split, the agent's own recovery attempts read back as proof
-    // the dongle is failing. Only SPONTANEOUS events are evidence of hardware.
-    const attr = kernel.attribution || null;
-    const attrLine = (attr && (attr.self_inflicted || attr.spontaneous))
-        ? `<div class="mt-1 text-[11px] ${attr.spontaneous ? 'text-slate-600' : 'text-slate-500'}">`
-          + `<b>${csEscape(String(attr.spontaneous))}</b> spontaneous`
-          + (attr.self_inflicted
-              ? ` · <span class="text-slate-400">${csEscape(String(attr.self_inflicted))} self-inflicted (agent usb_reset — not hardware evidence)</span>`
-              : '')
-          + (attr.spontaneous === 0 && attr.self_inflicted
-              ? ` — <span class="text-[#01A982] font-bold">every logged event was ours; no hardware fault evidenced</span>`
-              : '')
-          + `</div>`
-        : '';
-    const kernelLine = !kernel.available
-        ? '<span class="text-amber-600">kernel log unreadable — evidence could not be checked (not the same as a clean log)</span>'
-        : kTotals.length
-            ? kTotals.map(([k, v]) => `<span class="mr-3"><b>${csEscape(k)}</b> ${csEscape(String(v))}</span>`).join('')
-            : '<span class="text-slate-400">no USB errors logged in the window</span>';
-
-    const u = d.uhubctl || {};
-    const kTotalN = kTotals.reduce((n, [, v]) => n + Number(v || 0), 0);
-    // Hub tier. Renders NOTHING when there is no external hub -- which is the
-    // current fleet -- so this stays dark until one is fitted rather than
-    // showing an empty section forever. Root hubs are the controller itself and
-    // are only worth listing alongside a real hub, for contrast.
-    const hubs = Array.isArray(d.hubs) ? d.hubs : [];
-    const realHubs = hubs.filter(h => h && !h.is_root_hub);
-    const hubHtml = !realHubs.length ? '' : `
-      <p class="text-[11px] font-bold text-slate-400 uppercase tracking-wider mt-3 mb-1">USB hubs</p>
-      <div class="overflow-x-auto">${csTable(['Hub', 'Product', 'Ports', 'Attached', 'Power', 'Per-port power'],
-        realHubs.map(h => {
-            const over = Number(h.attached || 0) > Number(d.hub_dongle_ceiling || 7);
-            return `<tr>
-              <td class="px-3 py-1.5 font-mono text-xs">${csEscape(h.bus_path || '—')}</td>
-              <td class="px-3 py-1.5 text-xs text-slate-600">${csEscape(h.product || '—')}</td>
-              <td class="px-3 py-1.5 text-xs text-slate-500">${csEscape(String(h.ports != null ? h.ports : '—'))}</td>
-              <td class="px-3 py-1.5 text-xs ${over ? 'text-red-600 font-bold' : 'text-slate-700'}">${csEscape(String(h.attached != null ? h.attached : '—'))}${over ? ` / ${csEscape(String(d.hub_dongle_ceiling || 7))}` : ''}</td>
-              <td class="px-3 py-1.5 text-xs ${h.self_powered ? 'text-slate-600' : 'text-amber-600 font-bold'}">${h.self_powered ? 'self-powered' : 'bus-powered'}</td>
-              <td class="px-3 py-1.5 text-xs">${h.ppps
-                  ? '<span class="px-1.5 py-0.5 rounded text-[10px] font-bold bg-green-100 text-green-700" title="uhubctl can cut VBUS on an individual port — a far less destructive recovery rung than usb_reset, which yanks the device out from under a VM holding it.">✓ can power-cycle</span>'
-                  : '<span class="text-slate-400 text-[10px]">no PPPS</span>'}</td>
-            </tr>`;
-        }).join(''))}</div>
-      ${realHubs.flatMap(h => (h.warnings || []).map(w =>
-        `<div class="mt-1 text-[11px] text-amber-700 bg-amber-50 border border-amber-200 rounded px-2 py-1">⚠ ${csEscape(h.bus_path)}: ${csEscape(w)}</div>`)).join('')}`;
-    return `<div class="hpe-card rounded-lg p-4 shadow-sm mb-4">
-      <div class="flex items-center justify-between mb-2 flex-wrap gap-2">
-        <p class="text-[11px] font-bold text-slate-400 uppercase tracking-wider">${name}</p>
-        <span class="text-xs text-slate-500">${missing.length
-            ? `<span class="text-red-600 font-bold">● ${missing.length} MISSING</span>`
-            : '<span class="text-green-600 font-bold">● NONE MISSING</span>'} · collected ${csEscape(age)}</span>
-      </div>
-      ${csDiagTiles([
-        csDiagTile('Present', String(d.present_count ?? '—'), 'certified, on the bus'),
-        csDiagTile('Missing', String(missing.length), 'was seen, now gone', missing.length ? 'bad' : 'good'),
-        csDiagTile('Lost since boot', String(lost.length),
-                   bb.trusted === false ? 'baseline taken mid-boot — not authoritative'
-                                        : 'present at boot, gone now',
-                   lost.length ? 'bad' : 'good'),
-        csDiagTile('Passed through', String(passed.length + bootPt.length),
-                   (passed.length + bootPt.length) ? 'VM-owned controller — expected' : 'none'),
-        csDiagTile('Transient', String(transient.length),
-                   `seen < ${csAgeShort(d.inventory_min_age_s || 14400)} — not inventory`),
-        csDiagTile('Ever seen', String(d.known_count ?? '—'), 'persisted roster'),
-        csDiagTile('Autosuspend', `${autoN}/${power.length}`, "power/control=auto", autoN ? 'warn' : null),
-        csDiagTile('Kernel events', String(kTotalN), `${csAgeShort(kernel.window_s || 0)} window`,
-                   !kernel.available ? 'warn' : (kTotalN ? 'bad' : null)),
-        csDiagTile('uhubctl', u.supported ? 'PPPS ✓' : u.installed ? 'no PPPS hub' : 'not installed',
-                   u.supported ? `${(u.ppps_hubs || []).length} hub(s) — uhubctl -a cycle`
-                               : (u.error || 'port power cycling unavailable'),
-                   u.supported ? 'good' : 'warn'),
-        csDiagTile('Controllers', String(ctrls.length),
-                   ctrls.map(c => `${c.loc_label || c.pci_address} (${c.device_count})`).join(' · ') || '—'),
-        csDiagTile('Guest watchdog', gwTile.val, gwTile.hint, gwTile.tone),
-      ], 'lg:grid-cols-4')}
-      ${missing.length ? csDiagSub('Missing dongles') +
-        `<div class="overflow-x-auto mb-2">${csTable(['Bus', 'Location', 'Product', 'vid:pid', 'Last seen', 'Missing for'], missRows)}</div>` : ''}
-      ${causes.length ? csDiagSub('Probable cause — ranked') +
-        `<div class="grid grid-cols-1 xl:grid-cols-2 gap-2">${causeCards}</div>` : ''}
-      ${hubHtml}
-      ${kernel.available && kTotals.length ? csDiagNote(`Kernel: ${kernelLine}${attrLine}`) : ''}
-      ${!kernel.available ? csDiagNote('<span class="text-amber-600">Kernel log unreadable — evidence could not be checked. This is <b>not</b> the same as a clean log.</span>') : ''}
-    </div>`;
-}
-
 // ── Show Tech ────────────────────────────────────────────────────────────────
 // "show tech-support" for one host: dump EVERYTHING the hub holds, as JSON.
 //
@@ -10774,7 +11839,7 @@ window.csDeleteHost = async function (hostname) {
     }
 };
 
-// ── Clients / Central / API Server (per-spoke, from the aggregate reads) ────
+// ── Clients / Central (per-spoke, from the aggregate reads) ────
 async function csRenderVmServerClients() {
     csSetToolbar('');
     try { await csVmLoad(); } catch (e) { console.error('csRenderVmServerClients: vm load failed', e); csSet(csErrorBox('Could not load', e)); return; }
@@ -10812,6 +11877,606 @@ async function csRenderVmServerCentral() {
       <details class="text-xs"><summary class="cursor-pointer text-slate-400">Raw central payload</summary>${csJsonDump(central)}</details>
     </div>`);
 }
+
+// ── Setup → Diagnostics: CS Bridge Status (hub-side relay state per agent) ───
+// Lets an Azure-hub operator diagnose "why isn't svr-02 deleting?" without SSH:
+// per agent, the bridge decision (ACTIVE / SKIP not-enabled / SKIP no-cs-spoke)
+// + relay outcome counters (accepted / re-queued / gave-up / completed / failed)
+// + the last outcome ts. The same data is in the hub log (WebUI Logs →
+// Simulations) as greppable [cs-bridge] lines; this panel surfaces it structured.
+// Read-only; refreshes on render. Global across the tenant's agents — that's
+// why it lives under Setup/Diagnostics, not under a host-scoped VM Server tab.
+// Spoke Repo / Update Status cards (Setup → Diagnostics) — from
+// /aggregate/api-server's health.repo (CS_GET_REPO_STATUS). Answers "did my push
+// reach the spoke?" from the UI: branch, served VERSION, key script versions,
+// and warnings when a spoke tracks a non-main branch (main pushes never arrive)
+// or is serving pre-split scripts.
+function _csRepoStatusSection(apiData) {
+    const spokes = (apiData && apiData.spokes) || [];
+    const esc = csEscape;
+    // Compact row per spoke, matching the DHCP / sim-tag health panels: the
+    // 4-cell csStat grid this replaced was ~5x taller per spoke and pushed the
+    // rest of Diagnostics below the fold on a 4-spoke fleet. Same facts, two
+    // lines — headline on top, the forensic detail in a mono strip beneath.
+    const cards = spokes.map(sp => {
+        const rp = ((sp.api_server || {}).health || {}).repo;
+        const name = sp.spoke_name || sp.display_name || sp.spoke_id;
+        const online = (typeof csOnlineBadge === 'function') ? csOnlineBadge(sp.spoke_online) : '';
+        if (!rp) {
+            return `<div class="border border-slate-200 rounded-md p-3 mb-2">
+                <div class="flex items-center justify-between gap-2">
+                  <span class="text-xs font-bold text-slate-600">${esc(name)}</span>${online}
+                </div>
+                <div class="text-[11px] text-slate-400 italic mt-1">repo status unavailable — spoke offline or pre-update</div>
+              </div>`;
+        }
+        const rs = rp.scripts || {};
+        const warns = [];
+        if (rp.configured_branch && rp.configured_branch !== 'main') {
+            warns.push([`tracks branch <b>${esc(rp.configured_branch)}</b>, not <b>main</b> — pushes to main won't reach this spoke`, 'text-amber-600']);
+        }
+        if (!rp.dns_latency_present) {
+            warns.push(['dns_latency.sh missing — serving pre-split client scripts', 'text-red-500']);
+        }
+        // Branch + served VERSION are the two facts that answer "did my push
+        // land"; they ride the header so a healthy spoke is one glance.
+        const branchCls = (rp.configured_branch && rp.configured_branch !== 'main')
+            ? 'text-amber-700 bg-amber-50 border-amber-200' : 'text-slate-600 bg-white border-slate-200';
+        return `<div class="border border-slate-200 rounded-md p-3 mb-2">
+            <div class="flex flex-wrap items-center justify-between gap-2">
+              <span class="text-xs font-bold text-slate-600">${esc(name)}</span>
+              <span class="flex flex-wrap items-center gap-2 justify-end">
+                ${online}
+                <span class="border rounded-full px-2 py-0.5 text-[10px] font-bold ${branchCls}">${esc(rp.configured_branch || 'branch ?')}</span>
+                <span class="text-[10px] text-slate-400">v${esc(rp.served_version || '?')}</span>
+              </span>
+            </div>
+            <div class="text-[11px] text-slate-400 font-mono mt-1 break-all">simulation.sh ${esc(rs['simulation.sh'] || '?')} · dns_latency.sh ${esc(rp.dns_latency_present ? (rs['dns_latency.sh'] || 'yes') : 'MISSING')} · dns_fail ${esc(rs['dns_fail.sh'] || '?')} · head ${esc(rp.head || '?')} · checked-out ${esc(rp.checked_out_branch || '?')} · source ${esc(rp.source_of_truth || '?')}</div>
+            ${warns.map(([w, c]) => `<div class="text-[11px] ${c} mt-1">⚠️ ${w}</div>`).join('')}
+          </div>`;
+    }).join('');
+    // Two-up on wide screens so a 4-spoke fleet fills the width instead of
+    // stacking four narrow full-width cards down the page.
+    return cards
+        ? `<div class="grid grid-cols-1 xl:grid-cols-2 gap-2">${cards}</div>`
+        : '<p class="text-xs text-slate-400 italic">No spokes reporting.</p>';
+}
+
+// ── Diagnostics page shell ───────────────────────────────────────────────────
+// Every panel used to render expanded, each under its own paragraph of prose, so
+// finding the one broken thing meant scrolling past everything healthy. Sections
+// are now collapsibles carrying a one-line verdict in the header: the page is
+// scannable at a glance, and anything with a problem auto-opens while healthy
+// sections stay shut. The prose moved into an "ℹ What this means" sub-collapsible
+// — still there when you need it, out of the way when you don't.
+const _CS_DIAG_TONE = {
+    ok:   { dot: 'bg-green-500', cls: 'text-slate-500' },
+    warn: { dot: 'bg-amber-400', cls: 'text-amber-700' },
+    bad:  { dot: 'bg-red-500',   cls: 'text-red-600' },
+    idle: { dot: 'bg-slate-300', cls: 'text-slate-400' },
+};
+
+// Section data for the page-level Copy button. Each renderer stashes its payload
+// here as it loads; csCopyAllDiagnostics flattens whatever has arrived.
+window._csDiagData = window._csDiagData || {};
+
+// ── Tile primitives, matching the Telemetry Freshness panel ──────────────────
+// Same treatment as csFreshnessPanel: bordered white tile, micro-caps label,
+// mono value, optional hint — laid out on a responsive grid that FILLS the
+// width. The point is that the numbers you scan for sit in fixed-width tiles
+// across the screen instead of wrapping inside a paragraph.
+function csDiagTile(label, val, hint, tone) {
+    const v = tone === 'bad' ? 'text-red-600'
+        : tone === 'warn' ? 'text-amber-600'
+        : tone === 'good' ? 'text-[#01A982]' : 'text-slate-700';
+    return `<div class="rounded-md border border-slate-200 bg-white px-3 py-2">
+        <div class="text-[10px] uppercase tracking-wider text-slate-400">${csEscape(label)}</div>
+        <div class="text-sm font-mono font-bold ${v} truncate" title="${csEscape(val)}">${csEscape(val)}</div>
+        ${hint ? `<div class="text-[10px] text-slate-400 truncate" title="${csEscape(hint)}">${csEscape(hint)}</div>` : ''}</div>`;
+}
+
+// Default 5-up on large screens, matching the freshness grid.
+function csDiagTiles(tiles, cols) {
+    return `<div class="grid grid-cols-2 sm:grid-cols-3 ${cols || 'lg:grid-cols-5'} gap-2 mb-3">${tiles.join('')}</div>`;
+}
+
+// Group label inside a section (freshness's "Agent collect phase — last tick").
+function csDiagSub(text, right) {
+    return `<div class="flex items-center justify-between mb-2 flex-wrap gap-2 mt-3">
+      <p class="text-[11px] font-bold text-slate-400 uppercase tracking-wider">${csEscape(text)}</p>
+      ${right ? `<span class="text-xs text-slate-500">${right}</span>` : ''}</div>`;
+}
+
+// Footer note, freshness's closing-paragraph treatment.
+function csDiagNote(html) {
+    return `<div class="text-[10px] text-slate-400 mt-2">${html}</div>`;
+}
+
+function csDiagSection(id, title, opts) {
+    const o = opts || {};
+    const tone = _CS_DIAG_TONE[o.tone || 'idle'] || _CS_DIAG_TONE.idle;
+    return `<details id="${id}-wrap" class="hpe-card rounded-lg shadow-sm p-0 mb-3"${o.open ? ' open' : ''}>
+      <summary class="cursor-pointer select-none px-5 py-3 flex items-center gap-3">
+        <span id="${id}-dot" class="inline-block w-2.5 h-2.5 rounded-full ${tone.dot} shrink-0"></span>
+        <span class="text-sm font-bold text-[#263040] shrink-0">${csEscape(title)}</span>
+        <span id="${id}-sum" class="text-xs ${tone.cls} truncate">${o.summary || ''}</span>
+        <span class="ml-auto flex items-center gap-2 shrink-0">${o.actions || ''}</span>
+      </summary>
+      <div class="px-5 pb-5">
+        ${o.help ? `<details class="mb-3"><summary class="cursor-pointer text-[11px] text-slate-400 hover:text-slate-600">ℹ What this means</summary>
+          <div class="text-[11px] text-slate-500 mt-1 leading-relaxed">${o.help}</div></details>` : ''}
+        <div id="${id}">${o.body || '<p class="text-slate-400 italic text-xs">Loading…</p>'}</div>
+      </div>
+    </details>`;
+}
+
+// Set a section's verdict once its data lands. A non-ok tone auto-opens the
+// section — a problem must never be hidden behind a collapsed header.
+function csDiagSummary(id, tone, text) {
+    const t = _CS_DIAG_TONE[tone] || _CS_DIAG_TONE.idle;
+    const dot = document.getElementById(`${id}-dot`);
+    const sum = document.getElementById(`${id}-sum`);
+    const wrap = document.getElementById(`${id}-wrap`);
+    if (dot) dot.className = `inline-block w-2.5 h-2.5 rounded-full ${t.dot} shrink-0`;
+    if (sum) { sum.className = `text-xs ${t.cls} truncate`; sum.textContent = text || ''; }
+    if (wrap && (tone === 'warn' || tone === 'bad')) wrap.open = true;
+}
+
+// Buttons live inside <summary>, where a click would toggle the collapsible.
+function csDiagStop(ev) { ev.preventDefault(); ev.stopPropagation(); }
+window.csDiagStop = csDiagStop;
+
+// ── Copy the whole page as plain text ────────────────────────────────────────
+// The single most useful thing when reporting an issue: one paste carrying every
+// section. Stamped with the fetch time and an explicit staleness warning —
+// pasting an unrefreshed panel into a ticket has already caused an
+// already-fixed spoke to be reported as still failing.
+function _csDiagBridgeText(snap) {
+    if (!snap || !snap.available) return 'CS BRIDGE: not available (bridge poller has not completed a cycle)';
+    const L = [`CS BRIDGE — ${(snap.agents || []).length} agent(s), cycle ${snap.cycle || '?'}`,
+               `  timeouts: spoke→agent fast ${snap.configured_fast_s ?? '?'}s / long ${snap.configured_long_s ?? '?'}s` +
+               `; hub→spoke ${snap.relay_timeout_s ?? '?'}s / ${snap.relay_timeout_long_s ?? '?'}s; max retries ${snap.max_retries ?? '?'}`];
+    (snap.agents || []).forEach(a => {
+        L.push(`  ${a.agent_id || '?'} (${a.hostname || '?'}) via ${a.host_spoke || '?'}`);
+        L.push(`    decision=${a.decision || '?'} inbox=${a.last_inbox_count ?? 0} accepted=${a.accepted || 0} ` +
+               `requeued=${a.requeued || 0} gave_up=${a.gave_up || 0} completed=${a.completed || 0} failed=${a.failed || 0}`);
+        if (a.last_outcome) L.push(`    last=${a.last_outcome} @ ${a.last_ts_iso || ''}`);
+    });
+    return L.join('\n');
+}
+
+function _csDiagRepoText(apiData) {
+    const spokes = (apiData && apiData.spokes) || [];
+    if (!spokes.length) return 'REPO STATUS: no spokes reported';
+    const L = [`REPO / UPDATE STATUS — ${spokes.length} spoke(s)`];
+    spokes.forEach(sp => {
+        const rp = ((sp.api_server || {}).health || {}).repo;
+        const name = sp.spoke_name || sp.display_name || sp.spoke_id;
+        if (!rp) { L.push(`  ${name}: repo status unavailable (offline or pre-update)`); return; }
+        L.push(`  ${name}: branch=${rp.configured_branch || '?'} version=${rp.served_version || rp.version || '?'}` +
+               `${rp.configured_branch && rp.configured_branch !== 'main' ? '  ** NOT main — pushes to main will not reach this spoke **' : ''}` +
+               `${rp.dns_latency_present === false ? '  ** dns_latency.sh MISSING **' : ''}`);
+    });
+    return L.join('\n');
+}
+
+function _csDiagDongleText(hosts) {
+    const L = ['MISSING DONGLES'];
+    let any = false;
+    (hosts || []).forEach(h => {
+        const d = (h.proxmox || {}).usb_diagnostics;
+        const name = h.spoke_name || h.spoke_hostname || h.spoke_id || '?';
+        if (!d || !d.generated_at) { L.push(`  ${name}: no diagnostic reported (agent likely predates this feature)`); return; }
+        any = true;
+        const u = d.uhubctl || {};
+        const _bb = d.boot_baseline || {};
+        L.push(`  ${name}: ${(d.lost_since_boot || []).length} LOST since boot / ` +
+               `${((d.passed_through || []).length + (d.boot_passthrough || []).length)} passed-through / ` +
+               `${((d.lost_transient || []).length + (d.missing_transient || []).length)} transient / ` +
+               `${(d.missing || []).length} missing(roster) / ${d.present_count ?? '?'} present` +
+               `  boot_baseline=${_bb.count ?? '?'}${_bb.trusted === false ? ' (UNTRUSTED — taken mid-boot)' : ''}` +
+               `  uhubctl=${u.supported ? 'SUPPORTED (' + (u.ppps_hubs || []).length + ' PPPS hub)' : u.installed ? 'installed, no PPPS hub' : 'not installed'}`);
+        (d.missing || []).forEach(m => L.push(`    ${m.bus_path} [${m.location || 'location unknown'}] ${m.vidpid} ${m.product} — missing ${m.missing_for_s != null ? m.missing_for_s + 's' : '?'}`));
+        (d.causes || []).forEach(c => L.push(`    CAUSE [${c.confidence}] ${c.cause}: ${c.detail}` + (c.remedy ? ` | FIX: ${c.remedy}` : '')));
+        const k = d.kernel || {};
+        L.push(`    kernel(${k.window_s || 0}s): ` + (!k.available ? 'UNREADABLE (not the same as clean)'
+            : Object.entries(k.totals || {}).map(([a, b]) => `${a}=${b}`).join(' ') || 'no USB errors'));
+        (k.samples || []).slice(0, 8).forEach(s => L.push(`      ${s}`));
+        const autoN = (d.power || []).filter(p => p && p.autosuspend_enabled).length;
+        L.push(`    autosuspend: ${autoN}/${(d.power || []).length} devices on 'auto'` +
+               `   controllers: ${(d.controllers || []).map(c => c.pci_address + ' [' + (c.loc_label || '?') + '] (' + c.device_count + ')').join(' ') || '—'}`);
+        const gw = (h.proxmox || {}).guest_watchdog || {};
+        if (gw.ran_at) {
+            L.push(`    guest-watchdog: checked=${gw.checked} responding=${gw.responding} ` +
+                   `reset=[${(gw.reset || []).join(' ')}] cycled=[${(gw.power_cycled || []).join(' ')}] ` +
+                   `started=[${(gw.started || []).join(' ')}] skipped=${gw.skipped}`);
+        }
+    });
+    if (!any && L.length === 1) L.push('  (no host reported a dongle diagnostic)');
+    return L.join('\n');
+}
+
+function csCopyAllDiagnostics(btn) {
+    const D = window._csDiagData || {};
+    const stamp = D.fetched_at || new Date().toLocaleString();
+    const parts = [
+        `LM DIAGNOSTICS — tenant ${(typeof csTenant === 'function' ? csTenant() : '?')}`,
+        `captured ${stamp}  (this is the last FETCHED data — press Refresh for live values)`,
+        '', _csDiagRepoText(D.repo), '', _csDiagBridgeText(D.bridge),
+        '', _csDiagDongleText(D.hosts),
+        '', (typeof _csSimTagHealthText === 'function' ? _csSimTagHealthText(D.tagHealth) : ''),
+        '', (typeof _csDhcpHealthText === 'function' ? _csDhcpHealthText(window._csDhcpLast || {}) : ''),
+    ];
+    csCopyText(parts.join('\n'), btn);
+}
+window.csCopyAllDiagnostics = csCopyAllDiagnostics;
+
+async function csRenderSetupDiagnostics() {
+    csSetToolbar('');
+    // Repo/update status per spoke (best-effort; shown even if the CS bridge
+    // isn't up yet — it's the "did my change reach the spoke?" panel).
+    let repoSection = '';
+    window._csDiagData = window._csDiagData || {};
+    window._csDiagData.fetched_at = new Date().toLocaleString();
+    try {
+        const apiData = await csFetch(`/aggregate/api-server?tenant_id=${csTenant()}`);
+        window._csDiagData.repo = apiData;          // for the page-level Copy
+        repoSection = _csRepoStatusSection(apiData);
+    } catch (e) { console.error('csRenderSetupDiagnostics: api-server fetch failed', e); }
+    let snap = null;
+    try {
+        snap = await csFetch(`/${csTenant()}/cs-bridge-status?tenant_id=${csTenant()}`);
+        window._csDiagData.bridge = snap;
+    } catch (e) { console.error('csRenderSetupDiagnostics: load failed', e); csSet(`<div>${repoSection}${csErrorBox('Could not load CS bridge status', e)}</div>`); return; }
+    if (!snap || !snap.available) {
+        csSet(`<div>${repoSection}
+          <p class="text-sm text-slate-500">CS bridge not started on this hub yet. The bridge poller runs on the hub; status appears here once it completes its first cycle (a few seconds after hub boot).</p>
+        </div>`);
+        return;
+    }
+    const agents = snap.agents || [];
+    // Collapse CS-disabled (SKIP not-enabled) agents out of the table per the
+    // "hide non-CS everywhere in the cs app" rule — their host + VMs are already
+    // hidden in VM Server; the Diagnostics panel keeps a one-line count so the
+    // "why isn't svr-02 deleting" diagnostic the panel exists for still surfaces
+    // *that* an agent is disabled, without listing the disabled agent/VMs.
+    const _disabled = agents.filter(a => (a.decision || '').startsWith('SKIP not-enabled'));
+    const _shown = agents.filter(a => !(a.decision || '').startsWith('SKIP not-enabled'));
+    const _cfgFast = snap.configured_fast_s != null ? `${snap.configured_fast_s}s` : '15s (default)';
+    const _cfgLong = snap.configured_long_s != null ? `${snap.configured_long_s}s` : '60s (default)';
+    const cfg = csDiagSub('Relay configuration') + csDiagTiles([
+        csDiagTile('Cycle', snap.cycle || '—', 'bridge poll phase'),
+        csDiagTile('Max retries', String(snap.max_retries ?? '—'), 'before gave-up'),
+        csDiagTile('Spoke→agent fast', _cfgFast, 'configured'),
+        csDiagTile('Spoke→agent long', _cfgLong, 'configured'),
+        csDiagTile('Hub→spoke', `${snap.relay_timeout_s ?? '—'}s / ${snap.relay_timeout_long_s ?? '—'}s`, 'actual fast / long'),
+    ]) + csDiagNote('Set the spoke→agent windows in <b>Setup → General → Agent Relay Timeouts</b>. Hub→spoke tracks the configured value +5s (never below the env default) so the hub does not pre-empt the spoke\'s wait. If hub→spoke still shows the env defaults (16s/65s) after saving General, the save did not reach global_config — re-save.');
+    // 11 columns forced a horizontal scroll on every screen width. The five
+    // counters collapse into ONE mono "queue" cell (zeros greyed so a nonzero
+    // number is what your eye lands on), and hostname rides under the agent id
+    // rather than owning a column. Five columns fit without scrolling.
+    const _n = (v, cls) => {
+        const num = Number(v || 0);
+        return `<span class="${num ? cls : 'text-slate-300'}">${csEscape(String(num))}</span>`;
+    };
+    const head = ['Agent', 'Via (host spoke)', 'Decision', 'Queue (in·ok·rq·gave·done·fail)', 'Last outcome'];
+    const body = _shown.map(a => {
+        const _decClass = (a.decision || '').startsWith('ACTIVE') ? 'text-emerald-600' :
+                         (a.decision || '').startsWith('SKIP') ? 'text-amber-600' : 'text-slate-500';
+        return `<tr class="border-b border-slate-100 hover:bg-slate-50 align-top">
+      <td class="px-4 py-2">
+        <div class="font-mono text-xs text-slate-700">${csEscape(a.agent_id || '—')}</div>
+        <div class="font-mono text-[10px] text-slate-400">${csEscape(a.hostname || '—')}</div>
+      </td>
+      <td class="px-4 py-2 font-mono text-xs text-slate-500">${csEscape(a.host_spoke || '—')}</td>
+      <td class="px-4 py-2 text-xs ${_decClass}">${csEscape(a.decision || '—')}</td>
+      <td class="px-4 py-2 font-mono text-xs whitespace-nowrap" title="inbox · accepted · re-queued · gave up · completed · failed">
+        ${_n(a.last_inbox_count, 'text-slate-600')}<span class="text-slate-300">·</span>${_n(a.accepted, 'text-emerald-600')}<span class="text-slate-300">·</span>${_n(a.requeued, 'text-amber-600')}<span class="text-slate-300">·</span>${_n(a.gave_up, 'text-red-600')}<span class="text-slate-300">·</span>${_n(a.completed, 'text-slate-600')}<span class="text-slate-300">·</span>${_n(a.failed, 'text-red-600')}
+      </td>
+      <td class="px-4 py-2 text-xs text-slate-400">${csEscape(a.last_outcome ? (a.last_outcome + ' @ ' + (a.last_ts_iso || '')) : '—')}</td>
+    </tr>`;
+    }).join('');
+    // Section verdicts, computed once so the collapsed headers are honest.
+    const _stuck = _shown.filter(a => Number(a.gave_up || 0) || Number(a.failed || 0)).length;
+    const _bridgeTone = _stuck ? 'bad' : (_shown.length ? 'ok' : 'warn');
+    const _bridgeSum = _shown.length
+        ? `${_shown.length} agent(s)` + (_stuck ? ` · ${_stuck} with gave-up/failed commands` : ' · no stuck commands')
+          + (_disabled.length ? ` · ${_disabled.length} hidden (CS disabled)` : '')
+        : 'no active agents seen';
+    const _repoSpokes = ((window._csDiagData || {}).repo || {}).spokes || [];
+    const _offBranch = _repoSpokes.filter(sp => {
+        const rp = ((sp.api_server || {}).health || {}).repo;
+        return rp && rp.configured_branch && rp.configured_branch !== 'main';
+    }).length;
+    const _repoTone = _offBranch ? 'warn' : (_repoSpokes.length ? 'ok' : 'idle');
+    const _repoSum = _repoSpokes.length
+        ? `${_repoSpokes.length} spoke(s)` + (_offBranch ? ` · ${_offBranch} tracking a non-main branch` : ' · all on main')
+        : 'no repo status reported';
+    const _disabledLine = _disabled.length
+      ? `<p class="text-[11px] text-amber-600 mb-2">${csEscape(String(_disabled.length))} agent(s) hidden (CS disabled) — enable in Agent Config to manage their VMs.</p>`
+      : '';
+    const _btn = 'text-xs px-3 py-1 rounded-md border border-slate-300 text-slate-600 hover:bg-slate-50';
+    const _act = (label, fn, title) =>
+        `<button type="button" onclick="csDiagStop(event); ${fn}" class="${_btn}" title="${csEscape(title || '')}">${label}</button>`;
+
+    csSet(`<div>
+      <div class="hpe-card rounded-lg shadow-sm p-5 mb-4 flex flex-wrap items-center gap-3">
+        <div>
+          <p class="text-lg font-bold text-[#263040]">Diagnostics</p>
+          <p class="text-[11px] text-slate-400">Captured ${csEscape(window._csDiagData.fetched_at)} — sections with a problem open automatically.</p>
+        </div>
+        <div class="ml-auto flex items-center gap-2">
+          <button type="button" onclick="csCopyAllDiagnostics(this)" class="bg-[#01A982]/10 hover:bg-[#01A982]/20 text-[#01A982] border border-[#01A982] px-4 py-2 rounded-md text-xs font-bold" title="Copy EVERY section below as plain text — repo status, CS bridge, missing dongles, sim tags and sim DHCP. Paste straight into a ticket or chat.">⧉ Copy all diagnostics</button>
+          <button type="button" onclick="csRenderSetupDiagnostics()" class="${_btn}">↻ Refresh all</button>
+        </div>
+      </div>
+
+      ${csDiagSection('cs-diag-repo', 'Repo & update status', {
+        tone: _repoTone, summary: _repoSum, open: _repoTone !== 'ok',
+        body: repoSection || '<p class="text-xs text-slate-400 italic">No repo status reported.</p>',
+        help: 'Did my push actually reach the spoke? <b>Branch</b> and the served <b>VERSION</b> are the two facts that answer it. A spoke tracking a non-main branch will never see pushes to main.',
+      })}
+
+      ${csDiagSection('cs-diag-bridge', 'CS bridge — per-agent relay', {
+        tone: _bridgeTone, summary: _bridgeSum, open: _bridgeTone !== 'ok',
+        body: `${_disabledLine}${_shown.length ? csTable(head, body) : '<p class="text-sm text-slate-500">No active agents seen yet.</p>'}${cfg}`,
+        help: `ACTIVE = the bridge is polling + relaying this agent's queue. <b>Via</b> = the spoke the agent is actually connected to; <b>cs_spoke</b> in the Decision is the tenant's queue broker (one per tenant). The <b>Queue</b> cell reads <code>in·ok·rq·gave·done·fail</code>: <b>in</b> = commands found in the agent's inbox last poll (0 with 0 accepted = nothing queued / hostname-key mismatch; &gt;0 with 0 accepted = relay path issue). <b>rq</b> climbing = agent too busy to ACK (transient, retried to max). <b>gave</b>/<b>fail</b> = retries exhausted or a genuine rejection. SKIP no-cs-spoke = no client-sim spoke bound to the tenant. Same data streams to <b>WebUI Logs → Simulations</b> as <code>[cs-bridge]</code> lines.`,
+      })}
+
+      ${csDiagSection('cs-dongle-diag', 'Missing dongles — probable cause', {
+        actions: _act('⌫ Purge history', 'csClearUsbHistory(\'\')',
+                      'Forget the presence roster + boot baseline on every spoke. Use after moving dongles or pulling a controller card, so "missing" is recounted from what is actually attached. Quarantine and exclusions untouched.')
+               + _act('↻', 'csRenderDongleDiag()', 'Refresh this panel'),
+        help: 'Where dongles went when a host\'s <code>lsusb</code> count decays over days. The agent keeps a persisted roster of every certified dongle it has ever seen, so a bus that stops appearing is reported as <b>missing</b> rather than silently vanishing from the totals. The provisioning health ladder cannot recover these: its <code>usb_reset</code> rung writes <code>/sys/bus/usb/devices/&lt;bus&gt;/authorized</code>, which stops existing the moment the device leaves the bus. Causes are ranked from kernel evidence tied to the missing bus; <b>uhubctl</b> reports whether per-port power cycling is possible on this host at all.',
+      })}
+
+      ${csDiagSection('cs-sim-tag-health', 'Sim label (tag) health', {
+        actions: _act('⧉', 'csCopySimTagHealth(this)', 'Copy this panel as plain text')
+               + _act('↻', 'csRenderSimTagHealth()', 'Refresh this panel'),
+        help: 'Why a host shows no / stale / wrong <code>sim-</code> tags. Tagging is <b>per spoke</b> — each dispatches only to the agents connected to it — so a host whose agent does not resolve is never tagged and its VMs keep whatever tags they had. Per VM: <b>Desired</b> is what the engine says the client is running, <b>Actual</b> is what is on the box.',
+      })}
+
+      ${csDiagSection('cs-dhcp-health', 'Sim DHCP (Kea) health', {
+        actions: _act('⧉', 'csCopyDhcpHealth(this)', 'Copy this panel as plain text — including last errors and notes')
+               + _act('↻', 'csRenderDhcpHealth()', 'Refresh this panel'),
+        help: 'The cs-owned Kea instance (<code>kea-dhcp4-sim</code>) serving the isolated sim-client network. <b>Serving</b> needs all of: the unit active, the configured NIC present, and a lease DB. A crash-looping Kea hands out nothing while the spoke itself looks perfectly healthy, which is why this is separate from spoke status.',
+      })}
+    </div>`);
+    csRenderDhcpHealth();
+    csRenderSimTagHealth();
+    csRenderDongleDiag();
+}
+
+// ── Missing-dongle diagnostics (Setup → Diagnostics) ────────────────────────
+// Renders the agent's usb_diagnostics snapshot per host: what's gone, the ranked
+// probable cause, and whether the uhubctl power-cycle path exists on that box.
+//
+// Deliberate distinction throughout: "no dongles missing" and "the agent hasn't
+// reported a diagnostic yet" render DIFFERENTLY. An empty panel that reads as
+// "all good" when the agent is simply too old to send the field would hide the
+// exact problem this panel was built to surface.
+const _CS_CAUSE_STYLE = {
+    high:    'border-red-200 bg-red-50 text-red-700',
+    medium:  'border-amber-200 bg-amber-50 text-amber-700',
+    low:     'border-slate-200 bg-slate-50 text-slate-600',
+    unknown: 'border-slate-200 bg-slate-50 text-slate-500',
+};
+
+// uhubctl verdict badge — the answer to "can we take the power-cycle path?".
+// Three distinct states: supported (PPPS hub present), installed-but-no-PPPS
+// (the common on-board-controller case), and not installed.
+function csUhubctlBadge(u) {
+    if (!u || typeof u !== 'object') return '<span class="text-[10px] text-slate-400">uhubctl: unknown</span>';
+    if (u.supported) {
+        const hubs = (u.ppps_hubs || []).map(h => h.hub).join(', ');
+        return `<span class="px-1.5 py-0.5 rounded text-[10px] font-bold bg-green-100 text-green-700" title="${csEscape('PPPS-capable hub(s): ' + hubs + '. Power-cycle with: uhubctl -a cycle')}">uhubctl ✓ ${csEscape(String((u.ppps_hubs || []).length))} PPPS hub(s)</span>`;
+    }
+    if (u.installed) {
+        return `<span class="px-1.5 py-0.5 rounded text-[10px] font-bold bg-amber-100 text-amber-700" title="${csEscape(u.error || 'no per-port-power-switching hub found')}">uhubctl installed · no PPPS hub</span>`;
+    }
+    return `<span class="px-1.5 py-0.5 rounded text-[10px] font-bold bg-slate-100 text-slate-500" title="${csEscape((u.error || 'not installed') + ' — install: ' + (u.install_hint || 'apt-get install -y uhubctl'))}">uhubctl not installed</span>`;
+}
+
+function _csDongleDiagHost(h) {
+    const px = h.proxmox || {};
+    const d = px.usb_diagnostics;
+    const name = csEscape(h.spoke_name || h.spoke_hostname || h.spoke_id || '?');
+    if (!d || !d.generated_at) {
+        return `<div class="border border-slate-200 rounded-lg p-3 mb-3">
+          <div class="flex items-center justify-between mb-1">
+            <span class="font-mono text-xs font-bold text-slate-600">${name}</span>
+            <span class="text-[10px] text-slate-400">no diagnostic reported</span>
+          </div>
+          <p class="text-[11px] text-slate-500">This host's agent has not sent a dongle diagnostic. That is <b>not</b> the same as "no dongles missing" — it usually means the agent predates this feature and needs an update.</p>
+        </div>`;
+    }
+    const missing = Array.isArray(d.missing) ? d.missing : [];
+    // Absent BY DESIGN: their PCI controller was handed to a VM (T1/T3
+    // passthrough), so the host correctly stops seeing them — ~4 per host. Kept
+    // out of the "missing" count so that number only ever means "lost".
+    const passed = Array.isArray(d.passed_through) ? d.passed_through : [];
+    // Boot-anchored losses: present at boot, gone now, excluding controllers
+    // handed to VMs and dongles too briefly attached to be inventory. This is
+    // the authoritative "what should be here and is not".
+    const lost = Array.isArray(d.lost_since_boot) ? d.lost_since_boot : [];
+    const bootPt = Array.isArray(d.boot_passthrough) ? d.boot_passthrough : [];
+    const transient = (Array.isArray(d.lost_transient) ? d.lost_transient : [])
+        .concat(Array.isArray(d.missing_transient) ? d.missing_transient : []);
+    const bb = d.boot_baseline || {};
+    const causes = Array.isArray(d.causes) ? d.causes : [];
+    const kernel = d.kernel || {};
+    const power = Array.isArray(d.power) ? d.power : [];
+    const autoN = power.filter(p => p && p.autosuspend_enabled).length;
+    const ctrls = Array.isArray(d.controllers) ? d.controllers : [];
+    const nowS = Date.now() / 1000;
+    const age = d.generated_at ? csAgeShort(nowS - d.generated_at) + ' ago' : '—';
+
+    // Physical location, recorded by the agent while the dongle was still
+    // present. "0000:80:14.0" means nothing at the rack; "PCIe slot 1 · port 3"
+    // is the whole point of the field. Older agents don't send it -> em dash.
+    const missRows = missing.map(m => `<tr>
+      <td class="px-3 py-1.5 font-mono text-xs">${csEscape(m.bus_path || '—')}</td>
+      <td class="px-3 py-1.5 text-xs text-slate-600">${csEscape(m.location || '—')}</td>
+      <td class="px-3 py-1.5 text-xs text-slate-600">${csEscape(m.product || '—')}</td>
+      <td class="px-3 py-1.5 font-mono text-[11px] text-slate-500">${csEscape(m.vidpid || '—')}</td>
+      <td class="px-3 py-1.5 text-xs text-slate-500">${csEscape(m.last_seen ? csAgeShort(nowS - m.last_seen) + ' ago' : '—')}</td>
+      <td class="px-3 py-1.5 text-xs ${m.missing_for_s > 86400 ? 'text-red-600 font-bold' : 'text-amber-600'}">${m.missing_for_s != null ? csEscape(csAgeShort(m.missing_for_s)) : '—'}</td>
+    </tr>`).join('');
+
+    const causeCards = causes.map(c => {
+        const cls = _CS_CAUSE_STYLE[c.confidence] || _CS_CAUSE_STYLE.low;
+        return `<div class="border rounded-md p-2 mb-1.5 ${cls}">
+          <div class="flex items-center gap-2 mb-0.5">
+            <span class="text-xs font-bold">${csEscape(c.cause || '—')}</span>
+            <span class="text-[9px] uppercase tracking-wider opacity-70">${csEscape(c.confidence || '')}</span>
+          </div>
+          <p class="text-[11px] opacity-90">${csEscape(c.detail || '')}</p>
+          ${c.remedy ? `<p class="text-[11px] mt-1"><b>Fix:</b> ${csEscape(c.remedy)}</p>` : ''}
+        </div>`;
+    }).join('');
+
+    // Guest-agent watchdog last sweep, as a tile: an automatic VM reset or power
+    // cycle should be attributable at a glance, not buried in raw telemetry.
+    const gw = px.guest_watchdog || {};
+    const gwActs = (gw.reset || []).length + (gw.power_cycled || []).length + (gw.started || []).length;
+    const gwTile = !gw.ran_at
+        ? { val: '—', hint: 'no sweep reported', tone: null }
+        : { val: `${gw.responding ?? '?'}/${gw.checked ?? '?'}`,
+            hint: gwActs ? `${(gw.reset || []).length} reset · ${(gw.power_cycled || []).length} cycled · ${(gw.started || []).length} started`
+                         : 'guests responding, no action taken',
+            tone: gwActs ? 'warn' : 'good' };
+
+    const kTotals = Object.entries(kernel.totals || {});
+    // Who caused these? The recovery ladder's usb_reset writes authorized 0/1,
+    // which the kernel logs as a disconnect -- a category counted as evidence.
+    // Without the split, the agent's own recovery attempts read back as proof
+    // the dongle is failing. Only SPONTANEOUS events are evidence of hardware.
+    const attr = kernel.attribution || null;
+    const attrLine = (attr && (attr.self_inflicted || attr.spontaneous))
+        ? `<div class="mt-1 text-[11px] ${attr.spontaneous ? 'text-slate-600' : 'text-slate-500'}">`
+          + `<b>${csEscape(String(attr.spontaneous))}</b> spontaneous`
+          + (attr.self_inflicted
+              ? ` · <span class="text-slate-400">${csEscape(String(attr.self_inflicted))} self-inflicted (agent usb_reset — not hardware evidence)</span>`
+              : '')
+          + (attr.spontaneous === 0 && attr.self_inflicted
+              ? ` — <span class="text-[#01A982] font-bold">every logged event was ours; no hardware fault evidenced</span>`
+              : '')
+          + `</div>`
+        : '';
+    const kernelLine = !kernel.available
+        ? '<span class="text-amber-600">kernel log unreadable — evidence could not be checked (not the same as a clean log)</span>'
+        : kTotals.length
+            ? kTotals.map(([k, v]) => `<span class="mr-3"><b>${csEscape(k)}</b> ${csEscape(String(v))}</span>`).join('')
+            : '<span class="text-slate-400">no USB errors logged in the window</span>';
+
+    const u = d.uhubctl || {};
+    const kTotalN = kTotals.reduce((n, [, v]) => n + Number(v || 0), 0);
+    // Hub tier. Renders NOTHING when there is no external hub -- which is the
+    // current fleet -- so this stays dark until one is fitted rather than
+    // showing an empty section forever. Root hubs are the controller itself and
+    // are only worth listing alongside a real hub, for contrast.
+    const hubs = Array.isArray(d.hubs) ? d.hubs : [];
+    const realHubs = hubs.filter(h => h && !h.is_root_hub);
+    const hubHtml = !realHubs.length ? '' : `
+      <p class="text-[11px] font-bold text-slate-400 uppercase tracking-wider mt-3 mb-1">USB hubs</p>
+      <div class="overflow-x-auto">${csTable(['Hub', 'Product', 'Ports', 'Attached', 'Power', 'Per-port power'],
+        realHubs.map(h => {
+            const over = Number(h.attached || 0) > Number(d.hub_dongle_ceiling || 7);
+            return `<tr>
+              <td class="px-3 py-1.5 font-mono text-xs">${csEscape(h.bus_path || '—')}</td>
+              <td class="px-3 py-1.5 text-xs text-slate-600">${csEscape(h.product || '—')}</td>
+              <td class="px-3 py-1.5 text-xs text-slate-500">${csEscape(String(h.ports != null ? h.ports : '—'))}</td>
+              <td class="px-3 py-1.5 text-xs ${over ? 'text-red-600 font-bold' : 'text-slate-700'}">${csEscape(String(h.attached != null ? h.attached : '—'))}${over ? ` / ${csEscape(String(d.hub_dongle_ceiling || 7))}` : ''}</td>
+              <td class="px-3 py-1.5 text-xs ${h.self_powered ? 'text-slate-600' : 'text-amber-600 font-bold'}">${h.self_powered ? 'self-powered' : 'bus-powered'}</td>
+              <td class="px-3 py-1.5 text-xs">${h.ppps
+                  ? '<span class="px-1.5 py-0.5 rounded text-[10px] font-bold bg-green-100 text-green-700" title="uhubctl can cut VBUS on an individual port — a far less destructive recovery rung than usb_reset, which yanks the device out from under a VM holding it.">✓ can power-cycle</span>'
+                  : '<span class="text-slate-400 text-[10px]">no PPPS</span>'}</td>
+            </tr>`;
+        }).join(''))}</div>
+      ${realHubs.flatMap(h => (h.warnings || []).map(w =>
+        `<div class="mt-1 text-[11px] text-amber-700 bg-amber-50 border border-amber-200 rounded px-2 py-1">⚠ ${csEscape(h.bus_path)}: ${csEscape(w)}</div>`)).join('')}`;
+    return `<div class="hpe-card rounded-lg p-4 shadow-sm mb-4">
+      <div class="flex items-center justify-between mb-2 flex-wrap gap-2">
+        <p class="text-[11px] font-bold text-slate-400 uppercase tracking-wider">${name}</p>
+        <span class="text-xs text-slate-500">${missing.length
+            ? `<span class="text-red-600 font-bold">● ${missing.length} MISSING</span>`
+            : '<span class="text-green-600 font-bold">● NONE MISSING</span>'} · collected ${csEscape(age)}</span>
+      </div>
+      ${csDiagTiles([
+        csDiagTile('Present', String(d.present_count ?? '—'), 'certified, on the bus'),
+        csDiagTile('Missing', String(missing.length), 'was seen, now gone', missing.length ? 'bad' : 'good'),
+        csDiagTile('Lost since boot', String(lost.length),
+                   bb.trusted === false ? 'baseline taken mid-boot — not authoritative'
+                                        : 'present at boot, gone now',
+                   lost.length ? 'bad' : 'good'),
+        csDiagTile('Passed through', String(passed.length + bootPt.length),
+                   (passed.length + bootPt.length) ? 'VM-owned controller — expected' : 'none'),
+        csDiagTile('Transient', String(transient.length),
+                   `seen < ${csAgeShort(d.inventory_min_age_s || 14400)} — not inventory`),
+        csDiagTile('Ever seen', String(d.known_count ?? '—'), 'persisted roster'),
+        csDiagTile('Autosuspend', `${autoN}/${power.length}`, "power/control=auto", autoN ? 'warn' : null),
+        csDiagTile('Kernel events', String(kTotalN), `${csAgeShort(kernel.window_s || 0)} window`,
+                   !kernel.available ? 'warn' : (kTotalN ? 'bad' : null)),
+        csDiagTile('uhubctl', u.supported ? 'PPPS ✓' : u.installed ? 'no PPPS hub' : 'not installed',
+                   u.supported ? `${(u.ppps_hubs || []).length} hub(s) — uhubctl -a cycle`
+                               : (u.error || 'port power cycling unavailable'),
+                   u.supported ? 'good' : 'warn'),
+        csDiagTile('Controllers', String(ctrls.length),
+                   ctrls.map(c => `${c.loc_label || c.pci_address} (${c.device_count})`).join(' · ') || '—'),
+        csDiagTile('Guest watchdog', gwTile.val, gwTile.hint, gwTile.tone),
+      ], 'lg:grid-cols-4')}
+      ${missing.length ? csDiagSub('Missing dongles') +
+        `<div class="overflow-x-auto mb-2">${csTable(['Bus', 'Location', 'Product', 'vid:pid', 'Last seen', 'Missing for'], missRows)}</div>` : ''}
+      ${causes.length ? csDiagSub('Probable cause — ranked') +
+        `<div class="grid grid-cols-1 xl:grid-cols-2 gap-2">${causeCards}</div>` : ''}
+      ${hubHtml}
+      ${kernel.available && kTotals.length ? csDiagNote(`Kernel: ${kernelLine}${attrLine}`) : ''}
+      ${!kernel.available ? csDiagNote('<span class="text-amber-600">Kernel log unreadable — evidence could not be checked. This is <b>not</b> the same as a clean log.</span>') : ''}
+    </div>`;
+}
+
+async function csRenderDongleDiag() {
+    const el = document.getElementById('cs-dongle-diag');
+    if (!el) return;
+    let hosts = [];
+    try { hosts = await csVmLoad(); }
+    catch (e) {
+        console.error('csRenderDongleDiag: vm load failed', e);
+        el.innerHTML = '<p class="text-xs text-red-500">Could not load host data.</p>';
+        return;
+    }
+    const _hn = h => (h.spoke_name || h.spoke_hostname || h.spoke_id || '');
+    const sorted = (hosts || []).slice().sort((a, b) =>
+        _hn(a).localeCompare(_hn(b), undefined, { numeric: true, sensitivity: 'base' }));
+    (window._csDiagData = window._csDiagData || {}).hosts = sorted;   // page-level Copy
+    if (!sorted.length) {
+        el.innerHTML = '<p class="text-xs text-slate-400 italic">No hosts in scope.</p>';
+        csDiagSummary('cs-dongle-diag', 'idle', 'no hosts in scope');
+        return;
+    }
+    const totalMissing = sorted.reduce((n, h) =>
+        n + (((h.proxmox || {}).usb_diagnostics || {}).missing || []).length, 0);
+    const anyPpps = sorted.some(h =>
+        ((((h.proxmox || {}).usb_diagnostics || {}).uhubctl) || {}).supported);
+    const reported = sorted.filter(h => ((h.proxmox || {}).usb_diagnostics || {}).generated_at).length;
+    // "Nothing missing" and "no agent has reported yet" are different verdicts —
+    // the header must not read all-clear when the data simply hasn't arrived.
+    csDiagSummary('cs-dongle-diag',
+        totalMissing ? 'bad' : (reported ? 'ok' : 'warn'),
+        !reported ? `no diagnostic reported by ${sorted.length} host(s) — agents may predate this feature`
+                  : totalMissing ? `${totalMissing} missing across ${sorted.length} host(s)`
+                                 + (anyPpps ? ' · uhubctl available' : ' · no PPPS hub')
+                  : `none missing · ${reported}/${sorted.length} host(s) reporting`);
+    const summary = `<div class="flex flex-wrap items-center gap-2 mb-3 text-xs text-slate-500">
+      <span><b class="text-sm ${totalMissing ? 'text-red-600' : 'text-slate-700'}">${totalMissing}</b> dongle(s) missing fleet-wide</span>
+      <span class="text-[11px]">·</span>
+      <span class="text-[11px]">${anyPpps
+        ? 'at least one host can power-cycle ports with <code>uhubctl -a cycle</code>'
+        : 'no host has a PPPS-capable hub — the fallback is an xHCI unbind/rebind, which resets every device on that controller'}</span>
+    </div>`;
+    el.innerHTML = summary + sorted.map(_csDongleDiagHost).join('');
+}
+window.csRenderDongleDiag = csRenderDongleDiag;
 
 // ── Register all VM Server children ─────────────────────────────────────────
 window.CS_CHILD_RENDERERS['VM Server::Overview']     = csRenderVmServer;
@@ -10929,7 +12594,7 @@ async function csRenderSpokeManagement() {
       <button onclick="csRenderSpokeManagement()" class="ml-2 text-xs text-[#01A982] font-bold hover:underline">Refresh</button>`);
 
     const banner = (admin && (pending || unbound))
-        ? `<div class="hpe-card rounded-lg p-4 shadow-sm border-l-4 border-amber-400 bg-amber-50">
+        ? `<div class="hpe-card rounded-lg p-5 shadow-sm border-l-4 border-amber-400 bg-amber-50">
              <p class="text-sm text-amber-700"><b>${pending}</b> pending, <b>${unbound}</b> unbound — assign/approve below so their telemetry reaches a tenant's VM Server.</p>
            </div>`
         : '';
@@ -10951,7 +12616,9 @@ async function csRenderSpokeManagement() {
     // search hides/shows the pair together.
     window._csSpokeRowHtml = function (s) {
         const isPending = !s.approved;
-        const assignBtn = '';
+        const assignBtn = admin
+            ? `<button onclick="openSpokeAssignModal('${csEscape(s.spoke_id)}','${csEscape(s.tenant_id || '')}')" class="text-xs text-[#01A982] font-bold hover:underline whitespace-nowrap">${!s.tenant_id ? 'Assign' : 'Rebind'}</button>`
+            : '';
         const approveBtn = admin
             ? `<button onclick="csSpokeApprove('${csEscape(s.spoke_id)}',${isPending ? 'true' : 'false'})" class="text-xs ${isPending ? 'text-green-600 font-bold' : 'text-amber-600'} hover:underline whitespace-nowrap">${isPending ? 'Approve' : 'Revoke'}</button>`
             : '';
@@ -10965,7 +12632,7 @@ async function csRenderSpokeManagement() {
             ? `<button onclick="csSpokeDiag('${csEscape(s.spoke_id)}')" class="text-xs text-slate-500 hover:underline whitespace-nowrap">Diag</button>`
             : '';
         const delBtn = admin
-            ? `<button onclick="csSpokeDelete('${csEscape(s.spoke_id)}')" class="text-xs text-red-500 hover:underline whitespace-nowrap">Delete</button>`
+            ? `<button onclick="csSpokeDelete('${csEscape(s.spoke_id)}')" class="text-xs text-red-500 hover:underline whitespace-nowrap" title="Remove this spoke and its registration from the hub">Delete</button>`
             : '';
         const actions = admin
             ? `<div class="flex flex-wrap items-center gap-4">${assignBtn}${approveBtn}${labelBtn}${cfgBtn}${diagBtn}${delBtn}</div>`
@@ -10973,7 +12640,7 @@ async function csRenderSpokeManagement() {
         const dataAttrs = `data-cs-spoke="${csEscape(s.spoke_id).toLowerCase()}" data-cs-name="${csEscape((s.display_name || s.spoke_id || '').toLowerCase())}"`;
         return `<tr class="cs-spoke-row" ${dataAttrs}>
           <td class="px-3 pt-2 pb-1 font-mono text-xs whitespace-nowrap">${csEscape(s.spoke_id)}</td>
-          <td class="px-3 pt-2 pb-1 text-sm whitespace-nowrap">${csEscape(s.display_name || s.spoke_id)}</td>
+          <td class="px-3 pt-2 pb-1 text-sm whitespace-nowrap">${csEscape((s.display_name && s.display_name !== s.spoke_id) ? s.display_name : (s.hostname || '—'))}</td>
           <td class="px-3 pt-2 pb-1 whitespace-nowrap">${typeBadge(s.module_type)}</td>
           <td class="px-3 pt-2 pb-1 whitespace-nowrap">${csOnlineBadge(s.connected)}</td>
           <td class="px-3 pt-2 pb-1 whitespace-nowrap">${s.approved ? '<span class="text-green-600 text-xs font-bold">Approved</span>' : '<span class="text-amber-600 text-xs font-bold">Pending</span>'}</td>
@@ -11000,7 +12667,7 @@ async function csRenderSpokeManagement() {
       <div class="grid grid-cols-1 md:grid-cols-3 gap-3">
         <input id="cs-claim-id" placeholder="spoke-id" class="bg-white border border-slate-300 rounded-md px-3 py-2 text-sm font-mono">
         <input id="cs-claim-psk" placeholder="onboarding PSK" class="bg-white border border-slate-300 rounded-md px-3 py-2 text-sm font-mono">
-        <button onclick="csClaimSpoke()" class="bg-[#01A982] hover:bg-[#008c6a] text-white px-4 py-2 rounded-md text-sm font-bold shadow-sm">Claim</button>
+        <button onclick="csClaimSpoke()" class="bg-[#01A982]/10 hover:bg-[#01A982]/20 text-[#01A982] border border-[#01A982] px-4 py-2 rounded-md text-sm font-bold shadow-sm">Claim</button>
       </div>
     </div>`;
 
@@ -11083,7 +12750,7 @@ async function csSpokeMgmtPskCard() {
     const tenant = csTenantRaw();
     const rows = psks.map(p => `<tr>
       <td class="px-3 py-2 font-mono text-xs">${csEscape(p)}</td>
-      <td class="px-3 py-2 text-right"><button onclick="csSpokeMgmtRevokePsk('${csEscape(p)}')" class="text-xs text-red-500 hover:underline">Revoke</button></td>
+      <td class="px-3 py-2 text-right"><button onclick="csSpokeMgmtRevokePsk('${csEscape(p)}')" class="text-xs text-red-500 hover:underline" title="Revoke this pre-shared key — agents using it will be disconnected">Revoke</button></td>
     </tr>`).join('');
     const deploy = psks.length
         ? `<div class="mt-3 text-[11px] text-slate-500 bg-slate-50 border border-slate-200 rounded-md p-3">
@@ -11095,7 +12762,7 @@ async function csSpokeMgmtPskCard() {
     return `<div class="hpe-card rounded-lg p-5 shadow-sm">
       <div class="flex justify-between items-center mb-3">
         <h3 class="text-sm font-bold text-slate-500 uppercase tracking-wider">Onboarding PSK <span class="text-slate-400 normal-case font-normal">· tenant ${csEscape(tenant)}</span> ${helpIcon('cs', null, 'Simulations help')}</h3>
-        <button onclick="csSpokeMgmtGenPsk()" class="bg-[#01A982] hover:bg-[#008c6a] text-white px-4 py-1.5 rounded-md text-xs font-bold shadow-sm">+ Generate</button>
+        <button onclick="csSpokeMgmtGenPsk()" class="bg-[#01A982]/10 hover:bg-[#01A982]/20 text-[#01A982] border border-[#01A982] px-4 py-1.5 rounded-md text-xs font-bold shadow-sm">+ Generate</button>
       </div>
       ${psks.length ? csTable(['PSK', ''], rows) : '<p class="text-xs text-slate-400 italic py-4 text-center">No PSKs issued.</p>'}
       ${deploy}
@@ -11130,5 +12797,182 @@ window.csClaimSpoke = async function () {
         showToast('Claim failed: ' + m, 'error');
     }
 };
+
+// ── Simulation Build Assistant (Simulations → Assistant) ────────────────────
+// A chat-style, multi-turn conversation that helps scope a new client
+// simulation — the LLM logic lives entirely on the ab agent (relayed via
+// /api/sim-assistant/chat, mirroring /api/help/ask); this file only owns the
+// chat UI + the running message history. The hub keeps no session state, so
+// the FULL transcript is echoed back on every turn — held in
+// window._csAssistantMessages so it survives switching away from this tab
+// and back (lost on a full page reload, which is expected for a client-side
+// session). "File as Feature Request" packages the transcript through the
+// EXISTING /api/bug-report pipeline (type=feature, admin-approval-gated) —
+// this UI never writes code or files anything on its own initiative.
+window._csAssistantMessages = window._csAssistantMessages || [];
+
+function _csAssistantBubble(role, text) {
+    const isUser = role === 'user';
+    const bg = isUser ? 'bg-[#01A982] text-white' : 'bg-white border border-slate-200 text-slate-800';
+    const align = isUser ? 'justify-end' : 'justify-start';
+    const body = window.renderHelpMarkdown ? window.renderHelpMarkdown(text) :
+        '<p>' + csEscape(text) + '</p>';
+    return `<div class="flex ${align} mb-3">
+        <div class="max-w-[75%] rounded-2xl px-4 py-2.5 text-sm leading-relaxed ${bg} shadow-sm">
+            <div class="cs-assistant-msg">${body}</div>
+        </div>
+    </div>`;
+}
+
+function _csAssistantScrollToBottom() {
+    const log = csEl('cs-assistant-log');
+    if (log) log.scrollTop = log.scrollHeight;
+}
+
+function _csAssistantRenderLog() {
+    const log = csEl('cs-assistant-log');
+    if (!log) return;
+    if (!window._csAssistantMessages.length) {
+        log.innerHTML = '<p class="text-sm text-slate-400 text-center mt-8">' +
+            'Tell me what you want to build — e.g. "I want a simulation that runs this ' +
+            'script" and paste it in. I\'ll ask if I need more.</p>';
+        return;
+    }
+    log.innerHTML = window._csAssistantMessages.map(m => _csAssistantBubble(m.role, m.content)).join('');
+    _csAssistantScrollToBottom();
+}
+
+async function csAssistantSend() {
+    const input = csEl('cs-assistant-input');
+    if (!input) return;
+    const text = (input.value || '').trim();
+    if (!text) return;
+    input.value = '';
+    input.disabled = true;
+    const sendBtn = csEl('cs-assistant-send');
+    if (sendBtn) sendBtn.disabled = true;
+
+    window._csAssistantMessages.push({ role: 'user', content: text });
+    _csAssistantRenderLog();
+    const log = csEl('cs-assistant-log');
+    if (log) log.insertAdjacentHTML('beforeend',
+        '<div id="cs-assistant-thinking" class="flex justify-start mb-3">' +
+        '<div class="rounded-2xl px-4 py-2.5 text-sm bg-white border border-slate-200 text-slate-400 shadow-sm">Thinking…</div></div>');
+    _csAssistantScrollToBottom();
+
+    try {
+        const res = await fetch('/api/sim-assistant/chat', {
+            method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ messages: window._csAssistantMessages }),
+        });
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.detail || ('HTTP ' + res.status));
+        window._csAssistantMessages.push({ role: 'assistant', content: data.answer || '(no answer)' });
+    } catch (e) {
+        console.error('csAssistantSend: chat failed', e);
+        window._csAssistantMessages.push({
+            role: 'assistant',
+            content: '⚠️ ' + ((e && e.message) ? e.message : String(e)),
+        });
+    } finally {
+        input.disabled = false;
+        if (sendBtn) sendBtn.disabled = false;
+        _csAssistantRenderLog();
+        input.focus();
+    }
+}
+
+async function csAssistantSubmitFeatureRequest() {
+    if (!window._csAssistantMessages.length) {
+        showToast('Chat with the assistant first, then submit.', 'error');
+        return;
+    }
+    const transcript = window._csAssistantMessages
+        .map(m => (m.role === 'user' ? 'User: ' : 'Assistant: ') + m.content)
+        .join('\n\n---\n\n');
+    const explanation = 'New simulation requested via the Simulation Build Assistant.\n\n' +
+        '=== CONVERSATION TRANSCRIPT ===\n\n' + transcript;
+    try {
+        const res = await fetch('/api/bug-report', {
+            method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                explanation, severity: 'medium', type: 'feature',
+                context: { currentView: 'Simulations', source: 'sim-assistant' },
+            }),
+        });
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.detail || ('HTTP ' + res.status));
+        showToast('Filed as a feature request — pending admin approval.', 'success');
+        window._csAssistantMessages.push({
+            role: 'assistant',
+            content: '✅ Filed as a feature request (id `' + (data.id || '?') +
+                '`). An admin needs to approve it in Setup → before it moves forward. ' +
+                'You can keep chatting to refine the spec, or start a new conversation.',
+        });
+        _csAssistantRenderLog();
+    } catch (e) {
+        console.error('csAssistantSubmitFeatureRequest: submit failed', e);
+        showToast('Could not file the request: ' + ((e && e.message) ? e.message : String(e)), 'error');
+    }
+}
+
+function csAssistantNewConversation() {
+    window._csAssistantMessages = [];
+    _csAssistantRenderLog();
+}
+
+async function csRenderAssistant() {
+    csSetToolbar('');
+    let available = false;
+    try {
+        const res = await fetch('/api/sim-assistant/available');
+        const data = await res.json();
+        available = !!(res.ok && data.available);
+    } catch (e) {
+        console.error('csRenderAssistant: availability check failed', e);
+    }
+    if (!available) {
+        csSet(csEmpty(
+            'The Simulation Build Assistant is unavailable — the AppBuilder (ab) LLM ' +
+            'agent is not connected.', 'Connect an ab agent to the hub to enable it.'));
+        return;
+    }
+    csSet(`
+        <div class="flex flex-col h-[calc(100vh-14rem)] max-w-3xl mx-auto">
+            <div class="flex items-center justify-between mb-3">
+                <div>
+                    <h2 class="text-lg font-bold text-slate-800">Simulation Build Assistant</h2>
+                    <p class="text-xs text-slate-500">Describe what you want to build, or ask to copy/vary an existing sim (e.g. "dns_fail" for one deployment) — I can look up the real source and ask for anything missing.</p>
+                </div>
+                <div class="flex gap-2">
+                    <button onclick="csAssistantNewConversation()"
+                        class="text-xs px-3 py-1.5 rounded-md border border-slate-300 text-slate-600 hover:bg-slate-50">
+                        New conversation
+                    </button>
+                    <button onclick="csAssistantSubmitFeatureRequest()"
+                        class="text-xs px-3 py-1.5 rounded-md bg-[#01A982] text-white font-semibold hover:bg-[#019172]">
+                        File as Feature Request
+                    </button>
+                </div>
+            </div>
+            <div id="cs-assistant-log" class="flex-1 overflow-y-auto rounded-lg border border-slate-200 bg-slate-50 p-4"></div>
+            <form id="cs-assistant-form" class="flex gap-2 mt-3" onsubmit="event.preventDefault(); csAssistantSend();">
+                <input id="cs-assistant-input" type="text" placeholder="e.g. I want a simulation that runs this script… or: copy dns_fail for the LRB deployment"
+                    class="flex-1 border border-slate-300 rounded-lg px-3 py-2 text-sm outline-none focus:border-[#01A982]">
+                <button id="cs-assistant-send" type="submit"
+                    class="bg-[#01A982] text-white rounded-lg px-4 py-2 text-sm font-semibold hover:bg-[#019172]">
+                    Send
+                </button>
+            </form>
+        </div>
+    `);
+    _csAssistantRenderLog();
+    const input = csEl('cs-assistant-input');
+    if (input) input.focus();
+}
+window.csRenderAssistant = csRenderAssistant;
+window.csAssistantSend = csAssistantSend;
+window.csAssistantSubmitFeatureRequest = csAssistantSubmitFeatureRequest;
+window.csAssistantNewConversation = csAssistantNewConversation;
 
 })();
