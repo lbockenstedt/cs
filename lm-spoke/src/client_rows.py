@@ -185,12 +185,6 @@ def build_client_rows(spoke, now: float | None = None
             # is_default_route per interface). [] until the client's first
             # heartbeat with this field lands. See sim_quota_engine._media_ok.
             "adapters": c.get("adapters") or [],
-            # Passive SSID sweep the client ran this beacon: the WiFi networks it
-            # currently sees + the count. Relayed so the hub can distinguish
-            # "associated but no IP" (sees SSIDs) from a dead radio (sees nothing
-            # → faulty card) rather than treating both as "never connected".
-            "visible_ssids": c.get("visible_ssids") or [],
-            "visible_ssid_count": c.get("visible_ssid_count") or 0,
             # Authoritative tier (t1/t2/t3) from the agent's per-VM passthrough
             # classification; csClassifyClient prefers this over has_usb.
             "tier": tier,

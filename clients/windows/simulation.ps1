@@ -137,20 +137,6 @@ function Send-Status {
                 $activeSimulations += $name
             }
         }
-        # Passive SSID sweep — what WiFi networks does this dongle currently see?
-        # Reported up so the hub can tell "associated but no IP" (sees SSIDs)
-        # from a dead radio (sees nothing → faulty card). netsh drives a scan on
-        # read. Deduped, non-empty, capped at 32.
-        $visibleSsids = @()
-        try {
-            foreach ($line in (netsh wlan show networks mode=bssid 2>$null)) {
-                if ($line -match '^\s*SSID\s+\d+\s*:\s*(.*)$') {
-                    $s = $matches[1].Trim()
-                    if ($s -and ($visibleSsids -notcontains $s)) { $visibleSsids += $s }
-                }
-            }
-        } catch { }
-        if ($visibleSsids.Count -gt 32) { $visibleSsids = @($visibleSsids[0..31]) }
         $clientStatus = 'ok'
         if ($script:dot1xTlsUnsupported) { $clientStatus = 'unsupported' }
 
@@ -166,8 +152,6 @@ function Send-Status {
             errors = @($script:statusErrors)
             adapters = @(Get-AdapterInventory)
             active_simulations = $activeSimulations
-            visible_ssids = @($visibleSsids)
-            visible_ssid_count = $visibleSsids.Count
             config = @{
                 sim_phy = [string]$script:sim_phy
                 dot1x_eap = [string]$script:dot1x_eap

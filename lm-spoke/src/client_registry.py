@@ -243,13 +243,7 @@ class ClientRegistry:
                         # per interface), self-reported live each heartbeat — lets the
                         # sim-quota engine keep media-tagged sims (assoc_fail etc.) off
                         # clients that lack a matching wired/wireless adapter.
-                        "adapters",
-                        # Passive SSID sweep the client runs each beacon: the
-                        # list of WiFi networks it currently sees + the count.
-                        # Lets the quarantine sweep tell "associated but no IP"
-                        # (sees SSIDs) apart from a dead radio (sees nothing →
-                        # faulty card) instead of treating both as "never connected".
-                        "visible_ssids", "visible_ssid_count"):
+                        "adapters"):
                 if key in payload:
                     entry[key] = payload[key]
 
