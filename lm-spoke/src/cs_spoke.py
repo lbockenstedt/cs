@@ -47,6 +47,7 @@ from local_store import LocalStore
 from central_poller import CentralPoller
 from mist_poller import MistPoller
 import client_api  # for client_api.push_pending (live command delivery to WS agents)
+from client_api import build_client_api_app
 
 try:
     from core.src.base_spoke import BaseSpoke
@@ -135,6 +136,12 @@ class CSSpoke(AgentCommandsMixin, SimCommandsMixin, ConfigCommandsMixin,
         # connected_agents / approve_pending_agent / send_to_agent (mirrors
         # ProxmoxSpoke(control_plane=...)). None when driven standalone.
         self.control_plane = None
+        # Role-hosted client API server handles (started by
+        # start_client_api_server when the generic agent hosts this module as a
+        # role; standalone CSControlPlane builds its own TLS-aware server).
+        self._api_server = None
+        self._api_task = None
+        self._api_app = None
         # Local Setup-tab config this spoke now owns itself instead of an LM
         # hub tenant store: auto-provisioning knobs (hub_config) + Aruba
         # Central credentials/sites (central_config/central_sites_config).
@@ -185,6 +192,78 @@ class CSSpoke(AgentCommandsMixin, SimCommandsMixin, ConfigCommandsMixin,
         role, so the relay runs identically in both deployment modes.
         """
         return [asyncio.create_task(self._cs_telemetry_relay_loop(websocket))]
+
+    # ── Process-scoped local services (both deployment modes) ────────────────
+    def start_background_loops(self) -> None:
+        """Start the always-on background loops this module owns.
+
+        This is the single source of truth for the module's local service loops
+        (demo TTL sweep, registry prune, stale-client reclone, cloud + on-prem
+        Central pollers, Mist poller, quota engine, GitHub repo sync). It is
+        invoked by BOTH the standalone ``CSControlPlane.run()`` AND the generic
+        multi-role agent's ``RoleConnection`` when simulation is hosted as a
+        role, so both deployment modes run identical local services.
+
+        Previously these ``.start()`` calls lived inline in ``CSControlPlane.run``
+        only, so a role-HOSTED simulation spoke ran NONE of them — no pollers, no
+        quota engine, and (paired with :meth:`start_client_api_server`) no way
+        for sim VMs to check in. Each loop's ``start()`` guards its own re-entry,
+        so a duplicate call is harmless. Must run inside a running event loop.
+        """
+        self.demo.start()
+        self.registry.start()
+        self.stale_client_reclone.start()
+        self.central_poller.start()
+        self.central_on_prem_poller.start()
+        self.mist_poller.start()
+        if getattr(self, "sim_quota_engine", None) is not None:
+            self.sim_quota_engine.start()
+        if getattr(self, "repo_sync", None) is not None:
+            self.repo_sync.start()
+
+    def start_client_api_server(self, host: Optional[str] = None,
+                                port: Optional[int] = None):
+        """Build + start the client check-in API (8080) as a long-lived task.
+
+        The sim VMs phone home to ``http://169.253.1.1:8080`` (``GET /api/config``
+        + ``POST /api/status``). Standalone, ``CSControlPlane.run()`` builds its
+        own TLS-aware server; this plain-HTTP starter is for the generic-agent
+        ROLE-HOSTED path (``RoleConnection.run()``), where nothing otherwise
+        opens 8080 and every sim VM shows "never checked in". Plaintext is the
+        correct default here — the sim segment is isolated and the linux/windows
+        agents hard-code ``http://169.253.1.1:8080``.
+
+        Binds ``CS_API_HOST``/``CS_API_PORT`` (defaults ``0.0.0.0``/``8080`` — the
+        same env the installer honours), so the listener lands on the DHCP NIC
+        (169.253.1.1). Returns the ``uvicorn.Server`` (also stored on
+        ``self._api_server``) so the caller can signal shutdown. Idempotent: a
+        second call while a server is already running is a no-op.
+        """
+        if getattr(self, "_api_server", None) is not None:
+            return self._api_server
+        import uvicorn
+        if host is None:
+            host = os.getenv("CS_API_HOST", "0.0.0.0") or "0.0.0.0"
+        if port is None:
+            _p = os.getenv("CS_API_PORT", "8080") or "8080"
+            port = 8080 if str(_p) == "8000" else int(_p)
+        app = build_client_api_app(self)
+        self._api_app = app
+        server = uvicorn.Server(uvicorn.Config(app, host=host, port=int(port),
+                                               log_config=None))
+        self._api_server = server
+        self._api_task = asyncio.create_task(server.serve())
+        logger.info("CS client API on http://%s:%s (role-hosted)", host, port)
+        return server
+
+    def stop_client_api_server(self) -> None:
+        """Signal the role-hosted client API server to exit (best-effort)."""
+        server = getattr(self, "_api_server", None)
+        if server is not None:
+            try:
+                server.should_exit = True
+            except Exception:  # noqa: BLE001
+                pass
 
     @staticmethod
     def _relay_content_sig(payload: Dict[str, Any]) -> Optional[str]:

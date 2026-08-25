@@ -415,44 +415,12 @@ class CSControlPlane(AgentHostingControlPlane):
             logger.info("CS agent listener enabled (cs-dialed agents accepted)")
         else:
             logger.info("CS agent listener disabled (relay-only; --no-agent-listener was passed)")
-        # Start the demo-scenario TTL expiry sweep (no-op without a loop).
-        cs_spoke.demo.start()
-        # Start the client registry's stale-client prune sweep (hourly; see
-        # client_registry.py ClientRegistry.start()/prune_stale) — previously
-        # nothing removed an individual stale client short of a full Purge.
-        cs_spoke.registry.start()
-        # Start the stale-client-reclone sweep (5 min; see
-        # stale_client_reclone.py) — a VM Proxmox reports running but whose
-        # sim client has stopped reporting to the API gets reclonded, a
-        # failure mode neither guest_watchdog (QGA-only) nor the dongle-
-        # health ladder (T2-only, and deliberately never escalates a
-        # no_gateway infra fault) ever covered.
-        cs_spoke.stale_client_reclone.start()
-        # Start the Aruba Central poll loop (see central_poller.py). Runs
-        # regardless of hub-connection — its output feeds both the local
-        # dashboard's Simulations tab AND (via the CSSpoke telemetry relay loop)
-        # the hub's Simulations tab when this spoke is hub-connected.
-        cs_spoke.central_poller.start()
-        # Start the Central On-Prem poll loop (twin of the cloud Central loop
-        # above — a second Aruba Central instance via the SAME ArubaClient, just
-        # a separate config/status slot). Same 5-min cadence; writes
-        # cs_spoke.central_on_prem_status in the central_status shape so the
-        # on-prem tab renders on-prem data independently of cloud Central.
-        cs_spoke.central_on_prem_poller.start()
-        # Start the Juniper Mist poll loop (twin of the Central loop above).
-        # Same 5-min cadence; writes cs_spoke.mist_status in the central_status
-        # shape so the hub/local Simulations tabs render Mist data identically.
-        cs_spoke.mist_poller.start()
-        # Start the SimQuotaEngine self-heal loop (reconciles client assignments
-        # against the hub-pushed effective_sim_quotas every 60s; an immediate
-        # reconcile also fires on each effective_sim_quotas push).
-        if getattr(cs_spoke, "sim_quota_engine", None) is not None:
-            cs_spoke.sim_quota_engine.start()
-        # Start the GitHub config-branch pull loop (repo_sync.py): periodically
-        # fetch + reset onto origin/<branch> when source=github + creds are set;
-        # no-op otherwise. Survives hub reconnects like the loops above.
-        if getattr(cs_spoke, "repo_sync", None) is not None:
-            cs_spoke.repo_sync.start()
+        # Start the always-on local service loops (demo TTL sweep, registry
+        # prune, stale-client reclone, cloud + on-prem Central pollers, Mist
+        # poller, quota engine, repo sync). Extracted onto the CSSpoke module so
+        # the generic-agent RoleConnection starts the IDENTICAL set when it hosts
+        # this module as a role — see CSSpoke.start_background_loops.
+        cs_spoke.start_background_loops()
         # Start the client API server as a long-lived task that SURVIVES hub
         # reconnects (NOT via _create_spoke_tasks, which the base class tears
         # down per-connection). Server.serve() is awaitable (vs blocking
