@@ -113,8 +113,8 @@ detect_adapter_inventory() {
     mac=$(awk '{print $3}' <<<"$line")
     [[ "$mac" =~ ^[0-9a-fA-F:]{17}$ ]] || mac=""
     case "$name" in
-      wlx*|wlan*|wlp*) media="wireless" ;;
-      enx*|enp*|eno*|eth*|ens*) media="wired" ;;
+      wl*) media="wireless" ;;   # any wl* (wlp PCI / wlx USB / wlan legacy / wlo onboard / wls slot) — align with detect_phy_type so an onboard wlo* radio isn't misfiled "other" and locked out of wireless-only sims
+      en*|eth*) media="wired" ;;
       *) media="other" ;;
     esac
     is_default=false
