@@ -546,11 +546,27 @@ report_status() {
   # spoke keep media-tagged sims (assoc_fail etc.) off clients that lack a
   # matching adapter. detect_adapter_inventory lives in common.sh.
   detect_adapter_inventory
+  # Passive SSID sweep — what WiFi networks does this dongle currently see?
+  # Reads NetworkManager's scan cache (non-disruptive; NM rescans on its own),
+  # reported up so the hub can tell "associated but no IP" (sees SSIDs) from a
+  # dead radio (sees nothing → faulty card). Deduped, non-empty, capped at 32.
+  local visible_ssids_json="[]" visible_ssid_count=0 _ssid_list
+  _ssid_list=$(nmcli -t -f SSID device wifi list 2>/dev/null | sed 's/\\:/:/g' | grep -v '^[[:space:]]*$' | sort -u | head -n 32)
+  if [[ -n "$_ssid_list" ]]; then
+    local _vjoined="" _s
+    while IFS= read -r _s; do
+      [[ -z "$_s" ]] && continue
+      [[ -n "$_vjoined" ]] && _vjoined+=","
+      _vjoined+="\"$(json_escape "$_s")\""
+      visible_ssid_count=$((visible_ssid_count + 1))
+    done <<< "$_ssid_list"
+    visible_ssids_json="[${_vjoined}]"
+  fi
   local payload
   printf -v payload \
-    '{"hostname":"%s","simulation_id":"%s","platform":"%s","iteration":%s,"connected_ssid":"%s","ip":"%s","gateway_reachable":%s,"dns_ceiling":%s,"active_simulations":[%s],"errors":%s,"adapters":%s,"config":{"kill_switch":"%s","dns_fail":"%s","dns_latency":"%s","iperf":"%s","www_traffic":"%s","download":"%s","ping_test":"%s","ssidpw_fail":"%s","auth_fail":"%s","mac_auth_fail":"%s","dhcp_fail":"%s","collab":"%s"}}' \
+    '{"hostname":"%s","simulation_id":"%s","platform":"%s","iteration":%s,"connected_ssid":"%s","ip":"%s","gateway_reachable":%s,"dns_ceiling":%s,"active_simulations":[%s],"errors":%s,"adapters":%s,"visible_ssids":%s,"visible_ssid_count":%s,"config":{"kill_switch":"%s","dns_fail":"%s","dns_latency":"%s","iperf":"%s","www_traffic":"%s","download":"%s","ping_test":"%s","ssidpw_fail":"%s","auth_fail":"%s","mac_auth_fail":"%s","dhcp_fail":"%s","collab":"%s"}}' \
     "$(json_escape "$hostname")" "$(json_escape "${simulation_id:-}")" "$(json_escape "$platform")" \
-    "$iteration" "$(json_escape "${connected_ssid:-}")" "$(json_escape "${sim_ip:-}")" "$gateway_json" "$dns_ceiling" "$active_simulations" "$errors_json" "$adapters_json" \
+    "$iteration" "$(json_escape "${connected_ssid:-}")" "$(json_escape "${sim_ip:-}")" "$gateway_json" "$dns_ceiling" "$active_simulations" "$errors_json" "$adapters_json" "$visible_ssids_json" "$visible_ssid_count" \
     "$(json_escape "${kill_switch:-off}")" "$(json_escape "${dns_fail:-off}")" "$(json_escape "${dns_latency:-off}")" "$(json_escape "${iperf:-off}")" \
     "$(json_escape "${www_traffic:-off}")" "$(json_escape "${download:-off}")" "$(json_escape "${ping_test:-off}")" \
     "$(json_escape "${ssidpw_fail:-off}")" "$(json_escape "${auth_fail:-off}")" "$(json_escape "${mac_auth_fail:-off}")" "$(json_escape "${dhcp_fail:-off}")" \

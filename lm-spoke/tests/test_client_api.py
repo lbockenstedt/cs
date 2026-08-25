@@ -174,6 +174,43 @@ def test_build_client_rows_no_ip_is_empty_not_missing(spoke):
         asyncio.set_event_loop(asyncio.new_event_loop())
 
 
+def test_apply_status_persists_visible_ssids(spoke):
+    """The client's passive SSID sweep (visible_ssids + count) must survive the
+    apply_status whitelist so the hub can later distinguish 'associated but no
+    IP' (sees SSIDs) from a dead radio (sees nothing → faulty card)."""
+    import asyncio
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    try:
+        entry = loop.run_until_complete(spoke.registry.apply_status("sim-scan", {
+            "hostname": "sim-scan", "platform": "linux", "iteration": 1,
+            "visible_ssids": ["corp", "guest", "iot"], "visible_ssid_count": 3,
+        }))
+        assert entry["visible_ssids"] == ["corp", "guest", "iot"]
+        assert entry["visible_ssid_count"] == 3
+        # A dead-radio beacon (empty sweep) must round-trip as an explicit 0,
+        # not a missing key, so downstream can treat it as "saw nothing".
+        entry2 = loop.run_until_complete(spoke.registry.apply_status("sim-dead", {
+            "hostname": "sim-dead", "platform": "linux", "iteration": 1,
+            "visible_ssids": [], "visible_ssid_count": 0,
+        }))
+        assert entry2["visible_ssids"] == []
+        assert entry2["visible_ssid_count"] == 0
+        # And the sweep must reach the HUB view (build_client_rows projection),
+        # not just the local registry.
+        from client_rows import build_client_rows
+        rows, _ = build_client_rows(spoke)
+        row = next(r for r in rows if r["hostname"] == "sim-scan")
+        assert row["visible_ssids"] == ["corp", "guest", "iot"]
+        assert row["visible_ssid_count"] == 3
+        dead = next(r for r in rows if r["hostname"] == "sim-dead")
+        assert dead["visible_ssids"] == []
+        assert dead["visible_ssid_count"] == 0
+    finally:
+        loop.close()
+        asyncio.set_event_loop(asyncio.new_event_loop())
+
+
 # ── config delivery ──────────────────────────────────────────────────────────
 def test_config_renders_host_bucket(client):
     # HUB mode (configs/simulation.conf has web_server=on, the canon this test
