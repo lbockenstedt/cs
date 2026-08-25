@@ -447,10 +447,23 @@ class SimQuotaEngine:
                 if (now - float(fs)) < grace:
                     continue  # within the grace window — give it time to connect
                 active = set(c.get("active_simulations") or [])
-                # A client running ONLY exclusion sims (no-IP is the point) is
-                # NOT a candidate; one running any non-exclusion sim (or none)
-                # should have connected → candidate.
-                if active and active.issubset(exclude):
+                # A configured-on exclusion sim explains the no-IP even before
+                # (or without) the client echoing it back in active_simulations —
+                # that field can be empty on an early beacon or lag a config push,
+                # and shedding a dongle whose no-IP is the POINT of a running
+                # dhcp_fail/assoc_fail/… is the false positive we're closing.
+                # ``config`` (per-sim on/off) is persisted on every heartbeat, so
+                # fold its on-flags for exclusion sims into the "intended" set.
+                cfg = c.get("config") or {}
+                cfg_excl_on = {s for s in exclude
+                               if str(cfg.get(s) or "").strip().lower() == "on"}
+                intended = active | cfg_excl_on
+                # A client whose intended sims are ALL exclusion sims (no-IP is
+                # the point) is NOT a candidate; one running any non-exclusion
+                # sim (or none, with no no-IP sim configured) should have
+                # connected → candidate. This only ever ADDS protection over the
+                # old ``active``-only check — it can never newly shed a client.
+                if intended and intended.issubset(exclude):
                     continue
                 vmid = name_to_vmid.get(hkey)
                 if not vmid:

@@ -93,12 +93,13 @@ class _Spoke:
 
 
 def _t2_client(host, *, ip="", ssid="", ever_connected=False, age=4000.0,
-               active_sims=None, vmid=100, bus="3-1"):
+               active_sims=None, config=None, vmid=100, bus="3-1"):
     return {
         "hostname": host, "tier": "t2", "has_usb": True,
         "ip": ip, "connected_ssid": ssid, "ever_connected": ever_connected,
         "first_seen": time.time() - age, "last_seen": time.time(),
         "active_simulations": active_sims or [],
+        "config": config or {},
     }
 
 
@@ -169,6 +170,36 @@ def test_exclusion_sim_not_shed(tmp_path):
     eng = _eng(spoke)
     _sweep(eng)
     assert spoke.control_plane.sent == []  # no-IP is the point of dhcp_fail
+
+
+def test_config_on_exclusion_sim_not_shed_when_active_empty(tmp_path):
+    """The false positive we're closing: a client running a no-IP failure sim
+    whose ``active_simulations`` is empty (early beacon / lagged config push)
+    must still be protected via the persisted ``config`` on-flag — no-IP is the
+    point of dhcp_fail, so it must NOT be shed just because the echo is missing."""
+    deploy = _Deploy({"kbell-01": 100}, {"hostA": [{"vmid": 100, "bus_path": "3-1"}]},
+                     {"kbell-01": "hostA"})
+    spoke = _Spoke({"kbell-01": _t2_client("kbell-01", age=4000,
+                                           active_sims=[],
+                                           config={"dhcp_fail": "on"})},
+                   deploy, csc={})
+    eng = _eng(spoke)
+    _sweep(eng)
+    assert spoke.control_plane.sent == []
+
+
+def test_config_on_traffic_sim_still_shed(tmp_path):
+    """A config-on flag for a NON-exclusion (traffic) sim does not explain a
+    missing IP — it should have connected — so the client is still a candidate."""
+    deploy = _Deploy({"kbell-01": 100}, {"hostA": [{"vmid": 100, "bus_path": "3-1"}]},
+                     {"kbell-01": "hostA"})
+    spoke = _Spoke({"kbell-01": _t2_client("kbell-01", age=4000,
+                                           active_sims=[],
+                                           config={"www_traffic": "on"})},
+                   deploy, csc={})
+    eng = _eng(spoke)
+    _sweep(eng)
+    assert len(spoke.control_plane.sent) == 1
 
 
 def test_non_exclusion_sim_is_shed(tmp_path):
