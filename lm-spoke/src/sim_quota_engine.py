@@ -87,15 +87,55 @@ except Exception:  # noqa: BLE001
 # onto a free eligible non-permanent bus. Storm guard: >20% per host failed
 # raises a bulk alarm (infrastructure, not dongles) and suppresses the shed.
 QT_GRACE_S_DEFAULT = 3600.0          # 1h after first heartbeat before "never connected"
+# The QT exclusion set is DERIVED from the "exclusive" list (SIM_META
+# ``multi_capable=False`` — a failure sim that monopolizes its client) rather
+# than maintained as a separate hand-curated tuple: an exclusive/failure sim is,
+# by design, the reason a client can't connect, so no-IP/no-SSID is expected and
+# must NOT trigger a shed. The one nuance is the DNS sims below.
+QT_EXCLUDE_NONISOLATING_SIMS = frozenset({
+    "dns_fail", "dns_latency",
+})                                   # exclusive/failure sims that STILL associate
+                                     # and get an IP (they only break/slow DNS
+                                     # *after* the client is online) — a client
+                                     # running one of these that never got an IP
+                                     # is a genuine bad-dongle case we DO want to
+                                     # shed, so they are NOT no-IP-by-design.
 QT_EXCLUDE_SIMS_DEFAULT = ("dhcp_fail", "assoc_fail", "ssidpw_fail",
                            "auth_fail", "mac_auth_fail",
-                           "port_flap")  # sims where no-IP is the point
+                           "port_flap")  # literal fallback == the derived set
+                                         # today (used only if SIM_META can't be
+                                         # imported); see _default_qt_exclude_sims
 QT_BULK_THRESHOLD = 0.20             # >20% per host failed → bulk alarm, no mass shed
 QT_BULK_MIN_HOST = 3                 # a host needs ≥3 T2 clients before the ratio
                                      # is meaningful — a 1-client host at "100%
                                      # failed" is a single bad dongle, not a bulk
                                      # event, and must still be shed.
 QT_ONLINE_S = 300.0                  # client seen within 5min counts as online
+
+
+def _default_qt_exclude_sims() -> set:
+    """The dongle-quarantine exclusion set when no operator override is set.
+
+    Linked to the "exclusive" list rather than hand-maintained: an EXCLUSIVE sim
+    (``SIM_META`` ``multi_capable=False`` — a failure sim that monopolizes its
+    client) is by design the reason the client can't connect, so its no-IP /
+    no-SSID outcome must never trigger a shed. The DNS sims
+    (``QT_EXCLUDE_NONISOLATING_SIMS``) are the one exception — they still
+    associate + get an IP, so a DNS-sim client that never got an IP is a genuine
+    bad dongle we DO want to shed. Falls back to the literal
+    ``QT_EXCLUDE_SIMS_DEFAULT`` if ``SIM_META`` can't be imported.
+    """
+    try:
+        from sim_quota import SIM_META
+        excl = {s for s, m in SIM_META.items()
+                if not bool((m or {}).get("multi_capable"))}
+        excl -= set(QT_EXCLUDE_NONISOLATING_SIMS)
+        if excl:
+            return excl
+    except Exception:  # noqa: BLE001
+        pass
+    return set(QT_EXCLUDE_SIMS_DEFAULT)
+
 
 
 def _quota_key(q: Dict[str, Any]) -> str:
@@ -395,10 +435,10 @@ class SimQuotaEngine:
         try:
             csc = self.spoke.local_store.get_central_sites_config() or {}
         except Exception:  # noqa: BLE001
-            return set(QT_EXCLUDE_SIMS_DEFAULT)
+            return _default_qt_exclude_sims()
         vals = csc.get("qt_exclude_sims")
         if not vals:
-            return set(QT_EXCLUDE_SIMS_DEFAULT)
+            return _default_qt_exclude_sims()
         return {str(s) for s in vals}
 
     def _quarantine_sweep(self, now: float) -> None:

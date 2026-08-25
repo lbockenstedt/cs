@@ -22,7 +22,9 @@ if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
 from sim_quota_engine import (SimQuotaEngine,  # noqa: E402
-                              QT_EXCLUDE_SIMS_DEFAULT, QT_GRACE_S_DEFAULT)
+                              QT_EXCLUDE_SIMS_DEFAULT, QT_GRACE_S_DEFAULT,
+                              QT_EXCLUDE_NONISOLATING_SIMS,
+                              _default_qt_exclude_sims)
 
 
 class _Reg:
@@ -273,3 +275,26 @@ def test_defaults_are_the_locked_decisions():
     assert set(QT_EXCLUDE_SIMS_DEFAULT) == {"dhcp_fail", "assoc_fail",
                                             "ssidpw_fail", "auth_fail",
                                             "mac_auth_fail", "port_flap"}
+
+def test_default_qt_exclude_derives_from_exclusive_list():
+    """The QT exclusion default is LINKED to the exclusive (multi_capable=False)
+    sims minus the DNS sims — not a separate hand-curated list. It must equal the
+    literal fallback today, and stay in lockstep with SIM_META going forward."""
+    from sim_quota import SIM_META
+    exclusive = {s for s, m in SIM_META.items()
+                 if not bool((m or {}).get("multi_capable"))}
+    derived = _default_qt_exclude_sims()
+    # Every derived sim is an exclusive/failure sim (the link), and none is a DNS
+    # sim (those still get an IP, so a no-IP DNS-sim client IS a bad dongle).
+    assert derived == exclusive - set(QT_EXCLUDE_NONISOLATING_SIMS)
+    assert derived == set(QT_EXCLUDE_SIMS_DEFAULT)          # identical today
+    assert "dns_fail" not in derived and "dns_latency" not in derived
+    assert "dhcp_fail" in derived                            # no-IP-by-design
+
+
+def test_engine_default_exclusion_used_when_no_override():
+    """With no csc ``qt_exclude_sims`` override the engine resolves to the derived
+    default (linked to the exclusive list), not an empty set."""
+    eng = SimQuotaEngine.__new__(SimQuotaEngine)
+    eng.spoke = type("S", (), {"local_store": _Store(csc={})})()
+    assert eng._qt_exclude_sims() == _default_qt_exclude_sims()
