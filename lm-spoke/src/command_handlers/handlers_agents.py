@@ -224,4 +224,63 @@ class AgentCommandsMixin:
             if aid and self.control_plane:
                 await self.control_plane.send_raw_to_agent(aid, "VNC_DISCONNECT", d)
             return {"status": "OK"}
+
+        # ── Host-shell (xterm terminal) relay — same routing as VNC ─────────
+        # PORT of ProxmoxSpoke.SHELL_START/IN/RESIZE/DISCONNECT. In the all-cs-
+        # hosted topology the pxmx agents dial THIS cs spoke, so — exactly like
+        # VNC above — the cs spoke must relay the host shell to them. Without
+        # this branch a request_response(cs_spoke, "SHELL_START") fell through to
+        # a generic error, surfaced by the hub as "agent refused SHELL_START",
+        # so VM Server → Terminal never opened. SHELL_START is sync (spawns the
+        # PTY); SHELL_IN/RESIZE/DISCONNECT are fire-and-forget (high-volume
+        # keystrokes must not block the dispatch loop). The agent emits
+        # SHELL_OUT/READY/ERROR/DISCONNECT up via AGENT_RELAY_UP.
+        if cmd == "SHELL_START":
+            if not hasattr(self, "shell_sessions"):
+                self.shell_sessions = {}
+            session_id = d.get("session_id") or ""
+            agent_id = d.get("agent_id") or d.get("target_agent_id")
+            if not agent_id and session_id:
+                agent_id = self.shell_sessions.get(session_id)
+            if not agent_id and self.control_plane:
+                node = str(d.get("node") or "")
+                uid = str(d.get("unique_id") or "")
+                cluster = uid.split("/")[0] if "/" in uid else ""
+                for aid, info in self.control_plane.connected_agents.items():
+                    hosts = {info.get("hostname"), info.get("cluster_name")}
+                    if (node and node in hosts) or (cluster and cluster in hosts):
+                        agent_id = aid
+                        break
+                if not agent_id and len(self.control_plane.connected_agents) == 1:
+                    agent_id = next(iter(self.control_plane.connected_agents))
+            if not agent_id:
+                return {"status": "ERROR", "message": "No agent resolved for SHELL_START"}
+            if session_id:
+                self.shell_sessions[session_id] = agent_id
+                # Phase 2: register the relay token so a co-located edge proxy
+                # can attach a /ws/console-relay leg for this shell session
+                # (mirrors ProxmoxSpoke.SHELL_START).
+                relay_token = d.get("relay_token")
+                if relay_token and hasattr(self.control_plane, "register_console_relay"):
+                    try:
+                        self.control_plane.register_console_relay(
+                            session_id, relay_token, agent_id, "shell")
+                    except Exception:  # noqa: BLE001
+                        pass
+            return await self.control_plane.send_to_agent(
+                "SHELL_START", d, agent_id=agent_id, timeout=20.0)
+
+        if cmd in ("SHELL_IN", "SHELL_RESIZE"):
+            aid = getattr(self, "shell_sessions", {}).get(d.get("session_id") or "")
+            if aid and self.control_plane:
+                await self.control_plane.send_raw_to_agent(aid, cmd, d)
+            return {"status": "OK"}
+
+        if cmd == "SHELL_DISCONNECT":
+            aid = getattr(self, "shell_sessions", {}).pop(d.get("session_id") or "", None)
+            if self.control_plane and hasattr(self.control_plane, "unregister_console_relay"):
+                self.control_plane.unregister_console_relay(d.get("session_id") or "")
+            if aid and self.control_plane:
+                await self.control_plane.send_raw_to_agent(aid, "SHELL_DISCONNECT", d)
+            return {"status": "OK"}
         return None
