@@ -48,13 +48,17 @@ class _Store:
 
 class _Deploy:
     """Richer fake: name→vmid + per-host usb_state (vmid→bus) + name→host."""
-    def __init__(self, name_to_vmid, host_usb_state, name_to_host):
+    def __init__(self, name_to_vmid, host_usb_state, name_to_host, vm_health=None):
         self._n2v = name_to_vmid
         self._host_usb = host_usb_state  # {host: [{vmid,bus_path}, ...]}
         self._n2h = name_to_host
+        self._vm_health = vm_health or {}  # {vmid: 'no_scan'|'no_assoc'|...}
         self.proxmox_states = {
             host: {"usb_state": entries} for host, entries in host_usb_state.items()
         }
+
+    def vm_health_index(self):
+        return {str(k): v for k, v in self._vm_health.items() if v}
 
     def usb_vmid_index(self):
         usb_vmids = set()
@@ -298,3 +302,41 @@ def test_engine_default_exclusion_used_when_no_override():
     eng = SimQuotaEngine.__new__(SimQuotaEngine)
     eng.spoke = type("S", (), {"local_store": _Store(csc={})})()
     assert eng._qt_exclude_sims() == _default_qt_exclude_sims()
+
+
+def test_no_scan_dongle_shed_even_when_running_only_exclusion_sim():
+    """Dead-radio override (Rule 1): a T2 whose radio sees NO SSIDs (agent
+    health ``no_scan``) is shed even though it runs ONLY dhcp_fail (an exclusion
+    sim) — a dongle that can't see any SSID is a hardware fault, not the sim's
+    intended no-IP."""
+    deploy = _Deploy({"kbell-01": 100},
+                     {"hostA": [{"vmid": 100, "bus_path": "3-1"}]},
+                     {"kbell-01": "hostA"},
+                     vm_health={100: "no_scan"})
+    spoke = _Spoke(
+        {"kbell-01": _t2_client("kbell-01", age=4000,
+                                active_sims=["dhcp_fail"],
+                                config={"dhcp_fail": "on"})},
+        deploy, csc={})
+    eng = _eng(spoke)
+    _sweep(eng)
+    assert len(spoke.control_plane.sent) == 1
+    assert spoke.control_plane.sent[0]["data"]["action"] == "quarantine_dongle_and_destroy"
+
+
+def test_exclusion_sim_dongle_that_sees_ssids_not_shed():
+    """The dead-radio override is scoped to no_scan/radio_dead only: a dhcp_fail
+    dongle that DOES see SSIDs (health ``no_assoc`` — sees APs, not associated)
+    is still protected (its no-IP is the point)."""
+    deploy = _Deploy({"kbell-01": 100},
+                     {"hostA": [{"vmid": 100, "bus_path": "3-1"}]},
+                     {"kbell-01": "hostA"},
+                     vm_health={100: "no_assoc"})
+    spoke = _Spoke(
+        {"kbell-01": _t2_client("kbell-01", age=4000,
+                                active_sims=["dhcp_fail"],
+                                config={"dhcp_fail": "on"})},
+        deploy, csc={})
+    eng = _eng(spoke)
+    _sweep(eng)
+    assert spoke.control_plane.sent == []

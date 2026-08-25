@@ -443,11 +443,17 @@ class SimQuotaEngine:
 
     def _quarantine_sweep(self, now: float) -> None:
         """Detect T2 clients that never connected (no SSID / no IP) past the
-        grace window and aren't running an exclusion sim; shed them (QT bus +
-        destroy VM) unless the per-host storm guard trips (>20% failed → bulk
-        alarm, no mass shed). Synchronous analysis; dispatches are fired as
-        background tasks (``_qt_shed``) so a slow agent doesn't stall the sweep.
-        Never raises — populates ``self._qt_telemetry`` for the hub alarm engine.
+        grace window and shed them (QT bus + destroy VM), unless the per-host
+        storm guard trips (>20% failed → bulk alarm, no mass shed). Two shed
+        triggers: (1) a dongle running any non-exclusion sim (or none) that never
+        got an IP; (2) a dongle whose radio sees NO SSIDs at all (agent health
+        ``no_scan``/``radio_dead``) — a dead card — even if it's running only
+        exclusion sims, since even a failure sim must first see + associate to an
+        SSID. A dongle running ONLY exclusion sims that DOES see SSIDs is left
+        alone (its no-IP is the point). Synchronous analysis; dispatches are
+        fired as background tasks (``_qt_shed``) so a slow agent doesn't stall
+        the sweep. Never raises — populates ``self._qt_telemetry`` for the hub
+        alarm engine.
         """
         try:
             deploy = getattr(self.spoke, "deploy", None)
@@ -462,6 +468,17 @@ class SimQuotaEngine:
                 grace = QT_GRACE_S_DEFAULT
             _, name_to_vmid = deploy.usb_vmid_index()
             host_vm_bus = self._host_vm_bus_index(deploy)
+            # Per-VM in-guest health from the pxmx agent's QGA probe (already
+            # streak-debounced agent-side). ``no_scan``/``radio_dead`` mean the
+            # netdev is up but the radio sees NO APs at all → a dead card, not a
+            # sim's intended no-IP. We fetch it so a no-SSID dongle is shed even
+            # when it's running only exclusion sims (see below). Defensive: an
+            # older deploy without the index just yields no health signal.
+            try:
+                _hidx = getattr(deploy, "vm_health_index", None)
+                health_by_vmid = _hidx() if callable(_hidx) else {}
+            except Exception:  # noqa: BLE001
+                health_by_vmid = {}
             per_host_total: Dict[str, int] = {}
             per_host_failed: Dict[str, int] = {}
             per_bus_fail: Dict[str, int] = {}
@@ -498,15 +515,24 @@ class SimQuotaEngine:
                 cfg_excl_on = {s for s in exclude
                                if str(cfg.get(s) or "").strip().lower() == "on"}
                 intended = active | cfg_excl_on
-                # A client whose intended sims are ALL exclusion sims (no-IP is
-                # the point) is NOT a candidate; one running any non-exclusion
-                # sim (or none, with no no-IP sim configured) should have
-                # connected → candidate. This only ever ADDS protection over the
-                # old ``active``-only check — it can never newly shed a client.
-                if intended and intended.issubset(exclude):
-                    continue
                 vmid = name_to_vmid.get(hkey)
                 if not vmid:
+                    continue
+                # Dead-radio override: a dongle whose radio sees NO SSIDs at all
+                # (agent health ``no_scan``/``radio_dead``) is a hardware fault,
+                # not a sim doing its job — even a failure sim needs to SEE and
+                # associate to an SSID (assoc/auth/ssidpw sims fail the handshake
+                # AFTER the scan; dhcp_fail associates fine). So a no-SSID dongle
+                # is shed even when running only exclusion sims.
+                radio_dead = str(health_by_vmid.get(str(vmid)) or "").lower() \
+                    in ("no_scan", "radio_dead")
+                # Otherwise a client whose intended sims are ALL exclusion sims
+                # (no-IP is the point) is NOT a candidate; one running any
+                # non-exclusion sim (or none, with no no-IP sim configured)
+                # should have connected → candidate. This only ever ADDS
+                # protection over the old ``active``-only check — it can never
+                # newly shed a client.
+                if not radio_dead and intended and intended.issubset(exclude):
                     continue
                 bus = (host_vm_bus.get(host) or {}).get(str(vmid))
                 if host:
