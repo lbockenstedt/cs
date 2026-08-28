@@ -1,3 +1,8 @@
+---
+summary: "On boot, three GNOME terminal windows are launched via .desktop files in ~/.config/autostart/ (deployed by update.sh)."
+keywords: [adjust, adjustments, applet, calculation, cs, dashboard, deployment, layout, terminal, window]
+---
+
 # Terminal Layout Reference
 
 ## Overview

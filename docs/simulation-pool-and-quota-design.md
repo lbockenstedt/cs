@@ -1,3 +1,8 @@
+---
+summary: "Authoritative design spec for the client-sim pool and quota engine: how simulation slots are allocated, capped, and tracked across the fleet."
+keywords: [ambient_pct, capacity, connect_1x, cs, design, dhcp_fail, dns_fail, download, iperf, pool, quota, simulation, slots, web_server]
+---
+
 # Simulation Pool & Quota Engine — Design Spec
 
 Status: **implemented** (the model below is live in `lm-spoke` SimQuotaEngine +

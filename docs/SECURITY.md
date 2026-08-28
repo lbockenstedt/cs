@@ -1,3 +1,8 @@
+---
+summary: "Security policy for the client-sim repo: supported versions, how to report a vulnerability, secure configuration, and known security considerations."
+keywords: [access, cs, dependencies, disclosure, dns_latency, download, incident, iperf, security, sim_user]
+---
+
 # Security Policy
 
 **Last Updated**: March 19, 2026  

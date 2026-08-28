@@ -1,3 +1,8 @@
+---
+summary: "Read this before touching any high-traffic client sim (DNS flood, iperf, download, collab) or reasoning about why sim clients 'go offline.' It explains the hardware…"
+keywords: [clients, collab, cs, dashboard, disconnect, dns_fail, dongle, dropped, offline, recover, sim, t2, throttle, usb]
+---
+
 # T2 USB-Dongle Fleet — Throttle-and-Recover Design
 
 **Read this before touching any high-traffic client sim (DNS flood, iperf,
