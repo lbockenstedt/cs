@@ -1,3 +1,9 @@
+---
+summary: "Historical scope (2026-07): This changelog covers the legacy webui-spoke / standalone client-sim era (the installers/install-lxc.sh + proxmox/install-proxmox-agent.sh…"
+status: historical
+keywords: [apt_update, client, cs, dashboard, dns_fail, download, iperf, sim, simulation_id, sys_mon]
+---
+
 # Changelog
 
 > **Historical scope (2026-07):** This changelog covers the **legacy

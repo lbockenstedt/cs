@@ -1,3 +1,9 @@
+---
+summary: "Point-in-time Debian-readiness analysis of the legacy clients/linux simulation scripts: issues found and recommended fixes, some since shipped."
+status: historical
+keywords: [apt_update, compatibility, compatible, cs, debian, debian_name, install_package, log_file, sys_mon, terminal_cmd]
+---
+
 # Debian Linux Compatibility Analysis
 
 > **Status note (2026-07):** This is a point-in-time compatibility analysis of

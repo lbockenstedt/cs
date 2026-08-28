@@ -1,3 +1,9 @@
+---
+summary: "Historical note (2026-07): This document captures the pre-reset standalone client-sim scripts era and its MAJOR.MINOR per-script versioning scheme."
+status: historical
+keywords: [apt_update, client, cs, dashboard, dns_fail, download, iperf, scripts, sim, sys_mon]
+---
+
 # Version Management
 
 > **Historical note (2026-07):** This document captures the **pre-reset
