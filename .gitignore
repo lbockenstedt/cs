@@ -25,3 +25,8 @@ sim_quota_ledger.json
 
 # LM agent worktrees (never track)
 .claude/worktrees/
+
+# mTLS material and runtime secrets issued by the hub — never commit these
+certs/
+.env.lock
+*.crt
