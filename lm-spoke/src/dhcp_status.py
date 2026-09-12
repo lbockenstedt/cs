@@ -14,7 +14,7 @@ rather than killing the relay loop. It only reads world-readable files
 (``/etc/kea/kea-dhcp4-sim.conf``, ``/etc/network/interfaces.d/<iface>.conf``,
 the Kea memfile lease CSV) and runs the non-privileged ``systemctl is-active
 kea-dhcp4-sim``, so it works under the ``svc_lm`` service user. It deliberately
-does NOT call the ctrl-agent (:8002) HTTP RPC in this hot path — the memfile CSV
+does NOT call the ctrl-agent (:8102) HTTP RPC in this hot path — the memfile CSV
 read is far cheaper. Mirrors the subprocess idiom in
 ``simulation_engine._find_iface`` and the status shape of the sibling
 ``lm/dhcp`` Kea spoke's ``KeaManager.status()``.
