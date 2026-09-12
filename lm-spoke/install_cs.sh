@@ -251,7 +251,7 @@ step() { echo -e "\n${GRN}━━  $*  ━━${NC}"; }
 # Distinct-from-the-dhcp-module names so both Kea instances coexist on one box:
 #   config  /etc/kea/kea-dhcp4-sim.conf + /etc/kea/kea-ctrl-agent-sim.conf
 #   units   kea-dhcp4-sim.service + kea-ctrl-agent-sim.service
-#   socket  /run/kea/kea4-ctrl-socket-sim   ctrl-agent http-port 8002 (dhcp=8001)
+#   socket  /run/kea/kea4-ctrl-socket-sim   ctrl-agent http-port 8102 (dhcp=8001)
 #   leases  /var/lib/kea/kea-leases4-sim.csv
 disable_apparmor() {
     # Turn AppArmor OFF on this spoke.
@@ -680,7 +680,7 @@ SYSCTL
 EOF
         ok "kea-dhcp4-sim config written (169.253.1.0/24, no default gateway advertised)"
 
-        # ── cs kea-ctrl-agent config — loopback only, port 8002 (the dhcp module
+        # ── cs kea-ctrl-agent config — loopback only, port 8102 (the dhcp module
         #    uses 8001), control socket pointing at the -sim dhcp4 socket, no
         #    auth. Optional/nice-to-have: lets tooling read leases/health via the
         #    ctrl-agent RPC; dhcp_status reads the memfile CSV directly instead.
@@ -689,7 +689,7 @@ EOF
 {
   "Control-agent": {
     "http-host": "127.0.0.1",
-    "http-port": 8002,
+    "http-port": 8102,
     "control-sockets": {
       "dhcp4": {
         "socket-type": "unix",
@@ -706,7 +706,7 @@ EOF
   }
 }
 EOF
-        ok "kea-ctrl-agent-sim config written (127.0.0.1:8002 → -sim socket)"
+        ok "kea-ctrl-agent-sim config written (127.0.0.1:8102 → -sim socket)"
 
         # The spoke runs as $SVC_USER (non-root) and reads the sim Kea config +
         # lease CSV every 10s for the Simulations "DHCP Server" card
@@ -770,7 +770,7 @@ EOF
 
         cat > /etc/systemd/system/kea-ctrl-agent-sim.service <<EOF
 [Unit]
-Description=CS sim-client Kea Control Agent (127.0.0.1:8002)
+Description=CS sim-client Kea Control Agent (127.0.0.1:8102)
 After=network.target kea-dhcp4-sim.service
 Wants=kea-dhcp4-sim.service
 
@@ -793,7 +793,7 @@ EOF
         # kea-dhcp4-server.service / kea-ctrl-agent.service — those are the
         # lm/dhcp module's. On a fresh install the packages may auto-enable the
         # defaults; leave them to the dhcp module (they bind :8001 / their own
-        # socket and don't clash with the -sim instance's :8002 / -sim socket).
+        # socket and don't clash with the -sim instance's :8102 / -sim socket).
         systemctl enable --now kea-dhcp4-sim kea-ctrl-agent-sim >/dev/null 2>&1 || true
         systemctl restart kea-dhcp4-sim kea-ctrl-agent-sim >/dev/null 2>&1 || true
 
@@ -2006,7 +2006,7 @@ echo "                full installer re-run; a box that only git-pulled the new"
 echo "                spoke code must be re-installed once to enable rollback."
 if [[ -n "${DHCP_IFACE:-}" && "$DHCP_SKIP" != "1" ]]; then
     if systemctl is-active --quiet kea-dhcp4-sim 2>/dev/null; then
-        echo "  DHCP:          cs-owned Kea (kea-dhcp4-sim) RUNNING on ${DHCP_IFACE} (${DHCP_RANGE_START}–${DHCP_RANGE_END}); ctrl-agent :8002"
+        echo "  DHCP:          cs-owned Kea (kea-dhcp4-sim) RUNNING on ${DHCP_IFACE} (${DHCP_RANGE_START}–${DHCP_RANGE_END}); ctrl-agent :8102"
     else
         echo "  DHCP:          ${DHCP_IFACE} configured — kea-dhcp4-sim NOT RUNNING (journalctl -u kea-dhcp4-sim)"
     fi
