@@ -11201,25 +11201,25 @@ async function _csUsbClearCmd(host, action, doneMsg, allSpokes) {
             const countPart = (r.spokes_total != null)
                 ? `Cleared ${nLive}/${r.spokes_total} spoke(s)${queuePart} — failed: `
                 : `Cleared ${nLive} spoke(s)${queuePart} — failed: `;
-            showToast(`${doneMsg}. ${countPart}${bad.join('; ')}`, 'error');
+            if (typeof showToast === 'function') showToast(`${doneMsg}. ${countPart}${bad.join('; ')}`, 'error');
             return;
         }
 
         if (isQueued) {
             const countPart = (r.spokes_total != null) ? `live on ${nLive}/${r.spokes_total} spoke(s)` : `live on ${nLive} spoke(s)`;
-            showToast(`${doneMsg}. Cleared ${countPart}; queued for ${nQ} unreachable spoke(s) (applies when they reconnect)${qDetail}`, 'warning');
+            if (typeof showToast === 'function') showToast(`${doneMsg}. Cleared ${countPart}; queued for ${nQ} unreachable spoke(s) (applies when they reconnect)${qDetail}`, 'warning');
             return;
         }
 
         if (allSpokes && nLive === 0 && (r.spokes_total || 0) > 0) {
-            showToast(`${doneMsg}. No spokes were reachable (0/${r.spokes_total} cleared).`, 'warning');
+            if (typeof showToast === 'function') showToast(`${doneMsg}. No spokes were reachable (0/${r.spokes_total} cleared).`, 'warning');
             return;
         }
 
         const countText = (r.spokes_total != null)
             ? ` Cleared live on ${nLive}/${r.spokes_total} spoke(s).`
             : (r.pushed_to_spokes != null ? ` Pushed to ${nLive} spoke(s).` : '');
-        showToast(`${doneMsg}.${countText}`, 'success');
+        if (typeof showToast === 'function') showToast(`${doneMsg}.${countText}`, 'success');
     } catch (e) {
         console.error(`_csUsbClearCmd: ${action} failed`, e);
         if (typeof showToast === 'function') showToast(`Clear failed: ${e.message || e}`, 'error');
