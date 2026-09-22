@@ -11190,7 +11190,7 @@ async function _csUsbClearCmd(host, action, doneMsg, allSpokes) {
         const nLive = r.pushed_to_spokes || 0;
         const nTotal = r.spokes_total != null ? r.spokes_total : (allSpokes ? 0 : 1);
         const queuedNames = Array.isArray(r.queued) ? r.queued : [];
-        const isQueued = (r.queued_to_spokes > 0) || (r.queued === true);
+        const isQueued = (r.queued_to_spokes > 0) || (r.queued === true) || (queuedNames.length > 0);
         const nQ = r.queued_to_spokes || queuedNames.length || (isQueued ? 1 : 0);
 
         if (bad.length > 0) {
