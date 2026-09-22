@@ -283,4 +283,54 @@ class AgentCommandsMixin:
             if aid and self.control_plane:
                 await self.control_plane.send_raw_to_agent(aid, "SHELL_DISCONNECT", d)
             return {"status": "OK"}
+
+        # ── Drive health / ssacli install relay (split topology) ────────────
+        # PORT of ProxmoxSpoke's PXMX_DRIVE_HEALTH / PXMX_INSTALL_SSACLI
+        # branches (proxmox_spoke.py:340-374). In the all-cs-hosted topology
+        # the pxmx host agents dial THIS cs spoke, so the hub's drive-health
+        # route (which already treats "simulation" spokes as valid hypervisor
+        # targets — see hub_spoke_registry.get_hypervisor_spokes_for_tenant)
+        # sends the raw command here. Without this branch it fell through to
+        # the generic "Unknown command: PXMX_DRIVE_HEALTH" error, so the CS-
+        # hosted nodes' Drive Health panel showed "Agent vunknown" / 0 drives
+        # even though the SAME pxmx agent binary (with drive-health support)
+        # is running on those boxes. Node resolution mirrors VNC_START/
+        # SHELL_START above: explicit agent_id first, else match "node" (or
+        # unique_id's cluster prefix) against a connected agent's
+        # hostname/cluster_name, else fall back to the sole connected agent.
+        if cmd in ("PXMX_DRIVE_HEALTH", "PXMX_INSTALL_SSACLI"):
+            if not self.control_plane:
+                return {"status": "ERROR", "message": "not connected to a control plane"}
+            agent_id = d.get("agent_id") or d.get("target_agent_id")
+            if not agent_id:
+                node = str(d.get("node") or "")
+                uid = str(d.get("unique_id") or "")
+                cluster = uid.split("/")[0] if "/" in uid else ""
+                for aid, info in self.control_plane.connected_agents.items():
+                    hosts = {info.get("hostname"), info.get("cluster_name")}
+                    if (node and node in hosts) or (cluster and cluster in hosts):
+                        agent_id = aid
+                        break
+                if not agent_id and len(self.control_plane.connected_agents) == 1:
+                    agent_id = next(iter(self.control_plane.connected_agents))
+            if not agent_id:
+                return {"status": "ERROR", "message": "No agent resolved for node"}
+            cluster_name = (self.control_plane.connected_agents or {}).get(
+                agent_id, {}).get("cluster_name", agent_id)
+            fallback = ({"drives": []} if cmd == "PXMX_DRIVE_HEALTH"
+                        else {"installed": False})
+            timeout = 30.0 if cmd == "PXMX_DRIVE_HEALTH" else 120.0
+            try:
+                r = await self.control_plane.send_to_agent(
+                    cmd, {}, agent_id=agent_id, timeout=timeout)
+                result = (r.get("payload", {}).get("data", r)
+                          if isinstance(r, dict) else r)
+                if isinstance(result, dict):
+                    result["cluster"] = cluster_name
+                return result
+            except Exception as exc:  # noqa: BLE001 - one agent's failure must not raise
+                logger.debug("%s agent %s failed: %s", cmd, agent_id, exc)
+                return {"status": "ERROR", "message": str(exc),
+                        "cluster": cluster_name, **fallback}
+
         return None
