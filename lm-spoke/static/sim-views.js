@@ -11191,7 +11191,7 @@ async function _csUsbClearCmd(host, action, doneMsg, allSpokes) {
         }
 
         const bad = (r.errors || []).concat(r.refusals || []);
-        const nLive = r.pushed_to_spokes || 0;
+        const nLive = (r.pushed_to_spokes != null) ? r.pushed_to_spokes : null;
         const queuedNames = Array.isArray(r.queued) ? r.queued : [];
         const isQueued = (r.queued_to_spokes > 0) || (r.queued === true) || (queuedNames.length > 0);
         const nQ = r.queued_to_spokes || queuedNames.length || (isQueued ? 1 : 0);
@@ -11200,15 +11200,18 @@ async function _csUsbClearCmd(host, action, doneMsg, allSpokes) {
 
         if (bad.length > 0) {
             const countPart = (r.spokes_total != null)
-                ? `Cleared ${nLive}/${r.spokes_total} spoke(s)${queuePart} — failed: `
-                : `Cleared ${nLive} spoke(s)${queuePart} — failed: `;
+                ? `Cleared ${nLive != null ? nLive : 0}/${r.spokes_total} spoke(s)${queuePart} — failed: `
+                : (nLive != null ? `Cleared ${nLive} spoke(s)${queuePart} — failed: ` : '');
             _toast(`${doneMsg}. ${countPart}${bad.join('; ')}`, 'error');
             return;
         }
 
         if (isQueued) {
-            const countPart = (r.spokes_total != null) ? `live on ${nLive}/${r.spokes_total} spoke(s)` : `live on ${nLive} spoke(s)`;
-            _toast(`${doneMsg}. Cleared ${countPart}; queued for ${nQ} unreachable spoke(s) (applies when they reconnect)${qDetail}`, 'warning');
+            const countPart = (r.spokes_total != null)
+                ? `live on ${nLive != null ? nLive : 0}/${r.spokes_total} spoke(s)`
+                : (nLive != null ? `live on ${nLive} spoke(s)` : '');
+            const clearedPrefix = countPart ? `Cleared ${countPart}; ` : '';
+            _toast(`${doneMsg}. ${clearedPrefix}queued for ${nQ} unreachable spoke(s) (applies when they reconnect)${qDetail}`, 'warning');
             return;
         }
 
@@ -11219,8 +11222,8 @@ async function _csUsbClearCmd(host, action, doneMsg, allSpokes) {
         }
 
         const countText = (r.spokes_total != null)
-            ? ` Cleared live on ${nLive}/${r.spokes_total} spoke(s).`
-            : (r.pushed_to_spokes != null ? ` Pushed to ${nLive} spoke(s).` : '');
+            ? ` Cleared live on ${nLive != null ? nLive : 0}/${r.spokes_total} spoke(s).`
+            : (nLive != null ? ` Pushed to ${nLive} spoke(s).` : '');
         _toast(`${doneMsg}.${countText}`, 'success');
     } catch (e) {
         console.error(`_csUsbClearCmd: ${action} failed`, e);
