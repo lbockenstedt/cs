@@ -11186,7 +11186,7 @@ async function _csUsbClearCmd(host, action, doneMsg, allSpokes) {
         const r = await csFetch(`/${csTenant()}/proxmx/command?tenant_id=${csTenant()}`, {
             method: 'POST', body: JSON.stringify(body) });
         if (!r) {
-            _toast('Clear failed: no response received from server', 'error');
+            _toast(`${doneMsg}. Clear failed: no response received from server`, 'error');
             return;
         }
 
@@ -11201,7 +11201,7 @@ async function _csUsbClearCmd(host, action, doneMsg, allSpokes) {
         if (bad.length > 0) {
             const countPart = (r.spokes_total != null)
                 ? `Cleared ${nLive != null ? nLive : 0}/${r.spokes_total} spoke(s)${queuePart} — failed: `
-                : (nLive != null ? `Cleared ${nLive} spoke(s)${queuePart} — failed: ` : '');
+                : (nLive != null ? `Cleared ${nLive} spoke(s)${queuePart} — failed: ` : (queuePart ? `Cleared 0 spoke(s)${queuePart} — failed: ` : ''));
             _toast(`${doneMsg}. ${countPart}${bad.join('; ')}`, 'error');
             return;
         }
@@ -11215,7 +11215,7 @@ async function _csUsbClearCmd(host, action, doneMsg, allSpokes) {
             return;
         }
 
-        if (nLive === 0 && (r.spokes_total != null ? r.spokes_total > 0 : allSpokes)) {
+        if (r.spokes_total === 0 || nLive === 0) {
             const denom = r.spokes_total != null ? `0/${r.spokes_total}` : '0';
             _toast(`${doneMsg}. No spokes were reachable (${denom} cleared).`, 'warning');
             return;
@@ -11227,7 +11227,7 @@ async function _csUsbClearCmd(host, action, doneMsg, allSpokes) {
         _toast(`${doneMsg}.${countText}`, 'success');
     } catch (e) {
         console.error(`_csUsbClearCmd: ${action} failed`, e);
-        _toast(`Clear failed: ${e.message || e}`, 'error');
+        _toast(`${doneMsg}. Clear failed: ${e.message || e}`, 'error');
     }
 }
 // Purge the missing-dongle HISTORY (presence roster + boot baseline) on every
