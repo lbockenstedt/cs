@@ -18,6 +18,8 @@ logger = logging.getLogger("CSSpoke")
 
 
 class SimCommandsMixin:
+    """Mixin handling simulation profile switching, kill switches, and demo scenarios."""
+
     async def _dispatch_sim(self, cmd: str, d: Dict[str, Any]) -> Optional[Dict[str, Any]]:
 
         # ── simulation execution ────────────────────────────────────────────

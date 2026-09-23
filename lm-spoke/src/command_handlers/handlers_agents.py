@@ -42,6 +42,8 @@ def _deep_merge_cfg(base, incoming):
 
 
 class AgentCommandsMixin:
+    """Mixin handling agent relay, host configuration, VNC, and shell commands."""
+
     async def _dispatch_agents(self, cmd: str, d: Dict[str, Any]) -> Optional[Dict[str, Any]]:
 
         # ── agent hosting (cs-dialed pxmx agents, split topology) ───────────
