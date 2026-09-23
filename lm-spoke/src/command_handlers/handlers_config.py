@@ -22,6 +22,8 @@ logger = logging.getLogger("CSSpoke")
 
 
 class ConfigCommandsMixin:
+    """Mixin handling cloud poller settings, hub configuration, and quota controls."""
+
     async def _dispatch_config(self, cmd: str, d: Dict[str, Any]) -> Optional[Dict[str, Any]]:
 
         # ── repo / update status (Setup → Diagnostics → API Server) ──────────
