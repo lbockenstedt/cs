@@ -20,6 +20,8 @@ logger = logging.getLogger("CSSpoke")
 
 
 class IngestCommandsMixin:
+    """Mixin handling telemetry ingestion, progress tracking, and command queueing."""
+
     async def _dispatch_ingest(self, cmd: str, d: Dict[str, Any]) -> Optional[Dict[str, Any]]:
 
         # ── Client-Simulation ingest (unified pxmx agent → hub → here) ───────
