@@ -17,6 +17,8 @@ logger = logging.getLogger("CSSpoke")
 
 
 class ClientCommandsMixin:
+    """Mixin handling client configuration overrides and purge operations."""
+
     async def _dispatch_clients(self, cmd: str, d: Dict[str, Any]) -> Optional[Dict[str, Any]]:
 
         # ── per-client override control panel (hub/UI → registry overrides) ──

@@ -96,6 +96,7 @@ class CSControlPlane(AgentHostingControlPlane):
     AGENT_FALLBACK_PORT = 8767
 
     def get_service_name(self) -> str:
+        """Return systemd service unit name for the spoke process."""
         return "lm-cs"
 
     def __init__(self, spoke_id: str, secret: str, hub_secret: str = None,

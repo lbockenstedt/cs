@@ -117,6 +117,14 @@ Implementation: `local_ui_routes.py` answers the same `/sim/api/*` REST contract
 
 **Use the kill switch (emergency stop).** Simulations → **Clients** → the banner at the top: **"⛔ Emergency Stop"** halts all sims (clients poll `/api/kill-switch` and stand down); **"▶ Resume Sims"** re-enables. This is global; the per-client `kill_switch` override above stops just one client.
 
+## Simulation Build Assistant & Chat Capabilities
+
+The Client Simulation ecosystem integrates directly with the Lab Manager Simulation Build Assistant:
+- **Interactive Simulation Design:** Operators can converse with the AI Build Assistant to generate, validate, and tailor complex simulation scenario configurations and workload profiles.
+- **Scenario Synthesis:** Converts intent (e.g. "simulate roaming degradation during peak hours on AP-3") into concrete client traffic buckets, fault injection sequences, and demo scenario TTLs.
+- **Dynamic Policy Validation:** Validates quota ceilings (`sim_quota_engine.py`), template availability, and isolated DHCP pool allocations before applying changes.
+- **Troubleshooting & Telemetry Ingestion:** The assistant inspects live simulation errors, client registry heartbeats, and gateway reachability latch diagnostics to recommend root-cause remediations.
+
 ## Troubleshooting / common questions
 
 **"Auto-provisioning is enabled but nothing provisions."** This is almost always the **two-flag trap**: the tenant-level **"Auto-Provision VMs"** toggle (`usb_auto_provision`) is a *different* switch from each host's **"Enable Client Simulation mode on this host"** (`client_simulation.enabled`). The pxmx agent's loop only spawns when **both** are on. Check the host's `provision` diagnostic on **VM Server** — it reports `cs_enabled`, `loop_running`, `auto_provision_on`, a `reason` string for the current gate, and `halt`. Common gate reasons beyond the two flags: no VM template configured, an empty dongle VID:PID list, CPU/mem over the 1h-average thresholds, or `provision_halt` set. Remember the brain runs in the agent; cs only relays and displays the diagnostic.
