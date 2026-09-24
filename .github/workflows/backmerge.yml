@@ -102,11 +102,14 @@ jobs:
         run: |
           if [ "${{ matrix.source }}" != "${{ github.ref_name }}" ]; then
             echo "::notice::push was to '${{ github.ref_name }}'; the ${{ matrix.source }} -> ${{ matrix.target }} back-merge does not apply"
+            echo "status=skipped" >> "$GITHUB_OUTPUT"
             echo "ok=false" >> "$GITHUB_OUTPUT"
           elif git rev-parse --verify "origin/${{ matrix.target }}" >/dev/null 2>&1; then
+            echo "status=ok" >> "$GITHUB_OUTPUT"
             echo "ok=true" >> "$GITHUB_OUTPUT"
           else
             echo "::notice::no '${{ matrix.target }}' branch in this repo; nothing to back-merge"
+            echo "status=missing_target" >> "$GITHUB_OUTPUT"
             echo "ok=false" >> "$GITHUB_OUTPUT"
           fi
 
