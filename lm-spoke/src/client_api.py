@@ -20,16 +20,23 @@ identically from an LM hub command or an HTTP/WS client. This mirrors the
 webui-spoke ``server.py`` client surface but is headless (no browser UI, no
 proxmox-agent socket, no ACME/LDAP/RADIUS — those live in the LM hub).
 
-Auth: a shared ``client_api_key`` (``CSSettings``, default empty = open). When
-non-empty, the WS socket and the mutating/inbox HTTP routes require it (header
-``X-Client-Key`` or ``?api_key=``); ``secrets.compare_digest`` is used. The t3
-agent sends no key, so empty=open lets it connect out of the box; the linux
-agent fetches ``/api/client/key`` first when a key is set.
+Auth: a shared ``client_api_key`` (``CSSettings`` generates one on first start
+— see ``cs_settings._ensure_client_api_key``; it is never left empty). Callers
+on the isolated sim segment (169.253.1.0/24 — the DHCP scope this spoke owns,
+see ``cs_spoke.py``) are trusted by network position, matching how the t3
+agent has always connected with no key; everyone else must present the shared
+key on the WS socket and the mutating/inbox HTTP routes (header
+``X-Client-Key`` or ``?api_key=``, checked with ``secrets.compare_digest``).
+``/api/client/key`` itself only answers callers on that same segment, so the
+key isn't disclosed to whatever else reaches port 8080 (it binds 0.0.0.0). The
+linux agent, running on-segment, fetches ``/api/client/key`` first when it
+wants to pass a key along.
 """
 
 from __future__ import annotations
 
 import copy
+import ipaddress
 import logging
 import secrets
 from pathlib import Path
@@ -112,25 +119,45 @@ client_ws_connections: Dict[str, WebSocket] = {}
 
 
 # ── auth ─────────────────────────────────────────────────────────────────────
+# The isolated sim-client DHCP scope this spoke owns (169.253.1.1/24 — see
+# cs_spoke.start_client_api_server). Everything the t3/linux/windows agents run
+# on lives here; nothing else should be treated as trusted just because it
+# reached port 8080 (bound 0.0.0.0, so every interface reaches it).
+_SIM_SEGMENT = ipaddress.ip_network("169.253.1.0/24")
+
+
+def _on_sim_segment(host: Optional[str]) -> bool:
+    try:
+        return ipaddress.ip_address(host) in _SIM_SEGMENT
+    except (ValueError, TypeError):
+        return False
+
+
 def _client_key(spoke) -> str:
     return str(spoke.settings.get("client_api_key", "") or "")
 
 
-def _key_ok(spoke, provided: Optional[str]) -> bool:
-    """Empty key = open. Otherwise constant-time compare."""
+def _key_ok(spoke, provided: Optional[str], remote_host: Optional[str] = None) -> bool:
+    """Sim-segment callers are trusted by network position (the t3 agent sends
+    no key by design). Everyone else needs a constant-time match against
+    client_api_key, which CSSettings never leaves empty (see
+    cs_settings._ensure_client_api_key) — so an off-segment caller can no
+    longer skip auth just because no key was ever configured."""
+    if _on_sim_segment(remote_host):
+        return True
     key = _client_key(spoke)
     if not key:
-        return True
+        return False
     return secrets.compare_digest(str(provided or ""), key)
 
 
 def _require_key_dep(spoke):
-    """FastAPI dependency: reject 401 when a key is set and the request lacks it."""
+    """FastAPI dependency: reject 401 unless the caller is on the sim segment
+    or presents the correct client_api_key."""
     def _dep(request: Request) -> None:
-        if not _client_key(spoke):
-            return
+        remote_host = request.client.host if request.client else None
         provided = request.headers.get("x-client-key") or request.query_params.get("api_key")
-        if not _key_ok(spoke, provided):
+        if not _key_ok(spoke, provided, remote_host):
             raise HTTPException(status_code=401, detail="invalid client api key")
     return _dep
 
@@ -278,7 +305,13 @@ def build_client_api_app(spoke) -> FastAPI:
 
     # ── client key (auth bootstrap) ────────────────────────────────────────
     @app.get("/api/client/key")
-    async def api_client_key() -> Dict[str, str]:
+    async def api_client_key(request: Request) -> Dict[str, str]:
+        # Only the sim segment may bootstrap the shared key from here — an
+        # off-segment caller has no legitimate reason to fetch it (see
+        # _on_sim_segment / module docstring).
+        remote_host = request.client.host if request.client else None
+        if not _on_sim_segment(remote_host):
+            raise HTTPException(status_code=403, detail="not allowed")
         return {"client_api_key": _client_key(spoke)}
 
     # ── config delivery ────────────────────────────────────────────────────
@@ -674,8 +707,10 @@ def build_client_api_app(spoke) -> FastAPI:
                         hostname: str = Query(""),
                         platform: str = Query(""),
                         api_key: Optional[str] = Query(None)) -> None:
-        # Auth: empty key = open; else compare_digest, close 4403 on mismatch.
-        if not _key_ok(spoke, api_key):
+        # Auth: sim-segment callers are trusted (t3 sends no key); else
+        # compare_digest against client_api_key, close 4403 on mismatch.
+        remote_host = ws.client.host if ws.client else None
+        if not _key_ok(spoke, api_key, remote_host):
             await ws.close(code=4403)
             return
 

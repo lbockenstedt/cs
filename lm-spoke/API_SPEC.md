@@ -87,16 +87,18 @@ client-facing surface is implemented (`lm-spoke/src/client_api.py`,
 `CS_API_PORT` / `CS_API_HOST` (env or `--port` / `--host`). The same app runs in
 hub mode (a `uvicorn.Server.serve()` task started in `CSControlPlane.run()`,
 surviving hub reconnects) and standalone mode (`run_standalone_mode()`), so both
-serve identical routes. Auth is a shared `client_api_key` (`CSSettings`, default
-empty = open); when set, `/ws/client` and the mutating/inbox HTTP routes require
-it (`X-Client-Key` header or `?api_key=`, `secrets.compare_digest`).
+serve identical routes. Auth is a shared `client_api_key` (`CSSettings` generates
+one on first start, never left empty). Callers on the isolated sim segment
+(`169.253.1.0/24`) are trusted by network position (the t3 agent sends no key);
+everyone else must present it on `/ws/client` and the mutating/inbox HTTP routes
+(`X-Client-Key` header or `?api_key=`, `secrets.compare_digest`).
 
 | Route | Purpose |
 |---|---|
 | `GET /api/health` | `{status, version, clients, repo_synced, repo_error}` (public) |
 | `GET /api/kill-switch` | `on`/`off` plaintext (`engine.kill_switch_active()`) |
 | `POST /api/status` | client → spoke status beacon → `ClientRegistry.apply_status` (public) |
-| `GET /api/client/key` | `{"client_api_key": ...}` — agents fetch the PSK first (public) |
+| `GET /api/client/key` | `{"client_api_key": ...}` — sim-segment callers only (403 off-segment) |
 | `GET /api/config?hostname=` | rendered `simulation.conf` (host bucket + registry overrides baked in) |
 | `GET /api/config/overrides` | `user-overrides.conf` plaintext |
 | `GET /api/config/parsed` | `{section: {key: value}}` |
@@ -113,7 +115,7 @@ it (`X-Client-Key` header or `?api_key=`, `secrets.compare_digest`).
 | `GET /status` · `POST /simulate/trigger` · `GET\|POST /config` · `GET /version` | mgmt (same as the old standalone surface) |
 
 ### `/ws/client` protocol
-- Auth: empty key = open; else `secrets.compare_digest(api_key, key)`, close `4403` on mismatch. The t3 agent sends no key (connects open); the linux agent fetches `/api/client/key` first when a key is set.
+- Auth: sim-segment callers connect open (the t3 agent sends no key); else `secrets.compare_digest(api_key, key)`, close `4403` on mismatch. The linux agent fetches `/api/client/key` first (sim-segment only) when it wants to pass a key along.
 - On accept: server sends `{type:"hello"}`, then pushes pending commands (`{type:"commands", commands:[{id,action,args,type}]}`, marks them `delivered`).
 - Client → server: `{type:"status", payload}` → `{type:"status_ack"}`; `{type:"ack", payload:{id,status,message,...}}` → `queue.ack_command` → `{type:"ack_ok"}`; `{type:"sync"}` → re-push pending; `{type:"ping"}` → `{type:"pong"}`.
 - Live push: `CS_QUEUE_COMMAND` (hub) calls `client_api.push_pending(spoke, target)` so a queued command reaches a connected agent immediately, without waiting for its next `sync`.
