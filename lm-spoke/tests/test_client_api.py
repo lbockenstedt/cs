@@ -424,3 +424,36 @@ def test_empty_key_denies_off_segment(client, spoke, monkeypatch):
     with pytest.raises(Exception):  # WebSocketDisconnect / close 4403
         with client.websocket_connect("/ws/client?hostname=nope") as ws:
             ws.receive_json()
+
+
+# ── sim-segment membership (cs#143 panel findings) ───────────────────────────
+def test_on_sim_segment_accepts_plain_ipv4():
+    assert client_api._on_sim_segment("169.253.1.50") is True
+    assert client_api._on_sim_segment("169.253.1.1") is True
+
+
+def test_on_sim_segment_accepts_ipv4_mapped_ipv6():
+    """uvicorn on a dual-stack socket reports a v4 peer as '::ffff:a.b.c.d'.
+    That is not a member of an IPv4Network, so a real sim client used to be
+    denied purely because of the socket family."""
+    assert client_api._on_sim_segment("::ffff:169.253.1.50") is True
+    # The compressed/hex spelling of the same mapped address.
+    assert client_api._on_sim_segment("::ffff:a9fd:132") is True
+
+
+def test_on_sim_segment_rejects_off_segment_including_mapped():
+    assert client_api._on_sim_segment("10.0.0.5") is False
+    assert client_api._on_sim_segment("::ffff:10.0.0.5") is False
+    assert client_api._on_sim_segment("169.253.2.50") is False
+
+
+def test_on_sim_segment_fails_closed_on_unusable_hosts():
+    """No client info or an unparsable host must deny, never trust."""
+    for host in (None, "", "nonsense", "169.253.1.999"):
+        assert client_api._on_sim_segment(host) is False
+
+
+def test_on_sim_segment_rejects_real_ipv6():
+    """A genuine (non-mapped) IPv6 peer is off-segment, not an error."""
+    assert client_api._on_sim_segment("2001:db8::1") is False
+    assert client_api._on_sim_segment("::1") is False

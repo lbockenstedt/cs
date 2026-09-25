@@ -128,8 +128,19 @@ _SIM_SEGMENT = ipaddress.ip_network("169.253.1.0/24")
 
 def _on_sim_segment(host: Optional[str]) -> bool:
     try:
-        return ipaddress.ip_address(host) in _SIM_SEGMENT
+        addr = ipaddress.ip_address(host)
     except (ValueError, TypeError):
+        return False
+    # uvicorn on a dual-stack socket reports a v4 peer as an IPv4-MAPPED IPv6
+    # address ("::ffff:169.253.1.50"). That is not a member of an IPv4Network,
+    # so the sim client it really is would have been denied. Unwrap the mapping
+    # and compare the address that was actually on the wire.
+    mapped = getattr(addr, "ipv4_mapped", None)
+    if mapped is not None:
+        addr = mapped
+    try:
+        return addr in _SIM_SEGMENT
+    except TypeError:
         return False
 
 
