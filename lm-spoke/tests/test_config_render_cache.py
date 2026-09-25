@@ -191,7 +191,11 @@ def spoke(tmp_path) -> CSSpoke:
 
 
 @pytest.fixture
-def client(spoke, configs) -> TestClient:
+def client(spoke, configs, monkeypatch) -> TestClient:
+    # TestClient requests don't originate from the isolated sim segment; treat
+    # them as on-segment so the key-gated /api/clients/{h}/control calls below
+    # keep working (see test_client_api.py's fixture for the same rationale).
+    monkeypatch.setattr(client_api, "_on_sim_segment", lambda host: True)
     return TestClient(build_client_api_app(spoke))
 
 

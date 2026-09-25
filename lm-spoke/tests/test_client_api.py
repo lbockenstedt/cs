@@ -13,6 +13,7 @@ import pytest
 from fastapi.testclient import TestClient
 from starlette.websockets import WebSocketDisconnect
 
+import client_api
 import sim_config
 from client_api import build_client_api_app, resolve_script_path
 from client_registry import ClientRegistry
@@ -37,7 +38,12 @@ def spoke(tmp_path) -> CSSpoke:
 
 
 @pytest.fixture
-def client(spoke) -> TestClient:
+def client(spoke, monkeypatch) -> TestClient:
+    # TestClient requests don't originate from the isolated sim segment, so
+    # default them to "on segment" — most of this suite exercises queue/registry
+    # mechanics, not the auth boundary. Tests that target the boundary itself
+    # (key gating, /api/client/key) flip this back to False explicitly.
+    monkeypatch.setattr(client_api, "_on_sim_segment", lambda host: True)
     return TestClient(build_client_api_app(spoke))
 
 
@@ -78,10 +84,39 @@ def test_status_upserts_registry(client):
     assert clients["sim-1"]["active_simulations"] == ["www_traffic"]
 
 
-def test_client_key_default_empty(client):
+def test_client_api_key_never_empty(spoke):
+    # Deny-by-default: CSSettings must generate + persist a key on first
+    # start instead of leaving client_api_key "" (which client_api._key_ok
+    # used to treat as allow-all for every caller).
+    assert spoke.settings.get("client_api_key")
+
+
+def test_client_api_key_persists_across_reload(tmp_path):
+    data = tmp_path / "data"
+    data.mkdir()
+    first = CSSettings(data, CONFIGS)
+    key = first.get("client_api_key")
+    assert key
+    # A second load of the same data dir must reuse the persisted key, not
+    # mint a new one on every start.
+    reloaded = CSSettings(data, CONFIGS)
+    assert reloaded.get("client_api_key") == key
+
+
+def test_client_key_endpoint_refuses_off_segment(client, monkeypatch):
+    # Not a sim-segment caller → the shared key must not be handed out.
+    monkeypatch.setattr(client_api, "_on_sim_segment", lambda host: False)
+    r = client.get("/api/client/key")
+    assert r.status_code == 403
+
+
+def test_client_key_endpoint_allows_sim_segment(client, spoke):
+    # The client fixture defaults to "on segment" — a legitimate agent still
+    # gets the key.
+    spoke.settings.update({"client_api_key": "secret"})
     r = client.get("/api/client/key")
     assert r.status_code == 200
-    assert r.json() == {"client_api_key": ""}
+    assert r.json() == {"client_api_key": "secret"}
 
 
 def test_apersist_round_trips_to_disk(tmp_path):
@@ -343,24 +378,49 @@ def test_ws_pushes_pending_command_and_acks(client):
         assert ws.receive_json()["type"] == "pong"
 
 
-def test_ws_rejects_bad_key(client, spoke):
+def test_ws_rejects_bad_key(client, spoke, monkeypatch):
     spoke.settings.update({"client_api_key": "secret"})
+    monkeypatch.setattr(client_api, "_on_sim_segment", lambda host: False)
     with pytest.raises(Exception):  # WebSocketDisconnect / close 4403
         with client.websocket_connect("/ws/client?hostname=nope") as ws:
             ws.receive_json()
 
 
+def test_ws_sim_segment_connects_without_key(client, spoke):
+    # A caller on the sim segment (the client fixture default) connects even
+    # when a key is configured — matches the t3 agent, which sends none.
+    spoke.settings.update({"client_api_key": "secret"})
+    with client.websocket_connect("/ws/client?hostname=trusted") as ws:
+        assert ws.receive_json()["type"] == "hello"
+
+
 # ── shared-key gating on HTTP ────────────────────────────────────────────────
-def test_http_key_gating(client, spoke):
+def test_http_key_gating(client, spoke, monkeypatch):
     spoke.settings.update({"client_api_key": "secret"})
 
     # Public routes still work without a key.
     assert client.get("/api/health").status_code == 200
-    assert client.get("/api/client/key").json()["client_api_key"] == "secret"
 
-    # Gated route without a key → 401.
+    # Sim-segment callers (the client fixture default) bypass the key.
+    assert client.get("/api/commands").status_code == 200
+
+    # Off-segment: gated route without a key → 401.
+    monkeypatch.setattr(client_api, "_on_sim_segment", lambda host: False)
     assert client.get("/api/commands").status_code == 401
 
-    # Gated route with the right header → 200.
+    # Off-segment with the right header → 200.
     r = client.get("/api/commands", headers={"X-Client-Key": "secret"})
     assert r.status_code == 200
+
+
+def test_empty_key_denies_off_segment(client, spoke, monkeypatch):
+    # Simulate a settings file that still has the historical "" (predates the
+    # auto-generated key, or was hand-edited back). Off-segment callers must
+    # be denied, not fall back to the old allow-all behavior.
+    spoke.settings.settings["client_api_key"] = ""
+    monkeypatch.setattr(client_api, "_on_sim_segment", lambda host: False)
+    assert client.get("/api/commands").status_code == 401
+    assert client.get("/api/client/key").status_code == 403
+    with pytest.raises(Exception):  # WebSocketDisconnect / close 4403
+        with client.websocket_connect("/ws/client?hostname=nope") as ws:
+            ws.receive_json()
