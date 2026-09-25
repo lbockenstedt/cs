@@ -98,17 +98,36 @@ jobs:
           BR: ${{ steps.route.outputs.branch }}
         run: |
           set -e
-          existing=$(gh pr list --head "$BR" --base "$TGT" --state open --json number -q '.[0].number')
-          if [ -n "$existing" ]; then
-            echo "PR #$existing already open for $BR (force-pushed with the latest $SRC)."
-            exit 0
-          fi
+          # The body is REBUILT every run, including when the PR already
+          # exists. The promotion branch is force-pushed as new commits land on
+          # the source, so a body written once at open time goes stale
+          # immediately — it kept claiming "code only" while the branch had
+          # grown substantive behaviour changes underneath it. Skeptical
+          # reviewers read that as an intent-vs-diff mismatch and hold the PR.
           {
             printf 'Automated promotion of `%s` into `%s`.\n\n' "$SRC" "$TGT"
-            printf 'Carries **code only** - every tracked `VERSION` file is pinned to\n'
-            printf '`%s`'"'"'s own sequence and advanced one step here.\n' "$TGT"
-            printf 'A version set on `%s` never leaks across.\n' "$SRC"
+            printf 'Every tracked `VERSION` file is pinned to `%s`'"'"'s own sequence\n' "$TGT"
+            printf 'and advanced one step here. A version set on `%s` never leaks across.\n\n' "$SRC"
+            printf '## Commits carried\n\n'
+            # Subject lines only, VERSION-bump commits filtered out, so the
+            # body states what this promotion actually changes rather than
+            # asserting it is merely mechanical.
+            n=$(git log --no-merges --format='%s' "origin/$TGT..$BR" 2>/dev/null \
+                  | grep -v -i -E '^(chore: )?(bump |version )' | wc -l | tr -d ' ')
+            if [ "${n:-0}" -gt 0 ]; then
+              git log --no-merges --format='- %s' "origin/$TGT..$BR" 2>/dev/null \
+                | grep -v -i -E '^- (chore: )?(bump |version )' | head -50
+              printf '\n_%s commit(s) beyond the VERSION bump. Review the diff, not this summary._\n' "$n"
+            else
+              printf '_No commits beyond the VERSION bump._\n'
+            fi
           } > /tmp/promote-body.md
+          existing=$(gh pr list --head "$BR" --base "$TGT" --state open --json number -q '.[0].number')
+          if [ -n "$existing" ]; then
+            echo "PR #$existing already open for $BR (force-pushed with the latest $SRC) — refreshing its body."
+            gh pr edit "$existing" --body-file /tmp/promote-body.md
+            exit 0
+          fi
           gh pr create --base "$TGT" --head "$BR" \
             --title "promote: $SRC -> $TGT" \
             --body-file /tmp/promote-body.md
