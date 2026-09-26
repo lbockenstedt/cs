@@ -17,6 +17,7 @@ from __future__ import annotations
 import configparser
 import json
 import logging
+import secrets
 from pathlib import Path
 from typing import Any, Dict, Optional, Set
 
@@ -107,9 +108,11 @@ class CSSettings:
         "mem_delete_threshold": 90,
         # protected-vmid list (comma-separated ints/ranges) — drives the queue guard
         "protected_vmids": "",
-        # shared PSK for the client API (/ws/client + mutating HTTP routes).
-        # Empty = open (the t3 agent sends no key; linux agent fetches it first).
-        # Set via CS_UPDATE_SETTINGS at runtime → data/cs_settings.json (never committed).
+        # shared PSK for the client API (/ws/client + mutating HTTP routes) for
+        # callers OFF the isolated sim segment (169.253.1.0/24) — see
+        # client_api._key_ok. Never persisted empty: __init__ generates one on
+        # first start (see _ensure_client_api_key) so an unconfigured deployment
+        # denies off-segment callers instead of allowing them.
         "client_api_key": "",
     }
 
@@ -119,6 +122,18 @@ class CSSettings:
         self.path = data_dir / "cs_settings.json"
         self.settings: Dict[str, Any] = dict(self._DEFAULTS)
         self._load()
+        self._ensure_client_api_key()
+
+    def _ensure_client_api_key(self) -> None:
+        """Deny-by-default: an empty/unset client_api_key must not leave the
+        off-segment routes wide open (client_api._key_ok treated empty as
+        allow-all). Generate a strong PSK on first start and persist it, so an
+        existing deployment that never set one keeps its sim-segment clients
+        working (they're trusted by network position, not by this key) while
+        off-segment callers can no longer skip auth entirely."""
+        if not str(self.settings.get("client_api_key") or "").strip():
+            self.settings["client_api_key"] = secrets.token_urlsafe(32)
+            self._save()
 
     def _load(self) -> None:
         try:
