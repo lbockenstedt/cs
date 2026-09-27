@@ -86,8 +86,9 @@ fi
 
 # Build $BR as "$TGT plus everything up to <endpoint>", VERSION pinned.
 # Returns 0 when that produced a real change, 1 when it is a content no-op, and
-# 2 when a split unit conflicts against $TGT (the caller falls back to a batched
-# merge). Callers MUST capture the code -- `if stage_to ...` cannot tell 1 from 2.
+# 2 when the merge conflicts outside VERSION (the merge is aborted and the
+# conflicting paths are listed; the CALLER decides whether that is fatal).
+# Callers MUST capture the code -- `if stage_to ...` cannot tell 1 from 2.
 stage_to() {
   local endpoint="$1"
 
@@ -116,9 +117,11 @@ stage_to() {
   done < <(git diff --cached --name-only --diff-filter=A | grep -E '(^|/)VERSION$' || true)
 
   if git ls-files -u | grep -q .; then
-    echo "::error::merge conflict outside VERSION -- resolve $SRC -> $TGT by hand:"
+    echo "merge conflict outside VERSION staging $endpoint onto $TGT:"
     git ls-files -u | awk '{print "  " $4}' | sort -u
-    exit 1
+    git merge --abort >/dev/null 2>&1 || true
+    git reset -q --hard
+    return 2
   fi
 
   if git diff --cached --quiet && git diff --quiet; then
@@ -130,10 +133,16 @@ stage_to() {
 picked=""
 picked_idx=0
 for i in "${!units[@]}"; do
-  if stage_to "${units[$i]}"; then
+  rc=0
+  stage_to "${units[$i]}" || rc=$?
+  if [ "$rc" -eq 0 ]; then
     picked="${units[$i]}"
     picked_idx="$i"
     break
+  fi
+  if [ "$rc" -eq 2 ]; then
+    echo "::error::merge conflict outside VERSION -- resolve $SRC -> $TGT by hand"
+    exit 1
   fi
   [ "$SPLIT" = "1" ] && echo "  skipping ${units[$i]} -- no content change against $TGT (VERSION-only?)"
 done
@@ -190,9 +199,7 @@ if [ "$SPLIT" = "1" ]; then
       picked_idx="$ext_idx"
     else
       # stage_to is tri-state, so 1 and 2 must not be reported alike: 2 is a real
-      # merge conflict and 1 is a genuine no-op. Collapsing them printed "content
-      # no-op" over a conflict, which sent anyone reading the CI log looking for a
-      # VERSION-only diff that was never there.
+      # merge conflict (the smaller unit is promoted instead) and 1 is a no-op.
       if [ "$ext_rc" -eq 2 ]; then
         echo "::warning::extension to ${units[$ext_idx]} conflicts against $TGT -- keeping unit $picked_idx"
       else
