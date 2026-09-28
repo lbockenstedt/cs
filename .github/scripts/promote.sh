@@ -86,8 +86,9 @@ fi
 
 # Build $BR as "$TGT plus everything up to <endpoint>", VERSION pinned.
 # Returns 0 when that produced a real change, 1 when it is a content no-op, and
-# 2 when the merge conflicts outside VERSION (the merge is aborted and the
-# conflicting paths are listed; the CALLER decides whether that is fatal).
+# 2 when the merge conflicts outside VERSION (the conflicting paths are listed
+# and the merge is LEFT in progress -- the next stage_to call cleans it up; the
+# CALLER decides whether that is fatal).
 # Callers MUST capture the code -- `if stage_to ...` cannot tell 1 from 2.
 stage_to() {
   local endpoint="$1"
@@ -164,6 +165,9 @@ for i in "${!units[@]}"; do
          "batching it with the next unit"
     continue
   fi
+  # A clean no-op at a later (superset) endpoint means any earlier isolated
+  # conflict is already resolved there; only the LAST endpoint's state counts.
+  conflicted=0
   [ "$SPLIT" = "1" ] && echo "  skipping ${units[$i]} -- no content change against $TGT (VERSION-only?)"
 done
 
