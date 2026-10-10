@@ -376,6 +376,17 @@ if [[ "$DHCP_SKIP" != "1" ]]; then
         fi
         ok "Kea (kea-dhcp4-server + kea-ctrl-agent) installed"
 
+        # The Debian packages auto-enable + start the distro default
+        # kea-dhcp4-server/kea-ctrl-agent units. On a sim host we only want the
+        # binaries for the -sim instance; the defaults left running made the lm
+        # agent report a phantom "DHCP Server" role that reappeared after every
+        # reinstall. Leave them alone only if LM's dhcp installer owns this box
+        # (it writes kea-api-password / the lm-dhcp-worker env).
+        if [[ ! -e /etc/kea/kea-api-password && ! -e /etc/lm-dhcp-worker/worker.env ]]; then
+            systemctl disable --now kea-dhcp4-server kea-ctrl-agent >/dev/null 2>&1 || true
+            ok "Distro kea-dhcp4-server/kea-ctrl-agent disabled (sim uses kea-dhcp4-sim only)"
+        fi
+
         # ── AppArmor: allow the SIM instance's runtime files ──────────────────
         # Kea derives its PID file name from the CONFIG file name, so our
         # deliberately-renamed sim instance writes
