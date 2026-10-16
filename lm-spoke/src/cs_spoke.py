@@ -393,6 +393,28 @@ class CSSpoke(AgentCommandsMixin, SimCommandsMixin, ConfigCommandsMixin,
         self.control_plane._relay_wake = asyncio.Event()
         # Stagger the first send so a freshly-ingested frame is more likely.
         await asyncio.sleep(2)
+        # Pull a fresh config on every (re)connect instead of relying only on the
+        # hub's reconnect push: a spoke that was out of contact past the mailbox
+        # backlog window otherwise comes back on stale local config. The hub
+        # answers with a full CS_CONFIG_UPDATE only when our hash (from the last
+        # full push this process applied; "" after a restart) differs from what
+        # it would send. An older hub just logs and ignores the frame.
+        try:
+            req = {
+                "header": {
+                    "message_id": str(uuid.uuid4()),
+                    "timestamp": time.time(),
+                    "sender_id": self.control_plane.spoke_id,
+                    "destination_id": "hub",
+                },
+                "payload": {"type": "CS_CONFIG_REQUEST",
+                            "data": {"config_hash": getattr(self, "_cs_config_hash", "") or ""}},
+            }
+            await websocket.send(self.control_plane._encode_frame(req))
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:  # noqa: BLE001 — telemetry hash drift check is the backstop
+            logger.debug("CS_CONFIG_REQUEST send failed: %s", e)
         while True:
             try:
                 cs_mod = self
@@ -491,6 +513,11 @@ class CSSpoke(AgentCommandsMixin, SimCommandsMixin, ConfigCommandsMixin,
                 # out when we exit mid-reply. A fresh process starts False, so
                 # the first post-restart frame tells the hub to clear drain.
                 payload["draining"] = bool(getattr(self.control_plane, "_draining", False))
+                # Hash of the last full hub config applied ("" = none since this
+                # process started). Its presence also advertises that this spoke
+                # diffs full pushes, so the hub's drift check / hourly backstop
+                # may target it.
+                payload["cs_config_hash"] = getattr(self, "_cs_config_hash", "") or ""
                 # ── Conditional relay: send only on a state change, a forced
                 # reseed, or the heartbeat ceiling. A skipped tick sends NOTHING
                 # (the hub keeps the last frame, which is identical) — that's the
