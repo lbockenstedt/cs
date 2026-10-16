@@ -10,6 +10,8 @@ returns the result dict, or ``None`` when the command is not one of its own
 
 from __future__ import annotations
 
+import hashlib
+import json
 import logging
 import asyncio
 import time
@@ -19,6 +21,40 @@ import sim_config
 from typing import Any, Dict, Optional
 
 logger = logging.getLogger("CSSpoke")
+
+
+_CS_CONFIG_META_KEYS = ("config_hash", "full_config")
+
+# Keys whose apply branch reads/rewrites state owned by another key, so when the
+# owner is re-applied by a full-config diff the dependants must ride along even
+# if unchanged: central_sites_config replaces the local csc that qt_exclude_sims
+# / tier_priority are merged into, and the override-text write path depends on
+# config_source + the github token.
+_CS_CONFIG_COUPLED = {
+    "central_sites_config": ("qt_exclude_sims", "tier_priority"),
+    "config_source": ("sim_conf_override", "user_conf_override"),
+    "github_config": ("sim_conf_override", "user_conf_override"),
+}
+
+
+def cs_value_hash(value: Any) -> str:
+    return hashlib.sha256(
+        json.dumps(value, sort_keys=True, default=str).encode()).hexdigest()
+
+
+def cs_config_diff(patch: Dict[str, Any], applied_hashes: Optional[Dict[str, str]]) -> Dict[str, Any]:
+    """Subset of ``patch`` whose value differs from the last-applied hash (an
+    unseen key counts as changed), plus the coupled dependants of any kept key."""
+    if not isinstance(patch, dict):
+        return {}
+    applied_hashes = applied_hashes or {}
+    result = {k: v for k, v in patch.items()
+              if cs_value_hash(v) != applied_hashes.get(k)}
+    for key in list(result):
+        for dep in _CS_CONFIG_COUPLED.get(key, ()):
+            if dep in patch and dep not in result:
+                result[dep] = patch[dep]
+    return result
 
 
 class ConfigCommandsMixin:
@@ -139,8 +175,7 @@ class ConfigCommandsMixin:
             # the cs_bridge pulls an empty ``vidpids`` via CS_GET_USB_CONFIG
             # every 60s, the agent's _dongle_vidpids returns 0, and
             # auto-provision never fires ("no dongle_vidpids configured").
-            applied = self._apply_hub_config(d if isinstance(d, dict) else {})
-            return {"status": "SUCCESS", "applied": applied}
+            return self._handle_cs_config_update(d)
 
         # ── local Setup-tab config (hub_config / central) ───────────────────
         # This spoke owns these knobs itself now (local_store.py) instead of
@@ -1028,6 +1063,38 @@ class ConfigCommandsMixin:
         self.local_store.set_central_on_prem_config(merged)
         self.central_on_prem_poller.reload()
         return merged
+
+    def _handle_cs_config_update(self, d: Any) -> Dict[str, Any]:
+        """CS_CONFIG_UPDATE entry point: partial patches apply as-is; a hub
+        ``full_config`` push (reconnect / CS_CONFIG_REQUEST / hourly backstop /
+        drift repair) applies ONLY keys whose value changed since this process
+        last applied them, so a periodic full refresh never re-fires the
+        update_now / quota-reconcile / repo-sync side effects for unchanged
+        config. The hub's ``config_hash`` from the last full push is reported
+        back in CS_TELEMETRY (``cs_config_hash``) for drift detection."""
+        d = d if isinstance(d, dict) else {}
+        full = bool(d.get("full_config"))
+        cfg_hash = d.get("config_hash")
+        patch = {k: v for k, v in d.items() if k not in _CS_CONFIG_META_KEYS}
+        to_apply = cs_config_diff(patch, self._cs_applied_hashes()) if full else patch
+        applied = self._apply_hub_config(to_apply) if to_apply else []
+        hashes = self._cs_applied_hashes()
+        for k, v in patch.items():
+            hashes[k] = cs_value_hash(v)
+        if full and isinstance(cfg_hash, str):
+            self._cs_config_hash = cfg_hash
+        if full:
+            logger.info("CS_CONFIG_UPDATE[full]: %d key(s) received, %d changed",
+                        len(patch), len(to_apply))
+        return {"status": "SUCCESS", "applied": applied,
+                "config_hash": getattr(self, "_cs_config_hash", "") or ""}
+
+    def _cs_applied_hashes(self) -> Dict[str, str]:
+        h = getattr(self, "_cs_applied_value_hashes", None)
+        if h is None:
+            h = {}
+            self._cs_applied_value_hashes = h
+        return h
 
     def _apply_hub_config(self, patch: Dict[str, Any]) -> list:
         """Apply a hub-pushed CS_CONFIG_UPDATE patch to the cs settings store.
