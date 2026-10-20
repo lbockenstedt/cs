@@ -592,6 +592,7 @@ class CentralPoller:
             "config_getter": "get_central_config",
             "sites_getter": "get_central_sites_config",
             "status_attr": "central_status",
+            "mode_feature": "central_api",
             "cc_baseline": "client_count_baseline.json",
             "cc_7day": "client_count_7day.json",
             "health_file": "check_health_history.json",
@@ -600,6 +601,7 @@ class CentralPoller:
             "config_getter": "get_central_on_prem_config",
             "sites_getter": "get_central_on_prem_sites_config",
             "status_attr": "central_on_prem_status",
+            "mode_feature": "central_on_prem_api",
             "cc_baseline": "central_on_prem_client_count_baseline.json",
             "cc_7day": "central_on_prem_client_count_7day.json",
             "health_file": "central_on_prem_check_health_history.json",
@@ -675,7 +677,20 @@ class CentralPoller:
                 logger.warning("Central poll failed: %s", exc)
             await asyncio.sleep(_POLL_INTERVAL_S)
 
+    def _hub_polls(self) -> bool:
+        hub_polls = getattr(self.spoke.local_store, "hub_polls", None)
+        return bool(callable(hub_polls) and hub_polls(self._inst["mode_feature"]))
+
     async def _poll_once(self) -> None:
+        if self._hub_polls():
+            # Hub (centralized) mode: the hub's CentralHubPoller owns this API;
+            # a spoke poll would duplicate every site row on the hub dashboard.
+            if not getattr(self, "_hub_mode_logged", False):
+                logger.info("%s poll skipped: hub polls in centralized mode", self._inst_name)
+                self._hub_mode_logged = True
+            self._set_status({})
+            return
+        self._hub_mode_logged = False
         if not self._client or not self._client.is_configured():
             self._set_status({})
             return

@@ -1131,6 +1131,20 @@ class ConfigCommandsMixin:
             cc = patch.get("central_config")
             self._merge_central_config(cc if isinstance(cc, dict) else {})
             applied.append("central_config")
+        # Hub processing modes: a "centralized" feature is polled by the HUB, so
+        # its spoke poller goes idle (central_poller/mist_poller check
+        # local_store.hub_polls each cycle). Clear the relayed status now rather
+        # than waiting up to a poll interval for the hub dashboard to de-dupe.
+        if "processing_modes" in patch:
+            pm = patch.get("processing_modes")
+            if isinstance(pm, dict):
+                self.local_store.set_processing_modes(pm)
+                for feature, attr in (("central_api", "central_status"),
+                                      ("central_on_prem_api", "central_on_prem_status"),
+                                      ("mist_api", "mist_status")):
+                    if self.local_store.hub_polls(feature):
+                        setattr(self, attr, {})
+                applied.append("processing_modes")
         # Hub-pushed central_sites_config (monitored_checks/hardware_checks/
         # site_mappings + sim_quotas): apply to local_store + reload the poller
         # so a hub-side Config → Sim Quotas / Central save reaches this spoke.
