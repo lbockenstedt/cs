@@ -1649,15 +1649,11 @@ chmod 600 "$LM_DIR/cs/.env"
 
 # ── systemd unit ──────────────────────────────────────────────────────────────
 
-# Only pass --secret/--hub-secret when a value is present. Passing them with an
-# empty value makes argparse abort with "argument --secret: expected one
-# argument", crash-looping the service. Zero-touch provisioning handles the
-# empty case (control_plane.py falls back to SPOKE_SECRET from the .env, then
-# awaits admin approval in the WebUI).
-SECRET_ARG=""
-[ -n "$SPOKE_SECRET" ] && SECRET_ARG="--secret=$SPOKE_SECRET"
-HUB_SECRET_ARG=""
-[ -n "${HUB_SECRET:-}" ] && HUB_SECRET_ARG="--hub-secret=$HUB_SECRET"
+# Secrets are NOT passed on the ExecStart line: the spoke persists rotated /
+# renegotiated SPOKE_SECRET and HUB_SECRET to .env, and a value frozen into the
+# unit would override that on every restart (hub rejects it → zero-touch loop).
+# control_plane.py reads both from .env (EnvironmentFile) via argparse defaults;
+# it also ignores a stale pinned --secret left by an older install.
 
 # CAP_NET_BIND_SERVICE lets svc_lm (non-root) bind :443 for the agent listener.
 # Only granted when --agent-listener is on; a relay-only cs spoke needs no
@@ -1697,7 +1693,7 @@ EnvironmentFile=$LM_DIR/cs/.env
 Environment="PYTHONPATH=$LM_DIR:$LM_DIR/core/src:$LM_DIR/cs/lm-spoke:$LM_DIR/cs/lm-spoke/src"
 Environment="CS_API_PORT=$CS_API_PORT"
 Environment="CS_API_HOST=$CS_API_HOST"
-ExecStart=$LM_DIR/cs/venv/bin/python3 -m src.control_plane $ID_ARG --hub "\${HUB_URL}" $SECRET_ARG $HUB_SECRET_ARG --port $CS_API_PORT --host $CS_API_HOST
+ExecStart=$LM_DIR/cs/venv/bin/python3 -m src.control_plane $ID_ARG --hub "\${HUB_URL}" --port $CS_API_PORT --host $CS_API_HOST
 $CAP_LINES
 
 StandardOutput=append:/var/log/lm/lm-cs.log

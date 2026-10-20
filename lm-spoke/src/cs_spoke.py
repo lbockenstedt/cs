@@ -67,6 +67,10 @@ from command_handlers.handlers_agents import _deep_merge_cfg  # noqa: F401
 
 logger = logging.getLogger("CSSpoke")
 
+# Secret env names whose stale CLI-pinned value (unit ExecStart) was ignored at
+# startup in favour of .env — see control_plane.resolve_pinned_secret. Non-empty
+# means the systemd unit still pins a secret and install_cs.sh should be re-run.
+PINNED_SECRET_IGNORED: list = []
 
 class CSSpoke(AgentCommandsMixin, SimCommandsMixin, ConfigCommandsMixin,
               ClientCommandsMixin, IngestCommandsMixin, BaseSpoke):
@@ -597,6 +601,7 @@ class CSSpoke(AgentCommandsMixin, SimCommandsMixin, ConfigCommandsMixin,
             "status": state["status"],
             "iteration": state["iteration"],
             "kill_switch": self.engine.kill_switch_active(),
+            "pinned_secret_ignored": list(PINNED_SECRET_IGNORED),
         }
 
     def get_version(self) -> str:
