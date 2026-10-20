@@ -1649,15 +1649,11 @@ chmod 600 "$LM_DIR/cs/.env"
 
 # ── systemd unit ──────────────────────────────────────────────────────────────
 
-# Only pass --secret/--hub-secret when a value is present. Passing them with an
-# empty value makes argparse abort with "argument --secret: expected one
-# argument", crash-looping the service. Zero-touch provisioning handles the
-# empty case (control_plane.py falls back to SPOKE_SECRET from the .env, then
-# awaits admin approval in the WebUI).
-SECRET_ARG=""
-[ -n "$SPOKE_SECRET" ] && SECRET_ARG="--secret=$SPOKE_SECRET"
-HUB_SECRET_ARG=""
-[ -n "${HUB_SECRET:-}" ] && HUB_SECRET_ARG="--hub-secret=$HUB_SECRET"
+# Secrets are NOT passed on the ExecStart line: the spoke persists rotated /
+# renegotiated SPOKE_SECRET and HUB_SECRET to .env, and a value frozen into the
+# unit would override that on every restart (hub rejects it → zero-touch loop).
+# control_plane.py reads both from .env (EnvironmentFile) via argparse defaults;
+# it also ignores a stale pinned --secret left by an older install.
 
 # CAP_NET_BIND_SERVICE lets svc_lm (non-root) bind :443 for the agent listener.
 # Only granted when --agent-listener is on; a relay-only cs spoke needs no
@@ -1697,7 +1693,7 @@ EnvironmentFile=$LM_DIR/cs/.env
 Environment="PYTHONPATH=$LM_DIR:$LM_DIR/core/src:$LM_DIR/cs/lm-spoke:$LM_DIR/cs/lm-spoke/src"
 Environment="CS_API_PORT=$CS_API_PORT"
 Environment="CS_API_HOST=$CS_API_HOST"
-ExecStart=$LM_DIR/cs/venv/bin/python3 -m src.control_plane $ID_ARG --hub "\${HUB_URL}" $SECRET_ARG $HUB_SECRET_ARG --port $CS_API_PORT --host $CS_API_HOST
+ExecStart=$LM_DIR/cs/venv/bin/python3 -m src.control_plane $ID_ARG --hub "\${HUB_URL}" --port $CS_API_PORT --host $CS_API_HOST
 $CAP_LINES
 
 StandardOutput=append:/var/log/lm/lm-cs.log
@@ -1709,7 +1705,60 @@ RestartSec=10
 WantedBy=multi-user.target
 SYSD
 
+# ── Unit self-heal (root) ─────────────────────────────────────────────────────
+# The spoke runs as ${SVC_USER} and cannot edit its own root-owned unit, so a
+# --secret/--hub-secret pinned onto ExecStart by an older install (or by hand)
+# survives every spoke self-update. control_plane.py already ignores it at
+# runtime, but the stale secret stays on disk and in `ps`. This root oneshot
+# strips it and restarts lm-cs once; it touches nothing else.
+cat > /usr/local/sbin/lm-cs-unit-heal <<'CSHEAL'
+#!/usr/bin/env bash
+# Strip secrets pinned onto lm-cs's ExecStart. Installed by install_cs.sh.
+set -uo pipefail
+export PATH="/usr/sbin:/sbin:/usr/bin:/bin:$PATH"
+UNIT_DIR="${LM_CS_UNIT_DIR:-/etc/systemd/system}"
+log() { logger -t lm-cs-unit-heal -- "$*" 2>/dev/null; echo "lm-cs-unit-heal: $*"; }
+PIN_RE='[[:space:]]+--(hub-)?secret(=|[[:space:]]+)("[^"]*"|'"'"'[^'"'"']*'"'"'|[^[:space:]]+)'
+
+changed=0
+for f in "$UNIT_DIR/lm-cs.service" "$UNIT_DIR"/lm-cs.service.d/*.conf; do
+    [ -f "$f" ] || continue
+    grep -qE "^ExecStart=.*${PIN_RE}" "$f" || continue
+    tmp="$(mktemp)" || continue
+    sed -E "/^ExecStart=/ s/${PIN_RE}//g" "$f" > "$tmp" && cat "$tmp" > "$f"
+    rm -f "$tmp"
+    # Never log the value itself — only which file was healed.
+    log "removed pinned --secret/--hub-secret from $f (secrets come from .env)"
+    changed=1
+done
+[ "$changed" = "1" ] || exit 0
 systemctl daemon-reload
+if systemctl is-active --quiet lm-cs; then
+    systemctl restart lm-cs && log "restarted lm-cs with the .env secret"
+fi
+CSHEAL
+chmod 0755 /usr/local/sbin/lm-cs-unit-heal
+cat > /etc/systemd/system/lm-cs-unit-heal.service <<'CSHEALS'
+[Unit]
+Description=Lab Manager - strip secrets pinned on the lm-cs unit
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/lm-cs-unit-heal
+CSHEALS
+cat > /etc/systemd/system/lm-cs-unit-heal.timer <<'CSHEALT'
+[Unit]
+Description=Lab Manager - lm-cs unit self-heal (boot + every 15 min)
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=15min
+[Install]
+WantedBy=timers.target
+CSHEALT
+
+systemctl daemon-reload
+systemctl enable --now lm-cs-unit-heal.timer >/dev/null 2>&1 \
+    && ok "lm-cs unit self-heal installed (lm-cs-unit-heal.timer)" \
+    || warn "could not enable lm-cs-unit-heal.timer"
 # Clear any prior 'start-limit-hit'/failed state so a reinstall over a spoke that
 # systemd previously PARKED (the bug StartLimitIntervalSec=0 above prevents going
 # forward) actually starts instead of staying dead.

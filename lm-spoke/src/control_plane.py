@@ -495,6 +495,32 @@ class CSControlPlane(AgentHostingControlPlane):
             app.add_event_handler("startup", spoke.sim_quota_engine.start)
         uvicorn.run(app, host=self.api_host, port=self.api_port)
 
+def resolve_pinned_secret(name: str, cli_value: Optional[str]) -> str:
+    """Prefer the .env value over a stale CLI-pinned one.
+
+    The spoke persists rotated / zero-touch-renegotiated secrets to .env
+    (SPOKE_SECRET, HUB_SECRET), but an older install_cs.sh baked the secret into
+    the unit's ExecStart (``--secret=...``). argparse then let that frozen value
+    win on every restart, so the hub rejected it and the spoke fell back to
+    zero-touch each time. When both are set and differ, .env is the newer truth
+    (an empty .env value means the spoke cleared it after a hub rejection).
+    Records the override in ``cs_spoke.PINNED_SECRET_IGNORED`` for health."""
+    cli_value = cli_value or ""
+    if name not in os.environ:
+        return cli_value
+    env_value = os.environ.get(name, "")
+    if cli_value == env_value:
+        return cli_value
+    logger.warning(
+        "%s passed on the command line differs from %s in .env — ignoring the "
+        "pinned CLI value (stale ExecStart). Re-run install_cs.sh to drop it "
+        "from the systemd unit.", name, name)
+    import cs_spoke
+    if name not in cs_spoke.PINNED_SECRET_IGNORED:
+        cs_spoke.PINNED_SECRET_IGNORED.append(name)
+    return env_value
+
+
 if __name__ == "__main__":
     import os
     import socket
@@ -536,6 +562,8 @@ if __name__ == "__main__":
         # Derived id = the bare hostname (no "-spoke" suffix). A pinned --id /
         # SPOKE_ID still wins; only the unpinned/derived case is affected.
         args.id = socket.gethostname()
+    args.secret = resolve_pinned_secret("SPOKE_SECRET", args.secret)
+    args.hub_secret = resolve_pinned_secret("HUB_SECRET", args.hub_secret)
     cp = CSControlPlane(args.id, args.secret, args.hub_secret, args.hub,
                         onboarding_psk=args.onboarding_psk,
                         tenant_id_hint=args.tenant_id_hint,
