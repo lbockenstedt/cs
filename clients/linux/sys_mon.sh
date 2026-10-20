@@ -5,7 +5,9 @@ set -uo pipefail
 
 SERVICE_NAME="${SERVICE_NAME:-client-sim-agent.service}"
 AGENT_SCRIPT="${AGENT_SCRIPT:-/usr/local/scripts/agent.sh}"
-PID_FILE="${PID_FILE:-/var/run/client-sim-ws-agent.pid}"
+# Must match agent.sh's PID_FILE, else every --check-once sees pidfile_missing
+# and restarts a healthy agent (a WS drop/reconnect every timer tick).
+PID_FILE="${PID_FILE:-/usr/local/scripts/client-sim-ws-agent.pid}"
 HEALTH_FILE="${HEALTH_FILE:-/var/lib/client-sim/agent-health.json}"
 HEALTH_STALE_SECS="${HEALTH_STALE_SECS:-120}"
 WATCHDOG_LOG="${WATCHDOG_LOG:-/usr/local/scripts/sim_watchdog.log}"
