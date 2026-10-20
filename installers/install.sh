@@ -797,7 +797,7 @@ PATH_EOF
     if [[ -f /etc/systemd/system/client-sim-agent.service ]]; then
       info "Enabling client-sim agent service"
       systemctl daemon-reload >>"$LOG" 2>&1 || true
-      existing_agent_pid=$(cat /tmp/client-sim-ws-agent.pid 2>/dev/null || true)
+      existing_agent_pid=$(cat /usr/local/scripts/client-sim-ws-agent.pid 2>/dev/null || true)
       if [[ "$existing_agent_pid" =~ ^[0-9]+$ ]] && \
          ps -o args= -p "$existing_agent_pid" 2>/dev/null | grep -q '/usr/local/scripts/agent.sh'; then
         kill "$existing_agent_pid" 2>/dev/null || true
