@@ -1705,7 +1705,60 @@ RestartSec=10
 WantedBy=multi-user.target
 SYSD
 
+# ── Unit self-heal (root) ─────────────────────────────────────────────────────
+# The spoke runs as ${SVC_USER} and cannot edit its own root-owned unit, so a
+# --secret/--hub-secret pinned onto ExecStart by an older install (or by hand)
+# survives every spoke self-update. control_plane.py already ignores it at
+# runtime, but the stale secret stays on disk and in `ps`. This root oneshot
+# strips it and restarts lm-cs once; it touches nothing else.
+cat > /usr/local/sbin/lm-cs-unit-heal <<'CSHEAL'
+#!/usr/bin/env bash
+# Strip secrets pinned onto lm-cs's ExecStart. Installed by install_cs.sh.
+set -uo pipefail
+export PATH="/usr/sbin:/sbin:/usr/bin:/bin:$PATH"
+UNIT_DIR="${LM_CS_UNIT_DIR:-/etc/systemd/system}"
+log() { logger -t lm-cs-unit-heal -- "$*" 2>/dev/null; echo "lm-cs-unit-heal: $*"; }
+PIN_RE='[[:space:]]+--(hub-)?secret(=|[[:space:]]+)("[^"]*"|'"'"'[^'"'"']*'"'"'|[^[:space:]]+)'
+
+changed=0
+for f in "$UNIT_DIR/lm-cs.service" "$UNIT_DIR"/lm-cs.service.d/*.conf; do
+    [ -f "$f" ] || continue
+    grep -qE "^ExecStart=.*${PIN_RE}" "$f" || continue
+    tmp="$(mktemp)" || continue
+    sed -E "/^ExecStart=/ s/${PIN_RE}//g" "$f" > "$tmp" && cat "$tmp" > "$f"
+    rm -f "$tmp"
+    # Never log the value itself — only which file was healed.
+    log "removed pinned --secret/--hub-secret from $f (secrets come from .env)"
+    changed=1
+done
+[ "$changed" = "1" ] || exit 0
 systemctl daemon-reload
+if systemctl is-active --quiet lm-cs; then
+    systemctl restart lm-cs && log "restarted lm-cs with the .env secret"
+fi
+CSHEAL
+chmod 0755 /usr/local/sbin/lm-cs-unit-heal
+cat > /etc/systemd/system/lm-cs-unit-heal.service <<'CSHEALS'
+[Unit]
+Description=Lab Manager - strip secrets pinned on the lm-cs unit
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/lm-cs-unit-heal
+CSHEALS
+cat > /etc/systemd/system/lm-cs-unit-heal.timer <<'CSHEALT'
+[Unit]
+Description=Lab Manager - lm-cs unit self-heal (boot + every 15 min)
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=15min
+[Install]
+WantedBy=timers.target
+CSHEALT
+
+systemctl daemon-reload
+systemctl enable --now lm-cs-unit-heal.timer >/dev/null 2>&1 \
+    && ok "lm-cs unit self-heal installed (lm-cs-unit-heal.timer)" \
+    || warn "could not enable lm-cs-unit-heal.timer"
 # Clear any prior 'start-limit-hit'/failed state so a reinstall over a spoke that
 # systemd previously PARKED (the bug StartLimitIntervalSec=0 above prevents going
 # forward) actually starts instead of staying dead.
