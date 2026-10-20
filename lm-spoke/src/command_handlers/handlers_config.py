@@ -948,6 +948,17 @@ class ConfigCommandsMixin:
                 valid = set(sim_quota.available_sites(
                     self.settings.config_dir, csc.get("site_mappings")))
                 valid.add("Tenant-Wide Pool")  # a server may be in the tenant pool
+                # Site Links are the source of truth for wsites (the editor's
+                # dropdown offers exactly these); simulation.conf no longer
+                # carries wsite entries, so without them every site pool was
+                # rejected as unknown.
+                for lk in (csc.get("site_links") or []):
+                    if not isinstance(lk, dict):
+                        continue
+                    for f in ("wsite", "name", "central_site"):
+                        v = str(lk.get(f) or "").strip()
+                        if v:
+                            valid.add(v)
                 clean = {}
                 for host, site in raw.items():
                     h = str(host).strip()

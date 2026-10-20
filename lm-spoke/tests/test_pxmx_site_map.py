@@ -110,6 +110,22 @@ def test_set_flags_unknown_site_but_keeps_host(spoke_loop):
     assert any("px1" in e and "ZZZ" in e for e in res["errors"])
 
 
+def test_set_accepts_site_link_wsite(spoke_loop):
+    # The editor offers Site Links (value = wsite). With no simulation.conf
+    # wsites and no site_mappings, a linked wsite must still be accepted.
+    s, loop = spoke_loop
+    s.local_store.set_central_sites_config({
+        "site_mappings": {},
+        "site_links": [{"name": "Barcelona", "wsite": "BARBR-SSID", "central_site": ""}],
+    })
+    res = _run(loop, s.handle_command(
+        "CS_SET_PXMX_SITE_MAP",
+        {"pxmx_site_map": {"px1": "BARBR-SSID", "px2": "Tenant-Wide Pool"}}))
+    assert res["status"] == "SUCCESS"
+    assert res["errors"] == []
+    assert res["pxmx_site_map"] == {"px1": "BARBR-SSID", "px2": "Tenant-Wide Pool"}
+
+
 def test_local_store_set_normalizes(spoke_loop):
     s, loop = spoke_loop
     clean = s.local_store.set_pxmx_site_map(
