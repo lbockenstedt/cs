@@ -290,6 +290,7 @@ def build_client_api_app(spoke) -> FastAPI:
     # ── health / kill switch ───────────────────────────────────────────────
     @app.get("/api/health")
     async def api_health() -> Dict[str, Any]:
+        import cs_spoke
         return {
             "status": "ok",
             "spoke_id": spoke.spoke_id,
@@ -297,6 +298,7 @@ def build_client_api_app(spoke) -> FastAPI:
             "clients": spoke.registry.count() if spoke.registry is not None else 0,
             "repo_synced": True,
             "repo_error": None,
+            "pinned_secret_ignored": list(cs_spoke.PINNED_SECRET_IGNORED),
         }
 
     @app.get("/api/kill-switch")
