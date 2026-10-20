@@ -279,6 +279,24 @@ class LocalStore:
             self._data["central_config"] = cfg or {}
             self._save()
 
+    # ── hub processing modes (central_api / central_on_prem_api / mist_api) ──
+    # Hub-pushed ``{feature: "centralized"|"distributed"}``. In centralized (hub)
+    # mode the HUB polls the API and this spoke must not; only an explicit
+    # "centralized" disables the spoke poller, so a standalone spoke or an older
+    # hub that never pushes modes keeps polling as before.
+
+    def get_processing_modes(self) -> Dict[str, Any]:
+        return dict(self._data.get("processing_modes") or {})
+
+    def set_processing_modes(self, modes: Dict[str, Any]) -> None:
+        with self._lock:
+            self._data["processing_modes"] = dict(modes or {})
+            self._save()
+
+    def hub_polls(self, feature: str) -> bool:
+        mode = self.get_processing_modes().get(feature)
+        return str(mode or "").strip().lower() == "centralized"
+
     # ── central sites config (which sites to poll + monitored checks) ──────
 
     def get_central_sites_config(self) -> Dict[str, Any]:
