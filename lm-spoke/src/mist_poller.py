@@ -121,6 +121,15 @@ class MistPoller:
             await asyncio.sleep(_POLL_INTERVAL_S)
 
     async def _poll_once(self) -> None:
+        hub_polls = getattr(self.spoke.local_store, "hub_polls", None)
+        if callable(hub_polls) and hub_polls("mist_api"):
+            # Hub (centralized) mode: the hub's MistHubPoller owns this API.
+            if not getattr(self, "_hub_mode_logged", False):
+                logger.info("mist poll skipped: hub polls in centralized mode")
+                self._hub_mode_logged = True
+            self.spoke.mist_status = {}
+            return
+        self._hub_mode_logged = False
         if not self._client or not self._client.is_configured():
             self.spoke.mist_status = {}
             return
