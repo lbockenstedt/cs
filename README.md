@@ -141,8 +141,9 @@ curl -sSL https://raw.githubusercontent.com/lbockenstedt/cs/main/install_cs.sh \
 | `--hub-secret` | Hub PSK enabling automatic spoke approval. |
 | `--dhcp-iface IFACE` | Secondary network interface for the isolated simulation DHCP scope. |
 | `--no-dhcp` | Skips Kea DHCP setup. |
-| `--tls-verify` | Enables strict TLS certificate verification against `--tls-ca-cert`. |
-| `--tls-ca-cert PATH` | Custom CA certificate path for TLS validation. |
+| `--tls-verify` | Verifies the hub certificate against the system trust store (public-CA hub), or against `--tls-ca-cert` if given. Default: keep the existing `.env` setting on a re-run; on a fresh install, ON when `--hub` is a DNS name. |
+| `--no-tls-verify` | Disables hub certificate verification. |
+| `--tls-ca-cert PATH` | Pins a private/self-signed hub CA for `--tls-verify`. |
 | `--infra-only` | Host preparation only (cs Kea + 2nd NIC + agent-listener cert). Used when loaded as an agent role. |
 | `--purge-env`, `--reset-identity` | Deletes existing identity credentials and regenerates `/etc/machine-id`. |
 
