@@ -84,11 +84,14 @@ DHCP_RANGE_START="${DHCP_RANGE_START:-169.253.1.11}"
 DHCP_RANGE_END="${DHCP_RANGE_END:-169.253.1.254}"
 DHCP_LEASE_TIME="${DHCP_LEASE_TIME:-1h}"
 
-# TLS cert verification is OFF by default (self-signed hub cert → encrypt
-# without auth). Pass --tls-verify --tls-ca-cert <path> to make this spoke
-# verify the hub cert. A standalone cs spoke is remote, so the hub CA cert
-# MUST be supplied (--tls-ca-cert) — there is no local hub cert to default to.
-TLS_VERIFY=false
+# Hub TLS cert verification. --tls-verify alone trusts the system store (a
+# public-CA hub such as Let's Encrypt on the Azure endpoint); add
+# --tls-ca-cert <path> to pin a private/self-signed hub CA. --no-tls-verify
+# opts out. With neither flag, a re-run keeps the existing .env setting, and a
+# fresh install verifies when --hub is a DNS name (an IP can't match the cert).
+# Previously verification was opt-in AND required a CA file, so every cs spoke
+# reaching the public-CA hub ended up unauthenticated (verify=OFF).
+TLS_VERIFY=""
 TLS_CA_CERT=""
 # Agent listener (split topology): ON by default — a pxmx host agent dials
 # THIS cs spoke's /ws/agent directly (wss://<cs>:443/ws/agent) instead of the
@@ -131,6 +134,7 @@ while [[ "$#" -gt 0 ]]; do
         --dhcp-iface)         DHCP_IFACE="$2";   shift ;;
         --no-dhcp)            DHCP_SKIP=1 ;;
         --tls-verify)         TLS_VERIFY=true ;;
+        --no-tls-verify)      TLS_VERIFY=false ;;
         --tls-ca-cert)        shift; TLS_CA_CERT="$1" ;;
         --agent-listener)     CS_AGENT_LISTENER=1 ;;  # default already; kept as a harmless no-op
         --no-agent-listener)  CS_AGENT_LISTENER=0 ;;
@@ -165,8 +169,28 @@ if [ -n "${HUB_URL:-}" ] && [ "$HUB_URL" != "auto" ]; then
     esac
 fi
 
-if $TLS_VERIFY && [ -z "$TLS_CA_CERT" ]; then
-    echo "❌ --tls-verify requires --tls-ca-cert <path> on a standalone spoke (the hub CA cert is not on this box)."
+_env_file="$LM_DIR/cs/.env"
+if [ -z "$TLS_VERIFY" ] && [ -f "$_env_file" ] && grep -q '^LM_HUB_TLS_VERIFY=' "$_env_file"; then
+    case "$(grep '^LM_HUB_TLS_VERIFY=' "$_env_file" | tail -1 | cut -d= -f2-)" in
+        1|true|yes) TLS_VERIFY=true ;;
+        *)          TLS_VERIFY=false ;;
+    esac
+    if [ -z "$TLS_CA_CERT" ]; then
+        TLS_CA_CERT="$(grep '^LM_HUB_CA_CERT=' "$_env_file" | tail -1 | cut -d= -f2- || true)"
+    fi
+fi
+if [ -z "$TLS_VERIFY" ]; then
+    _hub_host="${HUB_URL#*://}"; _hub_host="${_hub_host%%[:/]*}"
+    if [ -n "$_hub_host" ] && [ "$HUB_URL" != "auto" ] \
+       && ! [[ "$_hub_host" =~ ^[0-9.]+$ || "$_hub_host" == \[* ]]; then
+        TLS_VERIFY=true
+    else
+        TLS_VERIFY=false
+        echo "⚠️  Hub TLS verification OFF (hub is an IP / auto-discovered). Pass --tls-verify [--tls-ca-cert <path>] to authenticate the hub."
+    fi
+fi
+if $TLS_VERIFY && [ -n "$TLS_CA_CERT" ] && [ ! -f "$TLS_CA_CERT" ]; then
+    echo "❌ --tls-ca-cert $TLS_CA_CERT does not exist."
     exit 1
 fi
 if $TLS_VERIFY; then
@@ -1620,7 +1644,7 @@ if [ "$SPOKE_ID_PINNED" = "1" ]; then
     ID_ARG="--id $SPOKE_ID"
 fi
 
-# TLS verify lines for the .env (empty unless --tls-verify was passed).
+# TLS verify lines for the .env (resolved from flags / existing .env / --hub above).
 TLS_VERIFY_LINE="LM_HUB_TLS_VERIFY=$HUB_TLS_VERIFY_ENV"
 TLS_CA_LINE=""
 [ -n "$HUB_TLS_CA_ENV" ] && TLS_CA_LINE="LM_HUB_CA_CERT=$HUB_TLS_CA_ENV"
