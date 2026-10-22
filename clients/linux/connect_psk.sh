@@ -43,10 +43,9 @@ connect_wifi() {
   # prefixed with the site name so the same bucket can map to different SSIDs
   # per site.
   local target_ssid
-  if [[ "$site_based_ssid" == "on" ]]; then
-    target_ssid="$wsite-$ssid"
-  else
-    target_ssid="$ssid"
+  if ! target_ssid=$(_target_ssid); then
+    echo "  [connect] no SSID assigned yet (awaiting spoke placement) — skipping connect" | tee -a ${LOG_FILE}
+    return 1
   fi
 
   # ---- Radio cycle (only as a LAST resort) ---------------------------------
@@ -112,11 +111,7 @@ connect_wifi_fail() {
   local cap="${1:-5}"
   delete_matching_connections
   local target_ssid
-  if [[ "$site_based_ssid" == "on" ]]; then
-    target_ssid="$wsite-$ssid"
-  else
-    target_ssid="$ssid"
-  fi
+  target_ssid=$(_target_ssid) || return 1
   # Same background-nmcli + wait-on-PID trick as connect_wifi: return the instant
   # the AP rejects the bad PSK (deauth — the real "WPA Passphrase Incorrect"
   # event) instead of blocking for the whole cap. $cap is only a silent-AP

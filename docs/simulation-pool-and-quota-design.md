@@ -141,10 +141,18 @@ Clients land on a cell in exactly **two ways**, configured in one place
    a site across that site's cells **proportional to weight**:
    - `weight 5` vs `weight 1` → 5× the clients;
    - `weight 0` → that cell takes none;
-   - **`all`** → that cell soaks the **balance** after the weighted split.
+   - **`all`** → that cell soaks the **balance** after the weighted split;
+   - **no rules at all** → every **enabled** cell gets weight 1 (even spread), so
+     an engine-driven client is never left without an SSID.
+
+   Placement uses "seen recently" only — a `gateway_confirmed_down` client is
+   still placed (it can't recover its gateway without an SSID), though harvest
+   keeps excluding it.
 
    No ledger, no per-client tracking — each sweep just re-sets the spare client's
-   `ssid`/`wsite`.
+   `ssid`/`wsite`. Clients never connect to a blank SSID: with no `ssid` assigned
+   the connect is skipped (never `"-"`), and a blank `wsite` with
+   `site_based_ssid=on` falls back to the bare SSID.
 
 Both write `wsite` / `ssid` / `ssidpw` into the served `[username]` (frozen
 connectivity — see §12), so bucket randomization can never move a box's SSID.
