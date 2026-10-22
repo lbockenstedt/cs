@@ -28,10 +28,9 @@ version=0.01
 manage_connection() {
   local action="$1" wait_time="$2" reset="${3:-}" scan_cap="${4:-}" track="${5:-1}"
   local target_ssid
-  if [[ "$site_based_ssid" == "on" ]]; then
-    target_ssid="$wsite-$ssid"
-  else
-    target_ssid="$ssid"
+  if ! target_ssid=$(_target_ssid); then
+    echo "  [connect] no SSID assigned yet (awaiting spoke placement) — skipping ${action}" | tee -a ${LOG_FILE}
+    return 1
   fi
 
   # ---- down: deactivate immediately, no event watch needed -----------------
