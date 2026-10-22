@@ -825,6 +825,38 @@ def test_same_source_same_site_still_stacks(tmp_path):
     assert pres == dns, "same-source presence+sim must stack onto the same clients"
 
 
+def test_reconcile_weighted_no_rules_defaults_to_enabled_cells(tmp_path):
+    # No ssid_weights configured → spare clients still get an SSID: an even
+    # spread over every ENABLED matrix cell. Previously the pass returned early
+    # and engine-driven clients built the SSID "-" (blank wsite + blank ssid).
+    clients = {f"c{i}": _client(f"c{i}", "") for i in range(4)}
+    spoke = _FakeSpoke(clients, [], tmp_path)
+    spoke.local_store._matrix = [
+        {"name": "BAR-CC", "site": "BAR", "ssid": "CC", "ssidpw": "pw", "enabled": True},
+        {"name": "BAR-OFF", "site": "BAR", "ssid": "OFF", "ssidpw": "pw", "enabled": False},
+    ]
+    eng = SimQuotaEngine(spoke)
+    _run(eng.reconcile())
+    for h in clients:
+        ov = spoke.registry.clients[h].get("overrides", {})
+        assert ov.get("ssid") == "CC" and ov.get("wsite") == "BAR", (h, ov)
+
+
+def test_reconcile_weighted_places_gateway_down_clients(tmp_path):
+    # A client latched gateway_confirmed_down is excluded from HARVEST, but must
+    # still be PLACED — without an SSID it can never reach its gateway, so the
+    # exclusion would otherwise strand it unplaced forever.
+    c = _client("c0", "")
+    c["gateway_confirmed_down"] = True
+    spoke = _FakeSpoke({"c0": c}, [], tmp_path)
+    spoke.local_store._matrix = [
+        {"name": "BAR-CC", "site": "BAR", "ssid": "CC", "ssidpw": "pw", "enabled": True},
+    ]
+    eng = SimQuotaEngine(spoke)
+    _run(eng.reconcile())
+    assert spoke.registry.clients["c0"]["overrides"].get("ssid") == "CC"
+
+
 def test_reconcile_weighted_spreads_tenant_pool_across_sites(tmp_path):
     # 4 tenant-pool (unmapped → assignable-anywhere) clients, NO harvest quota →
     # all spare. Two weighted SSID cells at sites A and B (even weights). The
