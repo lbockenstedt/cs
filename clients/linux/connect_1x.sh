@@ -81,10 +81,9 @@ _connect_1x_build_profile() {
 _connect_1x_normal() {
   local wait_time="$1" reset="${2:-}" scan_cap="" track=1
   local target_ssid
-  if [[ "$site_based_ssid" == "on" ]]; then
-    target_ssid="$wsite-$ssid"
-  else
-    target_ssid="$ssid"
+  if ! target_ssid=$(_target_ssid); then
+    echo "  [connect] no SSID assigned yet (awaiting spoke placement) — skipping connect" | tee -a ${LOG_FILE}
+    return 1
   fi
 
   # ---- Radio cycle (only as a LAST resort) ---------------------------------
@@ -136,11 +135,7 @@ _connect_1x_normal() {
 _connect_1x_fast() {
   local cap="${1:-5}"
   local target_ssid
-  if [[ "$site_based_ssid" == "on" ]]; then
-    target_ssid="$wsite-$ssid"
-  else
-    target_ssid="$ssid"
-  fi
+  target_ssid=$(_target_ssid) || return 1
 
   # Delete + rebuild the profile so each attempt is a fresh association.
   _connect_1x_build_profile "$target_ssid" || return 1

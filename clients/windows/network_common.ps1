@@ -51,7 +51,9 @@ $script:RadioCycleAfter = 5
 # connect paths. Reads $script:ssid / $script:wsite / $script:site_based_ssid,
 # which simulation.ps1 sets each loop.
 function Get-SimTargetSsid {
-    if ($script:site_based_ssid -eq 'on') {
+    # Empty (never "-") when no SSID is assigned yet — callers skip the connect.
+    if ([string]::IsNullOrWhiteSpace($script:ssid)) { return '' }
+    if ($script:site_based_ssid -eq 'on' -and -not [string]::IsNullOrWhiteSpace($script:wsite)) {
         return "$($script:wsite)-$($script:ssid)"
     }
     return $script:ssid

@@ -40,6 +40,20 @@ _reconnect_fails=0
 # cycle immediately (the "reset the adapter" recovery site).
 _RADIO_CYCLE_AFTER=5
 
+# _target_ssid — print the SSID to actually connect to. With site_based_ssid=on
+# the SSID is prefixed with the site ("$wsite-$ssid"); a blank wsite falls back
+# to the bare SSID. Returns 1 (prints nothing) when no SSID is assigned yet —
+# e.g. an engine-driven client the spoke hasn't placed — so callers skip the
+# connect instead of trying to join an SSID literally named "-".
+_target_ssid() {
+  [[ -n "${ssid:-}" ]] || return 1
+  if [[ "${site_based_ssid:-}" == "on" && -n "${wsite:-}" ]]; then
+    printf '%s\n' "$wsite-$ssid"
+  else
+    printf '%s\n' "$ssid"
+  fi
+}
+
 # delete_matching_connections — remove every saved NetworkManager wifi profile
 # whose name contains "PSK". Forces a fresh association on the next connect
 # (each attempt is then a distinct AP event, not a cached profile reuse). Used
