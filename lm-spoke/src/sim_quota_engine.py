@@ -217,6 +217,12 @@ class SimQuotaEngine:
         # shed map so a slow-destroy doesn't get re-dispatched each sweep.
         self._qt_telemetry: Dict[str, Any] = {}
         self._qt_shed_recent: Dict[str, Dict[str, float]] = {}
+        # Grace anchors beyond first_seen: a client can only connect once it has
+        # a target SSID, so the "never connected" clock restarts when its target
+        # (wsite, ssid) changes, and on engine start (a restart can deliver a
+        # new config fleet-wide). hostname -> ((wsite, ssid), since).
+        self._qt_ssid_since: Dict[str, Tuple[Tuple[str, str], float]] = {}
+        self._qt_started_at: float = time.time()
         try:
             data_dir = Path(getattr(spoke, "data_dir", None) or ".")
             data_dir.mkdir(parents=True, exist_ok=True)
@@ -483,10 +489,19 @@ class SimQuotaEngine:
             per_host_failed: Dict[str, int] = {}
             per_bus_fail: Dict[str, int] = {}
             candidates: List[Tuple[str, Any, str, Optional[str]]] = []
+            seen_t2: set = set()
             for hostname, c in self._all_clients().items():
                 if str(c.get("tier") or "").lower() != "t2":
                     continue
                 hkey = str(hostname).strip().lower()
+                seen_t2.add(hkey)
+                target = self._qt_target(c)
+                if target is None:
+                    self._qt_ssid_since.pop(hkey, None)
+                else:
+                    prev = self._qt_ssid_since.get(hkey)
+                    if prev is None or prev[0] != target:
+                        self._qt_ssid_since[hkey] = (target, now)
                 host = self._name_to_host.get(hkey)
                 if host:
                     per_host_total[host] = per_host_total.get(host, 0) + 1
@@ -500,8 +515,14 @@ class SimQuotaEngine:
                 ls = c.get("last_seen")
                 if not ls or (now - float(ls)) > QT_ONLINE_S:
                     continue  # offline (no heartbeat over the backend net)
+                # No target SSID = nothing to connect to (engine hasn't placed it,
+                # or the config carries none) — a config gap, never a dongle fault.
+                if target is None:
+                    continue
                 fs = c.get("first_seen") or ls
-                if (now - float(fs)) < grace:
+                anchor = max(float(fs), self._qt_started_at,
+                             self._qt_ssid_since[hkey][1])
+                if (now - anchor) < grace:
                     continue  # within the grace window — give it time to connect
                 active = set(c.get("active_simulations") or [])
                 # A configured-on exclusion sim explains the no-IP even before
@@ -540,6 +561,8 @@ class SimQuotaEngine:
                 if bus:
                     per_bus_fail[bus] = per_bus_fail.get(bus, 0) + 1
                 candidates.append((hostname, vmid, host, bus))
+            for k in [k for k in self._qt_ssid_since if k not in seen_t2]:
+                del self._qt_ssid_since[k]
             # Storm guard: >20% per host failed → bulk alarm; suppress shed there.
             bulk_hosts: List[str] = []
             for host, failed in per_host_failed.items():
@@ -564,6 +587,11 @@ class SimQuotaEngine:
                 if host and (now - self._qt_shed_recent.get(host, {})
                              .get(hostname, 0)) < grace:
                     continue  # already shed this client recently; don't re-dispatch
+                # Mark BEFORE dispatching: the send awaits an agent ack, and
+                # sweeps run every few seconds, so marking only after the ack
+                # re-dispatched the same shed many times over.
+                if host:
+                    self._qt_shed_recent.setdefault(host, {})[hostname] = now
                 asyncio.create_task(self._qt_shed(hostname, vmid, host, bus, now))
         except Exception as exc:  # noqa: BLE001 — a sweep must not kill the loop
             logger.warning("dongle-quarantine sweep failed: %s", exc)
@@ -588,8 +616,23 @@ class SimQuotaEngine:
             logger.warning("dongle-quarantine: shed %s (vmid %s, bus %s, host %s)",
                            hostname, vmid, bus, host)
         except Exception as exc:  # noqa: BLE001
+            # Un-mark so a later sweep can retry the failed dispatch.
+            (self._qt_shed_recent.get(host) or {}).pop(hostname, None)
             logger.warning("dongle-quarantine: shed dispatch failed for %s: %s",
                            hostname, exc)
+
+    @staticmethod
+    def _qt_target(c: Dict[str, Any]) -> Optional[Tuple[str, str]]:
+        """The (wsite, ssid) this client is supposed to join — override first,
+        then its reported config — or None when it has no usable SSID (blank or
+        the "-" a blank site+ssid renders to under site_based_ssid)."""
+        ov = c.get("overrides") or {}
+        cfg = c.get("config") or {}
+        ssid = str(ov.get("ssid") or cfg.get("ssid") or "").strip()
+        if not ssid or ssid == "-":
+            return None
+        wsite = str(ov.get("wsite") or cfg.get("wsite") or "").strip()
+        return (wsite, ssid)
 
     def _human_pinned_sim(self, hostname: str, sim_id: str) -> bool:
         """True when a human explicitly set this sim flag in the client's
