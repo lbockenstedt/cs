@@ -105,13 +105,21 @@ def _t2_client(host, *, ip="", ssid="", ever_connected=False, age=4000.0,
         "ip": ip, "connected_ssid": ssid, "ever_connected": ever_connected,
         "first_seen": time.time() - age, "last_seen": time.time(),
         "active_simulations": active_sims or [],
-        "config": config or {},
+        "config": {"wsite": "BAR", "ssid": "CC-BRIDGE", **(config or {})},
     }
 
 
-def _eng(spoke):
+def _eng(spoke, *, aged=True):
+    """Build an engine. ``aged`` backdates the engine start and each client's
+    SSID-assignment anchor so only ``first_seen`` gates the grace window."""
     e = SimQuotaEngine(spoke)
     e._refresh_host_index()  # populate _name_to_host from deploy.name_to_host
+    if aged:
+        e._qt_started_at = 0.0
+        for h, c in spoke.registry.clients.items():
+            t = e._qt_target(c)
+            if t is not None:
+                e._qt_ssid_since[h.strip().lower()] = (t, 0.0)
     return e
 
 
@@ -340,3 +348,73 @@ def test_exclusion_sim_dongle_that_sees_ssids_not_shed():
     eng = _eng(spoke)
     _sweep(eng)
     assert spoke.control_plane.sent == []
+
+
+def _one_client_setup(client):
+    deploy = _Deploy({"kbell-01": 100},
+                     {"hostA": [{"vmid": 100, "bus_path": "3-1"}]},
+                     {"kbell-01": "hostA"})
+    return _Spoke({"kbell-01": client}, deploy, csc={})
+
+
+def test_no_target_ssid_not_shed():
+    """A client with no SSID to join (engine hasn't placed it / blank config —
+    renders as "-") can't connect by construction: a config gap, not a dongle
+    fault. Never shed it, however old first_seen is."""
+    for cfg in ({"ssid": "", "wsite": ""}, {"ssid": "-"}):
+        spoke = _one_client_setup(_t2_client("kbell-01", age=99999, config=cfg))
+        eng = _eng(spoke)
+        _sweep(eng)
+        assert spoke.control_plane.sent == []
+
+
+def test_newly_assigned_ssid_restarts_grace():
+    """first_seen days old, but the SSID was only just assigned (the SSID-starved
+    fleet getting its first placement): the client gets a fresh grace window
+    instead of being shed minutes after it finally has something to join."""
+    spoke = _one_client_setup(_t2_client("kbell-01", age=99999))
+    eng = _eng(spoke, aged=False)
+    eng._qt_started_at = 0.0  # isolate the ssid anchor from the start anchor
+    _sweep(eng)
+    assert spoke.control_plane.sent == []
+    # Once the assignment itself is older than grace, it's a real candidate.
+    h = "kbell-01"
+    eng._qt_ssid_since[h] = (eng._qt_ssid_since[h][0], 0.0)
+    _sweep(eng)
+    assert len(spoke.control_plane.sent) == 1
+
+
+def test_ssid_change_restarts_grace():
+    spoke = _one_client_setup(_t2_client("kbell-01", age=99999))
+    eng = _eng(spoke)
+    spoke.registry.clients["kbell-01"]["overrides"] = {"ssid": "OTHER", "wsite": "BAR"}
+    _sweep(eng)
+    assert spoke.control_plane.sent == []
+
+
+def test_engine_start_restarts_grace():
+    """A spoke restart can push a new config fleet-wide; nothing is shed until
+    the engine itself has been up for the grace window."""
+    spoke = _one_client_setup(_t2_client("kbell-01", age=99999))
+    eng = _eng(spoke)
+    eng._qt_started_at = time.time()
+    _sweep(eng)
+    assert spoke.control_plane.sent == []
+
+
+def test_shed_dispatched_once_across_rapid_sweeps():
+    """The recent-shed mark is set at dispatch, not after the agent ack, so the
+    seconds-apart sweeps don't re-dispatch the same destroy while it's in flight."""
+    spoke = _one_client_setup(_t2_client("kbell-01", age=4000))
+    eng = _eng(spoke)
+    now = time.time()
+
+    async def _go():
+        eng._quarantine_sweep(now)
+        eng._quarantine_sweep(now + 1)
+        eng._quarantine_sweep(now + 2)
+        for _ in range(3):
+            await asyncio.sleep(0)
+
+    asyncio.new_event_loop().run_until_complete(_go())
+    assert len(spoke.control_plane.sent) == 1
