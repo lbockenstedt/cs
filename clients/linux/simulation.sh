@@ -887,8 +887,7 @@ if [ "$kill_switch" != "on" ]; then
      else
      echo "Running MAC Auth Failure (spoofed MAC deny-list test, target=${mac_auth_fail_mac})" | tee -a ${LOG_FILE}
      # Resolve the connection PROFILE name the same way connect_wifi does.
-     mac_fail_ssid="$ssid"
-     [[ "$site_based_ssid" == "on" ]] && mac_fail_ssid="$wsite-$ssid"
+     mac_fail_ssid=$(_target_ssid) || mac_fail_ssid=""
      # Bootstrap the profile ONCE, unspoofed, if it doesn't exist yet — `device
      # wifi connect` negotiates WPA2/WPA3/security automatically (a manual
      # `connection add` can't easily replicate that). This is the ONLY
@@ -897,7 +896,7 @@ if [ "$kill_switch" != "on" ]; then
      # cloned-mac-address. `device wifi connect` does NOT — it silently resets
      # the wifi MAC back to permanent on EVERY call, so it must never drive the
      # spoofed connection or the spoof is undone the instant it's applied.
-     if ! nmcli -t -f NAME connection show 2>/dev/null | grep -Fxq "$mac_fail_ssid"; then
+     if [[ -n "$mac_fail_ssid" ]] && ! nmcli -t -f NAME connection show 2>/dev/null | grep -Fxq "$mac_fail_ssid"; then
        echo "  [mac_auth_fail] bootstrapping connection profile '${mac_fail_ssid}' (one-time, unspoofed)" | tee -a ${LOG_FILE}
        nmcli -w 30 device wifi connect "$mac_fail_ssid" password "$ssidpw" >/dev/null 2>&1
      fi

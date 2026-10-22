@@ -109,7 +109,8 @@ function Get-AdapterInventory {
 }
 
 function Get-TargetSsid {
-    if ($script:site_based_ssid -eq 'on') {
+    if ([string]::IsNullOrWhiteSpace($script:ssid)) { return '' }
+    if ($script:site_based_ssid -eq 'on' -and -not [string]::IsNullOrWhiteSpace($script:wsite)) {
         return "$($script:wsite)-$($script:ssid)"
     }
     return $script:ssid

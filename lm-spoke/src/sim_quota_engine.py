@@ -1279,10 +1279,20 @@ class SimQuotaEngine:
             rules = self.spoke.local_store.get_ssid_weights() or []
         except Exception:  # noqa: BLE001
             return
+        cells = getattr(self, "_cells_by_name", {})
+        if not rules:
+            # No weighted rules configured → even spread across every enabled
+            # cell. Without this an engine-driven client (whose bucket carries no
+            # wsite/ssid) that no quota claims gets NO SSID and the client script
+            # builds "<wsite>-<ssid>" = "-".
+            rules = [{"ssid": name, "weight": 1} for name in cells]
         if not rules:
             return
-        cells = getattr(self, "_cells_by_name", {})
-        online = {h for h, c in clients.items() if self._is_harvestable(c, now)}
+        # Placement only needs "seen recently" — NOT the gateway-confirmed-down
+        # exclusion harvest applies: a client with no SSID can never prove its
+        # gateway, so excluding it here would strand it unplaced forever.
+        online = {h for h, c in clients.items()
+                  if c.get("last_seen") and (now - float(c["last_seen"])) < HARVEST_WINDOW_S}
         # NO tier filtering here, deliberately: EVERY spare client does background
         # work, T1 included. Reserving T1s out of the ambient spread would leave a
         # T1 no quota happens to need with no SSID/site placement — idle — and an
