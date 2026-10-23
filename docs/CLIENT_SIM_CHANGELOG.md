@@ -6,6 +6,20 @@ keywords: [apt_update, client, cs, dashboard, dns_fail, download, iperf, sim, si
 
 # Changelog
 
+## Client offline window — 2026-10-23
+
+- Added `client_offline` on Linux and Windows (script version 0.01), default off
+  in every bucket and overridable per user. The foreground end-of-cycle window
+  uses `client_offline_min_minutes=60` / `client_offline_max_minutes=240` under
+  `[simulation]`, validates bounds and randomly selects inclusive seconds.
+- Only the selected `sim_phy` adapter is disabled and restored; missing adapters
+  and any adapter carrying a `169.253.*` management IP are skipped. Management
+  and the agent/spoke API stay online. Linux USR1 reloads interrupt the sleep and
+  await restoration; active failure simulations suppress the Linux window.
+- Added override/status/UI wiring, without adding an ambient random roll or quota.
+- Removed the dead commented Linux `allow_offline` block and helper. The separate
+  Windows/engine legacy behavior is unchanged; keep `allow_offline=no`.
+
 > **Historical scope (2026-07):** This changelog covers the **legacy
 > `webui-spoke` / standalone client-sim** era (the `installers/install-lxc.sh`
 > + `proxmox/install-proxmox-agent.sh` deployment). It predates the LM-native

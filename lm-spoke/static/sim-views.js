@@ -2324,7 +2324,7 @@ async function csDemoLoad() {
 
 function csDemoOptions(activeScenario) {
     const names = Object.keys(window._csDemoScenarios || {});
-    if (!names.length) names.push('normal', 'dns_fail', 'dns_latency', 'dhcp_fail', 'assoc_fail', 'auth_fail', 'ssidpw_fail', 'mac_auth_fail', 'port_flap');
+    if (!names.length) names.push('normal', 'dns_fail', 'dns_latency', 'dhcp_fail', 'assoc_fail', 'auth_fail', 'ssidpw_fail', 'mac_auth_fail', 'port_flap', 'client_offline');
     return names.map(n => `<option value="${csEscape(n)}" ${n === activeScenario ? 'selected' : ''}>${csEscape(n)}</option>`).join('');
 }
 
@@ -2415,7 +2415,7 @@ window.csDemoClear = async function (btn) {
 // is an expandable row beneath each client; opening it fetches the host's
 // current overrides and seeds the toggles.
 // Alphabetical so the sim knobs + the Simulation facet dropdown list in order.
-const CS_CONTROL_FLAGS = ['assoc_fail', 'auth_fail', 'dhcp_fail', 'dns_fail',
+const CS_CONTROL_FLAGS = ['assoc_fail', 'auth_fail', 'client_offline', 'dhcp_fail', 'dns_fail',
     'dns_latency', 'download', 'iperf', 'kill_switch', 'mac_auth_fail', 'ping_test', 'port_flap',
     'ssidpw_fail', 'www_traffic'];
 
@@ -4245,8 +4245,22 @@ const CS_ONOFF_KEYS = new Set([
     'kill_switch', 'rapid_update', 'github_repo', 'smb_repo', 'site_based_ssid',
     'ssidpw_fail', 'auth_fail', 'mac_auth_fail', 'syslog', 'web_server',
     'dhcp_fail', 'dns_fail', 'dns_latency', 'assoc_fail', 'port_flap', 'ping_test',
-    'download', 'www_traffic', 'iperf',
+    'download', 'www_traffic', 'iperf', 'client_offline',
 ]);
+
+// Select choices keep unknown existing values as an extra option on save.
+const CS_SELECT_OPTIONS = {
+    dot1x_eap: { options: ['peap', 'tls'], defaultLabel: '— default (peap) —' },
+    ssid: { options: ['PSK', '1X'] },
+};
+
+function csSimSelectOptions(key, value) {
+    const v = (value === undefined || value === null) ? '' : String(value);
+    const { options, defaultLabel = '— default —' } = CS_SELECT_OPTIONS[key];
+    const choices = v && !options.includes(v) ? [...options, v] : options;
+    return `<option value="" ${v === '' ? 'selected' : ''}>${csEscape(defaultLabel)}</option>` +
+        choices.map(opt => `<option value="${csEscape(opt)}" ${v === opt ? 'selected' : ''}>${csEscape(opt)}</option>`).join('');
+}
 
 // Ordered field schema per section → [{key, label}]. Drives the labeled-input
 // editor (the legacy tab showed named fields, not raw INI). Keys not in the
@@ -4257,11 +4271,17 @@ const CS_SIM_SECTION_FIELDS = {
         ['sim_load', 'Sim Load'], ['mutter_cpu_limit', 'Mutter CPU Limit (% of 1 core; 0=off)'],
         ['repo_location', 'Repo Location'],
         ['repo_branch', 'Repo Branch'], ['reboot_schedule', 'Reboot Schedule'],
-        ['dot1x_password', 'Dot1x Password'], ['dot1x_eap', 'Dot1x Eap'],
+        ['dot1x_password', 'Dot1x Password (PEAP; falls back to the SSID Ssidpw when empty)'],
+        ['dot1x_eap', 'Dot1x EAP (tls is Linux-only; Windows clients report unsupported)', 'select'],
+        ['dot1x_client_cert', 'EAP-TLS only (Linux): path to client certificate'],
+        ['dot1x_private_key', 'EAP-TLS only (Linux): path to private key'],
+        ['dot1x_ca_cert', 'EAP-TLS only (Linux): path to CA certificate'],
         ['iperf_bw', 'Iperf Bw'], ['kill_switch', 'Kill Switch'],
         ['rapid_update', 'Rapid Update'], ['github_repo', 'Github Repo'],
         ['smb_repo', 'Smb Repo'], ['site_based_ssid', 'Site Based Ssid'],
         ['allow_offline', 'Allow Offline'], ['ssidpw_fail', 'Ssidpw Fail'],
+        ['client_offline_min_minutes', 'Client Offline Min (minutes)'],
+        ['client_offline_max_minutes', 'Client Offline Max (minutes)'],
         ['auth_fail', 'Auth Fail'], ['mac_auth_fail', 'Mac Auth Fail'], ['syslog', 'Syslog'],
         ['web_server', 'Web Server'],
         ['dns_fail_rate', 'DNS Fail Rate (/min)'],
@@ -4287,11 +4307,12 @@ const CS_SIM_SECTION_FIELDS = {
 };
 // Per-bucket [s0]–[s9] field schema (identical for each bucket).
 const CS_SIM_BUCKET_FIELDS = [
-    ['wsite', 'Wsite'], ['ssid', 'Ssid'], ['ssidpw', 'Ssidpw'],
+    ['wsite', 'Wsite'], ['ssid', 'SSID / Auth', 'select'], ['ssidpw', 'Ssidpw'],
     ['dhcp_fail', 'Dhcp Fail'], ['dns_fail', 'Dns Fail'], ['dns_latency', 'Dns Latency'],
     ['assoc_fail', 'Assoc Fail'], ['port_flap', 'Port Flap'],
     ['ping_test', 'Ping Test'], ['download', 'Download'],
     ['www_traffic', 'Www Traffic'], ['iperf', 'Iperf'],
+    ['client_offline', 'Client Offline'],
     ['sim_phy', 'Sim Phy'], ['l1', 'L1'],
 ];
 const CS_SIM_BUCKETS = ['s0', 's1', 's2', 's3', 's4', 's5', 's6', 's7', 's8', 's9'];
@@ -4313,12 +4334,20 @@ function csParseIni(text) {
     return out;
 }
 
-// Render one labeled field for a section. on/off keys → a select; others → text
-// input. Each input carries data-cs-section + data-cs-key so the serializer can
-// walk them regardless of which section card they live in.
+// Render one labeled field: select choices, on/off flags, lists or text inputs.
+// Each field carries data-cs-section + data-cs-key so the serializer can walk
+// them regardless of which section card they live in (empty values are skipped).
 function csSimField(section, key, label, value, type) {
     const id = `cs-sim-${csEscape(section)}-${csEscape(key)}`;
     const v = (value === undefined || value === null) ? '' : String(value);
+    if (type === 'select') {
+        return `<div class="flex flex-col gap-1">
+          <label class="text-[10px] text-slate-500 uppercase font-bold tracking-wider">${csEscape(label)}</label>
+          <select id="${id}" data-cs-section="${csEscape(section)}" data-cs-key="${csEscape(key)}"
+                  class="border border-slate-200 rounded-md px-2 py-1.5 text-sm text-slate-600">
+            ${csSimSelectOptions(key, v)}
+          </select></div>`;
+    }
     if (type === 'list') {
         // Space/comma-separated config value ↔ one-per-line textarea (unlimited).
         // data-cs-list tells the serializer to re-join lines with a space.
@@ -5125,7 +5154,7 @@ function csPoolConfigCardHtml() {
     const matrixRows = matrix.map((c, i) => {
         return `<div class="grid grid-cols-2 sm:grid-cols-4 gap-2 items-end bg-white border border-slate-200 rounded-md p-2" data-cs-cell="${i}">
           <label class="text-xs text-slate-500">Site<select data-cs-cell-k="site" class="w-full bg-white border border-slate-300 rounded-md px-2 py-1 text-sm mt-1">${csLinkSiteOptions(c.site, '— site —')}</select></label>
-          <label class="text-xs text-slate-500">SSID / Auth<input data-cs-cell-k="ssid" value="${esc(c.ssid)}" placeholder="PSK / 1X" class="w-full bg-white border border-slate-300 rounded-md px-2 py-1 text-sm mt-1"></label>
+          <label class="text-xs text-slate-500">SSID / Auth<select data-cs-cell-k="ssid" class="w-full bg-white border border-slate-300 rounded-md px-2 py-1 text-sm mt-1">${csSimSelectOptions('ssid', c.ssid)}</select></label>
           <label class="text-xs text-slate-500">Password<input data-cs-cell-k="ssidpw" value="${esc(c.ssidpw)}" class="w-full bg-white border border-slate-300 rounded-md px-2 py-1 text-sm mt-1"></label>
           <button onclick="csPoolCellDel(${i})" class="text-red-600 hover:text-red-800 text-xs font-bold py-1">Remove</button>
         </div>`;
@@ -5153,6 +5182,7 @@ function csPoolConfigCardHtml() {
             <button onclick="csSavePoolConfig()" class="bg-[#01A982]/10 hover:bg-[#01A982]/20 text-[#01A982] border border-[#01A982] px-4 py-1.5 rounded-md text-sm font-bold shadow-sm">Save Pool</button>
           </div>
         </div>
+        <p class="text-xs text-slate-500 mb-3"><code>1X</code> uses <code>dot1x_eap</code> and <code>dot1x_password</code> from <code>[simulation]</code>. PEAP falls back to the SSID Ssidpw when dot1x_password is empty; TLS uses the Linux-only certificate paths (Windows clients report unsupported).</p>
         <p class="text-xs text-slate-500 mb-3">The SSID matrix just <span class="font-semibold">defines</span> your SSIDs (site, auth, password). <span class="font-semibold">Sim Quotas</span> attach an exact (accounted) count of clients to a cell for an alert. The <span class="font-semibold">weighted rules</span> below spread the rest of the pool (random, unaccounted) across a site's SSIDs by weight. Whether a PXMX server is site-bound (RF chamber) or assignable is set in <span class="font-semibold">Config → Sites</span>.</p>
         <div class="mb-3">
           <div class="text-[11px] font-bold text-slate-500 uppercase tracking-wider mb-1">Randomizable (ambient) sims</div>

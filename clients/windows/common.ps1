@@ -168,7 +168,7 @@ $script:CS_OVERRIDE_KEYS = @(
     'www_traffic','ssidpw_fail','auth_fail','mac_auth_fail','mac_auth_fail_mac','smb_address','ping_address',
     'dns_bad_ip_1','dns_bad_ip_2','dns_bad_ip_3','dns_bad_record_1','dns_bad_record_2',
     'dns_bad_record_3','iperf_server','dot1x_password',
-    'collab','collab_app','collab_bw','collab_time','collab_server','web_server'
+    'collab','collab_app','collab_bw','collab_time','collab_server','web_server','client_offline'
 )
 # Returns the override value for a key ($null when unset). Callers assign it to
 # their own variable — PowerShell scoping makes an in-place declare -g awkward,

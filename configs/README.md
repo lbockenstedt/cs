@@ -65,12 +65,9 @@ site_based_ssid=on       # on  = prepend wsite to the SSID name when connecting.
                          #       e.g. wsite=MIA + ssid=PSK → connects to "MIA-PSK"
                          # off = connect to ssid exactly as written (e.g. "PSK")
 reboot_schedule=300      # minutes until client schedules a reboot (+ up to 600s jitter)
-allow_offline=on         # on = after each 100-iteration cycle, bring all network interfaces
-                         #      down for a random 1 second to 4 hours before restarting.
-                         #      WHY: clients that are always connected look like IoT devices.
-                         #      Going offline periodically makes them look like real user laptops
-                         #      that leave the office, sleep, or roam off the network.
-                         # off = client stays connected continuously between cycles.
+allow_offline=no         # legacy setting, separate from client_offline; keep off (no)
+client_offline_min_minutes=60    # minimum offline window (1 hour)
+client_offline_max_minutes=240   # maximum offline window (4 hours)
 ssidpw_fail=off          # global default — can be overridden per bucket or user
 auth_fail=off
 iperf_bw=1k              # iPerf bandwidth target
@@ -92,6 +89,33 @@ collab_time=120
 > path only. Windows clients fail closed and report `status=unsupported` until
 > certificate-store/PFX onboarding is implemented; do not schedule Windows
 > EAP-TLS quotas as successful runs.
+
+### Client offline window (Linux and Windows)
+
+Set `client_offline=on` in a bucket `[s0]`–`[s9]`, or in a user's override
+section, to hold the orchestrator at the end of each cycle. It defaults to `off`
+in all buckets and is not part of `randomizable_sims` or alert quotas.
+`[simulation] client_offline_min_minutes=60` and
+`client_offline_max_minutes=240` select an inclusive random duration in seconds
+(default 1–4 hours). Use 60 and 120 for a 1–2 hour range. Values must be positive
+whole minutes; missing, non-numeric, below-one or out-of-range values fall back
+to the respective defaults. A minimum above the maximum is swapped. The maximum
+supported value is 35791394 minutes on both platforms.
+
+Only the `sim_phy` interface goes down: `wireless` (default) selects Wi-Fi;
+`ethernet` selects the wired adapter. The other adapter is never touched by this
+simulation. An absent/ambiguous adapter, an already disabled adapter, or an adapter
+carrying a `169.253.*` management address is logged and skipped without sleeping.
+The management interface and agent/spoke API connection stay online; the agent
+is not stopped. The script restores only the adapter it disabled, including on
+interruption (Linux EXIT trap / Windows finally). Linux `restart_sim` and
+`kill_switch` USR1 signals interrupt the window immediately and await restoration
+before reloading. Linux also skips the window while any of `dhcp_fail`, `dns_fail`,
+`assoc_fail`, `port_flap`, `ssidpw_fail`, `auth_fail`, or `mac_auth_fail` is on.
+
+`allow_offline` remains a separate legacy setting: keep `allow_offline=no`.
+The dead Linux block was removed; the existing Windows and engine behavior is
+unchanged and does **not** provide this simulation's management-interface safety.
 
 ### [server] — Alternate server block
 
@@ -151,7 +175,8 @@ download=on             # run HTTP download traffic
 www_traffic=on          # run web browsing simulation traffic
 iperf=off               # run iPerf throughput test
 collab=off              # run collaboration-style UDP media traffic
-sim_phy=wireless        # wireless or wired
+client_offline=off      # end-of-cycle offline window on the simulation adapter only
+sim_phy=wireless        # wireless or ethernet
 ```
 
 **Simulation flags reference:**
