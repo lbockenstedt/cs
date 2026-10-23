@@ -454,6 +454,15 @@ def build_local_ui_router(spoke) -> APIRouter:
                 "pxmx_site_map": res.get("pxmx_site_map", {}),
                 "errors": res.get("errors", [])}
 
+    @router.delete("/proxmox/host/{hostname}")
+    async def delete_proxmox_host(hostname: str):
+        # Standalone twin of the hub's DELETE /sim/api/proxmox/host/{hostname}:
+        # drop a stale host from proxmox_states + its site assignment.
+        res = await _cmd("CS_PURGE_HOST", {"hostname": hostname})
+        return {"status": "ok" if res.get("status") == "SUCCESS" else "error",
+                "removed": bool(res.get("removed")), "unmapped": bool(res.get("unmapped")),
+                "message": f"Removed host {hostname}"}
+
     @router.get("/{tenant}/agents")
     async def get_agents(tenant: str):
         return await _cmd("GET_AGENTS", {})

@@ -138,7 +138,20 @@ class ClientCommandsMixin:
             if not hostname:
                 return {"status": "ERROR", "message": "missing hostname"}
             removed = self.deploy.remove_host(hostname)
-            return {"status": "SUCCESS", "hostname": hostname, "removed": removed}
+            # Also forget its Config → Sites server-to-site assignment, so a
+            # server that left this tenant (moved to another tenant's spoke)
+            # stops showing as an offline row there.
+            unmapped = False
+            try:
+                _m = self.local_store.get_pxmx_site_map()
+                if hostname in _m:
+                    _m.pop(hostname, None)
+                    self.local_store.set_pxmx_site_map(_m)
+                    unmapped = True
+            except Exception as exc:  # noqa: BLE001 — purge must still succeed
+                logger.warning("CS_PURGE_HOST: site-map cleanup failed for %s: %s", hostname, exc)
+            return {"status": "SUCCESS", "hostname": hostname,
+                    "removed": removed, "unmapped": unmapped}
 
         # ── Per-host USB VMID overrides ──────────────────────────────────────
         # Optional per-host vmid_start/vmid_end/vm_set_override that override the

@@ -131,3 +131,16 @@ def test_local_store_set_normalizes(spoke_loop):
     clean = s.local_store.set_pxmx_site_map(
         {"px1": "MIA", "  px2  ": "  DFW  ", "": "X", "px3": ""})
     assert clean == {"px1": "MIA", "px2": "DFW"}
+
+def test_purge_host_drops_stale_server_and_its_site_assignment(spoke_loop):
+    # A pxmx server moved to another tenant leaves an offline row + a stale
+    # site assignment here; CS_PURGE_HOST (the Delete button) removes both and
+    # leaves the other servers' assignments intact.
+    s, loop = spoke_loop
+    s.local_store.set_pxmx_site_map({"px1": "MIA", "pxmx-cs-svr-05": "Tenant-Wide Pool"})
+    s.deploy.proxmox_states["pxmx-cs-svr-05"] = {"last_seen": 1}
+    res = _run(loop, s.handle_command("CS_PURGE_HOST", {"hostname": "pxmx-cs-svr-05"}))
+    assert res["status"] == "SUCCESS" and res["removed"] and res["unmapped"]
+    got = _run(loop, s.handle_command("CS_GET_PXMX_SITE_MAP", {}))
+    assert got["pxmx_site_map"] == {"px1": "MIA"}
+    assert all(a["agent_id"] != "pxmx-cs-svr-05" for a in got["agents"])
