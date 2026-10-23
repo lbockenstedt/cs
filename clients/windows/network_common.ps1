@@ -42,6 +42,26 @@ if ($null -eq $script:ReconnectFails) { $script:ReconnectFails = 0 }
 # Linux _RADIO_CYCLE_AFTER=5.
 $script:RadioCycleAfter = 5
 
+# Adapter selectors shared by the orchestrator and lifecycle simulations.
+function Get-WifiAdapter {
+    Get-NetAdapter -ErrorAction SilentlyContinue |
+        Where-Object {
+            $_.Name -match 'wi-fi|wireless|wlan' -or
+            $_.InterfaceDescription -match 'wi-fi|wireless|wlan|802\.11'
+        } |
+        Sort-Object @{ Expression = { if ($_.Status -eq 'Up') { 0 } elseif ($_.Status -eq 'Disconnected') { 1 } else { 2 } } }, Name |
+        Select-Object -First 1
+}
+
+function Get-EthernetAdapter {
+    Get-NetAdapter -ErrorAction SilentlyContinue |
+        Where-Object {
+            $_.Name -match 'ethernet|eth' -or $_.InterfaceDescription -match 'ethernet|gigabit'
+        } |
+        Sort-Object @{ Expression = { if ($_.Status -eq 'Up') { 0 } elseif ($_.Status -eq 'Disconnected') { 1 } else { 2 } } }, Name |
+        Select-Object -First 1
+}
+
 # ---------------------------------------------------------------------------- #
 # Target SSID / connected SSID.                                                 #
 # ---------------------------------------------------------------------------- #
