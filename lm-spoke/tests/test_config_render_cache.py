@@ -85,6 +85,7 @@ def reference_render(spoke, configs_dir: Path, hostname: str) -> str:
             phys = _physical_site(hostname)
             if phys:
                 overrides.setdefault("wsite", phys)
+                overrides.setdefault("site_based_ssid", "off")
                 resolved_site = resolved_site or phys
     except Exception:
         pass
@@ -249,6 +250,36 @@ def test_ambient_suppressed_for_bucket_default_exclusive_sim(client, spoke, conf
     text = client.get("/api/config", params={"hostname": h}).text
     m = re.search(r"(?m)^ambient_pct\s*=\s*(\S+)", text)
     assert m and m.group(1) == "0", f"expected ambient_pct=0, got {m.group(1) if m else None!r}"
+
+
+class _Deploy:
+    def __init__(self, n2h):
+        self._n2h = n2h
+
+    def name_to_host(self):
+        return dict(self._n2h)
+
+
+def _served(text, key):
+    m = re.search(rf"(?m)^{key}\s*=\s*(\S+)", text.split("[jdoe]", 1)[-1])
+    return m.group(1) if m else None
+
+
+@pytest.mark.parametrize("site,expect", [("BAR", "off"), ("Tenant-Wide Pool", None)])
+def test_site_pool_serves_plain_ssid(client, spoke, configs, site, expect):
+    """A Site-Pool (RF chamber) client joins the plain SSID on the chamber AP:
+    the served [username] must carry site_based_ssid=off so a "CC-BRIDGE" cell
+    is not rendered as "BAR-CC-BRIDGE". Tenant-Wide Pool keeps the global value."""
+    (configs / "simulation.conf").write_text(
+        BASE_CONF.format(ws="on").replace("site_based_ssid=off", "site_based_ssid=on"),
+        encoding="utf-8")
+    spoke.deploy = _Deploy({"jdoe-7": "px1"})
+    spoke.local_store.set_pxmx_site_map({"px1": site})
+    client.post("/api/clients/jdoe-7/control",
+                json={"overrides": {"ssid": "CC-BRIDGE", "ssidpw": "x"}})
+    text = client.get("/api/config", params={"hostname": "jdoe-7"}).text
+    assert _served(text, "site_based_ssid") == expect
+    assert text == reference_render(spoke, configs, "jdoe-7")
 
 
 def test_cache_invalidation_on_conf_change(client, spoke, configs):

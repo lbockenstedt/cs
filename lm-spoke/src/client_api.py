@@ -431,6 +431,11 @@ def build_client_api_app(spoke) -> FastAPI:
                 phys = _physical_site(hostname)
                 if phys:
                     overrides.setdefault("wsite", phys)   # engine wsite (if set) kept
+                    # Site Pool (RF chamber) joins the plain SSID on the chamber
+                    # AP — never "{wsite}-{ssid}" (design doc §2). Without this the
+                    # simulation.conf default (on) makes a "CC-BRIDGE" cell render
+                    # as "BAR-CC-BRIDGE", which no AP broadcasts.
+                    overrides.setdefault("site_based_ssid", "off")
                     resolved_site = resolved_site or phys
         except Exception:  # noqa: BLE001
             pass
