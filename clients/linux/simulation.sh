@@ -48,7 +48,8 @@ _sleep_pid=""
 # If we're inside an interruptible sleep (_isleep, e.g. the offline window),
 # kill that sleep child so the loop wakes immediately and re-reads config — an
 # offline client is otherwise deaf to updates for up to 4h.
-trap '_sim_reload=1; [[ -n "${_sleep_pid:-}" ]] && kill "$_sleep_pid" 2>/dev/null' USR1
+_offline_pid=""
+trap '_sim_reload=1; [[ -z "${_sleep_pid:-}" ]] || kill "$_sleep_pid" 2>/dev/null; [[ -z "${_offline_pid:-}" ]] || kill -TERM "$_offline_pid" 2>/dev/null' USR1
 
 require_config_value() {
   local name="$1" value="${2:-}"
@@ -330,7 +331,7 @@ if [[ "$web_server" == "on" ]]; then
   # Start every sim OFF. The engine turns failure sims on via the [username]
   # override applied further down; the roll below is what turns AMBIENT traffic on.
   for sim in dhcp_fail dns_fail dns_latency assoc_fail port_flap ssidpw_fail auth_fail \
-             mac_auth_fail ping_test download iperf www_traffic collab; do declare -g "$sim=off"; done
+             mac_auth_fail ping_test download iperf www_traffic collab client_offline; do declare -g "$sim=off"; done
   #
   # Ambient distribution — two-step model (level, then weighted split)
   # ------------------------------------------------------------------
@@ -412,6 +413,9 @@ else
     done
   fi
 fi
+# Lifecycle flag is bucket-owned, never part of the ambient random roll.
+client_offline=$(get_value $simulation_id 'client_offline')
+client_offline="${client_offline:-off}"
 #------------------------------------------------------------
 #Simlation IP
 #------------------------------------------------------------
@@ -526,7 +530,7 @@ report_status() {
   # (its heartbeat rides a separate backend network, so absence here ≠ offline).
   sim_ip=$(ip -4 -o route get 1.1.1.1 2>/dev/null | grep -oP 'src \K\S+' | head -n1)
   [[ "${gateway_reachable:-}" == "true" ]] && gateway_json=true
-  for sim in dns_fail dns_latency assoc_fail port_flap iperf download www_traffic ping_test ssidpw_fail auth_fail mac_auth_fail dhcp_fail collab; do
+  for sim in dns_fail dns_latency assoc_fail port_flap iperf download www_traffic ping_test ssidpw_fail auth_fail mac_auth_fail dhcp_fail collab client_offline; do
     if [[ "${!sim}" == "on" ]]; then
       [[ $first == true ]] && first=false || active_simulations+=","
       active_simulations+="\"$sim\""
@@ -548,13 +552,13 @@ report_status() {
   detect_adapter_inventory
   local payload
   printf -v payload \
-    '{"hostname":"%s","simulation_id":"%s","platform":"%s","iteration":%s,"connected_ssid":"%s","ip":"%s","gateway_reachable":%s,"dns_ceiling":%s,"active_simulations":[%s],"errors":%s,"adapters":%s,"config":{"kill_switch":"%s","dns_fail":"%s","dns_latency":"%s","iperf":"%s","www_traffic":"%s","download":"%s","ping_test":"%s","ssidpw_fail":"%s","auth_fail":"%s","mac_auth_fail":"%s","dhcp_fail":"%s","collab":"%s"}}' \
+    '{"hostname":"%s","simulation_id":"%s","platform":"%s","iteration":%s,"connected_ssid":"%s","ip":"%s","gateway_reachable":%s,"dns_ceiling":%s,"active_simulations":[%s],"errors":%s,"adapters":%s,"config":{"kill_switch":"%s","dns_fail":"%s","dns_latency":"%s","iperf":"%s","www_traffic":"%s","download":"%s","ping_test":"%s","ssidpw_fail":"%s","auth_fail":"%s","mac_auth_fail":"%s","dhcp_fail":"%s","collab":"%s","client_offline":"%s"}}' \
     "$(json_escape "$hostname")" "$(json_escape "${simulation_id:-}")" "$(json_escape "$platform")" \
     "$iteration" "$(json_escape "${connected_ssid:-}")" "$(json_escape "${sim_ip:-}")" "$gateway_json" "$dns_ceiling" "$active_simulations" "$errors_json" "$adapters_json" \
     "$(json_escape "${kill_switch:-off}")" "$(json_escape "${dns_fail:-off}")" "$(json_escape "${dns_latency:-off}")" "$(json_escape "${iperf:-off}")" \
     "$(json_escape "${www_traffic:-off}")" "$(json_escape "${download:-off}")" "$(json_escape "${ping_test:-off}")" \
     "$(json_escape "${ssidpw_fail:-off}")" "$(json_escape "${auth_fail:-off}")" "$(json_escape "${mac_auth_fail:-off}")" "$(json_escape "${dhcp_fail:-off}")" \
-    "$(json_escape "${collab:-off}")"
+    "$(json_escape "${collab:-off}")" "$(json_escape "${client_offline:-off}")"
   local status_file="/usr/local/scripts/client-status.json"
   printf '%s\n' "$payload" > "$status_file" 2>/dev/null && \
     { [[ -z "${_in_report_error:-}" ]] && error_log=(); } || true
@@ -1115,60 +1119,28 @@ pkill -f 'firefox-esr.*--headless' || true
 #------------------------------------------------------------
 _run_apt_once
 #------------------------------------------------------------
-#DISABLED 2026-07-21 — allow_offline offline-window block commented out intact
-#to isolate it as the cause of clients disconnecting from the network too often.
-#This was the only place the loop deliberately takes BOTH adapters link-down
-#(up to a 4h _isleep) after the sim cycle. Restore by removing the '# ' prefixes
-#on the lines below (the helper, the if/fi, and every body line) when confirmed.
-#
-# QUEUED FEATURE (also commented out, activate with the block above): when the
-# hub engine is actively controlling a SPECIFIC simulation for this client, the
-# client is NOT allowed to go offline — a link-down blackout of up to 4h would
-# silence the sim and stop the insight/alert it exists to fire. "Engine
-# controlling a specific sim" = a [username] override has turned ON one of the
-# engine-owned failure sims (dhcp_fail/dns_fail/assoc_fail/port_flap/
-# ssidpw_fail/auth_fail/mac_auth_fail). Ambient traffic (ping/download/iperf/
-# www) is a local roll, NOT per-client engine control, so it does NOT block
-# offline.
-# Connectivity pinning (wsite/ssid/ssidpw) is intentionally excluded too — every
-# hub-mode client has it, so including it would disable the offline feature
-# entirely. Activate by uncommenting _engine_driving_sim + the && ! gate below.
-#------------------------------------------------------------
-#_engine_driving_sim() {
-#  [[ "${dhcp_fail:-off}" == "on" || "${dns_fail:-off}" == "on" || \
-#     "${assoc_fail:-off}" == "on" || "${port_flap:-off}" == "on" || \
-#     "${ssidpw_fail:-off}" == "on" || "${auth_fail:-off}" == "on" || \
-#     "${mac_auth_fail:-off}" == "on" ]]
-#}
-#------------------------------------------------------------
-#if [[ "$allow_offline" == "yes" ]] && ! _engine_driving_sim; then
-#  #------------------------------------------------------------
-#  #Bringing all interfaces down to make it look like the device is offline.
-#  #Otherwise they get triggered as IOT since they are always connected.
-#  #------------------------------------------------------------
-#  echo Bringing all interfaces down | tee -a ${LOG_FILE}
-#  if [[ -n ${wladapter} ]]; then sudo ip link set dev $wladapter down; fi
-#  # mgmt guard (#3): never take the eth adapter down if it's carrying a
-#  # 169.253.* mgmt IP — that would strand the box for the whole offline
-#  # window. Matches the ea_down() guard used at the pre-sim disable step.
-#  if [[ -n ${eadapter} ]] && ! ea_is_mgmt; then sudo ip link set dev $eadapter down; fi
-#  echo Sleeping for $rn_offline_time seconds \(interruptible by update signal\)
-#  echo ------------------------------| tee -a ${LOG_FILE}
-#  #------------------------------------------------------------
-#  #Sleep for up to 4 hours to show the device left. Interruptible: a USR1 from
-#  #agent.sh (restart_sim / kill_switch) kills this sleep early so a pushed
-#  #config change / repurpose lands immediately instead of after the offline
-#  #window — the interfaces come back up below and the outer loop re-reads config.
-#  #------------------------------------------------------------
-#  _isleep "$rn_offline_time"
-#  #------------------------------------------------------------
-#  #Bringing all interfaces back up to call home/update scripts
-#  #------------------------------------------------------------
-#  echo Bringing all interfaces online | tee -a ${LOG_FILE}
-#  if [[ -n ${eadapter} ]]; then sudo ip link set dev $eadapter up; fi
-#  if [[ -n ${wladapter} ]]; then sudo ip link set dev $wladapter up; fi
-#  echo ------------------------------| tee -a ${LOG_FILE}
-#fi
+# Foreground lifecycle window: wait on the child so USR1 can terminate it and
+# wait for its EXIT restoration before the outer loop reconnects. No agent stop.
+if [[ "${client_offline:-off}" == "on" && "${kill_switch:-off}" != "on" && "$_sim_reload" == 0 ]]; then
+  _offline_blocked=0
+  for sim in dhcp_fail dns_fail assoc_fail port_flap ssidpw_fail auth_fail mac_auth_fail; do
+    [[ "${!sim}" == "on" ]] && _offline_blocked=1
+  done
+  if (( _offline_blocked )); then
+    echo "client_offline: failure simulation active; skipping window" | tee -a ${LOG_FILE}
+  elif ! pgrep -f '[b]ash /usr/local/scripts/client_offline.sh' >/dev/null; then
+    bash /usr/local/scripts/client_offline.sh "${sim_phy:-wireless}" &
+    _offline_pid=$!
+    # A reload can arrive between the gate/launch and recording the child PID.
+    [[ "$_sim_reload" == 0 ]] || kill -TERM "$_offline_pid" 2>/dev/null
+    wait "$_offline_pid" 2>/dev/null || true
+    # wait is interrupted by USR1 before the child's cleanup is necessarily done.
+    while kill -0 "$_offline_pid" 2>/dev/null; do
+      wait "$_offline_pid" 2>/dev/null || true
+    done
+    _offline_pid=""
+  fi
+fi
 #------------------------------------------------------------
 #Looping Script
 #------------------------------------------------------------

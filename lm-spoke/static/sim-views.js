@@ -2324,7 +2324,7 @@ async function csDemoLoad() {
 
 function csDemoOptions(activeScenario) {
     const names = Object.keys(window._csDemoScenarios || {});
-    if (!names.length) names.push('normal', 'dns_fail', 'dns_latency', 'dhcp_fail', 'assoc_fail', 'auth_fail', 'ssidpw_fail', 'mac_auth_fail', 'port_flap');
+    if (!names.length) names.push('normal', 'dns_fail', 'dns_latency', 'dhcp_fail', 'assoc_fail', 'auth_fail', 'ssidpw_fail', 'mac_auth_fail', 'port_flap', 'client_offline');
     return names.map(n => `<option value="${csEscape(n)}" ${n === activeScenario ? 'selected' : ''}>${csEscape(n)}</option>`).join('');
 }
 
@@ -2415,7 +2415,7 @@ window.csDemoClear = async function (btn) {
 // is an expandable row beneath each client; opening it fetches the host's
 // current overrides and seeds the toggles.
 // Alphabetical so the sim knobs + the Simulation facet dropdown list in order.
-const CS_CONTROL_FLAGS = ['assoc_fail', 'auth_fail', 'dhcp_fail', 'dns_fail',
+const CS_CONTROL_FLAGS = ['assoc_fail', 'auth_fail', 'client_offline', 'dhcp_fail', 'dns_fail',
     'dns_latency', 'download', 'iperf', 'kill_switch', 'mac_auth_fail', 'ping_test', 'port_flap',
     'ssidpw_fail', 'www_traffic'];
 
@@ -4245,7 +4245,7 @@ const CS_ONOFF_KEYS = new Set([
     'kill_switch', 'rapid_update', 'github_repo', 'smb_repo', 'site_based_ssid',
     'ssidpw_fail', 'auth_fail', 'mac_auth_fail', 'syslog', 'web_server',
     'dhcp_fail', 'dns_fail', 'dns_latency', 'assoc_fail', 'port_flap', 'ping_test',
-    'download', 'www_traffic', 'iperf',
+    'download', 'www_traffic', 'iperf', 'client_offline',
 ]);
 
 // Select choices keep unknown existing values as an extra option on save.
@@ -4280,6 +4280,8 @@ const CS_SIM_SECTION_FIELDS = {
         ['rapid_update', 'Rapid Update'], ['github_repo', 'Github Repo'],
         ['smb_repo', 'Smb Repo'], ['site_based_ssid', 'Site Based Ssid'],
         ['allow_offline', 'Allow Offline'], ['ssidpw_fail', 'Ssidpw Fail'],
+        ['client_offline_min_minutes', 'Client Offline Min (minutes)'],
+        ['client_offline_max_minutes', 'Client Offline Max (minutes)'],
         ['auth_fail', 'Auth Fail'], ['mac_auth_fail', 'Mac Auth Fail'], ['syslog', 'Syslog'],
         ['web_server', 'Web Server'],
         ['dns_fail_rate', 'DNS Fail Rate (/min)'],
@@ -4310,6 +4312,7 @@ const CS_SIM_BUCKET_FIELDS = [
     ['assoc_fail', 'Assoc Fail'], ['port_flap', 'Port Flap'],
     ['ping_test', 'Ping Test'], ['download', 'Download'],
     ['www_traffic', 'Www Traffic'], ['iperf', 'Iperf'],
+    ['client_offline', 'Client Offline'],
     ['sim_phy', 'Sim Phy'], ['l1', 'L1'],
 ];
 const CS_SIM_BUCKETS = ['s0', 's1', 's2', 's3', 's4', 's5', 's6', 's7', 's8', 's9'];
