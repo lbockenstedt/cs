@@ -109,7 +109,10 @@ class SimulationEngine:
         # re-read); otherwise one inode-cached stat returns the cached bool.
         ks = self.config_dir / "kill_switch.txt"
         try:
-            mtime = ks.stat().st_mtime_ns
+            st = ks.stat()
+            # Size + inode too: two writes inside one coarse mtime tick
+            # (on → off) would otherwise share a key and return stale state.
+            mtime = (st.st_mtime_ns, st.st_size, st.st_ino)
             exists = True
         except OSError:
             mtime = -1
