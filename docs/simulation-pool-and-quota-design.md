@@ -126,6 +126,32 @@ The **SSID matrix** (Pool & SSID card) is **definitions only**: each cell is
 It carries **no** counts — no Hold N, no per-cell weight. A cell name like
 `MIA-PSK` encodes its physical site (`MIA`) and its auth (`PSK`).
 
+### Configuring 802.1X in the Simulation Engine editor
+
+The Pool & SSID matrix's **SSID / Auth** selector and the bucket (`[s0]`–`[s9]`)
+`ssid` selector offer **PSK** and **1X**. Existing custom values remain available
+as extra options and are preserved on save. The helper text under Pool & SSID
+explains that `1X` uses the shared `[simulation]` settings:
+
+- **`dot1x_eap`** selects `peap` or `tls`. **— default (peap) —** leaves the key
+  unset rather than writing a new default. TLS is Linux-only; Windows clients
+  report unsupported.
+- **`dot1x_password`** is the PEAP password. When empty, it falls back to the
+  SSID's `Ssidpw` (`ssidpw`).
+- **`dot1x_client_cert`**, **`dot1x_private_key`**, and **`dot1x_ca_cert`** are
+  EAP-TLS-only paths to the client certificate, private key, and CA certificate
+  on the Linux client. These text fields are always visible, even when PEAP is
+  selected, and populated values are still saved.
+
+The selectors preserve existing values outside their offered choices. In the
+config editor, an empty **— default —** selection omits the key, like the on/off
+fields. These controls clarify the existing `auth_fail` and normal 1X connect
+configuration; they do not change saved key names, the INI format, config
+defaults, or client/backend behavior. EAP settings remain shared in
+`[simulation]`, not per-cell or per-bucket settings.
+
+### Cell placement
+
 Clients land on a cell in exactly **two ways**, configured in one place
 (Config → Sim Quotas):
 
