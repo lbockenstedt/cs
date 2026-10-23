@@ -300,3 +300,35 @@ def test_cache_invalidation_on_override_change(client, spoke, configs):
     updated = client.get("/api/config", params={"hostname": h}).text
     assert updated != first
     assert updated == reference_render(spoke, configs, h)
+
+
+@pytest.mark.parametrize("site_map,placed_wsite,target", [
+    # Site Pool (RF chamber): plain SSID on the chamber AP.
+    ({"px1": "BAR"}, "", "CC-BRIDGE"),
+    ({"px1": "BAR"}, "BAR", "CC-BRIDGE"),
+    # Tenant-Wide Pool / unmapped (site-based SSID): {wsite}-{ssid}.
+    ({"px1": "Tenant-Wide Pool"}, "BAR", "BAR-CC-BRIDGE"),
+    ({}, "BAR", "BAR-CC-BRIDGE"),
+    # Site-based with no wsite placed yet falls back to the bare SSID.
+    ({"px1": "Tenant-Wide Pool"}, "", "CC-BRIDGE"),
+])
+def test_served_config_target_ssid_per_mode(client, spoke, configs,
+                                            site_map, placed_wsite, target):
+    """End to end: render /api/config, resolve it the way a client does, and
+    check the SSID it will actually join in each deployment mode."""
+    import configparser
+    import sim_config
+    from sim_primitives import _effective_ssid
+    (configs / "simulation.conf").write_text(
+        BASE_CONF.format(ws="on").replace("site_based_ssid=off", "site_based_ssid=on"),
+        encoding="utf-8")
+    spoke.deploy = _Deploy({"jdoe-7": "px1"})
+    spoke.local_store.set_pxmx_site_map(site_map)
+    ov = {"ssid": "CC-BRIDGE", "ssidpw": "x"}
+    if placed_wsite:
+        ov["wsite"] = placed_wsite
+    client.post("/api/clients/jdoe-7/control", json={"overrides": ov})
+    served = configparser.ConfigParser(interpolation=None)
+    served.read_string(client.get("/api/config", params={"hostname": "jdoe-7"}).text)
+    profile = sim_config.resolve_profile("jdoe-7", served, served)["profile"]
+    assert _effective_ssid(profile) == target
