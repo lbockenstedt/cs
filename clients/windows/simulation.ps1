@@ -32,25 +32,6 @@ function Write-SimDebug {
     $Message | Tee-Object -FilePath $debugPath -Append | Tee-Object -FilePath $logPath -Append | Out-Null
 }
 
-function Get-WifiAdapter {
-    Get-NetAdapter -ErrorAction SilentlyContinue |
-        Where-Object {
-            $_.Name -match 'wi-fi|wireless|wlan' -or
-            $_.InterfaceDescription -match 'wi-fi|wireless|wlan|802\.11'
-        } |
-        Sort-Object @{ Expression = { if ($_.Status -eq 'Up') { 0 } elseif ($_.Status -eq 'Disconnected') { 1 } else { 2 } } }, Name |
-        Select-Object -First 1
-}
-
-function Get-EthernetAdapter {
-    Get-NetAdapter -ErrorAction SilentlyContinue |
-        Where-Object {
-            $_.Name -match 'ethernet|eth' -or $_.InterfaceDescription -match 'ethernet|gigabit'
-        } |
-        Sort-Object @{ Expression = { if ($_.Status -eq 'Up') { 0 } elseif ($_.Status -eq 'Disconnected') { 1 } else { 2 } } }, Name |
-        Select-Object -First 1
-}
-
 function Get-ConnectedSsid {
     $output = netsh wlan show interfaces 2>$null
     foreach ($line in $output) {
@@ -133,7 +114,7 @@ function Send-Status {
         }
 
         $activeSimulations = @()
-        foreach ($name in @('dns_fail','dns_latency','collab','iperf','download','www_traffic','ping_test','ssidpw_fail','auth_fail','mac_auth_fail','dhcp_fail')) {
+        foreach ($name in @('dns_fail','dns_latency','collab','iperf','download','www_traffic','ping_test','ssidpw_fail','auth_fail','mac_auth_fail','dhcp_fail','client_offline')) {
             if ((Get-Variable -Name $name -Scope Script -ValueOnly -ErrorAction SilentlyContinue) -eq 'on') {
                 $activeSimulations += $name
             }
@@ -160,6 +141,7 @@ function Send-Status {
                 dns_fail = [string]$script:dns_fail
                 dns_latency = [string]$script:dns_latency
                 collab = [string]$script:collab
+                client_offline = [string]$script:client_offline
                 iperf = [string]$script:iperf
                 www_traffic = [string]$script:www_traffic
                 download = [string]$script:download
@@ -500,6 +482,8 @@ while ($true) {
     $script:www_traffic = get_value $script:simulation_id 'www_traffic'
     $script:dns_latency = get_value $script:simulation_id 'dns_latency'
     $script:collab = get_value $script:simulation_id 'collab'
+    $script:client_offline = get_value $script:simulation_id 'client_offline'
+    if (-not $script:client_offline) { $script:client_offline = 'off' }
 
     # ------------------------------------------------------------
     # Ambient random pool (see clients/linux/simulation.sh for the full story).
@@ -551,7 +535,7 @@ while ($true) {
         'download','iperf','www_traffic','ssidpw_fail','auth_fail','mac_auth_fail','mac_auth_fail_mac','smb_address','ping_address',
         'dns_bad_ip_1','dns_bad_ip_2','dns_bad_ip_3',
         'dns_bad_record_1','dns_bad_record_2','dns_bad_record_3','iperf_server',
-        'collab_app','collab_bw','collab_time','collab_server','dot1x_password','dot1x_eap','web_server'
+        'collab_app','collab_bw','collab_time','collab_server','dot1x_password','dot1x_eap','web_server','client_offline'
     )
 
     if (Test-Path -LiteralPath $killSwitchPath) {
@@ -775,6 +759,11 @@ while ($true) {
     Stop-Process -Name firefox -ErrorAction SilentlyContinue
     Write-SimDebug 'Running Updates'
     Start-Process powershell -ArgumentList @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', 'C:\Scripts\apt_update.ps1') -WindowStyle Hidden | Out-Null
+
+    # Foreground lifecycle window, deliberately not a Run-Simulation traffic job.
+    if ($script:client_offline -eq 'on' -and $script:kill_switch -ne 'on' -and -not (Test-ScriptRunning -ScriptName 'client_offline.ps1')) {
+        & 'C:\Scripts\client_offline.ps1' $script:sim_phy
+    }
 
     if ($script:allow_offline -in @('on', 'yes')) {
         Write-SimDebug 'Bringing all interfaces down'
