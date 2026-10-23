@@ -8,6 +8,7 @@ iteration to KILLED).
 """
 
 import asyncio
+import os
 from pathlib import Path
 
 import pytest
@@ -136,3 +137,15 @@ def test_get_version_returns_tracked_version_and_caches(spoke_loop):
     v2 = spoke.get_version()
     assert v2 == v1
     assert spoke._version_cache[0] == mtime
+
+def test_kill_switch_cache_not_fooled_by_same_mtime_rewrite(spoke_loop):
+    """Linux stamps mtime from a coarse clock, so on → off inside one tick can
+    leave mtime unchanged. Pin it to prove the cache still sees the rewrite."""
+    spoke, loop = spoke_loop
+    ks = spoke.engine.config_dir / "kill_switch.txt"
+    ks.write_text("on\n", encoding="utf-8")
+    os.utime(ks, ns=(1_000_000_000, 1_000_000_000))
+    assert spoke.engine.kill_switch_active() is True
+    ks.write_text("off\n", encoding="utf-8")
+    os.utime(ks, ns=(1_000_000_000, 1_000_000_000))
+    assert spoke.engine.kill_switch_active() is False

@@ -129,20 +129,24 @@ def sections_dict(parser: configparser.ConfigParser) -> Dict[str, Dict[str, str]
 # then render_ini_for_client bakes per-client [sX] overrides) get a deepcopy so
 # the cache can't be corrupted across requests. Bounded: only the latest mtime
 # tuple per config_dir is retained.
-_LOAD_CACHE: Dict[Tuple[str, Tuple[int, int, int, int]],
+_LOAD_CACHE: Dict[Tuple[str, Tuple[Tuple[int, int, int], ...]],
                   Tuple[configparser.ConfigParser, configparser.ConfigParser]] = {}
 
 
-def _mtime_ns(path: Path) -> int:
-    """Best-effort mtime in ns; 0 if the path is absent/unreadable."""
+def _mtime_ns(path: Path) -> Tuple[int, int, int]:
+    """Best-effort change signature ``(mtime_ns, size, inode)``; zeros if the
+    path is absent/unreadable. mtime alone is not enough: Linux stamps it from
+    a coarse clock, so two writes inside one tick share an mtime and the cache
+    would keep serving the first file's contents."""
     try:
-        return path.stat().st_mtime_ns
+        st = path.stat()
+        return (st.st_mtime_ns, st.st_size, st.st_ino)
     except OSError:
-        return 0
+        return (0, 0, 0)
 
 
 def configs_cache_key(config_dir: os.PathLike | str
-                      ) -> Tuple[str, Tuple[int, int, int, int, int]]:
+                      ) -> Tuple[str, Tuple[Tuple[int, int, int], ...]]:
     """The mtime-tuple cache key for *config_dir* — the same key
     :func:`load_configs` uses internally. Exposed so callers layering their own
     derived caches on top (client_api's /api/config render cache) can key them
