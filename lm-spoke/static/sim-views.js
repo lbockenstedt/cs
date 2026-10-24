@@ -12,6 +12,7 @@
  * instead (currentTenant/currentSubView/showToast/handleSessionExpired).
  * ==========================================================================*/
 /* ============================================================================
+/* ============================================================================
  * sim-views.js — Native Client-Sim (Simulations) views for the LM hub.
  *
  * Replaces the former <iframe src="/sim"> integration. The 7 Simulations
@@ -2324,7 +2325,7 @@ async function csDemoLoad() {
 
 function csDemoOptions(activeScenario) {
     const names = Object.keys(window._csDemoScenarios || {});
-    if (!names.length) names.push('normal', 'dns_fail', 'dns_latency', 'dhcp_fail', 'assoc_fail', 'auth_fail', 'ssidpw_fail', 'mac_auth_fail', 'port_flap', 'client_offline');
+    if (!names.length) names.push('normal', 'dns_fail', 'dns_latency', 'dhcp_fail', 'assoc_fail', 'auth_fail', 'ssidpw_fail', 'mac_auth_fail', 'port_flap');
     return names.map(n => `<option value="${csEscape(n)}" ${n === activeScenario ? 'selected' : ''}>${csEscape(n)}</option>`).join('');
 }
 
@@ -4242,24 +4243,29 @@ window.csSaveConfigPush = async function () {
 // (allow_offline and l1 use yes/no in the canon; they stay text inputs so the
 // exact value is preserved losslessly.)
 const CS_ONOFF_KEYS = new Set([
-    'kill_switch', 'rapid_update', 'github_repo', 'smb_repo', 'site_based_ssid',
+    'client_offline', 'kill_switch', 'rapid_update', 'github_repo', 'smb_repo', 'site_based_ssid',
     'ssidpw_fail', 'auth_fail', 'mac_auth_fail', 'syslog', 'web_server',
     'dhcp_fail', 'dns_fail', 'dns_latency', 'assoc_fail', 'port_flap', 'ping_test',
-    'download', 'www_traffic', 'iperf', 'client_offline',
+    'download', 'www_traffic', 'iperf',
 ]);
 
-// Select choices keep unknown existing values as an extra option on save.
+// Choices shared by the structured editor and the Pool & SSID matrix.
 const CS_SELECT_OPTIONS = {
-    dot1x_eap: { options: ['peap', 'tls'], defaultLabel: '— default (peap) —' },
-    ssid: { options: ['PSK', '1X'] },
+    dot1x_eap: ['peap', 'tls'],
+    ssid: ['PSK', '1X'],
 };
 
+// Keep unknown saved values as options, just like the Site Links selector.
 function csSimSelectOptions(key, value) {
     const v = (value === undefined || value === null) ? '' : String(value);
-    const { options, defaultLabel = '— default —' } = CS_SELECT_OPTIONS[key];
-    const choices = v && !options.includes(v) ? [...options, v] : options;
-    return `<option value="" ${v === '' ? 'selected' : ''}>${csEscape(defaultLabel)}</option>` +
-        choices.map(opt => `<option value="${csEscape(opt)}" ${v === opt ? 'selected' : ''}>${csEscape(opt)}</option>`).join('');
+    const options = CS_SELECT_OPTIONS[key] || [];
+    const placeholder = key === 'dot1x_eap' ? '— default (peap) —' : '— default —';
+    let out = `<option value="" ${v === '' ? 'selected' : ''}>${csEscape(placeholder)}</option>`;
+    out += options.map(opt => `<option value="${csEscape(opt)}" ${opt === v ? 'selected' : ''}>${csEscape(opt)}</option>`).join('');
+    if (v && !options.includes(v)) {
+        out += `<option value="${csEscape(v)}" selected>${csEscape(v)}</option>`;
+    }
+    return out;
 }
 
 // Ordered field schema per section → [{key, label}]. Drives the labeled-input
@@ -4307,12 +4313,12 @@ const CS_SIM_SECTION_FIELDS = {
 };
 // Per-bucket [s0]–[s9] field schema (identical for each bucket).
 const CS_SIM_BUCKET_FIELDS = [
-    ['wsite', 'Wsite'], ['ssid', 'SSID / Auth', 'select'], ['ssidpw', 'Ssidpw'],
+    ['wsite', 'Wsite'], ['ssid', 'Ssid', 'select'], ['ssidpw', 'Ssidpw'],
+    ['client_offline', 'Client Offline'],
     ['dhcp_fail', 'Dhcp Fail'], ['dns_fail', 'Dns Fail'], ['dns_latency', 'Dns Latency'],
     ['assoc_fail', 'Assoc Fail'], ['port_flap', 'Port Flap'],
     ['ping_test', 'Ping Test'], ['download', 'Download'],
     ['www_traffic', 'Www Traffic'], ['iperf', 'Iperf'],
-    ['client_offline', 'Client Offline'],
     ['sim_phy', 'Sim Phy'], ['l1', 'L1'],
 ];
 const CS_SIM_BUCKETS = ['s0', 's1', 's2', 's3', 's4', 's5', 's6', 's7', 's8', 's9'];
@@ -4334,19 +4340,19 @@ function csParseIni(text) {
     return out;
 }
 
-// Render one labeled field: select choices, on/off flags, lists or text inputs.
-// Each field carries data-cs-section + data-cs-key so the serializer can walk
-// them regardless of which section card they live in (empty values are skipped).
+// Render one labeled field for a section: text, list, select or on/off.
+// Each input carries data-cs-section + data-cs-key so the serializer can walk
+// them regardless of which section card they live in.
 function csSimField(section, key, label, value, type) {
     const id = `cs-sim-${csEscape(section)}-${csEscape(key)}`;
     const v = (value === undefined || value === null) ? '' : String(value);
     if (type === 'select') {
+        // Empty defaults are omitted by the existing INI serializer.
         return `<div class="flex flex-col gap-1">
           <label class="text-[10px] text-slate-500 uppercase font-bold tracking-wider">${csEscape(label)}</label>
           <select id="${id}" data-cs-section="${csEscape(section)}" data-cs-key="${csEscape(key)}"
-                  class="border border-slate-200 rounded-md px-2 py-1.5 text-sm text-slate-600">
-            ${csSimSelectOptions(key, v)}
-          </select></div>`;
+                  class="border border-slate-200 rounded-md px-2 py-1.5 text-sm text-slate-600">${csSimSelectOptions(key, v)}</select>
+        </div>`;
     }
     if (type === 'list') {
         // Space/comma-separated config value ↔ one-per-line textarea (unlimited).
@@ -5146,7 +5152,9 @@ function csPoolConfigCardHtml() {
     const matrix = pc.ssid_matrix || [];
     const placement = pc.ssid_placement || {};
     const randPool = pc.random_pool || {};
-    const flags = (typeof CS_CONTROL_FLAGS !== 'undefined' ? CS_CONTROL_FLAGS : []);
+    // Client Offline is an end-of-cycle lifecycle sim, not an ambient traffic roll.
+    const flags = (typeof CS_CONTROL_FLAGS !== 'undefined' ? CS_CONTROL_FLAGS : [])
+        .filter(f => f !== 'client_offline');
     const esc = csEscape;  // shared escaper (escapes &<>"')
     const simChecks = flags.map(f =>
         `<label class="flex items-center gap-1 text-xs"><input type="checkbox" data-cs-rand="${esc(f)}" ${rsims.indexOf(f) >= 0 ? 'checked' : ''}> ${esc(f)}</label>`).join('');
@@ -5182,7 +5190,7 @@ function csPoolConfigCardHtml() {
             <button onclick="csSavePoolConfig()" class="bg-[#01A982]/10 hover:bg-[#01A982]/20 text-[#01A982] border border-[#01A982] px-4 py-1.5 rounded-md text-sm font-bold shadow-sm">Save Pool</button>
           </div>
         </div>
-        <p class="text-xs text-slate-500 mb-3"><code>1X</code> uses <code>dot1x_eap</code> and <code>dot1x_password</code> from <code>[simulation]</code>. PEAP falls back to the SSID Ssidpw when dot1x_password is empty; TLS uses the Linux-only certificate paths (Windows clients report unsupported).</p>
+        <p class="text-xs text-slate-500 mb-2"><code>1X</code> uses <code>dot1x_eap</code> and <code>dot1x_password</code> from the Simulation config; PEAP falls back to the SSID Ssidpw when the Dot1x Password is empty.</p>
         <p class="text-xs text-slate-500 mb-3">The SSID matrix just <span class="font-semibold">defines</span> your SSIDs (site, auth, password). <span class="font-semibold">Sim Quotas</span> attach an exact (accounted) count of clients to a cell for an alert. The <span class="font-semibold">weighted rules</span> below spread the rest of the pool (random, unaccounted) across a site's SSIDs by weight. Whether a PXMX server is site-bound (RF chamber) or assignable is set in <span class="font-semibold">Config → Sites</span>.</p>
         <div class="mb-3">
           <div class="text-[11px] font-bold text-slate-500 uppercase tracking-wider mb-1">Randomizable (ambient) sims</div>
@@ -11238,48 +11246,59 @@ async function _csUsbClearCmd(host, action, doneMsg, allSpokes) {
         const r = await csFetch(`/${csTenant()}/proxmx/command?tenant_id=${csTenant()}`, {
             method: 'POST', body: JSON.stringify(body) });
         if (!r) {
-            _toast(`${doneMsg}. Clear failed: no response received from server`, 'error');
+            _toast('Clear failed: no response received from server', 'error');
             return;
         }
 
         const bad = (r.errors || []).concat(r.refusals || []);
+        // null means "the reply carried no fan-out count", which is NOT the same
+        // as a reported 0. The per-command route (/proxmx/command) enqueues to a
+        // SINGLE spoke and returns a queue result instead of a count, so the old
+        // `|| 0` announced "Cleared 0 spoke(s)" on a command that had in fact
+        // been accepted — the same regression csPushToast above documents.
         const nLive = (r.pushed_to_spokes != null) ? r.pushed_to_spokes : null;
         const queuedNames = Array.isArray(r.queued) ? r.queued : [];
         const isQueued = (r.queued_to_spokes > 0) || (r.queued === true) || (queuedNames.length > 0);
-        const nQ = r.queued_to_spokes || queuedNames.length || (isQueued ? 1 : 0);
+        // Likewise null = "queued, count unknown" (`r.queued === true`, one spoke).
+        // Inventing the number 1 there reported a spoke count the server never sent.
+        const nQ = (r.queued_to_spokes != null) ? r.queued_to_spokes
+            : (queuedNames.length ? queuedNames.length : null);
         const qDetail = queuedNames.length ? `: ${queuedNames.join(', ')}` : '';
-        const queuePart = isQueued ? `; queued for ${nQ} unreachable spoke(s)${qDetail}` : '';
+
+        const liveText = () => nLive === null
+            ? ''
+            : (r.spokes_total != null ? `${nLive}/${r.spokes_total}` : `${nLive}`);
+        // Never leave an empty count slot in the sentence: with no reported count
+        // the phrase drops the number rather than printing a blank or a zero.
+        const clearedPhrase = () => liveText()
+            ? `Cleared ${liveText()} spoke(s)`
+            : 'Cleared on the reachable spoke(s)';
+        const queuePart = !isQueued ? ''
+            : (nQ === null ? `; queued for delivery on reconnect${qDetail}`
+                : `; queued for ${nQ} unreachable spoke(s)${qDetail}`);
 
         if (bad.length > 0) {
-            const countPart = (r.spokes_total != null)
-                ? `Cleared ${nLive != null ? nLive : 0}/${r.spokes_total} spoke(s)${queuePart} — failed: `
-                : (nLive != null ? `Cleared ${nLive} spoke(s)${queuePart} — failed: ` : (queuePart ? `Cleared 0 spoke(s)${queuePart} — failed: ` : ''));
-            _toast(`${doneMsg}. ${countPart}${bad.join('; ')}`, 'error');
+            _toast(`${doneMsg}. ${clearedPhrase()}${queuePart} — failed: ${bad.join('; ')}`, 'error');
             return;
         }
 
         if (isQueued) {
-            const countPart = (r.spokes_total != null)
-                ? `live on ${nLive != null ? nLive : 0}/${r.spokes_total} spoke(s)`
-                : (nLive != null ? `live on ${nLive} spoke(s)` : '');
-            const clearedPrefix = countPart ? `Cleared ${countPart}; ` : '';
-            _toast(`${doneMsg}. ${clearedPrefix}queued for ${nQ} unreachable spoke(s) (applies when they reconnect)${qDetail}`, 'warning');
+            _toast(`${doneMsg}. ${clearedPhrase()}${queuePart} (applies when they reconnect)`, 'warning');
             return;
         }
 
-        if (r.spokes_total === 0 || nLive === 0) {
+        // Only a REPORTED zero means nothing was reachable. A missing count is
+        // "no spoke data returned", which must not be announced as a failure.
+        if (nLive === 0 && (r.spokes_total != null ? r.spokes_total > 0 : allSpokes)) {
             const denom = r.spokes_total != null ? `0/${r.spokes_total}` : '0';
             _toast(`${doneMsg}. No spokes were reachable (${denom} cleared).`, 'warning');
             return;
         }
 
-        const countText = (r.spokes_total != null)
-            ? ` Cleared live on ${nLive != null ? nLive : 0}/${r.spokes_total} spoke(s).`
-            : (nLive != null ? ` Pushed to ${nLive} spoke(s).` : '');
-        _toast(`${doneMsg}.${countText}`, 'success');
+        _toast(`${doneMsg}.${nLive !== null ? ` ${clearedPhrase()}.` : ''}`, 'success');
     } catch (e) {
         console.error(`_csUsbClearCmd: ${action} failed`, e);
-        _toast(`${doneMsg}. Clear failed: ${e.message || e}`, 'error');
+        _toast(`Clear failed: ${e.message || e}`, 'error');
     }
 }
 // Purge the missing-dongle HISTORY (presence roster + boot baseline) on every
