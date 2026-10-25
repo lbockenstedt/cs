@@ -201,6 +201,6 @@ def build_client_rows(spoke, now: float | None = None
             # WebUI's per-sim override buttons reflect what's SET (not just
             # what's running) and STAY across refreshes.
             "config": eff_cfg,
-            "overrides": c.get("overrides") or {},
+            "overrides": sim_config.mask_secret_overrides(c.get("overrides")),
         })
     return rows, tier_updates
