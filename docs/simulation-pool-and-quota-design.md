@@ -150,6 +150,25 @@ configuration; they do not change saved key names, the INI format, config
 defaults, or client/backend behavior. EAP settings remain shared in
 `[simulation]`, not per-cell or per-bucket settings.
 
+### Account location (JIT 802.1X accounts)
+
+Each 1X cell has an **Account location** setting (`dot1x_account` in the cell):
+
+- **— none —**: keeps the shared `dot1x_password` behavior.
+- **`entra`**, **`ldap`** (tenant OU), or **`clearpass`** (Policy Manager local user): turns on just-in-time accounts.
+
+On every reconcile, `SimQuotaEngine._reconcile_dot1x`:
+
+- finds the clients that the engine currently places on such a cell. Clients not seen for 24h are excluded.
+- builds each client's username with `username_for`.
+- sends `CS_DOT1X_PROVISION` to the hub.
+
+The hub creates the account, generates and stores a random password in the vault or its local encrypted store, and replies with `CS_DOT1X_CREDENTIAL`. That message writes the password into the client's engine `dot1x_password` override.
+
+When a client leaves the cell, or its account location changes, the engine sends `CS_DOT1X_RELEASE` and removes the override. It also sends `CS_DOT1X_SYNC` every 15 min so the hub can resend rotated passwords. Engine state is stored in `data/sim_quota_dot1x.json`.
+
+The password is masked as `********` in all overrides responses and client rows. Saving a masked value leaves the stored secret unchanged.
+
 ### Cell placement
 
 Clients land on a cell in exactly **two ways**, configured in one place
