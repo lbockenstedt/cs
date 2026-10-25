@@ -28,8 +28,11 @@ import logging
 import shutil
 import subprocess
 import time
+from itertools import islice
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
+
+from dhcp_health import live_leases
 
 logger = logging.getLogger("CSDhcpStatus")
 
@@ -54,8 +57,10 @@ def collect_dhcp_status() -> Dict[str, Any]:
     Never raises — wraps every probe so a broken parse can't destabilize the
     telemetry loop. Shape:
         {installed, running, iface, subnet, iface_address, pool_start,
-         pool_end, pool_size, leases_used, leases_free, utilization_pct,
-         lease_file, lease_time, leases[], ts}
+         pool_end, pool_size, leases_used, leases_readable, leases_free,
+         utilization_pct, lease_file, lease_time, leases[], ts}
+    ``leases_used``/``leases_free``/``utilization_pct`` are ``None`` (and
+    ``leases_readable`` False) when the lease file exists but can't be read.
     When Kea is not installed → ``{"installed": False}`` (the WebUI shows
     "Not configured"). On an unexpected error → ``{"installed": True,
     "running": False, "error": ...}``.
@@ -96,11 +101,15 @@ def _collect() -> Dict[str, Any]:
     running = _is_running()
 
     now = time.time()
-    leases = _read_leases(lease_file, now)
-    leases_used = len(leases)
+    leases_used, leases = _read_leases(lease_file, now)
     pool_size = _pool_size(pool_start, pool_end)
-    leases_free = max(pool_size - leases_used, 0) if pool_size else 0
-    utilization_pct = round(leases_used / pool_size * 100, 1) if pool_size else 0.0
+    if leases_used is None:
+        # Lease file unreadable (it is 0640 _kea:_kea): say "unknown", not
+        # "0 used / 100% free" — the same fix the health panel got in #55.
+        leases_free = utilization_pct = None
+    else:
+        leases_free = max(pool_size - leases_used, 0) if pool_size else 0
+        utilization_pct = round(leases_used / pool_size * 100, 1) if pool_size else 0.0
 
     subnet, iface_address = _iface_subnet(iface)
 
@@ -113,7 +122,8 @@ def _collect() -> Dict[str, Any]:
         "pool_start":      pool_start,
         "pool_end":        pool_end,
         "pool_size":       pool_size,
-        "leases_used":     leases_used,
+        "leases_used":     leases_used,      # None = lease file unreadable
+        "leases_readable": leases_used is not None,
         "leases_free":     leases_free,
         "utilization_pct": utilization_pct,
         "lease_file":      lease_file,
@@ -213,59 +223,32 @@ def _is_running() -> bool:
     return _kea_sim_running_pgrep()
 
 
-def _read_leases(lease_file: str, now: float) -> List[Dict[str, Any]]:
-    """Parse the Kea memfile lease CSV (``kea-leases4-sim.csv``).
+def _read_leases(lease_file: str, now: float) -> Tuple[Optional[int], List[Dict[str, Any]]]:
+    """Live leases in the Kea memfile lease CSV (``kea-leases4-sim.csv``).
 
-    Kea leases4 columns:
-        address,hwaddr,client_id,valid_lifetime,expire,subnet_id,fqdn_fwd,
-        fqdn_rev,hostname,state,user_context,pool_id
-    Kea APPENDS a new row on every lease change, so the LAST row for an address
-    is authoritative (last-wins). Drops rows whose ``expire`` unix timestamp is
-    in the past and rows with ``state != 0`` (0 = default/active; 1 = declined,
-    2 = expired-reclaimed). Maps to the same ``{ip, mac, hostname, expiry}``
-    shape the dnsmasq reader produced. Caps at ``_MAX_LEASE_ROWS`` for payload
-    size; the count is still exact up to that cap."""
-    out: List[Dict[str, Any]] = []
+    "Live" is ``dhcp_health.live_leases`` — the same rule the health panel
+    uses, so the card and the panel can't disagree. Returns
+    ``(count, rows)``:
+
+    * ``count`` is exact (NOT capped). ``0`` when the file doesn't exist yet
+      (Kea hasn't handed out a lease), ``None`` when it exists but can't be
+      read (it is 0640 _kea:_kea and the spoke user often can't read it).
+    * ``rows`` is ``{ip, mac, hostname, expiry}`` per live lease (the shape
+      the old dnsmasq reader produced), capped at ``_MAX_LEASE_ROWS`` to keep
+      the telemetry payload small."""
     try:
-        text = Path(lease_file).read_text(errors="replace")
-    except Exception:
-        return out
-
-    # Collapse to last-wins per address (Kea appends updates to the same file).
-    latest: Dict[str, Dict[str, Any]] = {}
-    order: List[str] = []
-    for line in text.splitlines():
-        row = line.split(",")
-        if len(row) < 10:
-            continue
-        ip = row[0].strip()
-        if not ip or ip.lower() == "address":  # header / blank line
-            continue
-        try:
-            expire = int(row[4])
-            state = int(row[9])
-        except ValueError:
-            continue
-        if ip not in latest:
-            order.append(ip)
-        latest[ip] = {
-            "mac":      row[1].strip(),
-            "ip":       ip,
-            "hostname": row[8].strip(),
-            "expiry":   expire,
-            "_state":   state,
-        }
-
-    for ip in order:
-        rec = latest[ip]
-        if rec.pop("_state", 0) != 0:
-            continue  # declined / reclaimed — not an active lease
-        if rec["expiry"] < now:
-            continue  # expired
-        out.append(rec)
-        if len(out) >= _MAX_LEASE_ROWS:
-            break
-    return out
+        with open(lease_file, errors="replace") as fh:
+            live, _addresses, _rows = live_leases(fh, int(now))
+    except FileNotFoundError:
+        return 0, []
+    except Exception:  # noqa: BLE001
+        return None, []
+    rows = [{"mac": cols[1].strip(),
+             "ip": addr,
+             "hostname": cols[8].strip() if len(cols) > 8 else "",
+             "expiry": int(float(cols[4]))}
+            for addr, cols in islice(live.items(), _MAX_LEASE_ROWS)]
+    return len(live), rows
 
 
 def _pool_size(pool_start: Optional[str], pool_end: Optional[str]) -> int:
