@@ -112,6 +112,14 @@ QT_BULK_MIN_HOST = 3                 # a host needs ≥3 T2 clients before the r
                                      # event, and must still be shed.
 QT_ONLINE_S = 300.0                  # client seen within 5min counts as online
 
+# JIT 802.1X accounts (hub broker: lm core dot1x_jit.py). A client the engine
+# places on a 1X cell whose ``dot1x_account`` names a backend gets an account
+# there; the hub delivers the password back as CS_DOT1X_CREDENTIAL.
+DOT1X_BACKENDS = ("entra", "ldap", "clearpass")
+DOT1X_RESEND_S = 300.0     # re-request a provision the hub hasn't answered
+DOT1X_SYNC_S = 900.0       # full keep-alive / reconciliation with the hub
+DOT1X_STALE_S = 86400.0    # unseen this long = torn down → release the account
+
 
 def _default_qt_exclude_sims() -> set:
     """The dongle-quarantine exclusion set when no operator override is set.
@@ -223,6 +231,11 @@ class SimQuotaEngine:
         # new config fleet-wide). hostname -> ((wsite, ssid), since).
         self._qt_ssid_since: Dict[str, Tuple[Tuple[str, str], float]] = {}
         self._qt_started_at: float = time.time()
+        # JIT 802.1X: hostname -> {username, backend, cell, requested_at,
+        # delivered, version}. Persisted so a restart doesn't re-provision.
+        self._dot1x: Dict[str, Dict[str, Any]] = {}
+        self._dot1x_last_sync: float = 0.0
+        self._dot1x_path: Optional[Path] = None
         try:
             data_dir = Path(getattr(spoke, "data_dir", None) or ".")
             data_dir.mkdir(parents=True, exist_ok=True)
@@ -230,12 +243,14 @@ class SimQuotaEngine:
             self._displaced_path = data_dir / "sim_quota_displaced.json"
             self._stacked_path = data_dir / "sim_quota_stacked.json"
             self._harvest_path = data_dir / "sim_quota_harvest.json"
+            self._dot1x_path = data_dir / "sim_quota_dot1x.json"
         except Exception:  # noqa: BLE001
             self._ledger_path = None
         self._load_ledger()
         self._load_displaced()
         self._load_stacked()
         self._load_harvest()
+        self._load_dot1x()
 
     # ── ledger persistence ───────────────────────────────────────────────────
     def _load_ledger(self) -> None:
@@ -301,6 +316,24 @@ class SimQuotaEngine:
                 json.dumps(self._last_harvest, indent=2), encoding="utf-8")
         except Exception as exc:  # noqa: BLE001
             logger.warning("SimQuotaEngine: harvest-cooldown save failed: %s", exc)
+
+    def _load_dot1x(self) -> None:
+        if not self._dot1x_path or not self._dot1x_path.exists():
+            return
+        try:
+            raw = json.loads(self._dot1x_path.read_text(encoding="utf-8")) or {}
+            self._dot1x = {str(h): dict(v) for h, v in raw.items() if isinstance(v, dict)}
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("SimQuotaEngine: dot1x state load failed: %s", exc)
+            self._dot1x = {}
+
+    def _save_dot1x(self) -> None:
+        if not self._dot1x_path:
+            return
+        try:
+            self._dot1x_path.write_text(json.dumps(self._dot1x, indent=2), encoding="utf-8")
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("SimQuotaEngine: dot1x state save failed: %s", exc)
 
     def _load_displaced(self) -> None:
         if not self._displaced_path or not self._displaced_path.exists():
@@ -1223,6 +1256,159 @@ class SimQuotaEngine:
         logger.info("SimQuotaEngine: released %s ← sim=%s (site %s)",
                     hostname, sim_id or "(presence)", target or from_site or "*")
 
+    # ── JIT 802.1X accounts ─────────────────────────────────────────────────
+    @staticmethod
+    def _dot1x_cell_backend(cd: Dict[str, Any]) -> str:
+        """The account location of a 1X cell ('' = manual / not a 1X cell).
+        Same 1X test as the matrix editor's csCellAuth: explicit auth, else an
+        SSID literally named 1X."""
+        auth = str(cd.get("auth") or "").strip().lower()
+        is_1x = auth == "1x" or (not auth and str(cd.get("ssid") or "").strip().upper() == "1X")
+        backend = str(cd.get("dot1x_account") or "").strip().lower()
+        return backend if is_1x and backend in DOT1X_BACKENDS else ""
+
+    def _dot1x_wanted(self, now: float) -> Dict[str, Dict[str, str]]:
+        """hostname -> {username, backend, cell} for every live client the
+        engine currently has on a JIT 1X cell. Re-reads the registry: the
+        reconcile snapshot predates this sweep's placement. A client unseen
+        for DOT1X_STALE_S is treated as torn down."""
+        from sim_config import username_for
+        cells = getattr(self, "_cells_by_name", {}) or {}
+        jit = {n: cd for n, cd in cells.items() if self._dot1x_cell_backend(cd)}
+        out: Dict[str, Dict[str, str]] = {}
+        if not jit:
+            return out
+        for h, c in self._all_clients().items():
+            try:
+                ls = float(c.get("last_seen") or 0)
+            except (TypeError, ValueError):
+                continue
+            if not ls or (now - ls) >= DOT1X_STALE_S:
+                continue
+            cell = self._cell_of(h, c, self._effective_site(h, c), jit)
+            if not cell:
+                continue
+            user = str(username_for(h) or "").strip().lower()
+            if user:
+                out[h] = {"username": user, "backend": self._dot1x_cell_backend(jit[cell]),
+                          "cell": cell}
+        return out
+
+    async def _dot1x_send(self, msg_type: str, data: Dict[str, Any]) -> bool:
+        cp = getattr(self.spoke, "control_plane", None)
+        if cp is None:
+            return False
+        try:
+            return bool(await cp.send_to_hub(msg_type, data))
+        except Exception as exc:  # noqa: BLE001 — retried next sweep
+            logger.debug("dot1x: %s send failed: %s", msg_type, exc)
+            return False
+
+    async def _dot1x_notify(self, hostname: str) -> None:
+        cb = getattr(self.spoke, "_on_client_override_changed", None)
+        if cb is not None:
+            try:
+                await cb(hostname)
+            except Exception:  # noqa: BLE001
+                pass
+
+    async def _reconcile_dot1x(self, now: float) -> None:
+        """Diff the wanted JIT accounts against what we've asked the hub for:
+        PROVISION new/changed ones, RELEASE (and drop the delivered password)
+        for clients the engine no longer has on a JIT cell, re-request any
+        provision the hub hasn't answered, and SYNC the full set periodically
+        so the hub can catch anything a lost frame missed."""
+        try:
+            wanted = self._dot1x_wanted(now)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("dot1x: wanted-set build failed: %s", exc)
+            return
+        changed = False
+        for h, st in list(self._dot1x.items()):
+            w = wanted.get(h)
+            if w and w["username"] == st.get("username") and w["backend"] == st.get("backend"):
+                if w["cell"] != st.get("cell"):
+                    st["cell"] = w["cell"]
+                    changed = True
+                continue
+            await self._dot1x_send("CS_DOT1X_RELEASE", {
+                "hostname": h, "username": st.get("username"), "backend": st.get("backend")})
+            self._dot1x.pop(h, None)
+            await self._engine_remove(h, ["dot1x_password"])
+            await self._dot1x_notify(h)
+            changed = True
+            logger.info("dot1x: released %s (%s/%s)", h, st.get("backend"), st.get("username"))
+        for h, w in wanted.items():
+            st = self._dot1x.get(h)
+            if st and (st.get("delivered") or now - float(st.get("requested_at") or 0) < DOT1X_RESEND_S):
+                continue
+            # Record before sending: the hub's CS_DOT1X_CREDENTIAL reply can
+            # race the send's return and is only accepted for known clients.
+            self._dot1x[h] = {**w, "requested_at": now, "delivered": False,
+                              "version": (st or {}).get("version", 0)}
+            if await self._dot1x_send("CS_DOT1X_PROVISION", {"hostname": h, **w}):
+                changed = True
+            elif st is None:
+                self._dot1x.pop(h, None)
+            else:
+                self._dot1x[h] = st
+        if now - self._dot1x_last_sync >= DOT1X_SYNC_S and (self._dot1x or wanted):
+            active = [{"hostname": h, "username": st.get("username"), "backend": st.get("backend"),
+                       "cell": st.get("cell"), "version": st.get("version", 0)}
+                      for h, st in self._dot1x.items()]
+            if await self._dot1x_send("CS_DOT1X_SYNC", {"active": active}):
+                self._dot1x_last_sync = now
+        if changed:
+            await asyncio.to_thread(self._save_dot1x)
+
+    async def dot1x_credential(self, d: Dict[str, Any]) -> Dict[str, Any]:
+        """Hub → CS_DOT1X_CREDENTIAL: apply (or revoke) a JIT account password
+        on the named clients as an engine-owned ``dot1x_password`` override.
+        Never echoes the password."""
+        username = str(d.get("username") or "").strip().lower()
+        backend = str(d.get("backend") or "").strip().lower()
+        revoke = bool(d.get("revoke"))
+        password = d.get("password")
+        if not revoke and not (isinstance(password, str) and password):
+            return {"status": "ERROR", "message": "missing password"}
+        try:
+            version = float(d.get("version") or 0)
+        except (TypeError, ValueError):
+            version = 0.0
+        applied, skipped = [], []
+        for h in d.get("hostnames") or []:
+            h = str(h or "").strip()
+            st = self._dot1x.get(h)
+            # Only clients we asked for under this exact account — a stale
+            # credential for a client since moved elsewhere is ignored.
+            if not h or not st or st.get("username") != username or st.get("backend") != backend:
+                skipped.append(h)
+                continue
+            if revoke:
+                await self._engine_remove(h, ["dot1x_password"])
+                # Forget it so the next sweep re-provisions if the client is
+                # still on a JIT cell (operator delete while assigned).
+                self._dot1x.pop(h, None)
+            else:
+                await self._engine_set(h, {"dot1x_password": password})
+                st.update({"delivered": True, "version": version})
+            await self._dot1x_notify(h)
+            applied.append(h)
+        if applied:
+            await asyncio.to_thread(self._save_dot1x)
+        return {"status": "SUCCESS", "applied": applied, "skipped": skipped, "revoked": revoke}
+
+    def dot1x_mark_undelivered(self, hostname: str) -> None:
+        """The client's overrides were wiped (Control Panel Clear) — re-request
+        on the next sweep so the hub re-delivers the (unchanged) password."""
+        st = self._dot1x.get(str(hostname or "").strip())
+        if st:
+            st.update({"version": 0, "delivered": False, "requested_at": 0})
+            self._save_dot1x()
+
+    def dot1x_managed(self, hostname: str) -> bool:
+        return str(hostname or "").strip() in self._dot1x
+
     async def _engine_set(self, hostname: str, overrides: Dict[str, Any]) -> None:
         """Set engine-owned overrides, recording provenance in ``engine_keys``
         so the reconcile tail can later remove ONLY keys the engine set (never
@@ -2004,6 +2190,9 @@ class SimQuotaEngine:
             await self._reconcile_engine_keys(clients)
             await self._reconcile_prune_defaults(clients)
             await self._reconcile_displaced(clients)
+            # JIT 802.1X accounts for clients now on a 1X cell with an
+            # account location (after every placement pass above settled).
+            await self._reconcile_dot1x(now)
 
             await asyncio.to_thread(self._save_ledger)
             if any(actions.values()):

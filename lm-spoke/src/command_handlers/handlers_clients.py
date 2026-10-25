@@ -13,6 +13,8 @@ from __future__ import annotations
 import logging
 from typing import Any, Dict, Optional
 
+from sim_config import mask_secret_overrides, strip_masked_secrets
+
 logger = logging.getLogger("CSSpoke")
 
 
@@ -32,13 +34,20 @@ class ClientCommandsMixin:
         # NOT_IMPLEMENTED matcher (both second-segments are in its set); SET is
         # not in the set but would fall through to "Unknown command", so it gets
         # an explicit handler too.
+        # ── JIT 802.1X credential (hub broker → engine-owned dot1x_password) ──
+        if cmd == "CS_DOT1X_CREDENTIAL":
+            eng = getattr(self, "sim_quota_engine", None)
+            if eng is None:
+                return {"status": "ERROR", "message": "sim quota engine not running"}
+            return await eng.dot1x_credential(d)
+
         if cmd in ("CS_GET_CLIENT_OVERRIDES",):
             hostname = str(d.get("hostname") or "").strip()
             if not hostname:
                 return {"status": "ERROR", "message": "missing 'hostname'"}
             entry = self.registry.get(hostname) or {}
             return {"status": "SUCCESS", "hostname": hostname,
-                    "overrides": entry.get("overrides", {})}
+                    "overrides": mask_secret_overrides(entry.get("overrides", {}))}
 
         if cmd in ("CS_SET_CLIENT_OVERRIDES",):
             hostname = str(d.get("hostname") or "").strip()
@@ -47,16 +56,20 @@ class ClientCommandsMixin:
                 return {"status": "ERROR", "message": "missing 'hostname'"}
             if not isinstance(overrides, dict):
                 return {"status": "ERROR", "message": "'overrides' must be an object"}
-            entry = await self.registry.set_overrides(hostname, overrides)
+            entry = await self.registry.set_overrides(hostname, strip_masked_secrets(overrides))
             await self._on_client_override_changed(hostname)
             return {"status": "SUCCESS", "hostname": hostname,
-                    "overrides": entry.get("overrides", {})}
+                    "overrides": mask_secret_overrides(entry.get("overrides", {}))}
 
         if cmd in ("CS_CLEAR_CLIENT_OVERRIDES",):
             hostname = str(d.get("hostname") or "").strip()
             if not hostname:
                 return {"status": "ERROR", "message": "missing 'hostname'"}
             await self.registry.clear_overrides(hostname)
+            # A cleared JIT dot1x_password is re-delivered on the next sweep.
+            eng = getattr(self, "sim_quota_engine", None)
+            if eng is not None and hasattr(eng, "dot1x_mark_undelivered"):
+                eng.dot1x_mark_undelivered(hostname)
             await self._on_client_override_changed(hostname)
             return {"status": "SUCCESS", "hostname": hostname, "cleared": True}
 
@@ -65,13 +78,14 @@ class ClientCommandsMixin:
             if not isinstance(overrides, dict):
                 return {"status": "ERROR", "message": "'overrides' must be an object"}
             applied = 0
+            overrides = strip_masked_secrets(overrides)
             for hostname in list(self.registry.get_all().keys()):
                 await self.registry.set_overrides(hostname, dict(overrides))
                 applied += 1
             # Every registered client's served [username] changed → re-fetch all.
             await self._push_config_refresh_to_clients()
             return {"status": "SUCCESS", "applied": applied,
-                    "overrides": dict(overrides)}
+                    "overrides": mask_secret_overrides(overrides)}
 
         if cmd in ("CS_CLEAR_ALL_CLIENT_OVERRIDES",):
             # Bulk-clear EVERY override layer /api/config bakes into the served
@@ -89,8 +103,11 @@ class ClientCommandsMixin:
             # this the client keeps its stale local simulation.conf with the old
             # [username] section — the "still there after Clear All" symptom.
             cleared = 0
+            eng = getattr(self, "sim_quota_engine", None)
             for hostname in list(self.registry.get_all().keys()):
                 await self.registry.clear_overrides(hostname)
+                if eng is not None and hasattr(eng, "dot1x_mark_undelivered"):
+                    eng.dot1x_mark_undelivered(hostname)
                 cleared += 1
             demos_cleared = 0
             demo = getattr(self, "demo", None)
