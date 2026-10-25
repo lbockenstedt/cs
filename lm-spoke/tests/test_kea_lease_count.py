@@ -9,25 +9,11 @@ grew without bound and the number was nonsense.
 """
 import time
 
+from dhcp_health import count_leases
+
 
 def count(lines, now=None):
-    """Mirror of the collector: distinct addresses, last row wins, live only."""
-    now = now or int(time.time())
-    state = {}
-    rows = 0
-    for i, line in enumerate(lines):
-        if i == 0 or not line.strip():
-            continue
-        rows += 1
-        c = line.rstrip("\n").split(",")
-        if len(c) < 5 or not c[0].strip():
-            continue
-        try:
-            state[c[0].strip()] = (int(float(c[3] or 0)), int(float(c[4] or 0)))
-        except (TypeError, ValueError):
-            continue
-    live = [a for a, (lt, exp) in state.items() if lt > 0 and exp > now]
-    return len(live), len(state), rows
+    return count_leases(lines, now or int(time.time()))
 
 
 HDR = "address,hwaddr,client_id,valid_lifetime,expire,subnet_id,fqdn_fwd,fqdn_rev,hostname,state"
@@ -75,3 +61,11 @@ def test_malformed_and_blank_rows_are_skipped():
     now = int(time.time())
     lines = [HDR, "", "garbage", ",,,,", _row("169.253.1.20", now=now)]
     assert count(lines, now)[0] == 1
+
+
+def test_denial_age_from_dmesg_timestamp():
+    from dhcp_health import denial_age_s
+    assert denial_age_s("[ 1105.38] apparmor=\"DENIED\" kea", 2000.0) == 895
+    assert denial_age_s("[ 1105.38] x", 0.0) is None          # uptime unknown
+    assert denial_age_s("no timestamp", 2000.0) is None
+    assert denial_age_s("[ 3000.1] x", 2000.0) == 0           # clock skew clamps to 0
