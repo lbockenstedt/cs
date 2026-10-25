@@ -31,7 +31,7 @@ import os
 import re
 import zlib
 from pathlib import Path
-from typing import Dict, Optional, Tuple
+from typing import Any, Dict, Optional, Tuple
 
 logger = logging.getLogger("CSConfig")
 
@@ -223,6 +223,31 @@ def load_configs(config_dir: os.PathLike | str) -> Tuple[configparser.ConfigPars
 def bucket_for(hostname: str) -> str:
     """Deterministic bucket ``s0``–``s9`` via ``zlib.crc32(hostname) % 10``."""
     return f"s{zlib.crc32(hostname.encode()) % 10}"
+
+
+# Per-client overrides that hold a secret (the JIT 802.1X password the hub
+# delivers). Served to the client by /api/config unmasked; masked everywhere an
+# operator can see overrides (Clients view, Control Panel GET/SET replies).
+SECRET_OVERRIDE_KEYS = ("dot1x_password",)
+SECRET_MASK = "********"
+
+
+def mask_secret_overrides(overrides: Any) -> Dict[str, Any]:
+    ov = dict(overrides or {}) if isinstance(overrides, dict) else {}
+    for k in SECRET_OVERRIDE_KEYS:
+        if ov.get(k):
+            ov[k] = SECRET_MASK
+    return ov
+
+
+def strip_masked_secrets(overrides: Any) -> Dict[str, Any]:
+    """Drop secret keys whose value is the mask — a UI round-tripping the
+    masked overrides (Control Panel Apply) must not overwrite the real value."""
+    ov = dict(overrides or {}) if isinstance(overrides, dict) else {}
+    for k in SECRET_OVERRIDE_KEYS:
+        if ov.get(k) == SECRET_MASK:
+            ov.pop(k, None)
+    return ov
 
 
 def username_for(hostname: str) -> str:
