@@ -137,32 +137,54 @@ def interface_report(want_ifaces: List[str], subnet: str) -> Dict[str, Any]:
     }
 
 
-def count_leases(lines, now: int) -> Tuple[int, int, int]:
-    """Return (live leases, distinct addresses, data rows) from a Kea memfile.
+def live_leases(lines, now: int) -> Tuple[Dict[str, List[str]], int, int]:
+    """The ONE rule for "which leases are live" in a Kea memfile.
+
+    Used by the health panel (``count_leases``) and the hub's DHCP Server
+    card (``dhcp_status._read_leases``). They used to count with different
+    rules and could show different numbers for the same pool.
 
     The memfile is APPEND-ONLY: every renew/release writes a NEW row for the
     same address, and the file only shrinks when kea-lfc compacts it. Counting
-    lines reported 688 "leases" in a 244-address pool in the field. So: count
-    distinct addresses, last row wins (that is the address's current state),
-    and drop rows that are not live: valid_lifetime 0 is a RELEASE, and an
-    expire in the past is a lapsed lease still sitting in the file.
-    Columns: address,hwaddr,client_id,valid_lifetime,expire,...
+    lines reported 688 "leases" in a 244-address pool in the field. So the
+    last row for an address wins (it is the address's current state), and
+    that row is live only when ALL of:
+
+    * ``valid_lifetime > 0`` — 0 is a RELEASE (Kea writes state 0 for it);
+    * ``state == 0`` — 1 is declined, 2 is expired-reclaimed;
+    * ``expire > now`` — a lapsed lease still sitting in the file.
+
+    Columns: address,hwaddr,client_id,valid_lifetime,expire,subnet_id,
+    fqdn_fwd,fqdn_rev,hostname,state,... (a missing state column counts as 0).
+
+    Returns ``({address: columns}, distinct addresses, data rows)``. The dict
+    keeps the order each address first appeared in the file.
     """
-    state: Dict[str, Tuple[int, int]] = {}
+    latest: Dict[str, Tuple[List[str], bool]] = {}
     rows = 0
-    for i, line in enumerate(lines):
-        if i == 0 or not line.strip():
-            continue  # header
-        rows += 1
+    for line in lines:
         cols = line.rstrip("\n").split(",")
-        if len(cols) < 5 or not cols[0].strip():
+        addr = cols[0].strip()
+        if not line.strip() or addr.lower() == "address":
+            continue  # blank line / header
+        rows += 1
+        if len(cols) < 5 or not addr:
             continue
         try:
-            state[cols[0].strip()] = (int(float(cols[3] or 0)), int(float(cols[4] or 0)))
+            lifetime = int(float(cols[3] or 0))
+            expire = int(float(cols[4] or 0))
+            state = int(float(cols[9] or 0)) if len(cols) > 9 else 0
         except (TypeError, ValueError):
             continue
-    live = [a for a, (lifetime, expire) in state.items() if lifetime > 0 and expire > now]
-    return len(live), len(state), rows
+        latest[addr] = (cols, lifetime > 0 and state == 0 and expire > now)
+    live = {addr: cols for addr, (cols, is_live) in latest.items() if is_live}
+    return live, len(latest), rows
+
+
+def count_leases(lines, now: int) -> Tuple[int, int, int]:
+    """Return (live leases, distinct addresses, data rows); see ``live_leases``."""
+    live, addresses, rows = live_leases(lines, now)
+    return len(live), addresses, rows
 
 
 def lease_db_info(lease_path: str, notes: List[str]) -> Dict[str, Any]:
