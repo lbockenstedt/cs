@@ -26,6 +26,7 @@ a docstring:
 """
 import asyncio
 import sys
+import logging
 import time
 from pathlib import Path
 
@@ -57,13 +58,16 @@ class _Deploy:
 
 
 class _ControlPlane:
-    def __init__(self, connected_agents):
+    def __init__(self, connected_agents, reply=None):
         self.connected_agents = connected_agents
-        self.sent = []  # [(command, data, agent_id)]
+        self.reply = reply if reply is not None else {"status": "ACCEPTED"}
+        self.raw = []   # [(command, data, agent_id)] exactly as sent
+        self.sent = []  # [(action, {"vmid": ..}, agent_id)] for short asserts
 
     async def send_to_agent(self, command, data, agent_id=None, timeout=None):
-        self.sent.append((command, dict(data), agent_id))
-        return {"status": "ACCEPTED"}
+        self.raw.append((command, dict(data), agent_id))
+        self.sent.append((data.get("action"), {"vmid": data.get("vmid")}, agent_id))
+        return self.reply
 
 
 class _Spoke:
@@ -248,3 +252,42 @@ def test_cooldown_value_covers_the_post_clone_settle_window():
     # ~15-20 min) or a freshly reclonded VM gets reclonded again before its
     # own client has had a fair chance to boot and report.
     assert _RECLONE_COOLDOWN_S >= 30 * 60.0
+
+
+def test_reclone_is_sent_as_cs_command_the_agent_accepts(tmp_path):
+    # The pxmx agent only runs cs actions that arrive as CS_COMMAND + action;
+    # a bare "reclone_vm" message type is answered "Unknown command" (the bug
+    # that left silent VMs un-recloned for days while the spoke logged success).
+    states = {_STATES_ONE_VM_KEY: {"vms": [_vm(90046, "qpeterson")]}}
+    clients = {"qpeterson": _client("qpeterson", _STALE_RECLONE_S + 60)}
+    spoke = _Spoke(states, clients, _AGENTS)
+    _sweep(spoke, tmp_path)
+    [(command, data, agent_id)] = spoke.control_plane.raw
+    assert command == "CS_COMMAND"
+    assert data["action"] == "reclone_vm" and data["vmid"] == 90046
+    assert data["cs_cmd_id"], "the agent de-dups long ops on cs_cmd_id"
+    assert agent_id == "agent-1"
+
+
+def test_rejected_reclone_is_logged_as_error(tmp_path, caplog):
+    states = {_STATES_ONE_VM_KEY: {"vms": [_vm(90046, "qpeterson")]}}
+    clients = {"qpeterson": _client("qpeterson", _STALE_RECLONE_S + 60)}
+    spoke = _Spoke(states, clients, _AGENTS)
+    spoke.control_plane.reply = {"status": "ERROR", "message": "Unknown command"}
+    with caplog.at_level(logging.WARNING, logger="StaleClientReclone"):
+        inst = _sweep(spoke, tmp_path)
+    errors = [r for r in caplog.records if r.levelno >= logging.ERROR]
+    assert errors and "rejected reclone of VM 90046" in errors[0].getMessage()
+    # The cooldown still starts, so a rejecting host isn't hammered every sweep.
+    assert "90046" in inst._triggered
+
+
+def test_accepted_reply_in_agent_response_envelope_is_not_an_error(tmp_path, caplog):
+    states = {_STATES_ONE_VM_KEY: {"vms": [_vm(90046, "qpeterson")]}}
+    clients = {"qpeterson": _client("qpeterson", _STALE_RECLONE_S + 60)}
+    spoke = _Spoke(states, clients, _AGENTS)
+    spoke.control_plane.reply = {"payload": {"type": "AGENT_RESPONSE",
+                                             "data": {"status": "ACCEPTED"}}}
+    with caplog.at_level(logging.WARNING, logger="StaleClientReclone"):
+        _sweep(spoke, tmp_path)
+    assert not [r for r in caplog.records if r.levelno >= logging.ERROR]
