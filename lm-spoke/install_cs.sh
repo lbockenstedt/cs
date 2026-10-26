@@ -2040,6 +2040,18 @@ SUDOERS
 chmod 0440 /etc/sudoers.d/lm-component-update
 visudo -cf /etc/sudoers.d/lm-component-update >/dev/null 2>&1 || true
 
+# Hub Setup → OS Updates: this spoke runs as $SVC_USER, so apt/reboot go through
+# the lm repo's fixed-action helper (core/src/os_update.py). Installed root-owned
+# outside $LM_DIR so $SVC_USER can't edit what sudo runs.
+if [ -f "$LM_DIR/scripts/lm-os-update" ]; then
+    install -o root -g root -m 0755 "$LM_DIR/scripts/lm-os-update" /usr/local/bin/lm-os-update
+    cat > /etc/sudoers.d/lm-os-update <<SUDOERS
+$SVC_USER ALL=(ALL) NOPASSWD: /usr/local/bin/lm-os-update *
+SUDOERS
+    chmod 0440 /etc/sudoers.d/lm-os-update
+    visudo -cf /etc/sudoers.d/lm-os-update >/dev/null 2>&1 || rm -f /etc/sudoers.d/lm-os-update
+fi
+
 LOCAL_IP=$(hostname -I 2>/dev/null | awk '{print $1}' || echo "this-host")
 echo ""
 echo "════════════════════════════════════════════"
