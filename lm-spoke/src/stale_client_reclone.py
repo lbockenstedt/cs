@@ -20,6 +20,9 @@ This is a distinct failure mode from everything else already watched:
     but only for the diagnostic panel (desired=[] / "client_stale_tags_cleared").
     Nothing ever ACTED on it.
 
+Reboot first: a flagged VM is rebooted, and only recloned if its client still
+hasn't reported 15 min after that reboot (_REBOOT_WAIT_S).
+
 This closes that gap: applies to every tier (whether the client can reach
 the API doesn't depend on how its NIC is attached), and reuses the SAME
 `reclone_vm` command the manual per-VM Reclone button already sends — no new
@@ -71,8 +74,12 @@ _NEVER_REPORTED_GRACE_S = 45 * 60.0
 # the correlation gate is somehow satisfied during a partial outage we bleed off
 # dead VMs slowly instead of destroying the whole pool in one tick.
 _NEVER_REPORTED_MAX_PER_SWEEP = 3
+# A flagged VM is rebooted first; reclone only if its client hasn't reported
+# this long after the reboot.
+_REBOOT_WAIT_S = 15 * 60.0
 _VMID_FLOOR = 90000
 _STATE_FILE = "stale_client_reclone.json"
+_REBOOT_STATE_FILE = "stale_client_reboot.json"
 _MISSING_STATE_FILE = "stale_client_reclone_missing.json"
 # The pxmx agent starts a reclone in the background and answers ACCEPTED.
 _ACCEPTED_STATUSES = {"ACCEPTED", "SUCCESS"}
@@ -87,6 +94,11 @@ def reclone_command(vmid: int) -> Dict[str, Any]:
     happens. ``cs_cmd_id`` is the agent's de-dup key for the long-running op.
     """
     return {"action": "reclone_vm", "vmid": vmid, "cs_cmd_id": uuid.uuid4().hex}
+
+
+def reboot_command(vmid: int) -> Dict[str, Any]:
+    """The CS_COMMAND payload for a single-VM reboot (fast, synchronous)."""
+    return {"action": "reboot_vm", "vmid": vmid}
 
 
 def reply_status(reply: Any) -> str:
@@ -112,6 +124,9 @@ class StaleClientReclone:
         self._triggered: Dict[str, float] = self._load(self._path)
         # {vmid: epoch we FIRST saw this running sim VM with no reporting client}
         self._missing_since: Dict[str, float] = self._load(self._missing_path)
+        # {vmid: epoch we rebooted it as the first recovery step}
+        self._reboot_path = Path(data_dir) / _REBOOT_STATE_FILE
+        self._rebooted: Dict[str, float] = self._load(self._reboot_path)
         self._task = None
 
     def start(self) -> None:
@@ -143,6 +158,12 @@ class StaleClientReclone:
             self._missing_path.write_text(json.dumps(self._missing_since))
         except Exception as e:  # noqa: BLE001
             logger.debug("stale-client-reclone: missing-state save failed: %s", e)
+
+    def _save_rebooted(self) -> None:
+        try:
+            self._reboot_path.write_text(json.dumps(self._rebooted))
+        except Exception as e:  # noqa: BLE001
+            logger.debug("stale-client-reclone: reboot-state save failed: %s", e)
 
     async def _loop(self) -> None:
         while True:
@@ -182,6 +203,7 @@ class StaleClientReclone:
         now = time.time()
         dirty = False
         missing_dirty = False
+        reboot_dirty = False
 
         # ── Pass 1: collect the running sim VMs on CONNECTED hosts. ──────────
         # (vid, name, hn, agent_id, last_seen) per VM; also count how many have a
@@ -239,6 +261,43 @@ class StaleClientReclone:
                              "VM %s (%s): %s", agent_id, vid, status or "no status",
                              reply)
 
+        async def _reboot(vid, name, hn, agent_id, reason):
+            nonlocal reboot_dirty
+            self._rebooted[str(vid)] = now
+            reboot_dirty = True
+            logger.warning("stale-client-reclone: VM %s (%s) on %s %s — rebooting "
+                           "first (reclone if still silent in %.0fs)",
+                           vid, name, hn, reason, _REBOOT_WAIT_S)
+            try:
+                reply = await cp.send_to_agent(
+                    "CS_COMMAND", reboot_command(vid),
+                    agent_id=agent_id, timeout=60.0)
+            except Exception as e:  # noqa: BLE001
+                logger.warning("stale-client-reclone: reboot dispatch for "
+                               "VM %s failed: %s", vid, e)
+                return
+            status = reply_status(reply)
+            if status != "SUCCESS":
+                logger.error("stale-client-reclone: agent %s failed to reboot "
+                             "VM %s (%s): %s", agent_id, vid, status or "no status",
+                             reply)
+
+        async def _recover(vid, name, hn, agent_id, reason):
+            """Reboot first; reclone only if the client is still silent
+            _REBOOT_WAIT_S after the reboot."""
+            nonlocal reboot_dirty
+            rebooted_at = self._rebooted.get(str(vid))
+            if rebooted_at is None:
+                await _reboot(vid, name, hn, agent_id, reason)
+                return
+            if now - rebooted_at < _REBOOT_WAIT_S:
+                return                             # give the reboot its window
+            self._rebooted.pop(str(vid), None)
+            reboot_dirty = True
+            await _reclone(vid, name, hn, agent_id,
+                           reason + " and still silent %.0fs after a reboot"
+                           % (now - rebooted_at))
+
         # ── Pass 2a: clients that REPORTED then went silent (existing path). ─
         never_reported = []
         for vid, name, hn, agent_id, ls in candidates:
@@ -253,10 +312,12 @@ class StaleClientReclone:
                 missing_dirty = True
             age = now - ls
             if age < _STALE_RECLONE_S:
+                if self._rebooted.pop(key, None) is not None:   # recovered
+                    reboot_dirty = True
                 continue
             if (now - self._triggered.get(key, 0.0)) < _RECLONE_COOLDOWN_S:
                 continue
-            await _reclone(vid, name, hn, agent_id,
+            await _recover(vid, name, hn, agent_id,
                            "running but client silent %.0fs (> %.0fs)"
                            % (age, _STALE_RECLONE_S))
 
@@ -278,10 +339,12 @@ class StaleClientReclone:
                     continue
                 if (now - self._triggered.get(key, 0.0)) < _RECLONE_COOLDOWN_S:
                     continue
+                if now - self._rebooted.get(key, 0.0) < _REBOOT_WAIT_S:
+                    continue                       # waiting out its reboot
                 if fired >= _NEVER_REPORTED_MAX_PER_SWEEP:
                     break                          # bleed off slowly, never storm
                 fired += 1
-                await _reclone(vid, name, hn, agent_id,
+                await _recover(vid, name, hn, agent_id,
                                "running but client NEVER checked in for %.0fs (> %.0fs)"
                                % (now - first, _NEVER_REPORTED_GRACE_S))
 
@@ -291,7 +354,16 @@ class StaleClientReclone:
             self._missing_since.pop(gone, None)
             missing_dirty = True
 
+        # Drop reboot marks for VMs no longer present, once their wait is over
+        # (a VM mid-reboot can briefly drop out of the running list).
+        for gone in [k for k, ts in self._rebooted.items()
+                     if k not in seen_vids and now - ts > _REBOOT_WAIT_S]:
+            self._rebooted.pop(gone, None)
+            reboot_dirty = True
+
         if dirty:
             self._save()
         if missing_dirty:
             self._save_missing()
+        if reboot_dirty:
+            self._save_rebooted()
