@@ -44,6 +44,7 @@ import asyncio
 import json
 import logging
 import time
+import uuid
 from pathlib import Path
 from typing import Any, Dict
 
@@ -73,6 +74,30 @@ _NEVER_REPORTED_MAX_PER_SWEEP = 3
 _VMID_FLOOR = 90000
 _STATE_FILE = "stale_client_reclone.json"
 _MISSING_STATE_FILE = "stale_client_reclone_missing.json"
+# The pxmx agent starts a reclone in the background and answers ACCEPTED.
+_ACCEPTED_STATUSES = {"ACCEPTED", "SUCCESS"}
+
+
+def reclone_command(vmid: int) -> Dict[str, Any]:
+    """The CS_COMMAND payload for a single-VM reclone.
+
+    The pxmx agent only runs cs actions that arrive as a ``CS_COMMAND`` message
+    carrying ``action`` (agent.py -> cs_commands.handle_cs_command); a bare
+    ``reclone_vm`` message type is answered with "Unknown command" and nothing
+    happens. ``cs_cmd_id`` is the agent's de-dup key for the long-running op.
+    """
+    return {"action": "reclone_vm", "vmid": vmid, "cs_cmd_id": uuid.uuid4().hex}
+
+
+def reply_status(reply: Any) -> str:
+    """The status of an agent reply, whether or not it is wrapped in an
+    AGENT_RESPONSE envelope (``{"payload": {"data": {...}}}``)."""
+    if not isinstance(reply, dict):
+        return ""
+    inner = (reply.get("payload") or {}).get("data")
+    if isinstance(inner, dict) and inner.get("status"):
+        return str(inner["status"]).upper()
+    return str(reply.get("status") or "").upper()
 
 
 class StaleClientReclone:
@@ -193,17 +218,26 @@ class StaleClientReclone:
 
         async def _reclone(vid, name, hn, agent_id, reason):
             nonlocal dirty
+            # The cooldown starts even if the dispatch fails, so a host that
+            # keeps rejecting it is retried every cooldown, not every sweep.
             self._triggered[str(vid)] = now
             dirty = True
             logger.warning("stale-client-reclone: VM %s (%s) on %s %s — reclone",
                            vid, name, hn, reason)
             try:
-                await cp.send_to_agent("reclone_vm", {"vmid": vid},
-                                       agent_id=agent_id, timeout=60.0)
+                reply = await cp.send_to_agent(
+                    "CS_COMMAND", reclone_command(vid),
+                    agent_id=agent_id, timeout=60.0)
             except Exception as e:  # noqa: BLE001 — one failed dispatch must not
                                      # stop the sweep covering other VMs
                 logger.warning("stale-client-reclone: reclone dispatch for "
                                "VM %s failed: %s", vid, e)
+                return
+            status = reply_status(reply)
+            if status not in _ACCEPTED_STATUSES:
+                logger.error("stale-client-reclone: agent %s rejected reclone of "
+                             "VM %s (%s): %s", agent_id, vid, status or "no status",
+                             reply)
 
         # ── Pass 2a: clients that REPORTED then went silent (existing path). ─
         never_reported = []
