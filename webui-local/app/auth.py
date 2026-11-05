@@ -7,7 +7,7 @@ from uuid import uuid4
 
 from fastapi import Depends, HTTPException, status
 from fastapi.security import OAuth2PasswordBearer
-from jose import JWTError, jwt
+import jwt  # PyJWT, already used elsewhere in the fleet (replaces python-jose)
 from passlib.context import CryptContext
 
 logger = logging.getLogger(__name__)
@@ -126,7 +126,7 @@ def _decode_token(token: str) -> User:
                 detail="Session expired after server restart — please log in again",
                 headers={"WWW-Authenticate": "Bearer"},
             )
-    except JWTError:
+    except jwt.PyJWTError:
         raise exc
 
     # Synthetic QA runner user — tenant-scoped admin, no DB lookup needed.
