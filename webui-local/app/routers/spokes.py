@@ -1,21 +1,32 @@
 """Spoke relay endpoints — used by spoke servers."""
+# Allow modern type-hint syntax on older Python versions.
 from __future__ import annotations
 
+# asyncio for background tasks; json for message parsing; logging for diagnostics.
 import asyncio
 import json
 import logging
+# re validates USB ids; time/uuid for timing and ids.
 import re
 import time
 import uuid
+# Timestamps and expiry times.
 from datetime import datetime, timedelta, timezone
+# Type hints.
 from typing import Any, Optional
 
+# FastAPI router, parameter, request and WebSocket types.
 from fastapi import APIRouter, Body, Depends, Header, HTTPException, Query, Request, WebSocket, WebSocketDisconnect
+# Pydantic models and validation errors.
 from pydantic import BaseModel, Field, ValidationError
 
+# auth checks users; store persists spokes; relay_ws manages spoke sockets.
 from .. import auth, store, ws as relay_ws
+# Spoke API key encryption and generation.
 from ..crypto import decrypt_str, encrypt_str, generate_api_key
+# Data models used here.
 from ..data_models import AuditEntry, Command, PendingSpoke, User
+# WebSocket helpers for spokes, shell/VNC relays and browser broadcasts.
 from ..ws import push_spoke_commands, register_spoke as ws_register_spoke, route_shell_message, route_vnc_message, register_log_fetch, unregister_log_fetch, route_log_fetch_message, unregister_spoke, ws_broadcast, register_provision_session, unregister_provision_session, route_provision_message, register_command_trace, unregister_command_trace, route_command_trace_message
 
 # In-memory update job store: job_id -> job dict
@@ -37,28 +48,35 @@ _AUTH_KEYS: set[str] = {
 # _handle_spoke_backup_progress(spoke_id, payload_dict) is defined in backups.py.
 async def _relay_backup_progress(spoke_id: str, msg_type: str, data: dict) -> None:
     """Forward backup_progress / reseed_progress messages from a spoke to the backup subsystem."""
+    # Imported here to avoid a circular import with backups.py.
     from .backups import BackupProgressPayload, backup_jobs, _refresh_backup_job_status, _RESEED_ERROR_STATES
     import asyncio
+    # The progress may be wrapped in "payload" or sent flat.
     raw = data.get("payload") if isinstance(data.get("payload"), dict) else data
     # Ensure spoke_id propagates for reseed jobs (agent may omit it)
+    # Fill in the spoke id if missing (copy so the original is untouched).
     if spoke_id and not raw.get("spoke_id"):
         raw = dict(raw)
         raw["spoke_id"] = spoke_id
+    # Validate the message; invalid ones are logged and dropped.
     try:
         payload = BackupProgressPayload(**raw)
     except Exception as exc:
         logger.warning("Invalid %s payload from spoke %s: %s", msg_type, spoke_id, exc)
         return
+    # Ignore progress for jobs the hub does not know (e.g. after a restart).
     job = backup_jobs.get(payload.job_id)
     if job is None:
         logger.debug("Received %s for unknown job %s from spoke %s — ignoring", msg_type, payload.job_id, spoke_id)
         return
+    # Reseed job: progress is per spoke.
     if job.get("type") == "reseed":
         effective_spoke_id = payload.spoke_id or spoke_id
         spoke_state = job.get("spoke_status", {}).get(effective_spoke_id)
         if spoke_state is None:
             logger.warning("Reseed progress from unknown spoke %s in job %s", effective_spoke_id, payload.job_id)
             return
+        # On failure, schedule a retry (up to 3) and mark the spoke as retrying.
         retry_count = int(spoke_state.get("retry_count", 0))
         next_status = payload.status
         if payload.status in _RESEED_ERROR_STATES:
@@ -67,6 +85,7 @@ async def _relay_backup_progress(spoke_id: str, msg_type: str, data: dict) -> No
                 next_status = "retrying"
                 from .backups import _retry_reseed_after_delay
                 asyncio.create_task(_retry_reseed_after_delay(job["job_id"], job["tenant_id"], effective_spoke_id, retry_count))
+        # Record the spoke's new state, recompute the job and tell browsers.
         spoke_state.update({"status": next_status, "step": payload.step, "error": payload.error, "retry_count": retry_count, "updated_at": datetime.utcnow().isoformat()})
         _refresh_backup_job_status(job)
         await ws_broadcast({
@@ -79,12 +98,14 @@ async def _relay_backup_progress(spoke_id: str, msg_type: str, data: dict) -> No
             "retries": retry_count,
             "template_name": job.get("template_name"),
         })
+    # Backup job: progress is per VM.
     else:
         effective_spoke_id = payload.spoke_id or spoke_id
         vm_state = job.get("vm_status", {}).get(payload.vm_id)
         if vm_state is None:
             logger.warning("Backup progress for unknown vm_id %s in job %s", payload.vm_id, payload.job_id)
             return
+        # Record the VM's progress, recompute the job and tell browsers.
         vm_state.update({"status": payload.status, "pct": payload.pct, "size": payload.size, "file": payload.file, "error": payload.error})
         _refresh_backup_job_status(job)
         await ws_broadcast({
@@ -99,6 +120,7 @@ async def _relay_backup_progress(spoke_id: str, msg_type: str, data: dict) -> No
             "spoke_id": effective_spoke_id,
         })
 
+# Router mounted by app.main, and the module logger.
 router = APIRouter()
 logger = logging.getLogger(__name__)
 
@@ -108,33 +130,43 @@ _registration_log: list[dict[str, Any]] = []
 
 
 def _reg_log_append(event: str, **kwargs: Any) -> None:
+    """Add a timestamped event to the in-memory registration log, keeping the last 100."""
+    # Timestamped entry with any extra details.
     entry = {"ts": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"),
              "event": event, **kwargs}
+    # Append and trim to the last _REG_LOG_MAX entries.
     _registration_log.append(entry)
     if len(_registration_log) > _REG_LOG_MAX:
         del _registration_log[:-_REG_LOG_MAX]
 
 
 def _now() -> datetime:
+    """Current time in UTC."""
     return datetime.now(timezone.utc)
 
 
+# Valid USB "vendor:product" id format, and allowed device types.
 _USB_VIDPID_RE = re.compile(r"^[0-9a-f]{4}:[0-9a-f]{4}$", re.IGNORECASE)
 _USB_DEVICE_TYPES = {"wireless", "wired", "storage", "generic"}
 
 
 class TenantUsbConfigRequest(BaseModel):
+    """Request body with the tenant's USB dongle id list."""
     usb_vidpids: list[dict[str, Any]] = Field(default_factory=list)
 
 
 class SpokeProxmoxCredentialsRequest(BaseModel):
+    """Request body with a spoke's Proxmox API token and host."""
     proxmox_token: Optional[str] = None
     proxmox_host: str = ""
 
 
 def _is_spoke_online(spoke) -> bool:
+    """Return True if the spoke has been seen in the last 5 minutes."""
+    # Never seen: offline.
     if not spoke or not spoke.last_seen:
         return False
+    # Treat naive timestamps as UTC.
     last_seen = spoke.last_seen
     if last_seen.tzinfo is None:
         last_seen = last_seen.replace(tzinfo=timezone.utc)
@@ -144,32 +176,46 @@ def _is_spoke_online(spoke) -> bool:
 
 
 def _normalize_usb_vidpids(items: Any) -> list[dict[str, str]]:
+    """Validate and clean a USB id list: lower-case ids, known types, one entry per id.
+
+    Raises:
+        HTTPException: 400 if the list or an entry is malformed.
+    """
+    # Missing list means none.
     if items is None:
         return []
     if not isinstance(items, list):
         raise HTTPException(status_code=400, detail="usb_vidpids must be a JSON array")
+    # Keyed by id so duplicates collapse (last one wins).
     deduped: dict[str, dict[str, str]] = {}
     for index, item in enumerate(items):
+        # Each entry must be an object with a valid XXXX:XXXX id.
         if not isinstance(item, dict):
             raise HTTPException(status_code=400, detail=f"usb_vidpids[{index}] must be an object")
         vidpid = str(item.get("vidpid") or "").strip().lower()
         if not vidpid or not _USB_VIDPID_RE.fullmatch(vidpid):
             raise HTTPException(status_code=400, detail=f"usb_vidpids[{index}].vidpid must match XXXX:XXXX")
+        # Unknown device types become "generic".
         device_type = str(item.get("type") or "generic").strip().lower() or "generic"
         if device_type not in _USB_DEVICE_TYPES:
             device_type = "generic"
+        # Store the cleaned entry.
         deduped[vidpid] = {
             "vidpid": vidpid,
             "type": device_type,
             "label": str(item.get("label") or "").strip(),
         }
+    # Return the entries sorted by id.
     return [deduped[key] for key in sorted(deduped)]
 
 
 def _is_valid_uuid(value: str) -> bool:
+    """Return True if the value is a canonical lower-case UUID string."""
+    # Blank is never valid.
     candidate = (value or "").strip().lower()
     if not candidate:
         return False
+    # Must round-trip through UUID unchanged.
     try:
         import uuid
         return str(uuid.UUID(candidate)) == candidate
@@ -178,7 +224,10 @@ def _is_valid_uuid(value: str) -> bool:
 
 
 def _name_conflict_message(spoke_name: str, state: str, tenant_id: str) -> str:
+    """Error message for a spoke name already used by an approved or pending spoke."""
+    # Describe the tenant scope.
     scope = f" within tenant '{tenant_id}'" if tenant_id else " within the same tenant"
+    # Different wording for approved and pending spokes.
     if state == "approved":
         return (
             f"Spoke name '{spoke_name}' is already in use by another approved spoke{scope}. "
@@ -191,6 +240,7 @@ def _name_conflict_message(spoke_name: str, state: str, tenant_id: str) -> str:
 
 
 def _raise_name_conflict(spoke_name: str, state: str, tenant_id: str) -> None:
+    """Raise 409 with a structured "name_in_use" error."""
     raise HTTPException(
         status_code=409,
         detail={
@@ -208,9 +258,15 @@ def _ensure_name_available_for_tenant(
     exclude_spoke_id: str = "",
     log_context: Optional[dict[str, Any]] = None,
 ) -> None:
+    """Raise 409 if another approved or pending spoke in the tenant already uses this name.
+
+    A spoke with the same hostname does not count as a conflict (it is the same machine).
+    """
+    # No tenant: nothing to check.
     if not tenant_id:
         return
 
+    # Approved spoke with this name on another host: log and reject.
     approved_conflict = store.find_spoke_name_conflict(
         tenant_id,
         spoke_name,
@@ -226,6 +282,7 @@ def _ensure_name_available_for_tenant(
         )
         _raise_name_conflict(spoke_name, "approved", tenant_id)
 
+    # Pending spoke with this name on another host: log and reject.
     pending_conflict = store.find_pending_spoke_name_conflict(
         tenant_id,
         spoke_name,
@@ -243,9 +300,12 @@ def _ensure_name_available_for_tenant(
 
 
 def _auth_spoke(tenant_id: str, spoke_id: str, api_key: str):
+    """Return the approved spoke if the API key matches, otherwise raise 401."""
+    # Must exist, be approved and have a key.
     spoke = store.get_spoke(tenant_id, spoke_id)
     if not spoke or spoke.status != "approved" or not spoke.api_key_enc:
         raise HTTPException(status_code=401, detail="Invalid credentials")
+    # Compare the decrypted key; any decryption error is also a 401.
     try:
         if decrypt_str(spoke.api_key_enc) != api_key:
             raise HTTPException(status_code=401, detail="Invalid credentials")
@@ -253,15 +313,19 @@ def _auth_spoke(tenant_id: str, spoke_id: str, api_key: str):
         if isinstance(exc, HTTPException):
             raise exc
         raise HTTPException(status_code=401, detail="Invalid credentials") from exc
+    # Authenticated.
     return spoke
 
 
 def _require_tenant_access(tenant_id: str, current_user: User) -> str:
+    """Require tenant access (any role); return the tenant id."""
     auth.require_tenant_access(tenant_id, current_user)
     return tenant_id
 
 
 def _require_tenant_admin(tenant_id: str, current_user: User) -> str:
+    """Require tenant access with the admin role (superadmins pass); return the tenant id."""
+    # Must have access; non-superadmins also need the admin role.
     auth.require_tenant_access(tenant_id, current_user)
     if not current_user.is_superadmin and current_user.get_role(tenant_id) != "admin":
         raise HTTPException(status_code=403, detail="Admin role required")
@@ -269,6 +333,7 @@ def _require_tenant_admin(tenant_id: str, current_user: User) -> str:
 
 
 def _get_approved_spoke(tenant_id: str, spoke_id: str):
+    """Return the spoke if it exists and is approved (404/409 otherwise)."""
     spoke = store.get_spoke(tenant_id, spoke_id)
     if not spoke:
         raise HTTPException(status_code=404, detail="Spoke not found")
@@ -278,10 +343,17 @@ def _get_approved_spoke(tenant_id: str, spoke_id: str):
 
 
 def _require_spoke_admin(spoke_id: str, current_user: User) -> tuple[str, Any]:
+    """Find an approved spoke by id across tenants and require admin rights in its tenant.
+
+    Returns:
+        (tenant_id, spoke).
+    """
+    # Find the spoke in any tenant.
     approved = store.get_approved_spoke_by_id(spoke_id)
     if not approved:
         raise HTTPException(status_code=404, detail="Spoke not found")
 
+    # Check the user is an admin of the spoke's tenant (or a superadmin).
     tenant_id, spoke = approved
     auth.require_tenant_access(tenant_id, current_user)
     if not current_user.is_superadmin and current_user.get_role(tenant_id) != "admin":
@@ -290,15 +362,24 @@ def _require_spoke_admin(spoke_id: str, current_user: User) -> tuple[str, Any]:
 
 
 def _serialize_spoke_command(command) -> dict[str, Any]:
+    """Convert a queued command to the dict sent to the spoke."""
     return {"id": command.id, "target": command.target, "type": command.type, "payload": command.payload}
 
 
 def _build_spoke_central_feed(tenant_id: str, spoke_id: str) -> dict[str, Any]:
+    """Build the Central data the hub sends a spoke in centralized mode.
+
+    Includes the hub's polling results for this spoke plus browse data filtered to the
+    spoke's sites.
+    """
+    # Imported here to avoid circular imports.
     from ..tasks import _hub_central_status
     from .aggregate import _central_browse_cache
 
+    # Hub polling results for the tenant and for this spoke.
     tenant_data = _hub_central_status.get(tenant_id, {})
     spoke_data = tenant_data.get("spokes", {}).get(spoke_id, {})
+    # Tenant-wide token state.
     token_valid = bool(tenant_data.get("token_valid", False))
     token_state_str = tenant_data.get("token_state", "not_configured")
 
@@ -308,13 +389,16 @@ def _build_spoke_central_feed(tenant_id: str, spoke_id: str) -> dict[str, Any]:
     spoke_site_names: set[str] = {
         str(v).strip().lower() for v in (spoke_data.get("site_mappings") or {}).values() if v
     }
+    # Hub browse cache for the tenant.
     hub_browse = _central_browse_cache.get(tenant_id) or {}
 
     def _filter_by_site(items: list[dict], field: str = "site") -> list[dict]:
+        """Return items whose site is one of the spoke's sites (all items if it has none)."""
         if not spoke_site_names:
             return list(items)
         return [i for i in (items or []) if str(i.get(field) or "").strip().lower() in spoke_site_names]
 
+    # Filter each browse list to the spoke's sites.
     filtered_alerts = _filter_by_site(hub_browse.get("alerts") or [])
     filtered_insights = _filter_by_site(hub_browse.get("insights") or [])
     filtered_clients = _filter_by_site(hub_browse.get("clients") or [])
@@ -328,6 +412,7 @@ def _build_spoke_central_feed(tenant_id: str, spoke_id: str) -> dict[str, Any]:
         if not spoke_site_names or str(k).strip().lower() in spoke_site_names
     }
 
+    # Combined feed: polling results, token state, site config and filtered browse data.
     return {
         "status": spoke_data.get("status", {}),
         "wireless_clients": spoke_data.get("wireless_clients", {}),
@@ -352,53 +437,75 @@ def _build_spoke_central_feed(tenant_id: str, spoke_id: str) -> dict[str, Any]:
 
 
 async def _apply_spoke_telemetry(tenant_id: str, spoke_id: str, spoke, payload: dict[str, Any]) -> None:
+    """Store a telemetry report from a spoke and keep its config versions consistent.
+
+    Updates hostname/name, seeds the spoke's config from its first report, clears the
+    config if the tenant no longer has one, fixes config drift, and notifies browsers.
+    """
+    # Store calls block, so they run in a thread pool.
     loop = asyncio.get_running_loop()
     tenant = await loop.run_in_executor(None, store.get_tenant, tenant_id)
+    # Track changes; read hostname, name and reported config from the payload.
     changed = False
     previous_config_version = spoke.config_version
     hostname = str(payload.get("hostname") or "").strip()
     spoke_name = str(payload.get("spoke_name") or "").strip()
     telemetry_config = payload.get("config") if isinstance(payload.get("config"), dict) else None
+    # Update hostname and name if the spoke reports new ones.
     if hostname and spoke.hostname != hostname:
         spoke.hostname = hostname
         changed = True
     if spoke_name and spoke.spoke_name != spoke_name:
         spoke.spoke_name = spoke_name
         changed = True
+    # No config on the hub yet: adopt the spoke's own config as version 1.
     if not spoke.config and telemetry_config:
         spoke.config = dict(telemetry_config)
         spoke.config_version = 1
         spoke.applied_config_version = 0
         changed = True
+    # The tenant no longer has a spoke config: reset versions and queue a config clear.
     if tenant and previous_config_version > 0 and not store.tenant_has_spoke_config_payload(tenant):
         spoke.config_version = 0
         spoke.applied_config_version = 0
         store.ensure_config_clear_command(tenant_id, spoke_id)
         changed = True
+    # Save the spoke if anything changed, then store the telemetry itself.
     if changed:
         await loop.run_in_executor(None, store.save_spoke, spoke)
     await loop.run_in_executor(None, store.update_spoke_telemetry, tenant_id, spoke_id, payload)
     # Drift detection: if the hub's authoritative config has changed since the
     # last push, bump config_version so the next inbox fetch queues a correction.
     drifted = await loop.run_in_executor(None, store.check_and_fix_config_drift, tenant_id, spoke_id)
+    # Config drifted: queue a corrective config_update.
     if drifted:
         await loop.run_in_executor(None, store.ensure_config_update_command, tenant_id, spoke_id)
+    # Tell browsers new telemetry arrived.
     await ws_broadcast({"type": "telemetry", "tenant_id": tenant_id, "spoke_id": spoke_id})
 
 
 def _get_spoke_inbox(tenant_id: str, spoke_id: str) -> list[dict[str, Any]]:
+    """Return the spoke's queued commands, queueing a config_update first if one is due."""
+    # Make sure a pending config change is queued, then return the queue.
     store.ensure_config_update_command(tenant_id, spoke_id)
     return [_serialize_spoke_command(c) for c in store.get_queued_commands(tenant_id, spoke_id)]
 
 
 async def _handle_spoke_ack(tenant_id: str, spoke_id: str, payload: AckPayload) -> dict[str, str]:
+    """Process a spoke's acknowledgement of a command.
+
+    Marks it done, records applied config versions, and audits/broadcasts task results.
+    """
+    # Look up the command and store the result.
     command = store.get_command(tenant_id, spoke_id, payload.command_id)
     result = payload.result.model_dump(exclude_none=True) if payload.result else None
     store.ack_command(tenant_id, spoke_id, payload.command_id, result)
+    # A successful config_update means the spoke now runs that config version.
     if command and command.type == "config_update" and (result or {}).get("success", True):
         version = int((command.payload or {}).get("__config_version", 0) or 0)
         if version > 0:
             store.mark_spoke_config_applied(tenant_id, spoke_id, version)
+    # Results with a task type are audited and announced to browsers.
     if result and result.get("task_type"):
         task_status = "success" if result.get("success") else "failure"
         store.append_audit(
@@ -422,10 +529,12 @@ async def _handle_spoke_ack(tenant_id: str, spoke_id: str, payload: AckPayload) 
                 "status": task_status,
             }
         )
+    # Acknowledged.
     return {"status": "ok"}
 
 
 class RegisterPayload(BaseModel):
+    """Body a spoke sends to register (or re-register) with the hub."""
     spoke_id: str = ""
     hostname: str
     label: str = ""
@@ -438,12 +547,19 @@ class RegisterPayload(BaseModel):
 
 @router.post("/spokes/register", status_code=201)
 async def register_spoke(payload: RegisterPayload, request: Request):
+    """Register a spoke, or re-register a known one.
     # Strip auth/credential keys — the hub must never store or push spoke auth config
+
+    Known spokes (matched by id, hostname or API key) get their API key back. New spokes
+    with a valid tenant onboarding PSK are approved at once; others wait for approval.
+    """
     payload.config = {k: v for k, v in payload.config.items() if k not in _AUTH_KEYS}
+    # Spoke name defaults to the hostname; read the tenant hint, requested id and caller IP.
     spoke_name = payload.spoke_name.strip() or payload.hostname
     tenant_hint = payload.tenant_id_hint.strip()
     requested_spoke_id = payload.spoke_id.strip().lower()
     client_ip = request.client.host if request.client else "unknown"
+    # Ignore spoke ids that are not valid UUIDs.
     if requested_spoke_id and not _is_valid_uuid(requested_spoke_id):
         _reg_log_append("invalid_spoke_id", hostname=payload.hostname, spoke_name=spoke_name,
                         spoke_id=requested_spoke_id, ip=client_ip)
@@ -459,16 +575,20 @@ async def register_spoke(payload: RegisterPayload, request: Request):
                             spoke_name=spoke_name, tenant_hint=tenant_hint, ip=client_ip)
             tenant_hint = ""  # Silently ignore invalid tenant IDs
 
+    # Look for an already-approved spoke: by id, then hostname, then API key.
     approved = store.get_approved_spoke_by_id(requested_spoke_id) if requested_spoke_id else None
     if not approved:
         approved = store.get_approved_spoke_by_hostname(payload.hostname)
     if not approved and payload.api_key:
         approved = store.get_approved_spoke_by_api_key(payload.api_key, tenant_hint)
+    # Known spoke: update it and return its credentials.
     if approved:
+        # Move the spoke to the requested id if it changed.
         tenant_id, spoke = approved
         if requested_spoke_id and spoke.id != requested_spoke_id:
             store.rekey_spoke(tenant_id, spoke.id, requested_spoke_id)
             spoke.id = requested_spoke_id
+        # A new name must not clash with another spoke in the tenant.
         if spoke.spoke_name != spoke_name:
             _ensure_name_available_for_tenant(
                 spoke_name,
@@ -477,6 +597,7 @@ async def register_spoke(payload: RegisterPayload, request: Request):
                 exclude_spoke_id=spoke.id,
                 log_context={"spoke_id": spoke.id, "ip": client_ip},
             )
+        # Update hostname, label and name if they changed.
         changed = False
         if spoke.hostname != payload.hostname:
             spoke.hostname = payload.hostname
@@ -487,6 +608,7 @@ async def register_spoke(payload: RegisterPayload, request: Request):
         if spoke.spoke_name != spoke_name:
             spoke.spoke_name = spoke_name
             changed = True
+        # Decrypt the stored API key, if any.
         regenerated_api_key = False
         api_key = ""
         if spoke.api_key_enc:
@@ -519,10 +641,12 @@ async def register_spoke(payload: RegisterPayload, request: Request):
                 spoke.config = dict(payload.config)
                 spoke.config_version += 1
             changed = True
+        # Save, and queue a config push if the spoke is behind.
         if changed:
             store.save_spoke(spoke)
         if spoke.config_version > spoke.applied_config_version:
             store.ensure_config_update_command(tenant_id, spoke.id)
+        # Log it and return the spoke's credentials.
         _reg_log_append("already_approved", hostname=payload.hostname,
                         spoke_name=spoke_name, spoke_id=spoke.id, tenant_id=tenant_id,
                         ip=client_ip, regenerated_api_key=regenerated_api_key)
@@ -536,15 +660,19 @@ async def register_spoke(payload: RegisterPayload, request: Request):
     # ── PSK auto-approve ──────────────────────────────────────────────────────
     # If the spoke supplies tenant_id_hint + spoke_name + onboarding_psk and the
     # PSK matches what the tenant has configured, skip the approval queue entirely.
+    # PSK supplied by the spoke.
     psk_provided = payload.onboarding_psk.strip()
     if tenant_hint and spoke_name and psk_provided:
+        # Look up the tenant.
         tenant_obj = store.get_tenant(tenant_hint)  # tenant_hint already normalized to id above
         psk_valid = False
         if tenant_obj:
+            # Move an old single PSK into the PSK list.
             if tenant_obj.onboarding_psk_enc and tenant_obj.onboarding_psk_enc not in tenant_obj.onboarding_psks_enc:
                 tenant_obj.onboarding_psks_enc.insert(0, tenant_obj.onboarding_psk_enc)
                 tenant_obj.onboarding_psk_enc = ""
                 store.save_tenant(tenant_obj)
+            # Check the PSK against each of the tenant's PSKs.
             for enc in tenant_obj.onboarding_psks_enc:
                 try:
                     if decrypt_str(enc) == psk_provided:
@@ -553,6 +681,7 @@ async def register_spoke(payload: RegisterPayload, request: Request):
                 except Exception:
                     pass
 
+        # Valid PSK: approve the spoke straight away.
         if psk_valid:
             _ensure_name_available_for_tenant(
                 spoke_name, tenant_hint,
@@ -560,6 +689,7 @@ async def register_spoke(payload: RegisterPayload, request: Request):
                 exclude_spoke_id=requested_spoke_id,
                 log_context={"spoke_id": requested_spoke_id, "ip": client_ip},
             )
+            # Create an approved spoke with a new API key and the spoke's own config.
             from ..data_models import Spoke as SpokeModel
             plain_key = generate_api_key()
             auto_spoke = SpokeModel(
@@ -573,9 +703,11 @@ async def register_spoke(payload: RegisterPayload, request: Request):
                 status="approved",
                 api_key_enc=encrypt_str(plain_key),
             )
+            # Save it.
             store.save_spoke(auto_spoke)
             # Clean up any stale pending entries for this hostname (e.g. from before
             # tenant resolution was fixed — those entries may have blank tenant_hint).
+            # Remove any pending entries for this hostname or id.
             stale = store.get_pending_by_hostname(payload.hostname)
             if stale:
                 store.delete_pending_spoke(stale.id)
@@ -583,6 +715,7 @@ async def register_spoke(payload: RegisterPayload, request: Request):
                 leftover = store.get_pending_spoke(requested_spoke_id)
                 if leftover:
                     store.delete_pending_spoke(requested_spoke_id)
+            # Log it, tell browsers, and return the credentials.
             _reg_log_append("psk_auto_approved", hostname=payload.hostname,
                             spoke_name=spoke_name, spoke_id=auto_spoke.id,
                             tenant_id=tenant_hint, ip=client_ip)
@@ -598,19 +731,23 @@ async def register_spoke(payload: RegisterPayload, request: Request):
                 "tenant_id": tenant_hint,
                 "api_key": plain_key,
             }
+        # Invalid PSK: log it and fall through to the normal approval queue.
         else:
             _reg_log_append("psk_rejected", hostname=payload.hostname,
                             spoke_name=spoke_name, tenant_hint=tenant_hint, ip=client_ip,
                             psks_configured=len(tenant_obj.onboarding_psks_enc) if tenant_obj else 0)
     # ── End PSK auto-approve ──────────────────────────────────────────────────
 
+    # Look for an existing pending registration: by id, then by hostname.
     existing = store.get_pending_spoke(requested_spoke_id) if requested_spoke_id else None
     if not existing:
         existing = store.get_pending_by_hostname(payload.hostname)
+        # Move the pending entry to the requested id if it changed.
         if existing and requested_spoke_id and existing.id != requested_spoke_id:
             store.rekey_pending_spoke(existing.id, requested_spoke_id)
             existing.id = requested_spoke_id
 
+    # Tenant to check the name against, and the id to exclude from the check.
     target_tenant_id = tenant_hint or (existing.tenant_hint if existing else "")
     exclude_spoke_id = existing.id if existing else requested_spoke_id
     _ensure_name_available_for_tenant(
@@ -620,6 +757,7 @@ async def register_spoke(payload: RegisterPayload, request: Request):
         exclude_spoke_id=exclude_spoke_id,
         log_context={"spoke_id": exclude_spoke_id, "ip": client_ip},
     )
+    # Already pending: update any changed details and report it is still pending.
     if existing:
         changed = False
         if existing.hostname != payload.hostname:
@@ -649,6 +787,7 @@ async def register_spoke(payload: RegisterPayload, request: Request):
             "message": "Registration already pending approval.",
         }
 
+    # New pending registration.
     pending_kwargs = {
         "hostname": payload.hostname,
         "label": payload.label,
@@ -660,6 +799,7 @@ async def register_spoke(payload: RegisterPayload, request: Request):
         pending_kwargs["id"] = requested_spoke_id
     pending = PendingSpoke(**pending_kwargs)
     store.save_pending_spoke(pending)
+    # Log it and tell browsers there is a new spoke to approve.
     _reg_log_append("new_pending", hostname=payload.hostname, spoke_name=spoke_name,
                     spoke_id=pending.id, tenant_hint=tenant_hint, ip=client_ip)
     asyncio.create_task(ws_broadcast({
@@ -669,11 +809,13 @@ async def register_spoke(payload: RegisterPayload, request: Request):
         "spoke_id": pending.id,
         "tenant_hint": tenant_hint,
     }))
+    # Message depends on whether a tenant was given.
     msg = (
         f"Registration received. Pending approval by tenant '{tenant_hint}'."
         if tenant_hint
         else "Registration received. Awaiting superadmin approval and tenant assignment."
     )
+    # Report the pending registration.
     return {
         "spoke_id": pending.id,
         "status": "pending",
@@ -685,6 +827,7 @@ async def register_spoke(payload: RegisterPayload, request: Request):
 @router.get("/spokes/diag")
 def spokes_diag(current_user: auth.User = Depends(auth.require_superadmin)):
     """Return hub-side registration diagnostics log."""
+    # Newest log entries first, plus the number of pending spokes.
     return {
         "registration_log": list(reversed(_registration_log)),
         "pending_count": len(store.list_pending_spokes()),
@@ -693,7 +836,10 @@ def spokes_diag(current_user: auth.User = Depends(auth.require_superadmin)):
 
 @router.delete("/spokes/{spoke_id}")
 def delete_spoke(spoke_id: str, current_user: User = Depends(auth.get_current_user)):
+    """Delete an approved spoke (admin of its tenant)."""
+    # Find the spoke and check the user is an admin of its tenant.
     tenant_id, _ = _require_spoke_admin(spoke_id, current_user)
+    # Delete it.
     store.delete_spoke(tenant_id, spoke_id)
     return {"ok": True}
 
@@ -701,10 +847,13 @@ def delete_spoke(spoke_id: str, current_user: User = Depends(auth.get_current_us
 @router.get("/{tenant_id}/spokes/{spoke_id}/config")
 def get_spoke_config(tenant_id: str, spoke_id: str, current_user: User = Depends(auth.get_current_user)):
     """Return the spoke's current applied config and telemetry-reported settings."""
+    # Any tenant member may use this; resolves the tenant id.
     resolved_tenant_id = _require_tenant_access(tenant_id, current_user)
+    # Load the spoke (404 if missing).
     spoke = store.get_spoke(resolved_tenant_id, spoke_id)
     if not spoke:
         raise HTTPException(status_code=404, detail="Spoke not found")
+    # Return the stored config and latest telemetry.
     return {"config": spoke.config or {}, "telemetry": spoke.telemetry or {}}
 
 
@@ -716,7 +865,9 @@ def get_spoke_config_diag(tenant_id: str, spoke_id: str, current_user: User = De
     version accounting, and hash comparison — useful for diagnosing why a
     spoke may not have received its USB allowlist or other hub-managed config.
     """
+    # Any tenant member may use this; resolves the tenant id.
     resolved_tenant_id = _require_tenant_access(tenant_id, current_user)
+    # Build the diagnostic; unknown spokes are a 404.
     result = store.get_spoke_config_diag(resolved_tenant_id, spoke_id)
     if result.get("error") == "Spoke not found":
         raise HTTPException(status_code=404, detail="Spoke not found")
@@ -733,14 +884,18 @@ async def get_spoke_remote_logs(
 ):
     """Fetch log lines from the spoke via the relay WebSocket.
     source: journal | agent | watchdog | install"""
+    # Any tenant member may use this; resolves the tenant id.
     resolved_tenant_id = _require_tenant_access(tenant_id, current_user)
+    # Load the spoke (404 if missing).
     spoke = store.get_spoke(resolved_tenant_id, spoke_id)
     if not spoke:
         raise HTTPException(status_code=404, detail="Spoke not found")
 
+    # Unique request id, with a queue registered to receive the spoke's reply.
     request_id = str(uuid.uuid4())
     queue = register_log_fetch(request_id)
     try:
+        # Send the request over the spoke's WebSocket (502 if the spoke is offline).
         sent = await relay_ws.send_to_spoke(resolved_tenant_id, spoke_id, {
             "type": "log_fetch",
             "request_id": request_id,
@@ -750,14 +905,18 @@ async def get_spoke_remote_logs(
         if not sent:
             raise HTTPException(status_code=502, detail="Spoke relay is offline")
         try:
+            # Wait for the reply (504 on timeout).
             response = await asyncio.wait_for(queue.get(), timeout=15.0)
         except asyncio.TimeoutError:
             raise HTTPException(status_code=504, detail="Spoke did not respond in time")
+    # Always unregister the reply queue.
     finally:
         unregister_log_fetch(request_id)
 
+    # The spoke reported an error.
     if response.get("error"):
         raise HTTPException(status_code=502, detail=response["error"])
+    # Return the log lines.
     return {"source": source, "lines": response.get("lines", [])}
 
 
@@ -768,14 +927,18 @@ async def get_spoke_command_trace(
     current_user: User = Depends(auth.get_current_user),
 ):
     """Fetch the command relay trace from the spoke for pipeline debugging."""
+    # Any tenant member may use this; resolves the tenant id.
     resolved_tenant_id = _require_tenant_access(tenant_id, current_user)
+    # Load the spoke (404 if missing).
     spoke = store.get_spoke(resolved_tenant_id, spoke_id)
     if not spoke:
         raise HTTPException(status_code=404, detail="Spoke not found")
 
+    # Unique request id, with a queue registered to receive the spoke's reply.
     request_id = str(uuid.uuid4())
     queue = register_command_trace(request_id)
     try:
+        # Send the request over the spoke's WebSocket (502 if the spoke is offline).
         sent = await relay_ws.send_to_spoke(resolved_tenant_id, spoke_id, {
             "type": "command_trace_request",
             "request_id": request_id,
@@ -783,12 +946,15 @@ async def get_spoke_command_trace(
         if not sent:
             raise HTTPException(status_code=502, detail="Spoke relay is offline")
         try:
+            # Wait for the reply (504 on timeout).
             response = await asyncio.wait_for(queue.get(), timeout=10.0)
         except asyncio.TimeoutError:
             raise HTTPException(status_code=504, detail="Spoke did not respond in time")
+    # Always unregister the reply queue.
     finally:
         unregister_command_trace(request_id)
 
+    # Return the trace details.
     return {
         "spoke_id": spoke_id,
         "agent_connected": response.get("agent_connected"),
@@ -804,10 +970,14 @@ def get_spoke_proxmox_credentials(
     spoke_id: str,
     current_user: User = Depends(auth.get_current_user),
 ):
+    """Return the spoke's Proxmox host and whether an API token is stored (tenant admins)."""
+    # Tenant admins only.
     resolved_tenant_id = _require_tenant_admin(tenant_id, current_user)
+    # Load the spoke (404 if missing).
     spoke = store.get_spoke(resolved_tenant_id, spoke_id)
     if not spoke:
         raise HTTPException(status_code=404, detail="Spoke not found")
+    # Host defaults to the spoke's hostname; the token is shown only as set/not-set.
     proxmox_host = str(spoke.proxmox_host or "").strip() or str(spoke.hostname or "").strip()
     return {
         "proxmox_host": proxmox_host,
@@ -822,15 +992,23 @@ def set_spoke_proxmox_credentials(
     payload: SpokeProxmoxCredentialsRequest,
     current_user: User = Depends(auth.get_current_user),
 ):
+    """Set a spoke's Proxmox host and API token (tenant admins) and push the token to the spoke.
+
+    A null token leaves the stored token unchanged; an empty one clears it.
+    """
+    # Tenant admins only.
     resolved_tenant_id = _require_tenant_admin(tenant_id, current_user)
+    # Load the spoke (404 if missing).
     spoke = store.get_spoke(resolved_tenant_id, spoke_id)
     if not spoke:
         raise HTTPException(status_code=404, detail="Spoke not found")
 
+    # Store the host, and the token (encrypted) if one was sent.
     spoke.proxmox_host = str(payload.proxmox_host or "").strip()
     if payload.proxmox_token is not None:
         token = str(payload.proxmox_token).strip()
         spoke.proxmox_token_enc = encrypt_str(token) if token else ""
+    # Save.
     store.save_spoke(spoke)
 
     # Push the API token to the spoke via config_update so it can use it locally
@@ -839,6 +1017,7 @@ def set_spoke_proxmox_credentials(
         token = str(payload.proxmox_token).strip()
         _queue_spoke_config_push(resolved_tenant_id, spoke_id, {"proxmox_api_token": token})
 
+    # Return the host and token state.
     proxmox_host = spoke.proxmox_host or str(spoke.hostname or "").strip()
     return {
         "ok": True,
@@ -854,16 +1033,21 @@ async def provision_proxmox_token(
     current_user: User = Depends(auth.get_current_user),
 ):
     """Auto-provision a Proxmox API token on the spoke via pvesh and store it on the hub."""
+    # Tenant admins only.
     resolved_tenant_id = _require_tenant_admin(tenant_id, current_user)
+    # Load the spoke (404 if missing).
     spoke = store.get_spoke(resolved_tenant_id, spoke_id)
     if not spoke:
         raise HTTPException(status_code=404, detail="Spoke not found")
+    # Must be approved.
     if spoke.status != "approved":
         raise HTTPException(status_code=409, detail="Spoke is not approved")
 
+    # Unique request id, with a queue registered to receive the spoke's reply.
     request_id = str(uuid.uuid4())
     queue = register_provision_session(request_id)
     try:
+        # Send the request over the spoke's WebSocket (502 if the spoke is offline).
         sent = await relay_ws.send_to_spoke(resolved_tenant_id, spoke_id, {
             "type": "provision_proxmox_token",
             "request_id": request_id,
@@ -871,14 +1055,18 @@ async def provision_proxmox_token(
         if not sent:
             raise HTTPException(status_code=502, detail="Spoke relay is offline")
         try:
+            # Wait for the reply (504 on timeout).
             response = await asyncio.wait_for(queue.get(), timeout=30.0)
         except asyncio.TimeoutError:
             raise HTTPException(status_code=504, detail="Spoke did not respond in time")
+        # The spoke reported a provisioning failure.
         if response.get("type") == "proxmox_token_provision_error":
             raise HTTPException(status_code=502, detail=response.get("error", "Token provisioning failed on spoke"))
+    # Always unregister the reply queue.
     finally:
         unregister_provision_session(request_id)
 
+    # The reply must contain a token.
     token = str(response.get("token") or "").strip()
     if not token:
         raise HTTPException(status_code=502, detail="Spoke returned an empty token")
@@ -893,26 +1081,38 @@ async def provision_proxmox_token(
 
 @router.get("/{tenant_id}/usb-config")
 def get_tenant_usb_config(tenant_id: str, current_user: User = Depends(auth.get_current_user)):
+    """Return the tenant's USB dongle id list."""
+    # Any tenant member may use this; resolves the tenant id.
     resolved_tenant_id = _require_tenant_access(tenant_id, current_user)
+    # Load the tenant (404 if missing).
     tenant = store.get_tenant(resolved_tenant_id)
     if not tenant:
         raise HTTPException(status_code=404, detail="Tenant not found")
+    # Return the list.
     return {"usb_vidpids": store.get_tenant_usb_vidpids(resolved_tenant_id)}
 
 
 
 def _queue_spoke_config_push(tenant_id: str, spoke_id: str, body: dict[str, Any] | None = None) -> dict[str, Any]:
+    """Merge settings into a spoke's config, bump its version and queue a config_update.
+
+    Auth keys are always removed. The command expires after 24 hours.
+    """
+    # Load the spoke (404 if missing).
     spoke = store.get_spoke(tenant_id, spoke_id)
     if not spoke:
         raise HTTPException(status_code=404, detail="Spoke not found")
 
+    # Merge the new settings and remove auth keys.
     next_config = dict(spoke.config or {})
     next_config.update(body or {})
     for key in _AUTH_KEYS:
         next_config.pop(key, None)
+    # Store the config with a new version.
     spoke.config = next_config
     spoke.config_version = (spoke.config_version or 0) + 1
     store.save_spoke(spoke)
+    # Queue the full config with its version number.
     store.enqueue_command(
         Command(
             spoke_id=spoke_id,
@@ -922,6 +1122,7 @@ def _queue_spoke_config_push(tenant_id: str, spoke_id: str, body: dict[str, Any]
             expires_at=_now() + timedelta(hours=24),
         )
     )
+    # Return the new version.
     return {"ok": True, "config_version": spoke.config_version}
 
 
@@ -931,11 +1132,15 @@ async def push_tenant_usb_config_to_all_spokes(
     payload: TenantUsbConfigRequest,
     current_user: User = Depends(auth.get_current_user),
 ):
+    """Save the tenant's USB id list and push it to every approved spoke (tenant admins)."""
+    # Tenant admins only.
     resolved_tenant_id = _require_tenant_admin(tenant_id, current_user)
+    # Validate and store the list (404 if the tenant is missing).
     tenant = store.set_tenant_usb_vidpids(resolved_tenant_id, _normalize_usb_vidpids(payload.usb_vidpids))
     if not tenant:
         raise HTTPException(status_code=404, detail="Tenant not found")
 
+    # Push to each approved spoke, noting which are online now.
     pushed_to: list[str] = []
     online_spokes: list[str] = []
     for spoke in store.list_spokes(resolved_tenant_id):
@@ -945,6 +1150,7 @@ async def push_tenant_usb_config_to_all_spokes(
         pushed_to.append(spoke.id)
         if _is_spoke_online(spoke):
             online_spokes.append(spoke.id)
+    # Return where it was pushed.
     return {"ok": True, "pushed_to": pushed_to, "online_spokes": online_spokes, "usb_vidpids": tenant.usb_vidpids}
 
 
@@ -954,9 +1160,12 @@ async def purge_all_spokes_client_history(
     current_user: User = Depends(auth.get_current_user),
 ):
     """Fan out a purge_clients relay message to all online approved spokes in the tenant."""
+    # Tenant admins only.
     resolved_tenant_id = _require_tenant_admin(tenant_id, current_user)
+    # Spokes reached and spokes offline.
     sent_to: list[str] = []
     offline: list[str] = []
+    # Send a purge to each approved spoke that is connected.
     for spoke in store.list_spokes(resolved_tenant_id):
         if spoke.status != "approved":
             continue
@@ -965,18 +1174,22 @@ async def purge_all_spokes_client_history(
             sent_to.append(spoke.id)
         else:
             offline.append(spoke.id)
+    # Return who was reached.
     return {"ok": True, "sent_to": sent_to, "offline": offline}
 
 
 def _spoke_versions_snapshot(tenant_id: str) -> dict[str, dict[str, Any]]:
     """Capture current agent + spoke versions for all approved spokes."""
+    # One entry per approved spoke.
     snapshot: dict[str, dict[str, Any]] = {}
     for spoke in store.list_spokes(tenant_id):
         if spoke.status != "approved":
             continue
+        # Current agent version (Proxmox section) and spoke version (API server health).
         tel = spoke.telemetry or {}
         proxmox = tel.get("proxmox") or {}
         health = (tel.get("api_server") or {}).get("health") or {}
+        # Record "before" versions with pending status.
         snapshot[spoke.id] = {
             "spoke_name": spoke.spoke_name or spoke.hostname or spoke.id,
             "agent_version_before": proxmox.get("agent_version"),
@@ -986,6 +1199,7 @@ def _spoke_versions_snapshot(tenant_id: str) -> dict[str, dict[str, Any]]:
             "spoke_version_after": None,
             "spoke_status": "pending",
         }
+    # Return the snapshot.
     return snapshot
 
 
@@ -994,20 +1208,25 @@ async def _poll_update_job(job_id: str, tenant_id: str) -> None:
     As soon as a spoke's proxmox agent is confirmed updated, immediately
     enqueue that spoke's self_update (no fixed delay needed since the WS
     connection is persistent and the command is delivered in real time)."""
+    # Job must exist.
     job = _update_jobs.get(job_id)
     if not job:
         return
+    # Poll until done or the deadline passes.
     deadline = time.time() + 600  # 10-minute timeout
     while time.time() < deadline:
         await asyncio.sleep(15)
+        # Stop if the job was removed.
         job = _update_jobs.get(job_id)
         if not job:
             return
+        # Check each spoke in the job.
         all_done = True
         for spoke in store.list_spokes(tenant_id):
             sd = job["spokes"].get(spoke.id)
             if not sd:
                 continue
+            # Current agent and spoke versions from telemetry.
             tel = spoke.telemetry or {}
             proxmox = tel.get("proxmox") or {}
             health = (tel.get("api_server") or {}).get("health") or {}
@@ -1038,6 +1257,7 @@ async def _poll_update_job(job_id: str, tenant_id: str) -> None:
                         payload={},
                         expires_at=_now() + timedelta(hours=24),
                     ))
+                # Not yet: count this poll and keep waiting.
                 else:
                     sd["agent_check_count"] = sd.get("agent_check_count", 0) + 1
                     all_done = False
@@ -1050,7 +1270,9 @@ async def _poll_update_job(job_id: str, tenant_id: str) -> None:
                 else:
                     all_done = False
 
+        # Tell browsers the current state.
         await ws_broadcast({"type": "update_job_status", "job_id": job_id, "job": job})
+        # Everything finished: mark the job complete and stop.
         if all_done:
             job["completed"] = True
             job["completed_at"] = datetime.now(timezone.utc).isoformat()
@@ -1075,11 +1297,14 @@ async def update_all_spokes(
 ):
     """Trigger proxmox agent update on all spokes, then spoke self-update after a 2-minute delay.
     Returns a job_id for tracking progress via GET /{tenant_id}/update-status/{job_id}."""
+    # Tenant admins only.
     resolved_tenant_id = _require_tenant_admin(tenant_id, current_user)
+    # Approved spokes; 404 if there are none.
     spokes = [s for s in store.list_spokes(resolved_tenant_id) if s.status == "approved"]
     if not spokes:
         raise HTTPException(status_code=404, detail="No approved spokes found")
 
+    # Create the job with "before" versions for each spoke.
     job_id = str(uuid.uuid4())
     job: dict[str, Any] = {
         "job_id": job_id,
@@ -1091,6 +1316,7 @@ async def update_all_spokes(
     }
     _update_jobs[job_id] = job
 
+    # Ids of the spokes being updated.
     spoke_ids = [s.id for s in spokes]
 
     # Enqueue proxmox agent updates immediately for all spokes.
@@ -1105,8 +1331,10 @@ async def update_all_spokes(
             expires_at=_now() + timedelta(hours=24),
         ))
 
+    # Start polling for version changes in the background.
     asyncio.create_task(_poll_update_job(job_id, resolved_tenant_id))
 
+    # Return the job id for status polling.
     return {"ok": True, "job_id": job_id, "spokes": len(spokes), "spoke_ids": spoke_ids}
 
 
@@ -1117,8 +1345,11 @@ def update_spoke_proxmox_agent(
     current_user: User = Depends(auth.get_current_user),
 ):
     """Queue a proxmox agent update for a single spoke."""
+    # Tenant admins only.
     resolved_tenant_id = _require_tenant_admin(tenant_id, current_user)
+    # The spoke must be approved.
     spoke = _get_approved_spoke(resolved_tenant_id, spoke_id)
+    # Queue the agent update (expires in 24 hours).
     store.enqueue_command(Command(
         spoke_id=spoke.id,
         tenant_id=resolved_tenant_id,
@@ -1126,6 +1357,7 @@ def update_spoke_proxmox_agent(
         payload={},
         expires_at=_now() + timedelta(hours=24),
     ))
+    # Confirm.
     return {"ok": True, "spoke_id": spoke_id}
 
 
@@ -1136,7 +1368,9 @@ async def get_update_status(
     current_user: User = Depends(auth.get_current_user),
 ):
     """Return current status of an update-all job."""
+    # Tenant admins only.
     resolved_tenant_id = _require_tenant_admin(tenant_id, current_user)
+    # Job must exist and belong to this tenant.
     job = _update_jobs.get(job_id)
     if not job or job["tenant_id"] != resolved_tenant_id:
         raise HTTPException(status_code=404, detail="Update job not found")
@@ -1151,10 +1385,13 @@ async def update_spokes_via_agent(
     """Queue an update_spoke command to each spoke's proxmox agent so the agent
     calls the spoke's /api/self-update endpoint.  Useful when spokes are too old
     to handle the self_update WS command directly."""
+    # Tenant admins only.
     resolved_tenant_id = _require_tenant_admin(tenant_id, current_user)
+    # Approved spokes in the tenant (404 if there are none).
     spokes = [s for s in store.list_spokes(resolved_tenant_id) if s.status == "approved"]
     if not spokes:
         raise HTTPException(status_code=404, detail="No approved spokes found")
+    # Queue an update_spoke action for each spoke's agent (expires in 24 hours).
     for spoke in spokes:
         store.enqueue_command(Command(
             spoke_id=spoke.id,
@@ -1163,6 +1400,7 @@ async def update_spokes_via_agent(
             payload={"action": "update_spoke"},
             expires_at=_now() + timedelta(hours=24),
         ))
+    # Report how many were queued.
     return {"ok": True, "queued": len(spokes), "spoke_ids": [s.id for s in spokes]}
 
 
@@ -1173,10 +1411,13 @@ async def force_update_spoke_servers(
 ):
     """Send self_update directly to all spokes — bypasses agent relay.
     Use this to deploy new spoke server.py before agents can relay commands."""
+    # Tenant admins only.
     resolved_tenant_id = _require_tenant_admin(tenant_id, current_user)
+    # Approved spokes in the tenant (404 if there are none).
     spokes = [s for s in store.list_spokes(resolved_tenant_id) if s.status == "approved"]
     if not spokes:
         raise HTTPException(status_code=404, detail="No approved spokes found")
+    # Queue self_update for each spoke (expires in 24 hours).
     queued = 0
     for spoke in spokes:
         store.enqueue_command(Command(
@@ -1187,6 +1428,7 @@ async def force_update_spoke_servers(
             expires_at=_now() + timedelta(hours=24),
         ))
         queued += 1
+    # Report how many were queued.
     return {"ok": True, "queued": queued, "spoke_ids": [s.id for s in spokes]}
 
 
@@ -1202,11 +1444,14 @@ def send_proxmox_agent_command(
     Body: {"action": "<action_name>", ...extra_payload}
     Supported actions include: clear_provision_lock, restart_agent, unlock_template, etc.
     """
+    # Tenant admins only.
     resolved_tenant_id = _require_tenant_admin(tenant_id, current_user)
+    # The spoke must be approved, and an action is required.
     spoke = _get_approved_spoke(resolved_tenant_id, spoke_id)
     action = body.get("action", "")
     if not action:
         raise HTTPException(status_code=400, detail="'action' field is required")
+    # Queue the command with the whole body as payload (expires in 1 hour).
     store.enqueue_command(Command(
         spoke_id=spoke.id,
         tenant_id=resolved_tenant_id,
@@ -1214,6 +1459,7 @@ def send_proxmox_agent_command(
         payload=dict(body),
         expires_at=_now() + timedelta(hours=1),
     ))
+    # Confirm.
     return {"ok": True, "spoke_id": spoke_id, "action": action}
 
 
@@ -1224,7 +1470,9 @@ async def push_spoke_config(
     current_user: User = Depends(auth.get_current_user),
 ):
     """Push a config_update command to the spoke."""
+    # Tenant admins only.
     resolved_tenant_id = _require_tenant_admin(tenant_id, current_user)
+    # Merge the body into the spoke's config and queue it.
     return _queue_spoke_config_push(resolved_tenant_id, spoke_id, body)
 
 
@@ -1235,7 +1483,10 @@ async def post_telemetry(
     payload: dict[str, Any],
     x_api_key: str = Header(..., alias="X-API-Key"),
 ):
+    """Receive a telemetry report from a spoke over HTTP (fallback for the WebSocket)."""
+    # Authenticate the spoke by its API key.
     spoke = _auth_spoke(tenant_id, spoke_id, x_api_key)
+    # Store it.
     await _apply_spoke_telemetry(tenant_id, spoke_id, spoke, payload)
     return {"status": "ok"}
 
@@ -1246,7 +1497,10 @@ def get_inbox(
     spoke_id: str,
     x_api_key: str = Header(..., alias="X-API-Key"),
 ):
+    """Return a spoke's queued commands over HTTP (fallback for the WebSocket)."""
+    # Authenticate the spoke by its API key.
     _auth_spoke(tenant_id, spoke_id, x_api_key)
+    # Return the queue.
     return _get_spoke_inbox(tenant_id, spoke_id)
 
 
@@ -1258,12 +1512,16 @@ def get_spoke_monitored_items(
 ):
     """Return hub-managed monitored items filtered to this spoke's assigned sites.
     If the spoke has no assigned sites, returns empty with has_sites=False."""
+    # Authenticate the spoke by its API key.
     spoke = _auth_spoke(tenant_id, spoke_id, x_api_key)
+    # Sites assigned to this spoke; none means nothing to monitor.
     assigned_sites = set(spoke.assigned_sites or [])
     if not assigned_sites:
         return {"items": [], "has_sites": False, "assigned_sites": []}
+    # All monitored items for the tenant.
     cfg = store.get_tenant_central_sites_config(tenant_id)
     all_items = cfg.get("monitored_items") if isinstance(cfg.get("monitored_items"), list) else []
+    # Keep site items only for the spoke's sites; keep all other item types.
     filtered = []
     for item in all_items:
         if not isinstance(item, dict):
@@ -1275,10 +1533,12 @@ def get_spoke_monitored_items(
         else:
             # Alerts, insights, clients are tenant-wide
             filtered.append(item)
+    # Return the items and assigned sites.
     return {"items": filtered, "has_sites": True, "assigned_sites": sorted(assigned_sites)}
 
 
 class AckResultPayload(BaseModel):
+    """Result details a spoke sends with a command acknowledgement."""
     success: Optional[bool] = None
     task_type: Optional[str] = None
     detail: str = ""
@@ -1287,6 +1547,7 @@ class AckResultPayload(BaseModel):
 
 
 class AckPayload(BaseModel):
+    """Acknowledgement a spoke sends for a command."""
     command_id: str
     status: str = "executed"
     result: Optional[AckResultPayload] = None
@@ -1299,7 +1560,10 @@ async def ack_command_endpoint(
     payload: AckPayload,
     x_api_key: str = Header(..., alias="X-API-Key"),
 ):
+    """Receive a command acknowledgement from a spoke over HTTP."""
+    # Authenticate the spoke by its API key.
     _auth_spoke(tenant_id, spoke_id, x_api_key)
+    # Process it.
     return await _handle_spoke_ack(tenant_id, spoke_id, payload)
 
 
@@ -1310,6 +1574,13 @@ async def spoke_websocket(
     spoke_id: str,
     api_key: str = Query(""),
 ):
+    """Main WebSocket a spoke keeps open to the hub.
+
+    Authenticates with the API key in the query string, then handles telemetry, acks,
+    pings, syncs, backup progress and shell/VNC/log/trace replies. Commands and the
+    Central feed are pushed back on the same socket.
+    """
+    # Authenticate; failures close with 4401 (bad key) or 4403.
     connection_api_key = str(api_key or "")
     try:
         spoke = _auth_spoke(tenant_id, spoke_id, connection_api_key)
@@ -1317,16 +1588,21 @@ async def spoke_websocket(
         await websocket.close(code=4401 if exc.status_code == 401 else 4403, reason=str(exc.detail))
         return
 
+    # Register the connection and send any queued commands.
     await ws_register_spoke(websocket, tenant_id, spoke_id)
     await push_spoke_commands(tenant_id, spoke_id)
+    # Send the Central feed first, then handle messages until disconnect.
     try:
         await websocket.send_json({"type": "central_feed", "payload": _build_spoke_central_feed(tenant_id, spoke_id)})
+        # Each message is handled separately; a bad one does not close the socket.
         while True:
             try:
+                # Messages must be JSON objects; the type defaults to telemetry.
                 data = await websocket.receive_json()
                 if not isinstance(data, dict):
                     raise ValueError("WebSocket payload must be a JSON object")
                 msg_type = str(data.get("type") or "telemetry").strip().lower()
+                # Telemetry: store it, time the processing, and reply with an ack and load info.
                 if msg_type == "telemetry":
                     payload = data.get("payload") if isinstance(data.get("payload"), dict) else data
                     t0 = time.monotonic()
@@ -1339,20 +1615,26 @@ async def spoke_websocket(
                         "processing_ms": processing_ms,
                         "loop_lag_ms": _tasks.hub_loop_lag_ms,
                     })
+                    # Then send the updated Central feed and any queued commands.
                     await websocket.send_json({"type": "central_feed", "payload": _build_spoke_central_feed(tenant_id, spoke_id)})
                     await push_spoke_commands(tenant_id, spoke_id)
+                # Command acknowledgement: process it and confirm.
                 elif msg_type == "ack":
                     raw_payload = data.get("payload") if isinstance(data.get("payload"), dict) else data
                     payload = AckPayload(**raw_payload)
                     await _handle_spoke_ack(tenant_id, spoke_id, payload)
                     await websocket.send_json({"type": "ack_ok", "command_id": payload.command_id})
+                # Keep-alive.
                 elif msg_type == "ping":
                     await websocket.send_json({"type": "pong"})
+                # Spoke asked to resync: send queued commands and the Central feed.
                 elif msg_type == "sync":
                     await push_spoke_commands(tenant_id, spoke_id)
                     await websocket.send_json({"type": "central_feed", "payload": _build_spoke_central_feed(tenant_id, spoke_id)})
+                # Backup/reseed progress goes to the backup subsystem.
                 elif msg_type in {"backup_progress", "reseed_progress"}:
                     await _relay_backup_progress(spoke_id, msg_type, data)
+                # Shell, VNC, token, log and trace replies go to whoever is waiting for them.
                 elif msg_type.startswith("shell_"):
                     route_shell_message(data)
                 elif msg_type.startswith("vnc_"):
@@ -1363,18 +1645,23 @@ async def spoke_websocket(
                     route_log_fetch_message(data)
                 elif msg_type == "command_trace_response":
                     route_command_trace_message(data)
+            # Disconnect ends the loop.
             except WebSocketDisconnect:
                 raise
+            # Bad message: log it, tell the spoke, and keep going.
             except (json.JSONDecodeError, ValidationError, ValueError, TypeError) as exc:
                 logger.warning("Invalid spoke websocket payload for %s/%s: %s", tenant_id, spoke_id, exc)
                 await websocket.send_json({"type": "error", "error": str(exc)})
                 continue
+            # Other processing error: log it, tell the spoke, and keep going.
             except Exception as exc:
                 logger.warning("Spoke websocket processing failed for %s/%s: %s", tenant_id, spoke_id, exc)
                 await websocket.send_json({"type": "error", "error": str(exc)})
                 continue
+    # Normal disconnect.
     except WebSocketDisconnect:
         pass
+    # Always remove the connection from the registry.
     finally:
         await unregister_spoke(tenant_id, spoke_id, websocket)
 
@@ -1386,5 +1673,7 @@ async def get_spoke_central_feed(
     x_api_key: str = Header(..., alias="X-API-Key"),
 ):
     """Return hub-polled Aruba Central data for a spoke to consume in centralized mode."""
+    # Authenticate the spoke by its API key.
     _auth_spoke(tenant_id, spoke_id, x_api_key)
+    # Return the feed.
     return _build_spoke_central_feed(tenant_id, spoke_id)

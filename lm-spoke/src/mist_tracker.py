@@ -19,14 +19,21 @@ A separate copy of this same logic also lives in lm's
 ``central_hub_poller.py`` (centralized mode) — keep these three in sync by
 hand when the drop-detection / health-bucketing math changes.
 """
+# Allow modern type-hint syntax without evaluating annotations at import time.
 from __future__ import annotations
 
+# Baselines and history are saved as JSON files.
 import json
+# Standard-library logging.
 import logging
+# Atomic file replace when saving.
 import os
+# Timestamps for samples and buckets.
 import time
+# Type hints only.
 from typing import Any, Dict
 
+# Logger for this module.
 logger = logging.getLogger("MistTracker")
 
 # Client-count baseline constants — mirrored verbatim from central_poller
@@ -74,6 +81,7 @@ _CC_RATE_DROP_PCT = 5.0        # short-window drop -> WARNING
 # jitter (5-sample window, modelled on a healthy steady site):
 #     jitter 2% -> 0.0% | 3% -> 2.9% | 5% -> 10.3% | 8% -> 22.1%
 # Raise _CC_RATE_DROP_PCT to 10 if a fleet turns out noisier than ~5%.
+# Separator used to join scope, site and kind into one key.
 _CC_KEYSEP = "\x1f"
 _MIST_CC_SCOPE = "_"  # single-tenant spoke -> one fixed scope key
 
@@ -83,19 +91,25 @@ def _mist_cc_thresholds(mist_config):
     ``mist_config['cc_thresholds']`` (Setup -> Mist API) with the module
     defaults as fallback and clamped to sane ranges. Mirror of
     ``central_poller._cc_thresholds`` (reads the mist config, not central)."""
+    # The tenant's threshold settings (empty if none).
     t = (mist_config or {}).get("cc_thresholds") or {}
 
     def _num(val, dflt, lo, hi):
+        """Return ``val`` as a float clamped to [lo, hi], or ``dflt`` if not a number."""
+        # Convert to a number; bad input uses the default.
         try:
             x = float(val)
         except (TypeError, ValueError):
             return dflt
+        # Clamp to the allowed range.
         return max(lo, min(hi, x))
 
+    # Warning and error drop percentages; the error level is never below the warning level.
     warn = _num(t.get("warn_pct"), _CC_WARN_PCT, 0.0, 100.0)
     err = _num(t.get("error_pct"), _CC_ERROR_PCT, 0.0, 100.0)
     if err < warn:
         err = warn
+    # Die-off fraction (percent setting turned into a fraction) and the minimum peak.
     die = _num(t.get("die_off_pct"), _CC_MAX_FRACTION * 100.0, 0.0, 100.0) / 100.0
     peak = int(_num(t.get("min_peak"), _CC_MAX_MIN_PEAK, 1, 1_000_000))
     # Steady-state fractions, defaulting to the existing die_off_pct so an
@@ -108,6 +122,7 @@ def _mist_cc_thresholds(mist_config):
     daily = _num(t.get("daily_pct"), die * 100.0, 0.0, 100.0) / 100.0
     weekly = _num(t.get("weekly_pct"), die * 100.0, 0.0, 100.0) / 100.0
     monthly = _num(t.get("monthly_pct"), die * 100.0, 0.0, 100.0) / 100.0
+    # Return every threshold in one dict.
     return {"warn_pct": warn, "error_pct": err, "die_off_frac": die,
             "min_peak": peak, "daily_frac": daily,
             "weekly_frac": weekly, "monthly_frac": monthly,
@@ -115,6 +130,7 @@ def _mist_cc_thresholds(mist_config):
             "rate_samples": rate_n}
 
 
+# Rank of each status, used to pick the worst.
 _CC_SEVERITY = {"error": 3, "warning": 2, "ok": 1}  # else (no_data/pending/...) -> 0
 
 
@@ -124,23 +140,30 @@ def _mist_cc_period_drop(hist, now, window_s):
     Returns None when either period lacks data, so a fresh site cannot alarm on
     an empty comparison. Drop only -- growth is not a fault.
     """
+    # Values in this period and in the period before it.
     cur = [v for ts, v in hist if ts >= now - window_s]
     prev = [v for ts, v in hist if now - 2 * window_s <= ts < now - window_s]
+    # Either period empty: cannot compare.
     if not cur or not prev:
         return None
+    # Average of the previous period (must be positive).
     a = sum(prev) / len(prev)
     if a <= 0:
         return None
+    # Percentage drop of this period's average; growth counts as 0.
     return max(0.0, (a - (sum(cur) / len(cur))) / a * 100.0)
 
 def _mist_cc_rate_drop(samples, n):
     """Drop % of the last *n* samples' average vs the *n* before them."""
+    # Need two full windows of samples.
     if len(samples) < 2 * n:
         return None
+    # Average of the earlier window (must be positive).
     vals = [s[1] for s in samples]
     prev = sum(vals[-2 * n:-n]) / n
     if prev <= 0:
         return None
+    # Percentage drop of the latest window; growth counts as 0.
     return max(0.0, (prev - sum(vals[-n:]) / n) / prev * 100.0)
 
 def _mist_cc_site_floor(sites_cfg, *site_names):
@@ -156,10 +179,12 @@ def _mist_cc_site_floor(sites_cfg, *site_names):
     Returns None when unset, zero or unparseable, which disables the floor rule
     for that site ONLY. Never inferred from history -- that is the peak problem.
     """
+    # The per-site minimum-client map; a bad config means no floor.
     try:
         floors = (sites_cfg or {}).get("site_min_clients") or {}
     except AttributeError:
         return None
+    # Try each site name; return the first positive value.
     for name in site_names:
         if name in (None, ""):
             continue
@@ -169,16 +194,19 @@ def _mist_cc_site_floor(sites_cfg, *site_names):
                 return float(raw)
         except (TypeError, ValueError):
             continue
+    # No usable floor configured.
     return None
 
 def _mist_cc_worst(*statuses):
     """Worst (most severe) of a set of client-count statuses (error > warning
     > ok > no_data). Mirror of ``central_poller._cc_worst``."""
+    # Keep the highest-ranked status seen.
     worst, rank = None, -1
     for s in statuses:
         r = _CC_SEVERITY.get(s, 0)
         if r > rank:
             rank, worst = r, s
+    # Default to "ok" when no statuses were given.
     return worst or "ok"
 
 
@@ -193,6 +221,8 @@ class MistClientCountTracker:
     history persist to disk so a restart keeps the reference."""
 
     def __init__(self, baseline_path: str, sevenday_path: str) -> None:
+        """Load saved baselines and history from the two JSON files."""
+        # File paths, raw samples, hourly history and saved baselines.
         self._baseline_path = baseline_path
         self._sevenday_path = sevenday_path
         self._samples: Dict[str, list] = {}
@@ -203,11 +233,16 @@ class MistClientCountTracker:
 
     @staticmethod
     def _key(scope: str, wsite: str, kind: str = "") -> str:
+        """Build the dict key for a scope, site and optional kind."""
+        # Join scope and site, adding the kind when given.
         base = f"{scope}{_CC_KEYSEP}{wsite}"
         return f"{base}{_CC_KEYSEP}{kind}" if kind else base
 
     def _load(self) -> None:
+        """Load the saved baselines and the 30-day hourly history from disk."""
         now = time.time()
+        # Load baselines and seed a few fake samples at each saved average, so the site has a
+        # reference right after a restart.
         try:
             with open(self._baseline_path, encoding="utf-8") as f:
                 self._baseline = json.load(f) or {}
@@ -216,8 +251,10 @@ class MistClientCountTracker:
                 self._samples[key] = [
                     (now - (_CC_MIN_SAMPLES - i) * 60, avg) for i in range(_CC_MIN_SAMPLES)
                 ]
+        # Missing or corrupt file: start with no baselines.
         except Exception:  # noqa: BLE001
             self._baseline = {}
+        # Load the hourly history, keeping only the last 30 days.
         try:
             with open(self._sevenday_path, encoding="utf-8") as f:
                 raw = json.load(f) or {}
@@ -226,14 +263,18 @@ class MistClientCountTracker:
                 k: [(float(ts), float(v)) for ts, v in entries if float(ts) >= cutoff]
                 for k, entries in raw.items()
             }
+        # Missing or corrupt file: start with no history.
         except Exception:  # noqa: BLE001
             self._hourly = {}
 
     def record(self, scope: str, wsite: str, current: int, kind: str = "") -> None:
+        """Record the current client count for a site and keep only the last hour of samples."""
+        # Add the sample under this site's key.
         now = time.time()
         key = self._key(scope, wsite, kind)
         samples = self._samples.setdefault(key, [])
         samples.append((now, int(current)))
+        # Drop samples older than an hour.
         cutoff = now - _CC_WINDOW
         self._samples[key] = [s for s in samples if s[0] >= cutoff]
 
@@ -246,6 +287,7 @@ class MistClientCountTracker:
             die_off_frac=0 disables it.
         ``thresholds`` (from _mist_cc_thresholds -> mist_config) overrides the
         module defaults per tenant. Mirror of ClientCountTracker.entry."""
+        # Read thresholds, falling back to the module defaults.
         _t = thresholds or {}
         warn_pct = _t.get("warn_pct", _CC_WARN_PCT)
         error_pct = _t.get("error_pct", _CC_ERROR_PCT)
@@ -258,13 +300,16 @@ class MistClientCountTracker:
         rate_samples = int(_t.get("rate_samples", _CC_RATE_SAMPLES))
         floor = _t.get("floor")
         monthly_frac = _t.get("monthly_frac", die_off_frac)
+        # This site's raw samples and hourly history.
         now = time.time()
         key = self._key(scope, wsite, kind)
         samples = self._samples.get(key, [])
         hist = self._hourly.get(key, [])
+        # History values for the last day, week and month.
         vals_1d = [v for ts, v in hist if ts >= now - _CC_1DAY_WINDOW]
         vals_7d = [v for ts, v in hist if ts >= now - _CC_7DAY_WINDOW]
         vals_30d = [v for ts, v in hist if ts >= now - _CC_30DAY_WINDOW]
+        # No samples yet: report no_data with whatever history exists.
         if not samples:
             return {"site_name": mist_site, "current": 0, "hourly_avg": 0,
                     "drop_pct": 0.0, "max_7day": round(max(vals_7d or [0]), 1),
@@ -273,6 +318,7 @@ class MistClientCountTracker:
                     "avg_7day": round(sum(vals_7d) / len(vals_7d), 1) if vals_7d else 0.0,
                     "avg_30day": round(sum(vals_30d) / len(vals_30d), 1) if vals_30d else 0.0,
                     "status": "no_data", "ts": now}
+        # Latest count, the hour's average and the peaks.
         current = samples[-1][1]
         hourly_avg = sum(s[1] for s in samples) / len(samples)
         max_7day = round(max(vals_7d + [hourly_avg]), 1)
@@ -290,13 +336,16 @@ class MistClientCountTracker:
         day_drop_pct = _mist_cc_period_drop(hist, now, _CC_1DAY_WINDOW)
         week_drop_pct = _mist_cc_period_drop(hist, now, _CC_7DAY_WINDOW)
         rate_drop_pct = _mist_cc_rate_drop(samples, rate_samples)
+        # Too few samples: no verdict yet.
         if len(samples) < _CC_MIN_SAMPLES:
             drop_pct, status = 0.0, "no_data"
         else:
+            # Drop of the latest count below the hour's average.
             if hourly_avg >= 1:
                 drop_pct = max(0.0, (hourly_avg - current) / hourly_avg * 100.0)
             else:
                 drop_pct = 0.0
+            # Map the within-hour drop to a status.
             if drop_pct > error_pct:
                 status = "error"
             elif drop_pct > warn_pct:
@@ -333,6 +382,7 @@ class MistClientCountTracker:
             # the day boundary would show it.
             if rate_drop_pct is not None and rate_drop_pct > rate_drop_thresh:
                 status = _mist_cc_worst(status, "warning")
+        # Return the counts, averages, drops and final status.
         return {"site_name": mist_site, "current": current,
                 "hourly_avg": round(hourly_avg, 1), "drop_pct": round(drop_pct, 1),
                 "max_7day": max_7day, "max_30day": max_30day,
@@ -344,13 +394,17 @@ class MistClientCountTracker:
                 "status": status, "ts": samples[-1][0]}
 
     def maybe_snapshot(self) -> None:
+        """Once an hour, save each site's hourly average to the baseline and history files."""
+        # Only snapshot once per interval.
         now = time.time()
         if now - self._last_snapshot < _CC_SNAPSHOT_INTERVAL:
             return
         self._last_snapshot = now
+        # Build the snapshot and append it to the 30-day history.
         cutoff = now - _CC_30DAY_WINDOW
         snapshot: Dict[str, dict] = {}
         for key, samples in self._samples.items():
+            # Skip sites with too few samples.
             if len(samples) < _CC_MIN_SAMPLES:
                 continue
             avg = sum(s[1] for s in samples) / len(samples)
@@ -358,6 +412,7 @@ class MistClientCountTracker:
             hist = self._hourly.setdefault(key, [])
             hist.append((now, avg))
             self._hourly[key] = [(ts, v) for ts, v in hist if ts >= cutoff]
+        # Save baselines and history when there is something to save.
         if snapshot:
             self._baseline.update(snapshot)
             self._persist(self._baseline_path, self._baseline)
@@ -366,15 +421,19 @@ class MistClientCountTracker:
 
     @staticmethod
     def _persist(path: str, data: dict) -> None:
+        """Write ``data`` as JSON to ``path`` atomically; failures only log a warning."""
+        # Write a temp file, then swap it in.
         try:
             tmp = path + ".tmp"
             with open(tmp, "w", encoding="utf-8") as f:
                 json.dump(data, f, indent=2)
             os.replace(tmp, path)
+        # Log and continue on failure.
         except Exception as exc:  # noqa: BLE001
             logger.warning("MistClientCountTracker: persist failed (%s): %s", path, exc)
 
 
+# Column of each status in an hourly bucket.
 _HEALTH_IDX = {"ok": 0, "warning": 1, "error": 2}  # else (no_data/pending/unknown) -> 3
 
 
@@ -385,15 +444,21 @@ class MistCheckHealthHistory:
     DAILY buckets; hourly() returns raw."""
 
     def __init__(self, path: str) -> None:
+        """Load the saved history from ``path``."""
+        # File path and the {key: {hour: counts}} history.
         self._path = path
         self._h: Dict[str, Dict[int, list]] = {}
         self._load()
 
     @staticmethod
     def _key(tenant: str, site: str, check_id: str) -> str:
+        """Build the dict key for a tenant, site and check."""
+        # Join the parts with the separator.
         return f"{tenant}{_CC_KEYSEP}{site}{_CC_KEYSEP}{check_id}"
 
     def _load(self) -> None:
+        """Load the saved history, keeping only the last 30 days."""
+        # Read the file and convert bucket keys back to ints.
         try:
             with open(self._path, encoding="utf-8") as f:
                 raw = json.load(f) or {}
@@ -406,40 +471,53 @@ class MistCheckHealthHistory:
             self._h = {}
 
     def record(self, tenant: str, site: str, check_id: str, status: str) -> None:
+        """Count one status result for a check in the current hour's bucket."""
+        # This check's buckets and the current hour.
         now = time.time()
         buckets = self._h.setdefault(self._key(tenant, site, check_id), {})
         bucket = int(now // 3600 * 3600)
+        # Create the hour's counters if missing.
         cell = buckets.get(bucket)
         if cell is None:
             cell = [0, 0, 0, 0]
             buckets[bucket] = cell
+        # Increment the counter for this status (unknown statuses go to "other").
         cell[_HEALTH_IDX.get(str(status).strip().lower(), 3)] += 1
+        # Drop buckets older than 30 days.
         cutoff = now - _CC_30DAY_WINDOW
         for b in [b for b in buckets if b < cutoff]:
             del buckets[b]
 
     def save(self) -> None:
+        """Save the history to disk atomically; failures are ignored."""
+        # Write a temp file, then swap it in.
         try:
             tmp = self._path + ".tmp"
             with open(tmp, "w", encoding="utf-8") as f:
                 json.dump({k: {str(b): v for b, v in bk.items()}
                            for k, bk in self._h.items()}, f, default=str)
             os.replace(tmp, self._path)
+        # Saving is best-effort.
         except Exception:  # noqa: BLE001
             pass
 
     def summary(self, tenant: str) -> Dict[str, Any]:
+        """Return 30 days of daily status counts for each site and check of ``tenant``."""
+        # Start of the oldest day to include, and this tenant's key prefix.
         now = time.time()
         floor = int(now // 86400 * 86400) - 29 * 86400
         prefix = f"{tenant}{_CC_KEYSEP}"
         out: Dict[str, Any] = {}
+        # Walk every check history belonging to this tenant.
         for key, buckets in self._h.items():
             if not key.startswith(prefix):
                 continue
+            # Split the key into tenant, site and check.
             parts = key.split(_CC_KEYSEP, 2)
             if len(parts) != 3:
                 continue
             _, site, check_id = parts
+            # Add each hour's counts into its day.
             days: Dict[int, list] = {}
             for b, cell in buckets.items():
                 d = int(b // 86400 * 86400)
@@ -448,13 +526,17 @@ class MistCheckHealthHistory:
                 acc = days.setdefault(d, [0, 0, 0, 0])
                 for i in range(4):
                     acc[i] += cell[i]
+            # Store the days, oldest first.
             out.setdefault(site, {})[check_id] = [
                 {"d": d, "o": v[0], "w": v[1], "e": v[2], "n": v[3]}
                 for d, v in sorted(days.items())
             ]
+        # Return {site: {check: [daily counts]}}.
         return out
 
     def hourly(self, tenant: str, site: str, check_id: str) -> list:
+        """Return the raw hourly counts for one check, oldest first."""
+        # This check's buckets, turned into a list.
         buckets = self._h.get(self._key(tenant, site, check_id), {})
         return [{"h": b, "o": v[0], "w": v[1], "e": v[2], "n": v[3]}
                 for b, v in sorted(buckets.items())]

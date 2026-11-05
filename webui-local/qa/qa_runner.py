@@ -41,6 +41,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Any
 
+# httpx is required; exit with code 2 if it is missing.
 try:
     import httpx
 except ImportError:
@@ -51,8 +52,10 @@ except ImportError:
 _USE_COLOR = sys.stdout.isatty()
 
 def _c(code: str, text: str) -> str:
+    """Wrap text in an ANSI colour code when colour is on."""
     return f"\033[{code}m{text}\033[0m" if _USE_COLOR else text
 
+# Colour helpers.
 GREEN  = lambda t: _c("32", t)
 RED    = lambda t: _c("31", t)
 YELLOW = lambda t: _c("33", t)
@@ -79,6 +82,11 @@ def _host_halt(host: dict) -> dict:
 
 @dataclass
 class TestResult:
+    """The result of one QA check.
+
+    A skipped or warning result still counts as passed; raw_data holds the API payload for
+    diagnosing a failure or warning.
+    """
     name: str
     phase: str
     passed: bool
@@ -90,6 +98,10 @@ class TestResult:
 
 @dataclass
 class QARunner:
+    """Runs the QA phases against a hub and records the results.
+
+    Swaps the QA API key for a JWT, then calls the hub API with it.
+    """
     base_url: str
     qa_key: str          # raw QA API key — exchanged for a JWT at startup
     tenant_id: str = ""  # populated from the token exchange response
@@ -103,6 +115,7 @@ class QARunner:
     # ── HTTP helpers ──────────────────────────────────────────────────────────
 
     def _http(self) -> httpx.Client:
+        """Return the HTTP client, creating it on first use."""
         if self._client is None:
             self._client = httpx.Client(
                 base_url=self.base_url,
@@ -113,39 +126,47 @@ class QARunner:
         return self._client
 
     def get(self, path: str, **kw: Any) -> httpx.Response:
+        """Send an authenticated GET request."""
         headers = {"Authorization": f"Bearer {self.token}"} if self.token else {}
         return self._http().get(path, headers=headers, **kw)
 
     def post(self, path: str, json: Any = None, **kw: Any) -> httpx.Response:
+        """Send an authenticated POST request."""
         headers = {"Authorization": f"Bearer {self.token}"} if self.token else {}
         return self._http().post(path, json=json, headers=headers, **kw)
 
     def patch(self, path: str, json: Any = None, **kw: Any) -> httpx.Response:
+        """Send an authenticated PATCH request."""
         headers = {"Authorization": f"Bearer {self.token}"} if self.token else {}
         return self._http().patch(path, json=json, headers=headers, **kw)
 
     def delete(self, path: str, **kw: Any) -> httpx.Response:
+        """Send an authenticated DELETE request."""
         headers = {"Authorization": f"Bearer {self.token}"} if self.token else {}
         return self._http().delete(path, headers=headers, **kw)
 
     # ── Result helpers ────────────────────────────────────────────────────────
 
     def _ok(self, name: str, phase: str, detail: str = "") -> TestResult:
+        """Record a passed check."""
         r = TestResult(name=name, phase=phase, passed=True, detail=detail)
         self.results.append(r)
         return r
 
     def _fail(self, name: str, phase: str, detail: str = "", raw_data: dict | None = None) -> TestResult:
+        """Record a failed check."""
         r = TestResult(name=name, phase=phase, passed=False, detail=detail, raw_data=raw_data)
         self.results.append(r)
         return r
 
     def _skip(self, name: str, phase: str, reason: str = "") -> TestResult:
+        """Record a skipped check (it counts as passed)."""
         r = TestResult(name=name, phase=phase, passed=True, skipped=True, detail=reason)
         self.results.append(r)
         return r
 
     def _warn(self, name: str, phase: str, detail: str = "", raw_data: dict | None = None) -> TestResult:
+        """Record a warning (it counts as passed)."""
         r = TestResult(name=name, phase=phase, passed=True, warning=True, detail=detail, raw_data=raw_data)
         self.results.append(r)
         return r
@@ -188,26 +209,32 @@ class QARunner:
         warn_fn: Any = None,
     ) -> TestResult:
         """Run a single API assertion and record result."""
+        # Wrong status code: fail.
         try:
             if resp.status_code != expect_status:
                 return self._fail(
                     name, phase,
                     f"HTTP {resp.status_code} (expected {expect_status}): {resp.text[:200]}"
                 )
+            # Parse the JSON body, if any.
             data: Any = resp.json() if resp.content else {}
+            # Fail if expected keys are missing.
             if assert_keys:
                 missing = [k for k in assert_keys if k not in data]
                 if missing:
                     return self._fail(name, phase, f"Missing keys in response: {missing}")
+            # Fail if the check function returns an error string.
             if assert_fn:
                 result = assert_fn(data)
                 if isinstance(result, str):  # returned an error string
                     return self._fail(name, phase, result)
+            # Warn if the warning function returns a message.
             if warn_fn:
                 w = warn_fn(data)
                 if isinstance(w, str):
                     return self._warn(name, phase, w)
             return self._ok(name, phase)
+        # Any exception fails the check.
         except Exception as exc:  # noqa: BLE001
             return self._fail(name, phase, f"Exception: {exc}")
 
@@ -216,6 +243,10 @@ class QARunner:
     # ═══════════════════════════════════════════════════════════════════════════
 
     def phase_auth(self) -> None:
+        """Phase 1: swap the QA key for a JWT and check auth works.
+
+        Exits with code 2 if the key exchange fails.
+        """
         _section("Phase 1 — Authentication")
 
         # 1.1 Exchange QA API key for a tenant-scoped JWT
@@ -257,8 +288,10 @@ class QARunner:
     # ═══════════════════════════════════════════════════════════════════════════
 
     def phase_hub_health(self) -> None:
+        """Phase 2: check the hub and tenant endpoints respond."""
         _section("Phase 2 — Hub & Tenant Health")
 
+        # Health, init, settings, hub config and ACME endpoints must return 200.
         r = self.get("/api/health")
         self._check("Hub /api/health", "hub_health", r)
 
@@ -271,6 +304,7 @@ class QARunner:
         r = self.get(f"/api/tenant/{self.tenant_id}/hub-config")
         self._check("Hub config readable", "hub_health", r)
 
+        # A missing onboarding PSK is only a warning.
         r = self.get(f"/api/tenant/{self.tenant_id}/onboarding-psk")
         if r.status_code == 200:
             self._ok("Onboarding PSK present", "hub_health")
@@ -280,6 +314,7 @@ class QARunner:
         r = self.get("/api/acme/status")
         self._check("ACME status", "hub_health", r)
 
+        # Superadmin endpoint: 403 is fine for a tenant key.
         r = self.get("/api/superadmin/tenants")
         if r.status_code in (200, 403):
             self._ok("Superadmin tenants endpoint reachable", "hub_health")
@@ -291,22 +326,27 @@ class QARunner:
     # ═══════════════════════════════════════════════════════════════════════════
 
     def phase_spokes(self) -> None:
+        """Phase 3: check approved spokes, how many are online, pending spokes and spoke configs."""
         _section("Phase 3 — Spoke Registration & Status")
 
+        # List spokes; stop if that fails.
         r = self.get(f"/api/{self.tenant_id}/spokes")
         res = self._check("List approved spokes", "spokes", r, assert_keys=["spokes"])
         if not res.passed:
             return
 
+        # Count total and online spokes.
         spokes: list[dict] = r.json().get("spokes", [])
         total = len(spokes)
         online = sum(1 for s in spokes if s.get("online") or s.get("status") == "online")
 
+        # No spokes is a warning.
         if total == 0:
             self._warn("Spokes count", "spokes", "No approved spokes — register and approve at least one")
         else:
             self._ok("Spokes count", "spokes", f"{total} approved spoke(s)")
 
+        # None online fails; some offline warns.
         if total > 0 and online == 0:
             self._fail("Spokes online", "spokes", f"0/{total} spokes online")
         elif total > 0:
@@ -342,18 +382,23 @@ class QARunner:
     # ═══════════════════════════════════════════════════════════════════════════
 
     def phase_proxmox(self) -> None:
+        """Phase 4: check Proxmox agents, VM counts and states, agent freshness and loop/WS health.
+        """
         _section("Phase 4 — Proxmox Agent & Telemetry")
 
+        # Get the Proxmox data; stop if that fails.
         r = self.get("/api/aggregate/proxmox", params={"tenant_id": self.tenant_id})
         res = self._check("Aggregate Proxmox telemetry", "proxmox", r, assert_keys=["hosts"])
         if not res.passed:
             return
 
+        # No hosts is a warning.
         hosts: list[dict] = r.json().get("hosts", [])
         if not hosts:
             self._warn("Proxmox agents", "proxmox", "No hosts in Proxmox telemetry — no spokes with Proxmox agents?")
             return
 
+        # Fail if no agents are connected; warn if only some are.
         connected = sum(1 for h in hosts if h.get("proxmox", {}).get("connected"))
         total = len(hosts)
         if connected == 0:
@@ -387,11 +432,13 @@ class QARunner:
             if not vms:
                 continue  # already reported by vm_count check above
 
+            # Group VMs by prov_status.
             missing_status = [v for v in vms if not v.get("prov_status")]
             provisioning  = [v for v in vms if v.get("prov_status") == "provisioning"]
             tearing_down  = [v for v in vms if v.get("prov_status") == "tearing_down"]
             active        = [v for v in vms if v.get("prov_status") == "active"]
 
+            # All missing fails; some missing warns.
             if len(missing_status) == len(vms):
                 # All VMs lack prov_status — join didn't work or usb_state not yet received
                 self._fail(
@@ -473,6 +520,7 @@ class QARunner:
                     raw_data=self._spoke_diag(h),
                 )
                 continue
+            # Fail over 5 minutes old, warn over 2 minutes.
             try:
                 ls = datetime.datetime.fromisoformat(px_last_seen.replace("Z", "+00:00"))
                 age_s = int((datetime.datetime.now(datetime.timezone.utc) - ls).total_seconds())
@@ -499,6 +547,7 @@ class QARunner:
                         "proxmox",
                         f"last_seen {age_s}s ago",
                     )
+            # Unparseable timestamp: warn.
             except Exception:
                 self._warn(
                     f"Spoke '{name}' proxmox agent freshness",
@@ -520,6 +569,7 @@ class QARunner:
             if not h.get("spoke_online"):
                 continue  # offline spoke — telemetry fields meaningless
 
+            # Read the diagnostic fields.
             hub_lag_ms = h.get("hub_loop_lag_ms")
             build_ms   = h.get("telemetry_build_ms")
             reconnects = h.get("ws_reconnect_count")
@@ -675,11 +725,13 @@ class QARunner:
                 continue
 
             def _lt_maxmem(v: dict) -> bool:
+                """Return True if the VM's memory use is below 99% of its allocation."""
                 try:
                     return float(v.get("mem", 0)) < float(v.get("maxmem", 1)) * 0.99
                 except (TypeError, ValueError):
                     return False
 
+            # Balloon is off if every running VM reports full allocation.
             mem_with_data = [v for v in running if _lt_maxmem(v)]
             all_at_alloc = len(mem_with_data) == 0 and all(
                 v.get("mem") and v.get("maxmem") for v in running
@@ -710,6 +762,7 @@ class QARunner:
             running = [v for v in vms if v.get("status") == "running"]
             if len(running) < 2:
                 continue  # too few VMs to be meaningful
+            # Warn if every running VM shows 0% CPU.
             zero_cpu = [v for v in running if v.get("cpu") is not None and float(v.get("cpu", 1)) == 0.0]
             if len(zero_cpu) == len(running):
                 self._warn(
@@ -737,6 +790,7 @@ class QARunner:
             spoke_id = h.get("spoke_id")
             if not spoke_id:
                 continue
+            # Send a probe command.
             r = self.post(
                 f"/api/{self.tenant_id}/spokes/{spoke_id}/proxmox-command",
                 json={"action": "__qa_probe__", "target": "spoke", "args": []},
@@ -769,11 +823,15 @@ class QARunner:
     # ═══════════════════════════════════════════════════════════════════════════
 
     def phase_usb(self) -> None:
+        """Phase 5: check the USB VID/PID endpoints respond (403 is fine for the superadmin ones).
+        """
         _section("Phase 5 — USB Dongle Configuration")
 
+        # Tenant USB list.
         r = self.get(f"/api/{self.tenant_id}/usb-vidpids")
         self._check("USB VID/PID list", "usb", r)
 
+        # Superadmin USB lists.
         r = self.get("/api/superadmin/global-usb-vidpids")
         if r.status_code in (200, 403):
             self._ok("Global USB VID/PIDs reachable", "usb")
@@ -797,6 +855,7 @@ class QARunner:
     # ═══════════════════════════════════════════════════════════════════════════
 
     def phase_provisioning(self) -> None:
+        """Phase 6: check spokes are set up for auto-provisioning and VMs are being provisioned."""
         _section("Phase 6 — Auto-Provisioning (Critical Path ⭐)")
 
         # USB provisioning status
@@ -810,11 +869,13 @@ class QARunner:
         if not res.passed:
             return
 
+        # Dongle count and whether auto-provisioning is on.
         prov_data = r.json()
         total_dongles: int = prov_data.get("total_dongles", 0)
         auto_on: bool = prov_data.get("auto_provision_on", False)
         spokes_prov: list[dict] = prov_data.get("spokes", [])
 
+        # No dongles is a warning.
         if total_dongles == 0:
             self._warn(
                 "Dongles detected",
@@ -824,6 +885,7 @@ class QARunner:
         else:
             self._ok("Dongles detected", "provisioning", f"total_dongles={total_dongles}")
 
+        # Auto-provisioning off with dongles present is a warning.
         if not auto_on and total_dongles > 0:
             self._warn(
                 "Auto-provisioning enabled",
@@ -846,6 +908,7 @@ class QARunner:
         if not res.passed:
             return
 
+        # Expected vs actual client counts.
         qa = r.json()
         expected = qa.get("expected_clients", 0)
         actual = qa.get("actual_clients", 0)
@@ -903,13 +966,16 @@ class QARunner:
     # ═══════════════════════════════════════════════════════════════════════════
 
     def phase_clients(self) -> None:
+        """Phase 7: check clients are reporting and simulating, and the client endpoints respond."""
         _section("Phase 7 — Client Status & Simulations")
 
+        # Get the client list; stop if that fails.
         r = self.get("/api/aggregate/clients", params={"tenant_id": self.tenant_id})
         res = self._check("Aggregate client list", "clients", r, assert_keys=["clients"])
         if not res.passed:
             return
 
+        # No clients is a warning.
         client_list: list[dict] = r.json().get("clients", [])
         if not client_list:
             self._warn("Clients reporting", "clients", "No clients reporting — expected > 0 if dongles are present")
@@ -949,8 +1015,10 @@ class QARunner:
     # ═══════════════════════════════════════════════════════════════════════════
 
     def phase_commands(self) -> None:
+        """Phase 8: check the command queue for expired or stuck commands, plus the audit logs."""
         _section("Phase 8 — Commands & Control")
 
+        # Read the queue.
         r = self.get(f"/api/{self.tenant_id}/commands")
         res = self._check("Command queue readable", "commands", r)
 
@@ -961,6 +1029,7 @@ class QARunner:
             pending = [c for c in cmds if c.get("status") == "queued"]
             expired = []
             old_pending = []
+            # Collect expired commands and ones queued over 5 minutes; bad timestamps are ignored.
             for c in pending:
                 exp = c.get("expires_at")
                 cre = c.get("created_at")
@@ -979,6 +1048,7 @@ class QARunner:
                             old_pending.append((c, int(age_s)))
                     except Exception:
                         pass
+            # Warn on expired commands.
             if expired:
                 self._warn(
                     "Command queue — expired commands",
@@ -997,6 +1067,7 @@ class QARunner:
             else:
                 self._ok("Command queue — expired commands", "commands", "queue empty or all executed")
 
+            # Warn on stuck commands.
             if old_pending:
                 self._warn(
                     "Command queue — stuck pending commands",
@@ -1010,6 +1081,7 @@ class QARunner:
                     ]},
                 )
 
+        # API server status.
         r = self.get("/api/aggregate/api-server", params={"tenant_id": self.tenant_id})
         self._check("Aggregate API server status", "commands", r)
 
@@ -1032,8 +1104,10 @@ class QARunner:
     # ═══════════════════════════════════════════════════════════════════════════
 
     def phase_settings(self) -> None:
+        """Phase 9: check the processing mode and config endpoints respond."""
         _section("Phase 9 — Settings & Configuration")
 
+        # Processing mode, summary and simulation config must return 200.
         r = self.get(f"/api/{self.tenant_id}/settings/processing-mode")
         self._check("Processing mode", "settings", r)
 
@@ -1043,6 +1117,7 @@ class QARunner:
         r = self.get(f"/api/{self.tenant_id}/config/simulation-conf")
         self._check("Simulation config", "settings", r)
 
+        # Override endpoints: 404 (none set) is fine.
         r = self.get(f"/api/{self.tenant_id}/config/sim-conf-override")
         if r.status_code in (200, 404):
             self._ok("Sim conf override endpoint", "settings")
@@ -1060,8 +1135,10 @@ class QARunner:
     # ═══════════════════════════════════════════════════════════════════════════
 
     def phase_central(self) -> None:
+        """Phase 10: check Central is configured and connected."""
         _section("Phase 10 — Aruba Central Integration")
 
+        # Skip the rest if Central is not configured.
         r = self.get("/central/available")
         res = self._check("Central available", "central", r)
         if res.passed:
@@ -1071,6 +1148,7 @@ class QARunner:
                 return
             self._ok("Central configured", "central")
 
+        # Central status, aggregate and site config must return 200.
         r = self.get("/api/aggregate/central-status")
         self._check("Central status", "central", r)
 
@@ -1080,6 +1158,7 @@ class QARunner:
         r = self.get(f"/api/{self.tenant_id}/aggregate/central-sites-config")
         self._check("Central sites config", "central", r)
 
+        # Webhook status: 404 (not registered) is fine.
         r = self.get(f"/api/{self.tenant_id}/aggregate/register-central-webhook")
         if r.status_code in (200, 404):
             self._ok("Central webhook status", "central")
@@ -1091,8 +1170,10 @@ class QARunner:
     # ═══════════════════════════════════════════════════════════════════════════
 
     def phase_backup(self) -> None:
+        """Phase 11: check the backup endpoints respond."""
         _section("Phase 11 — Backup & Restore")
 
+        # Backup config, status and templates must return 200.
         r = self.get("/api/backup/config")
         self._check("Backup config readable", "backup", r)
 
@@ -1102,6 +1183,7 @@ class QARunner:
         r = self.get("/api/backup/templates")
         self._check("Backup templates", "backup", r)
 
+        # SAS token endpoint: any expected status is fine.
         r = self.get("/api/backup/installer/sas-token")
         if r.status_code in (200, 400, 403, 404):
             self._ok("Installer SAS token endpoint reachable", "backup")
@@ -1113,11 +1195,14 @@ class QARunner:
     # ═══════════════════════════════════════════════════════════════════════════
 
     def phase_t3(self) -> None:
+        """Phase 12: check the OUI pool and T3 endpoints for up to two spokes."""
         _section("Phase 12 — T3 / MAC Profiles")
 
+        # OUI pool.
         r = self.get("/api/oui-pool")
         self._check("OUI pool", "t3", r)
 
+        # MAC profile and devices endpoints (404 is fine).
         r = self.get(f"/api/{self.tenant_id}/spokes")
         if r.status_code == 200:
             spokes = r.json().get("spokes", [])
@@ -1142,11 +1227,14 @@ class QARunner:
     # ═══════════════════════════════════════════════════════════════════════════
 
     def phase_health(self) -> None:
+        """Phase 13: check the hub health summary and the kill switch endpoint."""
         _section("Phase 13 — System Health & QA Summary")
 
+        # Health endpoint.
         r = self.get("/api/health")
         self._check("Hub health endpoint", "health", r)
 
+        # System health summary; fail once per issue if not all OK.
         r = self.get("/api/aggregate/qa/system-health", params={"tenant_id": self.tenant_id})
         res = self._check(
             "QA system health (new API)",
@@ -1165,6 +1253,7 @@ class QARunner:
                 for issue in data.get("issues", ["all_ok=false"]):
                     self._fail("QA system health all_ok", "health", issue)
 
+        # API server status.
         r = self.get("/api/aggregate/api-server", params={"tenant_id": self.tenant_id})
         self._check("API server aggregate", "health", r)
 
@@ -1180,6 +1269,9 @@ class QARunner:
     # ═══════════════════════════════════════════════════════════════════════════
 
     def phase_background(self) -> None:
+        """Phase 14: check spoke heartbeats, recovery commands, and whether all spokes dropped
+        together.
+        """
         _section("Phase 14 — Background Task Validation")
 
         # Heartbeat: at least one spoke should have been seen recently
@@ -1188,6 +1280,7 @@ class QARunner:
             spokes = r.json().get("spokes", [])
             stale_threshold = 300  # seconds
             now = time.time()
+            # Fail if a spoke was last seen more than 5 minutes ago or never.
             for spoke in spokes:
                 name = spoke.get("spoke_name") or spoke.get("id", "?")
                 last_seen_str = spoke.get("last_seen")
@@ -1231,6 +1324,7 @@ class QARunner:
         # the root cause of the 12-minute all-spokes-offline incident.
         # Re-uses the same spoke list fetched above when possible.
         r2 = self.get(f"/api/{self.tenant_id}/spokes")
+        # Count offline spokes.
         if r2.status_code == 200:
             all_spokes = r2.json().get("spokes", [])
             total_sp = len(all_spokes)
@@ -1267,6 +1361,7 @@ class QARunner:
     # ═══════════════════════════════════════════════════════════════════════════
 
     def phase_teardown(self) -> None:
+        """Phase 15: delete all simulation VMs and wait up to 5 minutes for them to go."""
         _section("Phase 15 — VM Teardown (⚠ Destructive)")
 
         # Step 1: trigger teardown
@@ -1280,6 +1375,7 @@ class QARunner:
         if not res.passed:
             return
 
+        # Nothing queued: skip.
         td = r.json()
         total_queued: int = td.get("total_vms_queued", 0)
         if total_queued == 0:
@@ -1302,6 +1398,7 @@ class QARunner:
         deadline = time.monotonic() + timeout_s
 
         while time.monotonic() < deadline:
+            # Stop polling if the status call fails.
             r = self.get(f"/api/{self.tenant_id}/qa/teardown-status")
             if r.status_code != 200:
                 self._warn(
@@ -1311,6 +1408,7 @@ class QARunner:
                 )
                 break
 
+            # Done when nothing remains.
             status = r.json()
             remaining = status.get("total_remaining", 0)
             if status.get("complete"):
@@ -1321,6 +1419,7 @@ class QARunner:
                 )
                 return
 
+            # Show progress and wait.
             elapsed_s = int(timeout_s - (deadline - time.monotonic()))
             print(f"    ⏳  {remaining} VM(s) still present — waiting... ({elapsed_s}s elapsed)")
             time.sleep(poll_interval_s)
@@ -1348,6 +1447,7 @@ class QARunner:
     # ═══════════════════════════════════════════════════════════════════════════
 
     def phase_autoprov_e2e(self) -> None:
+        """Phase 16: turn auto-provisioning on and check VMs and clients appear for each dongle."""
         _section("Phase 16 — Auto-Provisioning End-to-End (⚠ Long-running)")
 
         # Step 1: verify dongles are present before enabling
@@ -1358,6 +1458,7 @@ class QARunner:
 
         prov = r.json()
         total_dongles: int = prov.get("total_dongles", 0)
+        # No dongles: skip the test.
         if total_dongles == 0:
             self._skip(
                 "Auto-provisioning E2E",
@@ -1391,6 +1492,7 @@ class QARunner:
             f"expected_clients={expected} ({ap.get('updated_spokes', 0)} spoke(s) updated)",
         )
 
+        # Nothing to provision: skip the wait.
         if expected == 0:
             self._skip(
                 "Wait for clients online",
@@ -1405,6 +1507,7 @@ class QARunner:
         deadline = time.monotonic() + timeout_s
 
         while time.monotonic() < deadline:
+            # Stop polling if the call fails.
             r = self.get(f"/api/{self.tenant_id}/qa/provisioning-check")
             if r.status_code != 200:
                 self._warn("Client online poll", "autoprov_e2e", f"HTTP {r.status_code} during poll")
@@ -1414,6 +1517,7 @@ class QARunner:
             actual = qa.get("actual_clients", 0)
             overall_pass = qa.get("overall_pass", False)
 
+            # All clients online: pass, then report each spoke.
             if overall_pass and actual >= expected:
                 self._ok(
                     f"All {expected} clients online",
@@ -1435,6 +1539,7 @@ class QARunner:
                             self._warn(f"Spoke '{name}' provisioning", "autoprov_e2e", issue)
                 return
 
+            # Show progress and wait.
             elapsed_s = int(timeout_s - (deadline - time.monotonic()))
             print(f"    ⏳  {actual}/{expected} clients online — waiting... ({elapsed_s}s elapsed)")
             time.sleep(poll_interval_s)
@@ -1445,6 +1550,7 @@ class QARunner:
             qa = r.json()
             actual = qa.get("actual_clients", 0)
             delta = qa.get("delta", 0)
+            # Fail, listing the spokes that are short.
             spoke_details = []
             for s in qa.get("spokes", []):
                 if not s.get("pass"):
@@ -1471,6 +1577,10 @@ class QARunner:
     # ═══════════════════════════════════════════════════════════════════════════
 
     def phase_sim_cycle(self) -> None:
+        """Phase 17: full cycle of auto-provisioning off, queue cleared, VMs deleted, then on again.
+
+        Then waits up to 10 minutes for every dongle's client to come online.
+        """
         _section("Phase 17 — Full Simulation Cycle (⚠ Destructive + Long-running)")
         MODULE = "sim_cycle"
 
@@ -1479,11 +1589,13 @@ class QARunner:
         if r.status_code != 200:
             self._fail("Dongles present", MODULE, f"HTTP {r.status_code}")
             return
+        # No dongles: skip the cycle.
         prov = r.json()
         total_dongles: int = prov.get("total_dongles", 0)
         if total_dongles == 0:
             self._skip("Simulation cycle", MODULE, "No USB dongles detected — cannot run simulation cycle")
             return
+        # List each spoke's dongles.
         spoke_detail = ", ".join(
             f"{s.get('spoke_name', s.get('spoke_id', '?'))}: {s.get('dongle_count', 0)} dongle(s)"
             for s in prov.get("spokes", [])
@@ -1522,6 +1634,7 @@ class QARunner:
         )
         if not res.passed:
             return
+        # Nothing queued: already clean.
         td = r.json()
         total_queued: int = td.get("total_vms_queued", 0)
         if total_queued == 0:
@@ -1542,6 +1655,7 @@ class QARunner:
             teardown_ok = False
 
             while time.monotonic() < deadline:
+                # Stop polling if the status call fails; finish when nothing remains.
                 r = self.get(f"/api/{self.tenant_id}/qa/teardown-status")
                 if r.status_code != 200:
                     self._warn("Teardown status poll", MODULE, f"HTTP {r.status_code} during poll")
@@ -1551,11 +1665,13 @@ class QARunner:
                     self._ok("All sim VMs deleted", MODULE, "total_remaining=0 across all spokes")
                     teardown_ok = True
                     break
+                # Show progress and wait.
                 remaining = status.get("total_remaining", 0)
                 elapsed_s = int(timeout_s - (deadline - time.monotonic()))
                 print(f"    ⏳  {remaining} VM(s) still present — waiting... ({elapsed_s}s elapsed)")
                 time.sleep(poll_interval_s)
 
+            # Timed out: fail, listing what remains, and stop.
             if not teardown_ok:
                 r = self.get(f"/api/{self.tenant_id}/qa/teardown-status")
                 if r.status_code == 200:
@@ -1585,6 +1701,7 @@ class QARunner:
         )
         if not res.passed:
             return
+        # Expected client count and each spoke's dongles.
         ap = r.json()
         expected: int = ap.get("expected_clients", 0)
         spoke_detail = ", ".join(
@@ -1596,6 +1713,7 @@ class QARunner:
             f"expected_clients={expected} ({ap.get('updated_spokes', 0)} spoke(s)) — {spoke_detail}",
         )
 
+        # Nothing to provision: skip the wait.
         if expected == 0:
             self._skip("Wait for clients online", MODULE, "expected_clients=0 — no dongles to provision")
             return
@@ -1606,12 +1724,14 @@ class QARunner:
         deadline = time.monotonic() + timeout_s
 
         while time.monotonic() < deadline:
+            # Stop polling if the call fails.
             r = self.get(f"/api/{self.tenant_id}/qa/provisioning-check")
             if r.status_code != 200:
                 self._warn("Client online poll", MODULE, f"HTTP {r.status_code} during poll")
                 break
             qa = r.json()
             actual = qa.get("actual_clients", 0)
+            # All clients online: pass with each spoke's counts.
             if qa.get("overall_pass") and actual >= expected:
                 per_spoke = ", ".join(
                     f"{s.get('spoke_name', s.get('spoke_id', '?'))}: {s['reporting_clients']}/{s['dongle_count']}"
@@ -1622,10 +1742,12 @@ class QARunner:
                     f"actual={actual}, expected={expected} — {per_spoke}",
                 )
                 break
+            # Show progress and wait.
             elapsed_s = int(timeout_s - (deadline - time.monotonic()))
             print(f"    ⏳  {actual}/{expected} clients online — waiting... ({elapsed_s}s elapsed)")
             time.sleep(poll_interval_s)
         else:
+            # Timed out: fail, listing the spokes that are short.
             r = self.get(f"/api/{self.tenant_id}/qa/provisioning-check")
             if r.status_code == 200:
                 qa = r.json()
@@ -1651,12 +1773,14 @@ class QARunner:
         if r.status_code != 200:
             self._warn("No over-provisioning check", MODULE, f"HTTP {r.status_code} fetching proxmox aggregate")
         else:
+            # Spokes with dongles; fail any with more VMs than dongles.
             hosts = r.json().get("hosts", [])
             with_dongles = [h for h in hosts if (h.get("usb_count") or 0) > 0]
             if not with_dongles:
                 self._skip("No over-provisioning (vm_count ≤ dongle_count)", MODULE, "No spokes with dongles in proxmox aggregate")
             else:
                 over = [h for h in with_dongles if (h.get("vm_count") or 0) > (h.get("usb_count") or 0)]
+                # Per-spoke summary, noting spokes paused by CPU pacing.
                 per_spoke = "; ".join(
                     f"{h.get('spoke_name', h.get('spoke_id', '?'))}: vms={h.get('vm_count', '?')}/{h.get('usb_count', '?')} dongles"
                     + (
@@ -1683,6 +1807,7 @@ class QARunner:
         if r.status_code != 200:
             self._warn("CPU provisioning throttle", MODULE, f"HTTP {r.status_code} fetching proxmox aggregate")
         else:
+            # Online spokes; pacing ones count as the throttle working.
             hosts = r.json().get("hosts", [])
             online = [h for h in hosts if h.get("spoke_online")]
             if not online:
@@ -1723,6 +1848,7 @@ class QARunner:
         if r.status_code != 200:
             self._warn("CPU delete-threshold teardown check", MODULE, f"HTTP {r.status_code} fetching proxmox aggregate")
         else:
+            # Online spokes; list each spoke's CPU average against the threshold.
             hosts = r.json().get("hosts", [])
             online = [h for h in hosts if h.get("spoke_online")]
             if not online:
@@ -1762,6 +1888,11 @@ class QARunner:
     # ═══════════════════════════════════════════════════════════════════════════
 
     def run(self, phases: list[str] | None = None) -> int:
+        """Run the chosen phases (all by default) and print the report.
+
+        Returns the exit code: 0 all passed, 1 failures, 2 unknown phase or failed key exchange.
+        """
+        # Phase names and the methods that run them.
         all_phases = {
             "auth":         self.phase_auth,
             "hub":          self.phase_hub_health,
@@ -1782,6 +1913,7 @@ class QARunner:
             "sim_cycle":    self.phase_sim_cycle,
         }
 
+        # Reject unknown phase names.
         selected = phases if phases else list(all_phases.keys())
         unknown = [p for p in selected if p not in all_phases]
         if unknown:
@@ -1802,6 +1934,7 @@ class QARunner:
                 print(f"ERROR: No access_token in key exchange response: {data}", file=sys.stderr)
                 return 2
 
+        # Run each phase; an unexpected error is recorded as a failure.
         start = time.monotonic()
         for phase_name in selected:
             try:
@@ -1811,6 +1944,7 @@ class QARunner:
             except Exception as exc:  # noqa: BLE001
                 self._fail(f"Phase {phase_name} (unhandled error)", phase_name, str(exc))
 
+        # Print the report and return its exit code.
         elapsed = time.monotonic() - start
         return self._report(elapsed)
 
@@ -1819,16 +1953,20 @@ class QARunner:
     # ═══════════════════════════════════════════════════════════════════════════
 
     def _report(self, elapsed: float) -> int:
+        """Print the text report and return 1 if anything failed, else 0."""
+        # Split results by outcome.
         passed   = [r for r in self.results if r.passed and not r.skipped and not r.warning]
         failed   = [r for r in self.results if not r.passed and not r.skipped]
         warnings = [r for r in self.results if r.warning]
         skipped  = [r for r in self.results if r.skipped]
 
+        # Header.
         print()
         print(BOLD("━" * 70))
         print(BOLD("  CLIENT-SIM QA REPORT"))
         print(BOLD("━" * 70))
 
+        # One line per result.
         for r in self.results:
             if r.skipped:
                 icon = YELLOW("  SKIP")
@@ -1845,6 +1983,7 @@ class QARunner:
             if self.dump_on_fail and r.raw_data and (not r.passed or r.warning):
                 print(DIM("      raw_data: " + json.dumps(r.raw_data, indent=6, default=str)))
 
+        # Summary counts.
         print()
         print(BOLD("━" * 70))
         summary_parts = [
@@ -1857,6 +1996,7 @@ class QARunner:
         print(DIM(f"  Completed in {elapsed:.1f}s"))
         print(BOLD("━" * 70))
 
+        # List the failures again at the end.
         if failed:
             print()
             print(RED(BOLD("  FAILURES:")))
@@ -1870,6 +2010,7 @@ class QARunner:
         return 1 if failed else 0
 
     def report_json(self, elapsed: float) -> int:
+        """Print the results as JSON and return 1 if anything failed, else 0."""
         failed = [r for r in self.results if not r.passed and not r.skipped]
         output = {
             "passed": sum(1 for r in self.results if r.passed and not r.skipped and not r.warning),
@@ -1899,11 +2040,14 @@ class QARunner:
 # ── CLI helpers ───────────────────────────────────────────────────────────────
 
 def _section(title: str) -> None:
+    """Print a phase heading."""
     print()
     print(BOLD(f"\n  ── {title} ──"))
 
 
 def _parse_args() -> argparse.Namespace:
+    """Parse the command-line options; the hub URL and key can also come from environment variables.
+    """
     p = argparse.ArgumentParser(
         description="Client-Sim end-to-end QA runner",
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -1931,22 +2075,31 @@ def _parse_args() -> argparse.Namespace:
 
 
 def main() -> None:
+    """Run the QA from the command line and exit with its exit code.
+
+    With --json, colour is turned off and a JSON report is printed after the text report.
+    """
     args = _parse_args()
 
+    # A QA key is required.
     if not args.qa_key:
         print("ERROR: --qa-key or CS_QA_API_KEY is required.", file=sys.stderr)
         print("       Generate a key: POST /api/superadmin/qa-api-keys (superadmin only)", file=sys.stderr)
         sys.exit(2)
 
+    # No colour in JSON mode.
     if args.json:
         global _USE_COLOR
         _USE_COLOR = False
 
+    # Phases to run (all if none given).
     phases = [p.strip() for p in args.phases.split(",") if p.strip()] if args.phases else None
 
+    # Banner showing the hub and the start of the key.
     print(BOLD(f"\n  Client-Sim QA Runner"))
     print(DIM(f"  Hub: {args.url}  |  Key: {args.qa_key[:8]}…"))
 
+    # Build the runner.
     runner = QARunner(
         base_url=args.url.rstrip("/"),
         qa_key=args.qa_key,
@@ -1955,6 +2108,7 @@ def main() -> None:
         dump_on_fail=args.dump_on_fail,
     )
 
+    # Run it; a SystemExit from a phase becomes the exit code.
     start = time.monotonic()
     try:
         exit_code = runner.run(phases)
@@ -1963,6 +2117,7 @@ def main() -> None:
 
     elapsed = time.monotonic() - start
 
+    # JSON report if asked for.
     if args.json:
         exit_code = runner.report_json(elapsed)
 

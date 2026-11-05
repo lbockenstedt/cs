@@ -49,12 +49,19 @@ USAGE
   # explicit targets
   python3 dns_flood_test.py --servers 10.252.0.1,172.16.252.1 --rate 2000 --duration 30
 """
+# argparse parses the rate/duration/server flags.
 import argparse
+# os is used only to print our process id in the start-up banner.
 import os
+# random picks a starting DNS query id.
 import random
+# socket sends the UDP DNS queries.
 import socket
+# struct packs the binary DNS header and question fields.
 import struct
+# sys provides stderr and the process exit code.
 import sys
+# time measures elapsed time precisely and sleeps between pacing ticks.
 import time
 
 # Defaults mirror configs/simulation.conf so a bare run is comparable to the sim.
@@ -62,7 +69,9 @@ DEFAULT_SERVERS = [
     "10.252.0.1", "172.16.252.1", "192.168.252.1",
     "172.31.201.129", "172.31.201.130", "172.31.201.131",
 ]
+# Same list of junk hostnames that dns_fail.sh reads.
 NAMES_FILE = "/usr/local/scripts/dns_fail.txt"
+# Used when the names file is missing or empty; .invalid names can never resolve.
 FALLBACK_NAMES = ["nonexistent.invalid", "bogus.invalid", "missing.invalid"]
 
 
@@ -70,6 +79,8 @@ def build_query(name: str, qid: int) -> bytes:
     """Minimal DNS A/IN query. Same wire request `dig <name> @<server>` sends."""
     # ID, flags=0x0100 (standard query, recursion desired), QD=1, AN/NS/AR=0
     header = struct.pack(">HHHHHH", qid, 0x0100, 1, 0, 0, 0)
+    # Encode the hostname as DNS labels: each dot-separated part prefixed by its length,
+    # ending with a zero byte.
     qname = b"".join(
         bytes([len(lbl)]) + lbl.encode("ascii", "ignore")
         for lbl in name.rstrip(".").split(".") if lbl
@@ -78,13 +89,18 @@ def build_query(name: str, qid: int) -> bytes:
 
 
 def load_names(path: str):
+    """Read hostnames to query from a file, falling back to built-in junk names."""
+    # A missing or unreadable file is fine; we fall back to the built-in names below.
     try:
         with open(path) as fh:
+            # Keep non-blank lines that are not # comments.
             names = [ln.strip() for ln in fh if ln.strip() and not ln.startswith("#")]
+        # Only use the file if it actually contained names.
         if names:
             return names
     except OSError:
         pass
+    # Return a copy so callers can never modify the module-level fallback list.
     return list(FALLBACK_NAMES)
 
 
@@ -95,12 +111,14 @@ def drain(sock) -> int:
     fail, which would silently cap the send rate and look like a client that
     "cannot go faster" when it is really just not reading.
     """
+    # Count replies read; keep reading until the socket says nothing is waiting.
     got = 0
     while True:
         try:
             sock.recv(4096)
             got += 1
         except (BlockingIOError, InterruptedError):
+            # Nothing left to read right now: report how many replies we drained.
             return got
         except OSError:
             # ICMP port-unreachable surfaces here on connected UDP sockets;
@@ -109,6 +127,7 @@ def drain(sock) -> int:
 
 
 def main() -> int:
+    # Command-line flags; defaults match the simulation config so a bare run is comparable.
     ap = argparse.ArgumentParser(description="single-process DNS query generator (test tool)")
     ap.add_argument("--servers", default=",".join(DEFAULT_SERVERS),
                     help="comma-separated DNS servers to query")
@@ -122,12 +141,15 @@ def main() -> int:
     ap.add_argument("--quiet", action="store_true", help="summary line only")
     args = ap.parse_args()
 
+    # Split the comma list into server IPs; with none we cannot run, so exit with code 2.
     servers = [s.strip() for s in args.servers.split(",") if s.strip()]
     if not servers:
         print("no servers given", file=sys.stderr)
         return 2
+    # Hostnames to cycle through.
     names = load_names(args.names_file)
 
+    # Non-blocking so sends and drains never stall the pacing loop.
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.setblocking(False)
     # A large send buffer keeps a burst from blocking on a slow link; we never
@@ -135,8 +157,10 @@ def main() -> int:
     try:
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 1 << 20)
     except OSError:
+        # Some systems refuse the bigger buffer; the default one still works.
         pass
 
+    # Counters, the run window, the per-second target rate and round-robin indices.
     sent = errors = replies = 0
     start = time.perf_counter()
     end = start + args.duration
@@ -144,17 +168,21 @@ def main() -> int:
     qid = random.randrange(1, 65535)
     si = ni = 0
 
+    # Print a start-up banner unless --quiet asked for the summary line only.
     if not args.quiet:
         pace = f"{args.rate}/min" if args.rate > 0 else "UNPACED (ceiling test)"
         print(f"dns_flood_test: {pace} for {args.duration}s "
               f"across {len(servers)} servers x {len(names)} names, pid {os.getpid()}",
               flush=True)
 
+    # Main loop: each pass works out how many queries are due, sends them, drains replies, sleeps.
     try:
         while True:
+            # Stop once the requested duration has elapsed.
             now = time.perf_counter()
             if now >= end:
                 break
+            # Paced mode: compute how many queries we are behind schedule.
             if args.rate > 0:
                 # Derive the backlog from ELAPSED TIME, not by accumulating a
                 # per-tick quota. time.sleep() reliably overshoots (a 5ms sleep
@@ -163,17 +191,21 @@ def main() -> int:
                 # sent against what elapsed time says we owe is self-correcting:
                 # a late tick simply sends more.
                 due = int(per_sec * (now - start)) - sent
+                # We are ahead of schedule, so send nothing this tick.
                 if due < 0:
                     due = 0
             else:
                 due = 256  # unpaced: send in chunks, then drain, then repeat
 
+            # Send the due queries, rotating through servers and names independently.
             for _ in range(due):
                 server = servers[si % len(servers)]
                 name = names[ni % len(names)]
                 si += 1
                 ni += 1
+                # New 16-bit query id per packet, wrapping around at 65535.
                 qid = (qid + 1) & 0xFFFF
+                # Fire the query at port 53 and forget it; any answer is drained later.
                 try:
                     sock.sendto(build_query(name, qid), (server, 53))
                     sent += 1
@@ -184,10 +216,13 @@ def main() -> int:
                     errors += 1
                     break
                 except OSError:
+                    # Other send errors (e.g. no route) are counted but do not stop the run.
                     errors += 1
 
+            # Read and count any replies so the receive buffer never fills.
             replies += drain(sock)
 
+            # Only paced mode sleeps; unpaced mode loops again immediately.
             if args.rate > 0:
                 # Sleep the remainder of this tick, never past the end time.
                 nxt = min(now + args.tick, end)
@@ -195,21 +230,26 @@ def main() -> int:
                 if delay > 0:
                     time.sleep(delay)
     except KeyboardInterrupt:
+        # Ctrl-C ends the test early but still prints the summary.
         pass
     finally:
+        # Drain final replies and close the socket however the loop ended.
         replies += drain(sock)
         sock.close()
 
+    # Report achieved rate per minute and per second so it can be compared to dns_fail.sh.
     elapsed = time.perf_counter() - start
     rate_min = (sent / elapsed) * 60.0 if elapsed > 0 else 0.0
     print(f"sent={sent} errors={errors} replies={replies} "
           f"elapsed={elapsed:.1f}s achieved={rate_min:.0f}/min ({sent/elapsed:.0f}/s)",
           flush=True)
+    # Warn if any "bad" server answered, since that means it is not producing DNS failures.
     if replies:
         print(f"NOTE: {replies} server(s) ANSWERED — those targets are reachable, "
               f"so those queries are not generating DNS failures.", flush=True)
     return 0
 
 
+# Run main() only when executed as a script and exit with its return code.
 if __name__ == "__main__":
     sys.exit(main())

@@ -1,7 +1,10 @@
 """Settings API routes (moved verbatim from server.py; logic imported from server)."""
+# Postpone annotation evaluation so modern type hints are never evaluated at runtime.
 from __future__ import annotations
 
+# APIRouter groups these endpoints so server.py can mount them with include_router().
 from fastapi import APIRouter
+# Settings helpers, constants and shared state live in server.py; this file only defines routes.
 from server import (
     Any,
     Body,
@@ -51,6 +54,7 @@ from server import (
     time,
 )
 
+# The router object every endpoint below is registered on.
 router = APIRouter()
 
 
@@ -58,6 +62,7 @@ router = APIRouter()
 
 @router.get("/api/settings")
 async def api_settings_get() -> dict[str, Any]:
+    """Return the settings as shown to the UI (secrets masked by _public_settings)."""
     return _public_settings()
 
 
@@ -65,17 +70,25 @@ async def api_settings_get() -> dict[str, Any]:
 
 @router.post("/api/settings")
 async def api_settings_update(update: SettingsUpdate) -> dict[str, Any]:
+    """Apply a partial settings update, persist it, restart affected tasks and notify UIs.
+
+    Only fields present in the request are changed; values are validated and clamped first.
+    """
+    # Flags noting which follow-up actions are needed after saving.
     changed_branch = False
     relay_config_changed = False
     auth_provider_changed = False
     autoprov_disabled = False
+    # Only the fields the client actually sent.
     update_data = update.model_dump(exclude_none=True)
 
+    # When the hub manages this spoke, only the locally-allowed keys may change.
     if settings.get("hub_managed"):
         non_relay = set(update_data.keys()) - HUB_LOCAL_ALLOWED_KEYS
         if non_relay:
             raise HTTPException(status_code=403, detail="Settings are hub-managed. Only relay settings can be changed locally.")
 
+    # Branch name: allow only safe git branch characters.
     if update.repo_branch is not None:
         branch = update.repo_branch.strip()
         if not branch or not re.match(r'^[a-zA-Z0-9._/\-]+$', branch):
@@ -83,45 +96,55 @@ async def api_settings_update(update: SettingsUpdate) -> dict[str, Any]:
         settings["repo_branch"] = branch
         changed_branch = True
 
+    # GitHub token.
     if update.github_token is not None:
         settings["github_token"] = update.github_token.strip()
 
+    # Relay server URL.
     if update.relay_server_url is not None:
         settings["relay_server_url"] = update.relay_server_url.strip()
         relay_config_changed = True
 
+    # Whether to verify the hub's TLS certificate.
     if update.hub_tls_verify is not None:
         settings["hub_tls_verify"] = _normalize_relay_enabled(update.hub_tls_verify)
         relay_config_changed = True
 
+    # Display name for this spoke on the hub.
     if update.relay_spoke_name is not None:
         settings["relay_spoke_name"] = update.relay_spoke_name.strip()
         relay_config_changed = True
 
+    # Tenant hint and tenant id are kept the same.
     if update.relay_tenant_hint is not None:
         tenant_id = update.relay_tenant_hint.strip()
         settings["relay_tenant_hint"] = tenant_id
         settings["relay_tenant_id"] = tenant_id
         relay_config_changed = True
 
+    # Relay API key.
     if update.relay_api_key is not None:
         settings["relay_api_key"] = update.relay_api_key.strip()
         relay_config_changed = True
 
+    # Spoke id assigned by the hub.
     if update.relay_spoke_id is not None:
         settings["relay_spoke_id"] = update.relay_spoke_id.strip()
         relay_config_changed = True
 
+    # Tenant id (mirrored into the tenant hint).
     if update.relay_tenant_id is not None:
         tenant_id = update.relay_tenant_id.strip()
         settings["relay_tenant_id"] = tenant_id
         settings["relay_tenant_hint"] = tenant_id
         relay_config_changed = True
 
+    # Relay on/off.
     if update.relay_enabled is not None:
         settings["relay_enabled"] = _normalize_relay_enabled(update.relay_enabled)
         relay_config_changed = True
 
+    # Relay poll interval, clamped to the allowed range.
     if update.relay_poll_interval is not None:
         settings["relay_poll_interval"] = _clamp_relay_interval(update.relay_poll_interval)
         relay_config_changed = True
@@ -131,19 +154,23 @@ async def api_settings_update(update: SettingsUpdate) -> dict[str, Any]:
         relay_config_changed = True  # Treat timeout edits as relay changes so isolation status is re-broadcast immediately when the threshold moves.
         _save_settings()  # Persist the new timeout right away so the safeguard survives crashes even before the handler reaches its shared save call.
 
+    # New admin password: log everyone out.
     if update.admin_password is not None:
         settings["admin_password"] = update.admin_password.strip()
         _spoke_sessions.clear()
 
+    # Session timeout, clamped to 5 minutes - 24 hours.
     if update.session_timeout_minutes is not None:
         settings["session_timeout_minutes"] = max(5, min(1440, int(update.session_timeout_minutes)))
 
+    # Auth provider; note if it actually changed so sessions can be cleared.
     if update.auth_provider is not None:
         next_provider = _normalize_spoke_auth_provider(update.auth_provider)
         if next_provider != _normalize_spoke_auth_provider(settings.get("auth_provider", "local")):
             auth_provider_changed = True
         settings["auth_provider"] = next_provider
 
+    # LDAP/RADIUS/TACACS text settings: copy any that were sent, trimmed.
     for key in (
         "auth_ldap_url",
         "auth_ldap_bind_dn",
@@ -163,18 +190,23 @@ async def api_settings_update(update: SettingsUpdate) -> dict[str, Any]:
         if value is not None:
             settings[key] = str(value).strip()
 
+    # RADIUS port, clamped to a valid port number.
     if update.auth_radius_port is not None:
         settings["auth_radius_port"] = max(1, min(65535, int(update.auth_radius_port)))
 
+    # TACACS port, clamped to a valid port number.
     if update.auth_tacacs_port is not None:
         settings["auth_tacacs_port"] = max(1, min(65535, int(update.auth_tacacs_port)))
 
+    # TACACS privilege level that counts as admin (never negative).
     if update.auth_tacacs_admin_priv is not None:
         settings["auth_tacacs_admin_priv"] = max(0, int(update.auth_tacacs_admin_priv))
 
+    # Changing auth provider logs everyone out.
     if auth_provider_changed:
         _spoke_sessions.clear()
 
+    # Relay settings changed: reset the relay status and ask it to re-register.
     if relay_config_changed:
         relay_state.update({
             "enabled": settings.get("relay_enabled") == "on" and bool(settings.get("relay_server_url")),
@@ -185,11 +217,13 @@ async def api_settings_update(update: SettingsUpdate) -> dict[str, Any]:
         state.relay_registration_refresh_needed = bool(relay_state["enabled"])
         _save_relay_state()
         # Kick the relay loop immediately instead of waiting for the next poll interval
+        # Restart the relay loop so the new settings take effect now.
         task = background_tasks.get("relay")
         if task and not task.done():
             task.cancel()
         background_tasks["relay"] = asyncio.get_event_loop().create_task(relay_loop())
 
+    # Central API settings: start from the current normalised config and set the mode.
     if update.central_api is not None:
         merged_api = _normalize_central_api_settings(settings.get("central_api", {}), settings.get("central_config", {}))
         mode = str(update.central_api.get("mode", merged_api.get("mode", "classic"))).strip().lower()
@@ -197,6 +231,7 @@ async def api_settings_update(update: SettingsUpdate) -> dict[str, Any]:
             raise HTTPException(status_code=422, detail="central_api.mode must be 'classic' or 'central'")
         merged_api["mode"] = mode
 
+        # Classic Central: copy url/username (trimmed) and password (as-is) if sent.
         classic_update = update.central_api.get("classic")
         if isinstance(classic_update, dict):
             for key in ("url", "username"):
@@ -205,6 +240,7 @@ async def api_settings_update(update: SettingsUpdate) -> dict[str, Any]:
             if "password" in classic_update:
                 merged_api["classic"]["password"] = str(classic_update.get("password", ""))
 
+        # New Central: copy url/client ids (trimmed) and client secret (as-is) if sent.
         central_update = update.central_api.get("central")
         if isinstance(central_update, dict):
             for key in ("url", "client_id", "customer_id"):
@@ -213,9 +249,11 @@ async def api_settings_update(update: SettingsUpdate) -> dict[str, Any]:
             if "client_secret" in central_update:
                 merged_api["central"]["client_secret"] = str(central_update.get("client_secret", ""))
 
+        # Save and apply the merged Central config.
         settings["central_api"] = merged_api
         _sync_central_runtime_config()
 
+    # Legacy central_config block: merge only the keys that were sent.
     if update.central_config is not None:
         merged = dict(settings["central_config"])
         # Only update keys that are explicitly provided so omitted secrets are preserved.
@@ -230,6 +268,7 @@ async def api_settings_update(update: SettingsUpdate) -> dict[str, Any]:
             central_token["access_token"] = None
             central_token["refresh_token"] = None
             central_token["expires_at"] = 0.0
+        # Save it and mirror New Central values into central_api.
         settings["central_config"] = merged
         merged_api = _normalize_central_api_settings(settings.get("central_api", {}), merged)
         if merged.get("api_version") == "new_central":
@@ -247,9 +286,11 @@ async def api_settings_update(update: SettingsUpdate) -> dict[str, Any]:
             central_token["refresh_token"] = merged.get("refresh_token") or None
             central_token["expires_at"] = time.time() + 7200 if merged.get("access_token") else 0.0
 
+    # Site mappings: trimmed keys and values, dropping empty keys.
     if update.site_mappings is not None:
         settings["site_mappings"] = {k.strip(): v.strip() for k, v in update.site_mappings.items() if k.strip()}
 
+    # Monitored checks: keep only entries with both a type and an id.
     if update.monitored_checks is not None:
         settings["monitored_checks"] = [
             {"type": c.get("type", ""), "id": c.get("id", ""), "name": c.get("name", c.get("id", ""))}
@@ -257,6 +298,7 @@ async def api_settings_update(update: SettingsUpdate) -> dict[str, Any]:
             if c.get("type") and c.get("id")
         ]
 
+    # Hardware checks: fill in friendly name and device type when missing.
     if update.hardware_checks is not None:
         settings["hardware_checks"] = [
             {
@@ -268,6 +310,7 @@ async def api_settings_update(update: SettingsUpdate) -> dict[str, Any]:
             if c.get("id")
         ]
 
+    # Notification settings: merge into the existing ones.
     if update.notifications is not None:
         merged_notif = dict(settings.get("notifications", {}))
         merged_notif.update(update.notifications)
@@ -276,16 +319,20 @@ async def api_settings_update(update: SettingsUpdate) -> dict[str, Any]:
             merged_notif["smtp_to"] = [a.strip() for a in merged_notif["smtp_to"].split(",") if a.strip()]
         settings["notifications"] = merged_notif
 
+    # Repo sync interval.
     if update.repo_sync_interval is not None:
         interval = max(60, min(86400, update.repo_sync_interval))  # clamp 1min–24hr
         settings["repo_sync_interval"] = interval
 
+    # Certified USB VID:PIDs (must be a JSON list).
     if update.usb_vidpids is not None:
         settings["usb_vidpids"] = _ensure_json_list(update.usb_vidpids.strip(), "usb_vidpids")
 
+    # Seconds a USB device may be missing (at least 1).
     if update.usb_missing_timeout is not None:
         settings["usb_missing_timeout"] = str(max(1, int(update.usb_missing_timeout.strip() or "60")))
 
+    # Any VM template field sent: work out both template specs.
     if any(value is not None for value in (
         update.usb_template_id,
         update.vm_image_1_template_id,
@@ -293,6 +340,8 @@ async def api_settings_update(update: SettingsUpdate) -> dict[str, Any]:
         update.vm_image_2_template_id,
         update.vm_image_2_template_spec,
     )):
+        # Spec 1 comes from the new spec field, then the legacy id field, then the old USB template
+        # id.
         spec1_raw = update.vm_image_1_template_spec
         if spec1_raw is None:
             spec1_raw = update.vm_image_1_template_id
@@ -302,6 +351,7 @@ async def api_settings_update(update: SettingsUpdate) -> dict[str, Any]:
         if spec2_raw is None:
             spec2_raw = update.vm_image_2_template_id
 
+        # Validate both specs; a bad spec becomes a 422.
         try:
             spec1 = _resolved_template_spec(settings, 1) if spec1_raw is None else _normalize_vmid_spec(spec1_raw, field_name="vm_image_1_template_spec")
             spec2 = _resolved_template_spec(settings, 2) if spec2_raw is None else _normalize_vmid_spec(spec2_raw, field_name="vm_image_2_template_spec")
@@ -309,27 +359,34 @@ async def api_settings_update(update: SettingsUpdate) -> dict[str, Any]:
         except ValueError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
 
+        # Save the specs and the primary template id for each image.
         settings["vm_image_1_template_spec"] = spec1
         settings["vm_image_2_template_spec"] = spec2
         settings["vm_image_1_template_id"] = _primary_template_id(spec1, _legacy_template_id(settings, 1))
         settings["vm_image_2_template_id"] = _primary_template_id(spec2, _legacy_template_id(settings, 2))
 
+    # Percent of VMs using image 1 (0-100).
     if update.vm_image_1_pct is not None:
         settings["vm_image_1_pct"] = str(max(0, min(100, int(update.vm_image_1_pct.strip() or "50"))))
 
+    # USB auto-provisioning on/off; turning it off clears any provisioning halt later.
     if update.usb_auto_provision is not None:
         settings["usb_auto_provision"] = _normalize_toggle(update.usb_auto_provision)
         autoprov_disabled = settings["usb_auto_provision"] != "on"
 
+    # Use every dongle, not only certified ones.
     if update.use_all_dongles is not None:
         settings["use_all_dongles"] = bool(update.use_all_dongles)  # validated: always boolean
 
+    # Maximum USB slots (1-256).
     if update.usb_max_slots is not None:
         settings["usb_max_slots"] = str(max(1, min(256, int(update.usb_max_slots.strip() or "24"))))
 
     def _clamp_pct(val: str, default: str) -> str:
+        """Clamp a percent string to 0-100, using the default when it is blank."""
         return str(max(0, min(100, int(val.strip() or default))))
 
+    # CPU and memory thresholds for provisioning and deleting VMs.
     if update.cpu_provision_threshold is not None:
         settings["cpu_provision_threshold"] = _clamp_pct(update.cpu_provision_threshold, "80")
     if update.cpu_delete_threshold is not None:
@@ -339,27 +396,34 @@ async def api_settings_update(update: SettingsUpdate) -> dict[str, Any]:
     if update.mem_delete_threshold is not None:
         settings["mem_delete_threshold"] = _clamp_pct(update.mem_delete_threshold, "90")
 
+    # First VMID to use.
     if update.vmid_start is not None:
         settings["vmid_start"] = max(0, int(update.vmid_start))
 
+    # Ignored USB VID:PIDs (must be a JSON list).
     if update.usb_ignored_vidpids is not None:
         settings["usb_ignored_vidpids"] = _ensure_json_list(update.usb_ignored_vidpids.strip(), "usb_ignored_vidpids")
 
+    # Hostnames to ignore (must be a JSON list).
     if update.ignored_hostnames is not None:
         settings["ignored_hostnames"] = _ensure_json_list(update.ignored_hostnames.strip(), "ignored_hostnames")
 
+    # Hours a VM may stay silent (at least 1).
     if update.vm_silent_timeout is not None:
         settings["vm_silent_timeout"] = str(max(1, int(update.vm_silent_timeout.strip() or "24")))
 
+    # Scheduled reclone on/off.
     if update.reclone_schedule_enabled is not None:
         settings["reclone_schedule_enabled"] = _normalize_toggle(update.reclone_schedule_enabled)
 
+    # Reclone schedule, must look like "<day> HH:MM".
     if update.reclone_schedule_cron is not None:
         cron_value = update.reclone_schedule_cron.strip().lower() or "sunday 02:00"
         if _parse_reclone_schedule(cron_value) is None:
             raise HTTPException(status_code=422, detail="reclone_schedule_cron must be in '<day> HH:MM' format")
         settings["reclone_schedule_cron"] = cron_value
 
+    # How many VMs to reclone at once (at least 1).
     if update.reclone_concurrency is not None:
         settings["reclone_concurrency"] = str(max(1, int(update.reclone_concurrency.strip() or "1")))
 
@@ -375,12 +439,14 @@ async def api_settings_update(update: SettingsUpdate) -> dict[str, Any]:
                 parsed_strs.append(str(entry))
         settings["protected_vmids"] = ", ".join(parsed_strs)
 
+    # L1 VLAN range start and end (valid VLAN ids).
     if update.l1_vlan_start is not None:
         settings["l1_vlan_start"] = str(max(1, min(4094, int(update.l1_vlan_start.strip() or "100"))))
 
     if update.l1_vlan_end is not None:
         settings["l1_vlan_end"] = str(max(1, min(4094, int(update.l1_vlan_end.strip() or "199"))))
 
+    # Guest agent watchdog settings (minute values are at least 1).
     if update.guest_agent_watchdog_enabled is not None:
         settings["guest_agent_watchdog_enabled"] = _normalize_toggle(update.guest_agent_watchdog_enabled)
     if update.guest_agent_grace_minutes is not None:
@@ -394,19 +460,24 @@ async def api_settings_update(update: SettingsUpdate) -> dict[str, Any]:
     if update.watchdog_reboot_enabled is not None:
         settings["watchdog_reboot_enabled"] = _normalize_toggle(update.watchdog_reboot_enabled)
 
+    # Proxmox API token, also kept in the persisted store.
     if update.proxmox_api_token is not None:
         token = update.proxmox_api_token.strip()
         settings["proxmox_api_token"] = token
         _persisted["proxmox_api_token"] = token
 
+    # Serve the spoke UI over TLS or not.
     if update.spoke_tls is not None:
         settings["spoke_tls"] = _normalize_toggle(update.spoke_tls)
 
+    # Write all settings to disk.
     _save_settings()
 
+    # Auto-provisioning turned off: clear any halt state.
     if autoprov_disabled:
         _clear_provision_halt_state()
 
+    # Branch changed: restart the repo sync task on the new branch.
     if changed_branch:
         if "sync_repo" in background_tasks:
             background_tasks["sync_repo"].cancel()
@@ -434,6 +505,7 @@ async def api_settings_update(update: SettingsUpdate) -> dict[str, Any]:
             and str(d.get("vidpid", "")).strip().lower() not in _exclude
         ]
 
+    # Send the new settings to UIs, plus Proxmox/relay state if those changed.
     payload = await api_settings_get()
     await broadcast({"type": "settings_update", "settings": payload})
     if autoprov_disabled:
@@ -447,16 +519,20 @@ async def api_settings_update(update: SettingsUpdate) -> dict[str, Any]:
 
 @router.post("/api/settings/clear/{provider}")
 async def api_settings_clear(provider: str, payload: dict[str, Any] | None = Body(default=None)) -> dict[str, Any]:
+    """Clear the saved settings for one provider (github, relay or central) and notify UIs."""
+    # Flags and data for the follow-up steps.
     provider_key = provider.strip().lower()
     changed_branch = False
     relay_config_changed = False
     relay_payload: dict[str, Any] | None = None
 
+    # GitHub: clear branch and token.
     if provider_key == "github":
         changed_branch = bool(settings.get("repo_branch"))
         settings["repo_branch"] = ""
         settings["github_token"] = ""
     elif provider_key == "relay":
+        # Relay: reset all relay settings and the relay status.
         settings.update({
             "relay_enabled": "off",
             "relay_server_url": "",
@@ -485,6 +561,7 @@ async def api_settings_clear(provider: str, payload: dict[str, Any] | None = Bod
         relay_config_changed = True
         relay_payload = _relay_status_payload()
     elif provider_key == "central":
+        # Central: clear credentials for the requested mode only.
         requested_mode = str((payload or {}).get("mode") or settings.get("central_api", {}).get("mode", "classic")).strip().lower()
         if requested_mode not in {"classic", "central"}:
             raise HTTPException(status_code=422, detail="mode must be 'classic' or 'central'")
@@ -497,10 +574,13 @@ async def api_settings_clear(provider: str, payload: dict[str, Any] | None = Bod
         settings["central_api"] = central_api_cfg
         _sync_central_runtime_config()
     else:
+        # Unknown provider.
         raise HTTPException(status_code=404, detail=f"Unknown settings provider: {provider}")
 
+    # Write settings to disk.
     _save_settings()
 
+    # Branch was cleared: restart the repo sync task.
     if changed_branch:
         if "sync_repo" in background_tasks:
             background_tasks["sync_repo"].cancel()
@@ -508,11 +588,13 @@ async def api_settings_clear(provider: str, payload: dict[str, Any] | None = Bod
                 await background_tasks["sync_repo"]
         background_tasks["sync_repo"] = asyncio.create_task(sync_repo())
 
+    # Send the new settings (and relay state if changed) to UIs.
     payload = await api_settings_get()
     await broadcast({"type": "settings_update", "settings": payload})
     if relay_config_changed and relay_payload is not None:
         await _broadcast_relay_state()
 
+    # Include the relay status in the reply when relay was cleared.
     response: dict[str, Any] = {"status": "ok", "provider": provider_key, "settings": payload}
     if relay_payload is not None:
         response["relay_status"] = relay_payload

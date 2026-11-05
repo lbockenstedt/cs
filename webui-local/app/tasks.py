@@ -38,8 +38,10 @@ from .ws import ws_broadcast
 
 logger = logging.getLogger(__name__)
 
+# Text file holding "on" or "off" for the global kill switch.
 GKILL_SWITCH_URL = "https://raw.githubusercontent.com/solutions-hpe/main/main/gkill"
 
+# Latest gkill value, and each tenant's spoke online state as last broadcast.
 gkill_state: dict[str, Any] = {"value": "off", "last_fetched": 0.0, "error": None}
 spoke_online: dict[str, dict[str, bool]] = {}
 # Hub-side Aruba Central status cache: tenant_id → polled status
@@ -49,6 +51,7 @@ _cache_updated_at: dict[str, float] = {}
 _hub_client_samples: dict[str, dict[str, list[tuple[float, int]]]] = {}
 _hub_client_baseline: dict[str, dict[str, dict[str, float]]] = {}
 
+# Client-count drop alert: minimum samples, drop percent, and window length.
 HUB_CLIENT_COUNT_MIN_SAMPLES = 3
 HUB_CLIENT_COUNT_DROP_PCT = 25.0
 HUB_CLIENT_WINDOW_SECS = 3600
@@ -69,21 +72,25 @@ async def loop_lag_monitor() -> None:
     blocking calls on the hot path (synchronous disk I/O, CPU-bound work, etc.).
     """
     global hub_loop_lag_ms
+    # Time a 100 ms sleep; the excess is how long the loop was blocked.
     while True:
         t0 = time.monotonic()
         await asyncio.sleep(_LAG_MONITOR_INTERVAL)
         excess = (time.monotonic() - t0 - _LAG_MONITOR_INTERVAL) * 1000
         hub_loop_lag_ms = round(max(excess, 0.0), 1)
+        # Warn on lag above 200 ms.
         if hub_loop_lag_ms > 200:
             logger.warning("hub event-loop lag: %.0f ms — synchronous blocking detected", hub_loop_lag_ms)
 
 
 def _set_hub_central_status(tenant_id: str, payload: dict[str, Any]) -> None:
+    """Store a tenant's polled Central status and when it was stored."""
     _hub_central_status[tenant_id] = payload
     _cache_updated_at[tenant_id] = time.time()
 
 
 def _clear_hub_central_status(tenant_id: str) -> None:
+    """Remove a tenant's cached Central status."""
     _hub_central_status.pop(tenant_id, None)
     _cache_updated_at.pop(tenant_id, None)
 
@@ -119,31 +126,40 @@ def _audit(spoke_id: str, tenant_id: str, task_type: str, mode: str, status: str
 
 async def gkill_switch_poller() -> None:
     """Poll global kill switch from GitHub every 5 minutes. Broadcast changes."""
+    # One HTTP client reused for every poll.
     async with httpx.AsyncClient(timeout=10) as client:
         while True:
             try:
+                # Fetch the value; anything other than on/off counts as off.
                 resp = await client.get(GKILL_SWITCH_URL)
                 value = resp.text.strip().lower()
                 if value not in {"on", "off"}:
                     value = "off"
+                # Store the new value and clear any old error.
                 prev = gkill_state["value"]
                 gkill_state["value"] = value
                 gkill_state["last_fetched"] = _now().timestamp()
                 gkill_state["error"] = None
+                # Broadcast only on a change.
                 if value != prev:
                     logger.warning("GKill switch changed: %s → %s", prev, value)
                     await _broadcast_gkill(value)
+            # Let shutdown cancel the loop.
             except asyncio.CancelledError:
                 raise
+            # Record the error and keep polling.
             except Exception as exc:
                 gkill_state["error"] = str(exc)
                 logger.warning("GKill switch fetch failed: %s", exc)
+            # Every 5 minutes.
             await asyncio.sleep(300)
 
 
 async def _broadcast_gkill(value: str) -> None:
     """Publish a new gkill value to the UI and queue updates for distributed islands."""
+    # Tell the browsers.
     await ws_broadcast({"type": "gkill_switch_update", "value": value})
+    # Queue an update for each approved spoke that runs gkill itself, and audit it.
     for tenant in store.list_tenants():
         for spoke in store.list_spokes(tenant.id):
             if spoke.status != "approved":
@@ -156,10 +172,12 @@ async def _broadcast_gkill(value: str) -> None:
 
 async def heartbeat_monitor() -> None:
     """Check spoke last_seen every 30 seconds. Update online state, broadcast changes."""
+    # Wait 30 seconds before the first check.
     await asyncio.sleep(30)
     while True:
         try:
             changed = False
+            # Check each approved spoke in each tenant.
             for tenant in store.list_tenants():
                 tenant_state = spoke_online.setdefault(tenant.id, {})
                 for spoke in store.list_spokes(tenant.id):
@@ -168,6 +186,7 @@ async def heartbeat_monitor() -> None:
                     # Use 300s to match the frontend isOnline() threshold — keeps the
                     # WS heartbeat_update in sync with what the browser displays.
                     online = bool(spoke.last_seen and (_now() - spoke.last_seen).total_seconds() < 300)
+                    # Log and record each change.
                     prev = tenant_state.get(spoke.id)
                     if prev != online:
                         tenant_state[spoke.id] = online
@@ -178,6 +197,7 @@ async def heartbeat_monitor() -> None:
                             spoke.id,
                             "online" if online else "offline",
                         )
+            # Broadcast the full online map if anything changed.
             if changed:
                 await ws_broadcast(
                     {
@@ -185,8 +205,10 @@ async def heartbeat_monitor() -> None:
                         "island_online": {tenant_id: dict(values) for tenant_id, values in spoke_online.items()},
                     }
                 )
+        # Let shutdown cancel the loop.
         except asyncio.CancelledError:
             raise
+        # Log and keep going.
         except Exception as exc:
             logger.exception("Heartbeat monitor error: %s", exc)
         await asyncio.sleep(30)
@@ -194,16 +216,20 @@ async def heartbeat_monitor() -> None:
 
 async def auto_recovery_check() -> None:
     """Check for islands offline > configured threshold and queue recovery commands."""
+    # First check after 30 minutes.
     await asyncio.sleep(1800)
     while True:
         try:
+            # Check each approved spoke in each tenant.
             for tenant in store.list_tenants():
                 for spoke in store.list_spokes(tenant.id):
                     if spoke.status != "approved":
                         continue
+                    # Offline limit in hours (default 24); spokes never seen are skipped.
                     timeout_hours = float(spoke.config.get("vm_silent_timeout", 24))
                     if not spoke.last_seen:
                         continue
+                    # Past the limit: queue a recovery, audit it, and alert the browsers.
                     offline_secs = (_now() - spoke.last_seen).total_seconds()
                     if offline_secs > timeout_hours * 3600:
                         mode = spoke.processing_mode.resolve("heartbeat")
@@ -233,25 +259,31 @@ async def auto_recovery_check() -> None:
                                 "message": f"Auto-recovery: spoke {spoke.hostname} offline {offline_secs / 3600:.1f}h",
                             }
                         )
+        # Let shutdown cancel the loop.
         except asyncio.CancelledError:
             raise
+        # Log and keep going.
         except Exception as exc:
             logger.exception("Auto-recovery error: %s", exc)
         await asyncio.sleep(1800)
 
 
+# Last minute each spoke's schedule fired, so it fires once per minute.
 _last_schedule_trigger: dict[str, str] = {}
 
 
 async def schedule_check() -> None:
     """Check per-spoke schedules every 60 seconds."""
+    # First check after 60 seconds.
     await asyncio.sleep(60)
     while True:
         try:
+            # Today's day name.
             now = _now()
             day_names = ["monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"]
             current_day = day_names[now.weekday()]
 
+            # Check each approved spoke with a reclone schedule.
             for tenant in store.list_tenants():
                 for spoke in store.list_spokes(tenant.id):
                     if spoke.status != "approved":
@@ -259,6 +291,7 @@ async def schedule_check() -> None:
                     cfg = spoke.config
                     if cfg.get("reclone_schedule_enabled") != "on":
                         continue
+                    # Schedule format is "<day> HH:MM"; bad formats are skipped.
                     cron = cfg.get("reclone_schedule_cron", "sunday 02:00")
                     parts = cron.strip().lower().split()
                     if len(parts) != 2:
@@ -269,47 +302,58 @@ async def schedule_check() -> None:
                     except ValueError:
                         continue
 
+                    # Only fire at the scheduled minute.
                     if current_day != sched_day or now.hour != sched_hour or now.minute != sched_min:
                         continue
 
+                    # Only fire once for this minute.
                     trigger_key = now.strftime("%Y-%m-%d %H:%M")
                     if _last_schedule_trigger.get(spoke.id) == trigger_key:
                         continue
                     _last_schedule_trigger[spoke.id] = trigger_key
 
+                    # Queue the reclone and audit it.
                     mode = spoke.processing_mode.resolve("schedules")
                     store.enqueue_command(_cmd(spoke.id, tenant.id, "reclone_schedule", {}))
                     store.append_audit(_audit(spoke.id, tenant.id, "schedule", mode, "pending", f"Scheduled reclone: {cron}"))
                     logger.info("Schedule triggered reclone for spoke %s (%s)", spoke.hostname, spoke.id)
+        # Let shutdown cancel the loop.
         except asyncio.CancelledError:
             raise
+        # Log and keep going.
         except Exception as exc:
             logger.exception("Schedule check error: %s", exc)
         await asyncio.sleep(60)
 
 
+# Aruba clients per tenant and the hash of the config each was built from.
 _aruba_clients: dict[str, ArubaClient] = {}
 _aruba_client_hashes: dict[str, str] = {}
 
 
 def _get_aruba_client(tenant_id: str) -> ArubaClient | None:
     """Return a cached Aruba client for a tenant, rebuilding it when config changes."""
+    # No config: drop any cached client.
     tenant = store.get_tenant(tenant_id)
     if not tenant or not tenant.aruba_config_enc:
         _aruba_clients.pop(tenant_id, None)
         _aruba_client_hashes.pop(tenant_id, None)
         return None
     try:
+        # Decrypt and check the config.
         cfg = decrypt_dict(tenant.aruba_config_enc)
         cfg["cluster_url"] = validate_cluster_url(cfg.get("cluster_url", ""))
+        # Reuse the cached client if the config is unchanged.
         cfg_hash = hashlib.md5(json.dumps(cfg, sort_keys=True, default=str).encode()).hexdigest()
         cached = _aruba_clients.get(tenant_id)
         if cached and _aruba_client_hashes.get(tenant_id) == cfg_hash:
             return cached
+        # Otherwise build and cache a new one.
         client = ArubaClient(cfg)
         _aruba_clients[tenant_id] = client
         _aruba_client_hashes[tenant_id] = cfg_hash
         return client
+    # On error, log and drop the cached client.
     except Exception as exc:
         logger.warning("Failed to load Aruba config for tenant %s: %s", tenant_id, exc)
         _aruba_clients.pop(tenant_id, None)
@@ -318,10 +362,13 @@ def _get_aruba_client(tenant_id: str) -> ArubaClient | None:
 
 
 def _normalize_site_token(value: Any) -> str:
+    """Return a site name lowercased with extra spaces removed, for matching."""
     return " ".join(str(value or "").strip().casefold().split())
 
 
 def _spoke_aruba_config(config: dict[str, Any] | None) -> dict[str, Any] | None:
+    """Return a copy of a spoke's Aruba config without its webhook fields, or None."""
+    # Not a dict: nothing.
     if not isinstance(config, dict):
         return None
     return {
@@ -332,6 +379,7 @@ def _spoke_aruba_config(config: dict[str, Any] | None) -> dict[str, Any] | None:
 
 
 def _finding_payload(finding: ArubaFinding) -> dict[str, Any]:
+    """Convert an Aruba finding to a dict for the status payload."""
     return {
         "site": finding.site_name,
         "check": finding.check_name,
@@ -344,12 +392,18 @@ def _merge_webhook_findings(
     findings: list[dict[str, Any]],
     webhook_findings: dict[str, dict[str, Any]] | None,
 ) -> list[dict[str, Any]]:
+    """Return findings plus webhook findings not already present.
+
+    Findings are matched on site, check and source.
+    """
+    # Keys of the findings already present.
     merged = list(findings)
     existing = {
         (str(item.get("site") or "").strip(), str(item.get("check") or "").strip(), str(item.get("source") or "").strip())
         for item in findings
         if isinstance(item, dict)
     }
+    # Add each new, valid webhook finding.
     for item in (webhook_findings or {}).values():
         if not isinstance(item, dict):
             continue
@@ -367,6 +421,13 @@ def _merge_webhook_findings(
 
 
 async def _auto_discover_hub_central_config(tenant_id: str, client: ArubaClient) -> tuple[dict[str, Any], dict[str, str]]:
+    """Fill in a tenant's Central site config from what Central reports, and save any changes.
+
+    Adds unmapped, non-excluded sites as same-name mappings and, for new Central, the
+    default monitored and hardware checks if none are set. Returns the normalized config
+    and a map of Central site id to site name.
+    """
+    # Load the saved config.
     config = dict(store.get_tenant_central_sites_config(tenant_id) or {})
     site_mappings = dict(config.get("site_mappings") or {}) if isinstance(config.get("site_mappings"), dict) else {}
     monitored_checks = list(config.get("monitored_checks") or []) if isinstance(config.get("monitored_checks"), list) else []
@@ -374,14 +435,17 @@ async def _auto_discover_hub_central_config(tenant_id: str, client: ArubaClient)
     excluded_sites = {str(s).strip().casefold() for s in (config.get("excluded_sites") or []) if str(s).strip()}
     changed = False
 
+    # Ask Central for its sites and map site id to name.
     discovered_sites = await client.list_sites()
     site_id_map = {
         str((site or {}).get("site_id") or "").strip(): str((site or {}).get("name") or "").strip()
         for site in discovered_sites
         if str((site or {}).get("site_id") or "").strip() and str((site or {}).get("name") or "").strip()
     }
+    # Names already mapped on either side.
     existing_wsites = {_normalize_site_token(name) for name in site_mappings}
     existing_central = {_normalize_site_token(name) for name in site_mappings.values()}
+    # Add a same-name mapping for each new site.
     for site in discovered_sites:
         site_name = str((site or {}).get("name") or "").strip()
         normalized = _normalize_site_token(site_name)
@@ -393,6 +457,7 @@ async def _auto_discover_hub_central_config(tenant_id: str, client: ArubaClient)
         existing_central.add(normalized)
         changed = True
 
+    # New Central with no checks set: use the defaults.
     if client.api_version == "new_central" and not monitored_checks:
         monitored_checks = [dict(item) for item in DEFAULT_NEW_CENTRAL_MONITORED_CHECKS]
         changed = True
@@ -409,6 +474,7 @@ async def _auto_discover_hub_central_config(tenant_id: str, client: ArubaClient)
         updated["hardware_checks"] = [dict(item) for item in hardware_checks if isinstance(item, dict)]
         store.set_tenant_central_sites_config(tenant_id, updated)
 
+    # Return the cleaned config and the site id map.
     normalized_config = {
         "site_mappings": {str(wsite).strip(): str(central_site).strip() for wsite, central_site in site_mappings.items() if str(wsite).strip() and str(central_site).strip()},
         "monitored_checks": [dict(item) for item in monitored_checks if isinstance(item, dict)],
@@ -418,11 +484,15 @@ async def _auto_discover_hub_central_config(tenant_id: str, client: ArubaClient)
 
 
 def _load_hub_client_baseline(tenant_id: str) -> None:
+    """Load a tenant's saved client-count baselines into memory, once."""
+    # Already loaded.
     if tenant_id in _hub_client_baseline:
         return
+    # Read the baselines from the tenant's hub config.
     tenant = store.get_tenant(tenant_id)
     saved = ((tenant.hub_config or {}).get("hub_client_baseline", {}) if tenant else {}) or {}
     baseline: dict[str, dict[str, float]] = {}
+    # Keep only well-formed entries.
     if isinstance(saved, dict):
         for wsite, info in saved.items():
             if not isinstance(info, dict):
@@ -437,8 +507,10 @@ def _load_hub_client_baseline(tenant_id: str) -> None:
 
 
 def _refresh_hub_client_baseline(tenant_id: str) -> None:
+    """Recompute each site's baseline average from the current samples."""
     tenant_samples = _hub_client_samples.get(tenant_id, {})
     baseline = _hub_client_baseline.setdefault(tenant_id, {})
+    # Sites with too few samples keep their old baseline.
     for wsite, samples in tenant_samples.items():
         if len(samples) < HUB_CLIENT_COUNT_MIN_SAMPLES:
             continue
@@ -449,9 +521,12 @@ def _refresh_hub_client_baseline(tenant_id: str) -> None:
 
 
 def _persist_hub_client_baseline(tenant_id: str) -> None:
+    """Save a tenant's baselines into its hub config if they changed."""
+    # Tenant must exist.
     tenant = store.get_tenant(tenant_id)
     if not tenant:
         return
+    # Clean up the baselines.
     baseline = _hub_client_baseline.get(tenant_id, {})
     payload = {
         str(wsite): {
@@ -461,6 +536,7 @@ def _persist_hub_client_baseline(tenant_id: str) -> None:
         for wsite, info in baseline.items()
         if isinstance(info, dict)
     }
+    # Save only if changed.
     hub_config = dict(tenant.hub_config or {})
     if hub_config.get("hub_client_baseline") == payload:
         return
@@ -470,15 +546,23 @@ def _persist_hub_client_baseline(tenant_id: str) -> None:
 
 
 def _hub_client_count_payload(tenant_id: str, site_mappings: dict[str, str]) -> dict[str, Any]:
+    """Return each site's current client count, average, drop percent and status.
+
+    With too few samples, the saved baseline is used and marked stale; with no baseline
+    either, the status is NO_DATA.
+    """
+    # Make sure baselines are loaded.
     _load_hub_client_baseline(tenant_id)
     tenant_samples = _hub_client_samples.get(tenant_id, {})
     baseline = _hub_client_baseline.get(tenant_id, {})
     result: dict[str, Any] = {}
+    # Each site with samples; the latest sample is the current count.
     for wsite, samples in tenant_samples.items():
         if not samples:
             continue
         current = samples[-1][1]
         site_name = site_mappings.get(wsite, wsite)
+        # Too few samples: compare with the saved baseline, if any.
         if len(samples) < HUB_CLIENT_COUNT_MIN_SAMPLES:
             saved = baseline.get(wsite)
             if saved:
@@ -506,6 +590,7 @@ def _hub_client_count_payload(tenant_id: str, site_mappings: dict[str, str]) -> 
                     "baseline_stale": False,
                 }
             continue
+        # Enough samples: compare with the window average.
         avg = sum(sample[1] for sample in samples) / len(samples)
         drop_pct = max(0.0, (avg - current) / avg * 100.0) if avg >= 1 else 0.0
         status = "DEGRADED" if drop_pct >= HUB_CLIENT_COUNT_DROP_PCT else "OK"
@@ -522,9 +607,15 @@ def _hub_client_count_payload(tenant_id: str, site_mappings: dict[str, str]) -> 
 
 
 async def hub_baseline_saver() -> None:
+    """Save every tenant's client-count baselines once an hour.
+
+    Baselines for deleted tenants are dropped.
+    """
+    # First save after an hour.
     await asyncio.sleep(HUB_CLIENT_WINDOW_SECS)
     while True:
         try:
+            # Drop deleted tenants; refresh and save the rest.
             active_tenant_ids = {tenant.id for tenant in store.list_tenants()}
             for tenant_id in list(_hub_client_baseline):
                 if tenant_id not in active_tenant_ids:
@@ -533,8 +624,10 @@ async def hub_baseline_saver() -> None:
                     continue
                 _refresh_hub_client_baseline(tenant_id)
                 _persist_hub_client_baseline(tenant_id)
+        # Let shutdown cancel the loop.
         except asyncio.CancelledError:
             raise
+        # Log and keep going.
         except Exception as exc:
             logger.exception("Hub baseline saver error: %s", exc)
         await asyncio.sleep(HUB_CLIENT_WINDOW_SECS)
@@ -542,14 +635,17 @@ async def hub_baseline_saver() -> None:
 
 async def aruba_poller() -> None:
     """Poll Aruba Central every 5 minutes per tenant. Centralized or push config to islands."""
+    # First poll after 60 seconds.
     await asyncio.sleep(60)
     while True:
         try:
+            # Each tenant and its approved spokes.
             tenants = store.list_tenants()
             active_tenant_ids = {tenant.id for tenant in tenants}
             for tenant in tenants:
                 spokes = [spoke for spoke in store.list_spokes(tenant.id) if spoke.status == "approved"]
 
+                # The hub's Aruba client, and the config to send if any spoke polls itself.
                 client = _get_aruba_client(tenant.id)
                 tenant_config: dict[str, Any] | None = None
                 if any(spoke.processing_mode.resolve("aruba_polling") == "distributed" for spoke in spokes):
@@ -559,6 +655,7 @@ async def aruba_poller() -> None:
                         except Exception as exc:
                             logger.warning("Failed to load Aruba config for tenant %s: %s", tenant.id, exc)
 
+                # Send the config to spokes that poll themselves; audit a failure if there is none.
                 distributed_spokes = [spoke for spoke in spokes if spoke.processing_mode.resolve("aruba_polling") == "distributed"]
                 for spoke in distributed_spokes:
                     if not tenant_config:
@@ -570,6 +667,8 @@ async def aruba_poller() -> None:
                 # Check monitored items for distributed spokes using spoke telemetry
                 if distributed_spokes:
                     try:
+                        # Gather site, alert, insight, client and device names from those spokes'
+                        # telemetry.
                         dist_site_names: set[str] = set()
                         dist_alert_names: set[str] = set()
                         dist_insight_names: set[str] = set()
@@ -579,9 +678,11 @@ async def aruba_poller() -> None:
                         dist_device_names: dict[str, str] = {}
                         for spoke in distributed_spokes:
                             central_tel = spoke.telemetry.get("central", {}) if isinstance(spoke.telemetry, dict) else {}
+                            # Mapped site names.
                             for wsite, csite in (central_tel.get("site_mappings") or {}).items():
                                 dist_site_names.add(str(wsite).strip().lower())
                                 dist_site_names.add(str(csite).strip().lower())
+                            # Checks with a nonzero count, split into alerts and insights.
                             for wsite, checks in (central_tel.get("status") or {}).items():
                                 for check_id, info in (checks or {}).items():
                                     if isinstance(info, dict) and int(info.get("count") or 0) > 0:
@@ -605,6 +706,7 @@ async def aruba_poller() -> None:
                                     dist_alert_names.add(n)
                                     if alt.get("ts") and n not in dist_alert_ts:
                                         dist_alert_ts[n] = str(alt["ts"])
+                            # Client MACs.
                             for client_entry in (central_tel.get("clients") or []):
                                 if isinstance(client_entry, dict) and client_entry.get("mac"):
                                     dist_client_macs.add(str(client_entry["mac"]).strip().lower())
@@ -615,7 +717,9 @@ async def aruba_poller() -> None:
                                     dev_key = str(dev.get("name") or dev.get("serial") or "").strip().lower()
                                     if dev_key and dev_key not in dist_device_names:
                                         dist_device_names[dev_key] = str(dev.get("last_seen") or "")
+                        # Check monitored items against what was gathered.
                         await _check_monitored_items(tenant.id, "distributed", dist_site_names, dist_alert_names, dist_insight_names, dist_client_macs, dist_alert_ts, dist_insight_ts, dist_device_names)
+                    # Log and carry on.
                     except Exception as exc:
                         logger.warning("Distributed monitored items check failed for tenant %s: %s", tenant.id, exc)
 
@@ -626,9 +730,11 @@ async def aruba_poller() -> None:
                 should_poll_central = bool(centralized_spokes) or (
                     not spokes and tenant.default_processing_mode.resolve("aruba_polling") == "centralized"
                 )
+                # No polling needed: clear the cached status.
                 if not should_poll_central:
                     _clear_hub_central_status(tenant.id)
                     continue
+                # No working client: store a not-configured status.
                 if not client or not client.is_configured():
                     _set_hub_central_status(
                         tenant.id,
@@ -645,8 +751,11 @@ async def aruba_poller() -> None:
                     )
                     continue
 
+                # Poll Central's alerts and insights.
                 try:
                     findings = await client.poll_alerts_and_insights()
+                # Poll failed: store and broadcast an error status, and audit a failure for each
+                # spoke.
                 except Exception as exc:
                     _set_hub_central_status(
                         tenant.id,
@@ -678,6 +787,7 @@ async def aruba_poller() -> None:
                         store.append_audit(_audit(spoke.id, tenant.id, "aruba_poll", "centralized", "failure", str(exc)))
                     continue
 
+                # Poll worked: audit a success for each centralized spoke.
                 finding_payload = [_finding_payload(finding) for finding in findings]
                 for spoke in centralized_spokes:
                     store.append_audit(
@@ -685,12 +795,14 @@ async def aruba_poller() -> None:
                     )
 
                 try:
+                    # Fill in the site config from Central and read its mappings and checks.
                     site_raw: dict[str, dict[str, Any]] = {}
                     spokes_status: dict[str, dict[str, Any]] = {}
                     hub_sites_cfg, site_id_map = await _auto_discover_hub_central_config(tenant.id, client)
                     hub_site_mappings = hub_sites_cfg.get("site_mappings", {}) if isinstance(hub_sites_cfg.get("site_mappings"), dict) else {}
                     hub_monitored_checks = hub_sites_cfg.get("monitored_checks", []) if isinstance(hub_sites_cfg.get("monitored_checks"), list) else []
                     hub_hardware_checks = hub_sites_cfg.get("hardware_checks", []) if isinstance(hub_sites_cfg.get("hardware_checks"), list) else []
+                    # The Central sites to poll and the hardware check ids.
                     unique_sites = {
                         str(site_name).strip()
                         for site_name in hub_site_mappings.values()
@@ -702,9 +814,11 @@ async def aruba_poller() -> None:
                         if isinstance(check, dict) and str(check.get("id") or "").strip()
                     }
 
+                    # Poll each Central site.
                     for central_site in unique_sites:
                         site_raw[central_site] = await client.poll_site_data(central_site, hw_check_ids=hw_check_ids)
 
+                    # Add a client-count sample for each site, dropping those older than the window.
                     now = time.time()
                     cutoff = now - HUB_CLIENT_WINDOW_SECS
                     _load_hub_client_baseline(tenant.id)
@@ -715,9 +829,11 @@ async def aruba_poller() -> None:
                         samples = tenant_samples.setdefault(wsite, [])
                         samples.append((now, wl_count))
                         tenant_samples[wsite] = [sample for sample in samples if sample[0] >= cutoff]
+                    # Refresh the baselines and work out the client-count status.
                     _refresh_hub_client_baseline(tenant.id)
                     client_count_status = _hub_client_count_payload(tenant.id, hub_site_mappings)
 
+                    # Per-site results, and the sites where each hardware check found devices.
                     aggregated_status: dict[str, dict[str, Any]] = {}
                     aggregated_wireless_clients: dict[str, int] = {}
                     aggregated_total_clients: dict[str, int] = {}
@@ -727,6 +843,7 @@ async def aruba_poller() -> None:
                         if isinstance(check, dict) and str(check.get("id") or "").strip()
                     }
 
+                    # For each mapped site, read that site's poll results.
                     for wsite, central_site in hub_site_mappings.items():
                         raw = site_raw.get(central_site, {})
                         alert_type_counts = raw.get("alert_type_counts", {}) if isinstance(raw.get("alert_type_counts"), dict) else {}
@@ -755,6 +872,7 @@ async def aruba_poller() -> None:
                                     [str(c.get("id")) for c in hub_monitored_checks if isinstance(c, dict) and c.get("id")],
                                     sorted(_alert_ci), sorted(_insight_ci))
 
+                        # Status of each monitored alert/insight check: OK when it is present.
                         for check in hub_monitored_checks:
                             if not isinstance(check, dict):
                                 continue
@@ -774,10 +892,12 @@ async def aruba_poller() -> None:
                                 "ts": now,
                             }
 
+                        # Store the site's status and client counts.
                         aggregated_status[wsite] = site_status
                         aggregated_wireless_clients[wsite] = int(raw.get("wireless_clients") or 0)
                         aggregated_total_clients[wsite] = int(raw.get("client_count") or raw.get("wireless_clients") or 0)
 
+                        # Devices each hardware check found at this site.
                         for check in hub_hardware_checks:
                             if not isinstance(check, dict):
                                 continue
@@ -789,6 +909,7 @@ async def aruba_poller() -> None:
                             if device_names:
                                 hw_sites.setdefault(check_id, {})[wsite] = device_names
 
+                    # One hardware alert entry per check, listing the sites and devices.
                     aggregated_hardware_alerts: list[dict[str, Any]] = []
                     for check in hub_hardware_checks:
                         if not isinstance(check, dict):
@@ -810,6 +931,7 @@ async def aruba_poller() -> None:
                             }
                         )
 
+                    # Each centralized spoke gets a copy of the same results.
                     for spoke in centralized_spokes:
                         spokes_status[spoke.id] = {
                             "assigned_sites": spoke.assigned_sites,
@@ -823,11 +945,13 @@ async def aruba_poller() -> None:
                             "hardware_checks": list(hub_hardware_checks),
                         }
 
+                    # Keep earlier webhook findings and merge them into the poll's findings.
                     existing_webhook_findings = {}
                     existing_status = _hub_central_status.get(tenant.id, {})
                     if isinstance(existing_status.get("webhook_findings"), dict):
                         existing_webhook_findings = dict(existing_status.get("webhook_findings") or {})
                     merged_findings = _merge_webhook_findings(finding_payload, existing_webhook_findings)
+                    # Store and broadcast the new status.
                     _set_hub_central_status(
                         tenant.id,
                         {
@@ -861,6 +985,7 @@ async def aruba_poller() -> None:
                     )
                     # Check monitored items against fresh Central data
                     try:
+                        # Site names and the names of the alerts and insights found.
                         site_names_lower = {str(s).strip().lower() for s in hub_site_mappings.values() if s} | {str(s).strip().lower() for s in hub_site_mappings.keys() if s}
                         alert_names_lower = {str(f.check_name or "").strip().lower() for f in findings if isinstance(f, ArubaFinding) and f.source == "alert"}
                         insight_names_lower = {str(f.check_name or "").strip().lower() for f in findings if isinstance(f, ArubaFinding) and f.source == "insight"}
@@ -869,6 +994,7 @@ async def aruba_poller() -> None:
                         # the insights/alerts from /network-notifications/v1/* so monitored items
                         # added via the browse tab would never match without this.
                         try:
+                            # Alert and insight names and times, and device names.
                             browse = await client.browse_all()
                             alert_ts: dict[str, str] = {}
                             insight_ts: dict[str, str] = {}
@@ -890,24 +1016,31 @@ async def aruba_poller() -> None:
                                     dev_key = str(dev.get("name") or dev.get("serial") or "").strip().lower()
                                     if dev_key:
                                         device_names_lower[dev_key] = str(dev.get("last_seen") or "")
+                        # Browse failed: carry on without it.
                         except Exception as browse_exc:
                             alert_ts = {}
                             insight_ts = {}
                             device_names_lower = {}
                             logger.debug("browse_all() augment for monitored check failed: %s", browse_exc)
                         # Fetch clients only if there are client-type monitored items
+                        # Is any monitored item a client?
                         cfg_snap = store.get_tenant_central_sites_config(tenant.id)
                         needs_clients = any(isinstance(mi, dict) and mi.get("type") == "client" for mi in (cfg_snap.get("monitored_items") or []))
                         client_macs_lower: set[str] = set()
+                        # If so, get the client MACs; failures are ignored.
                         if needs_clients:
                             try:
                                 cl_list = await client.list_clients()
                                 client_macs_lower = {str(c.get("mac") or "").strip().lower() for c in cl_list if c.get("mac")}
                             except Exception:
                                 pass
+                        # Check the monitored items.
                         await _check_monitored_items(tenant.id, "centralized", site_names_lower, alert_names_lower, insight_names_lower, client_macs_lower, alert_ts, insight_ts, device_names_lower)
+                    # Log and carry on.
                     except Exception as exc:
                         logger.warning("Monitored items check failed for tenant %s: %s", tenant.id, exc)
+                # Site poll failed: store and broadcast an error status, and audit a failure for
+                # each spoke.
                 except Exception as exc:
                     _set_hub_central_status(
                         tenant.id,
@@ -938,6 +1071,7 @@ async def aruba_poller() -> None:
                     for spoke in centralized_spokes:
                         store.append_audit(_audit(spoke.id, tenant.id, "aruba_poll", "centralized", "failure", str(exc)))
 
+            # Drop cached status, samples and clients for deleted tenants.
             for tenant_id in list(_hub_central_status):
                 if tenant_id not in active_tenant_ids:
                     _clear_hub_central_status(tenant_id)
@@ -949,10 +1083,13 @@ async def aruba_poller() -> None:
                 if tenant_id not in active_tenant_ids:
                     _aruba_clients.pop(tenant_id, None)
                     _aruba_client_hashes.pop(tenant_id, None)
+        # Let shutdown cancel the loop.
         except asyncio.CancelledError:
             raise
+        # Log and keep going.
         except Exception as exc:
             logger.exception("Aruba poller error: %s", exc)
+        # Every 5 minutes.
         await asyncio.sleep(300)
 
 
@@ -960,18 +1097,22 @@ async def send_notification(tenant_id: str, spoke_id: str, title: str, message: 
     """Send notifications centrally or queue spoke-side delivery based on feature mode."""
     from .notifications import send_email, send_teams_webhook
 
+    # No notification config: nothing to send.
     cfg = get_notification_config(tenant_id)
     if not cfg:
         return
 
+    # Use the spoke's Teams and email modes, or the given mode if there is no spoke.
     spoke = store.get_spoke(tenant_id, spoke_id) if spoke_id else None
     teams_mode = spoke.processing_mode.resolve("teams_webhook") if spoke else mode
     email_mode = spoke.processing_mode.resolve("email") if spoke else mode
 
+    # Config to send to the spoke, and which paths were used.
     distributed_cfg: dict[str, Any] = {"enabled": True}
     distributed = False
     centralized = False
 
+    # Teams: add to the spoke's config, or send it from here.
     if cfg.get("teams_webhook"):
         if teams_mode == "distributed":
             distributed_cfg["teams_webhook"] = cfg["teams_webhook"]
@@ -981,6 +1122,7 @@ async def send_notification(tenant_id: str, spoke_id: str, title: str, message: 
             await send_teams_webhook(cfg["teams_webhook"], title, message)
             centralized = True
 
+    # Email: add to the spoke's config, or send it from here.
     if cfg.get("smtp_host") and cfg.get("to_emails"):
         if email_mode == "distributed":
             distributed_cfg.update(
@@ -1007,6 +1149,7 @@ async def send_notification(tenant_id: str, spoke_id: str, title: str, message: 
             )
             centralized = True
 
+    # Queue the spoke's share and audit it.
     if distributed and spoke_id:
         store.enqueue_command(
             _cmd(
@@ -1017,6 +1160,7 @@ async def send_notification(tenant_id: str, spoke_id: str, title: str, message: 
             )
         )
         store.append_audit(_audit(spoke_id, tenant_id, "notification", "distributed", "pending", title))
+    # Audit what was sent from here.
     if centralized and spoke_id:
         store.append_audit(_audit(spoke_id, tenant_id, "notification", "centralized", "success", title))
 
@@ -1037,23 +1181,28 @@ async def _check_monitored_items(
     device_names maps lowercase device name/serial → lastSeenAt ISO string (or empty string).
     Used to resolve 'gateway' type monitored items.
     """
+    # No monitored items: nothing to check.
     cfg = store.get_tenant_central_sites_config(tenant_id)
     items: list[dict[str, Any]] = list(cfg.get("monitored_items") or [])
     if not items:
         return
 
+    # Times past which an item turns yellow, turns red, and triggers a notification.
     now = time.time()
     WARN_SECS  = 15 * 60   # 15 minutes → yellow
     CRIT_SECS  = 30 * 60   # 30 minutes → red
     NOTIFY_SECS = 30 * 60  # notify once when crossing 30-minute threshold
+    # Missing maps count as empty.
     alert_ts = alert_ts or {}
     insight_ts = insight_ts or {}
     device_names = device_names or {}
     changed = False
 
+    # Check each item.
     for item in items:
         if not isinstance(item, dict):
             continue
+        # Is the item in the matching data, and when did Central last see it?
         item_type = str(item.get("type") or "")
         identifier = str(item.get("identifier") or "").strip().lower()
 
@@ -1075,6 +1224,7 @@ async def _check_monitored_items(
         else:
             continue
 
+        # Found: reset to OK.
         if found:
             item["consecutive_failures"] = 0
             item["last_seen"] = now
@@ -1095,9 +1245,11 @@ async def _check_monitored_items(
                 item["missing_since"] = now
             missing_for = now - float(item["missing_since"])
 
+            # Count the failure.
             prev = int(item.get("consecutive_failures") or 0)
             item["consecutive_failures"] = prev + 1
 
+            # Status from how long it has been missing.
             if missing_for >= CRIT_SECS:
                 item["status"] = "missing"   # red
             elif missing_for >= WARN_SECS:
@@ -1108,6 +1260,7 @@ async def _check_monitored_items(
 
             # Notify once when the item first crosses the 30-minute threshold.
             last_notified = float(item.get("last_notified") or 0)
+            # Notify once when it passes 30 minutes, at most every 30 minutes; failures are logged.
             if missing_for >= NOTIFY_SECS and (now - last_notified) > NOTIFY_SECS:
                 item["last_notified"] = now
                 item_name = item.get("name") or identifier
@@ -1121,6 +1274,7 @@ async def _check_monitored_items(
                 except Exception as exc:
                     logger.warning("Monitored item notification failed for tenant %s: %s", tenant_id, exc)
 
+    # Save the updated items.
     if changed:
         cfg["monitored_items"] = items
         store.set_tenant_central_sites_config(tenant_id, cfg)
@@ -1129,6 +1283,8 @@ async def _check_monitored_items(
 async def maintenance_loop() -> None:
     """Purge expired commands and old audit entries every 5 minutes."""
     while True:
+        # Every 5 minutes, purge expired commands, old audit entries, and tenants deleted 30+ days
+        # ago.
         await asyncio.sleep(300)
         try:
             purged_cmds = store.purge_expired_commands()
@@ -1138,6 +1294,7 @@ async def maintenance_loop() -> None:
                 logger.info("Maintenance: purged %s expired commands, %s old audit entries", purged_cmds, purged_audit)
             if purged_tenants:
                 logger.info("Maintenance: purged %s tenant(s) deleted >30 days ago: %s", len(purged_tenants), purged_tenants)
+        # Log and keep going.
         except Exception as exc:
             logger.warning("Maintenance error: %s", exc)
 
@@ -1149,24 +1306,30 @@ async def acme_renewal_check() -> None:
 
     while True:
         try:
+            # Renew the certificate if needed and tell the browsers.
             renewed = await renew_if_needed(Path(settings.data_dir))
             if renewed:
                 cert_info = get_cert_info()
                 logger.info("ACME certificate renewed; expires %s", cert_info.get("expires", ""))
                 await ws_broadcast({"type": "cert_renewed", "expires": cert_info.get("expires", "")})
+        # Let shutdown cancel the loop.
         except asyncio.CancelledError:
             raise
+        # Log and keep going.
         except Exception as exc:
             logger.exception("ACME renewal check error: %s", exc)
+        # Every 24 hours.
         await asyncio.sleep(86400)
 
 
 async def check_state_engine() -> None:
     """Evaluate spoke online/offline status and fire notifications on transitions."""
+    # First check after 60 seconds; online state from the last pass.
     await asyncio.sleep(60)
     prev_online: dict[str, bool] = {}
     while True:
         try:
+            # Check each approved spoke in each tenant.
             for tenant in store.list_tenants():
                 for spoke in store.list_spokes(tenant.id):
                     if spoke.status != "approved":
@@ -1174,6 +1337,7 @@ async def check_state_engine() -> None:
                     key = f"{tenant.id}:{spoke.id}"
                     # Use 300s to match the frontend isOnline() threshold.
                     online = bool(spoke.last_seen and (_now() - spoke.last_seen).total_seconds() < 300)
+                    # Online to offline: notify.
                     was_online = prev_online.get(key)
                     if was_online is True and not online:
                         await send_notification(
@@ -1183,8 +1347,10 @@ async def check_state_engine() -> None:
                             f"Spoke {spoke.hostname} has gone offline (no telemetry in 10 minutes).",
                         )
                     prev_online[key] = online
+        # Let shutdown cancel the loop.
         except asyncio.CancelledError:
             raise
+        # Log and keep going.
         except Exception as exc:
             logger.exception("Check state engine error: %s", exc)
         await asyncio.sleep(60)
@@ -1207,6 +1373,7 @@ async def central_browse_poller() -> None:
     first_run = True
     while True:
         try:
+            # Each tenant.
             tenants = store.list_tenants()
             now = _time.time()
             for tenant in tenants:
@@ -1219,6 +1386,7 @@ async def central_browse_poller() -> None:
                             _central_browse_cache_ts[tenant.id] = disk.get("cached_at", 0)
                             logger.info("central_browse_poller: loaded disk cache for tenant %s", tenant.id)
                 else:
+                    # Refresh if the cache is older than the tenant's interval (at least 1 minute).
                     interval_secs = max(60, (tenant.central_browse_interval_minutes or 5) * 60)
                     last_ts = _central_browse_cache_ts.get(tenant.id, 0)
                     if now - last_ts >= interval_secs:
@@ -1227,8 +1395,10 @@ async def central_browse_poller() -> None:
                             logger.debug("central_browse_poller: refreshed tenant %s (interval=%dm)", tenant.id, tenant.central_browse_interval_minutes)
                         except Exception as exc:
                             logger.warning("central_browse_poller: refresh failed for %s: %s", tenant.id, exc)
+        # Let shutdown cancel the loop.
         except asyncio.CancelledError:
             raise
+        # Log and keep going.
         except Exception as exc:
             logger.warning("central_browse_poller error: %s", exc)
 

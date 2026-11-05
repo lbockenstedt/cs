@@ -1,6 +1,8 @@
 """Settings (helpers moved verbatim from server.py; shared deps imported from server)."""
+# Postpone annotation evaluation so modern type hints are never evaluated at runtime.
 from __future__ import annotations
 
+# Shared state, constants and helpers come from server.py; this module builds settings payloads.
 from server import (
     Any,
     RELAY_INTERVAL_DEFAULT,
@@ -24,19 +26,27 @@ from server import (
 
 
 def _get_cached_settings() -> dict[str, Any]:
+    """Return the UI-safe settings snapshot, reusing a cached copy for a short time.
+
+    Secrets are removed and replaced by "configured" flags; callers get a deep copy.
+    """
+    # Use the cached snapshot while it is newer than the cache TTL.
     now = time.monotonic()
     if state._settings_cache and (now - state._settings_cache_time) < _SETTINGS_CACHE_TTL:
         return copy.deepcopy(state._settings_cache)
 
+    # Copy the legacy Central config so secrets can be removed from it.
     cfg = dict(settings["central_config"])
     # Strip all secrets — return only non-sensitive fields + presence flags.
     # Runtime token flags are refreshed in api_settings_get() so they never go stale.
     for secret_key in ("client_secret", "access_token", "refresh_token"):
         cfg.pop(secret_key, None)
+    # Report which tokens/secrets are set (stored or held at runtime).
     cfg["access_token_configured"] = bool(settings["central_config"].get("access_token") or central_token.get("access_token"))
     cfg["refresh_token_configured"] = bool(settings["central_config"].get("refresh_token") or central_token.get("refresh_token"))
     cfg["client_secret_configured"] = bool(settings["central_config"].get("client_secret"))
 
+    # Build the snapshot: each setting with its default, secrets as booleans only.
     state._settings_cache = {
         "repo_url": REPO_URL,
         "repo_branch": settings.get("repo_branch", ""),
@@ -117,6 +127,7 @@ def _get_cached_settings() -> dict[str, Any]:
         },
         "proxmox_config": copy.deepcopy(settings.get("proxmox_config") or {}),
     }
+    # Remember when it was built and return a copy so callers cannot change the cache.
     state._settings_cache_time = now
     return copy.deepcopy(state._settings_cache)
 
@@ -125,7 +136,10 @@ def _get_cached_settings() -> dict[str, Any]:
 
 
 def _public_settings() -> dict[str, Any]:
+    """Return the public settings with live token flags and Proxmox config refreshed."""
+    # Start from the cached snapshot.
     payload = _get_cached_settings()
+    # Refresh the values that can change between cache rebuilds.
     payload["central_config"]["access_token_configured"] = bool(
         settings["central_config"].get("access_token") or central_token.get("access_token")
     )
@@ -141,10 +155,14 @@ def _public_settings() -> dict[str, Any]:
 
 
 def _public_acme_settings(cfg: Any) -> dict[str, Any]:
+    """Return ACME settings for the UI with DNS credential values blanked out."""
+    # Convert the dataclass to a dict.
     data = asdict(cfg)
+    # Blank every credential value but say which ones are set.
     credentials = dict(cfg.dns_credentials or {})
     data["dns_credentials"] = {key: "" for key in credentials}
     data["dns_credentials_configured"] = {key: bool(value) for key, value in credentials.items()}
+    # Shortcut flags for the two common DNS providers.
     data["cf_api_token_set"] = bool(credentials.get("cf_api_token"))
     data["he_ddns_key_set"] = bool(credentials.get("he_ddns_key"))
     return data

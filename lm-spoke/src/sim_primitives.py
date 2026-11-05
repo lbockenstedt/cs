@@ -11,18 +11,29 @@ the host can actually do.
 Returns a dict: ``{"name", "ok", "detail", "tool", "degraded?"}``.
 """
 
+# Allow modern type-hint syntax without evaluating annotations at import time.
 from __future__ import annotations
 
+# Async subprocesses, worker threads and timeouts.
 import asyncio
+# Standard-library logging.
 import logging
+# Random counts, sizes and URL choices.
 import random
+# Checks whether host tools are installed.
 import shutil
+# UDP socket for collab traffic.
 import socket
+# Timing for the collab send loop.
 import time
+# Dataclass for the shared context.
 from dataclasses import dataclass
+# Filesystem path handling.
 from pathlib import Path
+# Type hints only.
 from typing import Awaitable, Callable, Dict, Optional
 
+# Logger for this module.
 logger = logging.getLogger("CSPrimitives")
 
 # Optional, purely-Python deps — degrade if absent.
@@ -53,6 +64,7 @@ logging.getLogger("httpcore").setLevel(logging.WARNING)
 class SimCtx:
     """Runtime context shared by all primitives for one spoke."""
 
+    # Folder holding the data files, and a scratch folder for downloads.
     config_dir: Path
     work_dir: Path = Path("/tmp")
     # Caps keep a single run_iteration responsive; the loop repeats the work.
@@ -67,9 +79,11 @@ class SimCtx:
 
     def data_lines(self, name: str) -> list[str]:
         """Non-blank, de-duplicated lines from ``configs/<name>`` (preserves order)."""
+        # Missing file: no lines.
         p = self.config_dir / name
         if not p.exists():
             return []
+        # Collect each trimmed, non-blank line once, in order.
         seen: set[str] = set()
         out: list[str] = []
         for line in p.read_text(encoding="utf-8", errors="replace").splitlines():
@@ -80,15 +94,20 @@ class SimCtx:
         return out
 
 
+# Type aliases for a primitive's result and its function signature.
 PrimResult = Dict[str, object]
 PrimFn = Callable[[Dict[str, str], SimCtx], Awaitable[PrimResult]]
 
 
 def _degraded(name: str, missing: str, detail: str = "") -> PrimResult:
+    """Return a result saying ``name`` could not run because ``missing`` is absent."""
+    # Build the degraded result.
     return {"name": name, "ok": False, "degraded": True, "missing": missing, "detail": detail}
 
 
 def _ok(name: str, detail: str = "", tool: str = "") -> PrimResult:
+    """Return a successful result for ``name``."""
+    # Build the success result.
     return {"name": name, "ok": True, "detail": detail, "tool": tool}
 
 
@@ -102,19 +121,26 @@ def _ok(name: str, detail: str = "", tool: str = "") -> PrimResult:
 # only the server set differs. _dns_query is the shared engine.
 async def _dns_query(sim_id: str, profile: Dict[str, str], ctx: SimCtx,
                      server_keys: "list[str]", target_label: str) -> PrimResult:
+    """Query DNS records against the servers in ``server_keys``; shared by dns_fail and dns_latency.
+    """
+    # Records to look up (capped); none means nothing to do.
     records = ctx.data_lines("dns_fail.txt")
     if not records:
         return _ok(sim_id, "no dns_fail.txt records", "none")
     records = records[: ctx.dns_max_records]
 
+    # Server addresses from the profile, ignoring blanks.
     servers = [profile.get(k, "") for k in server_keys]
     servers = [s for s in servers if s]
     if not servers:
         return _degraded(sim_id, target_label, "no DNS targets configured")
 
+    # Prefer dnspython, run in a worker thread.
     digs = 0
     if _HAS_DNSPYTHON:
         def _query() -> int:
+            """Query every record on every server, ignoring errors; return the query count."""
+            # One query per record, server and pass.
             count = 0
             for _ in range(ctx.dns_passes):
                 for rec in records:
@@ -132,6 +158,7 @@ async def _dns_query(sim_id: str, profile: Dict[str, str], ctx: SimCtx,
         return _ok(sim_id, f"{digs} queries to {len(servers)} servers", "dnspython")
 
     # Fallback: subprocess dig if present.
+    # Fall back to the dig command when dnspython is missing.
     if shutil.which("dig"):
         cmds = []
         for _ in range(ctx.dns_passes):
@@ -141,6 +168,7 @@ async def _dns_query(sim_id: str, profile: Dict[str, str], ctx: SimCtx,
         digs = await _run_batched(cmds, per_timeout=3.0, concurrency=4)
         return _ok(sim_id, f"{digs} dig queries", "dig")
 
+    # Neither tool available.
     return _degraded(sim_id, "dnspython|dig", "install dnspython or dig")
 
 
@@ -150,6 +178,7 @@ async def sim_dns_fail(profile: Dict[str, str], ctx: SimCtx) -> PrimResult:
     failure alert. The slow-server (``dns_latency_*``) set is handled separately
     by ``sim_dns_latency`` so a genuine latency condition isn't lumped in as a
     failure. Mirrors ``dns_fail.sh``."""
+    # Use the bad-record and bad-IP servers.
     keys = [f"dns_bad_record_{i}" for i in (1, 2, 3)] + [f"dns_bad_ip_{i}" for i in (1, 2, 3)]
     return await _dns_query("dns_fail", profile, ctx, keys, "dns_bad_*")
 
@@ -159,6 +188,7 @@ async def sim_dns_latency(profile: Dict[str, str], ctx: SimCtx) -> PrimResult:
     so lookups are delayed — drives the DNS latency alert (distinct from the
     unreachable-server failure alert dns_fail produces). Mirrors
     ``dns_latency.sh``."""
+    # Use the slow-responder servers.
     keys = [f"dns_latency_{i}" for i in (1, 2, 3)]
     return await _dns_query("dns_latency", profile, ctx, keys, "dns_latency_*")
 
@@ -166,14 +196,19 @@ async def sim_dns_latency(profile: Dict[str, str], ctx: SimCtx) -> PrimResult:
 # ── ping_test ─────────────────────────────────────────────────────────────────
 async def sim_ping_test(profile: Dict[str, str], ctx: SimCtx) -> PrimResult:
     """ICMP ping ``ping_address`` with a random count (1–60) and size (1–1400)."""
+    # Target host; none means degraded.
     host = profile.get("ping_address", "").strip()
     if not host:
         return _degraded("ping_test", "ping_address", "no ping target configured")
+    # Random packet count and size.
     count = random.randint(1, min(ctx.ping_max_count, 60))
     size = random.randint(1, 1400)
 
+    # Prefer icmplib, run in a worker thread.
     if _HAS_ICMPLIB:
         def _ping() -> PrimResult:
+            """Ping with icmplib and return the result."""
+            # Send the pings; errors give a degraded result.
             try:
                 icmplib.ping(host, count=count, size=size, timeout=2, privileged=False)
                 return _ok("ping_test", f"pinged {host} x{count} size={size}", "icmplib")
@@ -181,30 +216,37 @@ async def sim_ping_test(profile: Dict[str, str], ctx: SimCtx) -> PrimResult:
                 return _degraded("ping_test", "icmplib", str(exc))
         return await asyncio.to_thread(_ping)
 
+    # Fall back to the ping command.
     if shutil.which("ping"):
         proc = await asyncio.create_subprocess_exec(
             "ping", "-c", str(count), "-s", str(size), "-W", "2", host,
             stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
         )
+        # Wait for it, killing it if it runs too long.
         try:
             await asyncio.wait_for(proc.wait(), timeout=count + 5)
         except asyncio.TimeoutError:
             proc.kill()
         return _ok("ping_test", f"pinged {host} x{count} size={size}", "ping")
 
+    # Neither tool available.
     return _degraded("ping_test", "icmplib|ping", "install icmplib or ping")
 
 
 # ── download ─────────────────────────────────────────────────────────────────
 async def sim_download(profile: Dict[str, str], ctx: SimCtx) -> PrimResult:
     """HTTP-download a random URL from ``downloads.txt`` to a temp file."""
+    # Pick a random URL; none configured means degraded.
     urls = ctx.data_lines("downloads.txt")
     if not urls:
         return _degraded("download", "downloads.txt", "no download URLs configured")
     url = random.choice(urls)
+    # httpx is required.
     if not _HAS_HTTPX:
         return _degraded("download", "httpx", "install httpx")
+    # Scratch file for the download.
     dest = ctx.work_dir / "cs-download.tmp"
+    # Stream the download to the file, stopping at the byte cap.
     try:
         written = 0
         async with httpx.AsyncClient(timeout=20.0, follow_redirects=True) as client:
@@ -216,6 +258,7 @@ async def sim_download(profile: Dict[str, str], ctx: SimCtx) -> PrimResult:
                         if written >= ctx.download_max_bytes:
                             break
         return _ok("download", f"downloaded {written} bytes from {url}", "httpx")
+    # Any download error gives a degraded result.
     except Exception as exc:  # noqa: BLE001
         return _degraded("download", "httpx", str(exc))
 
@@ -223,13 +266,17 @@ async def sim_download(profile: Dict[str, str], ctx: SimCtx) -> PrimResult:
 # ── www_traffic ──────────────────────────────────────────────────────────────
 async def sim_www_traffic(profile: Dict[str, str], ctx: SimCtx) -> PrimResult:
     """Fetch a random URL from ``websites.txt`` with a browser UA (traffic gen)."""
+    # Pick a random URL; none configured means degraded.
     urls = ctx.data_lines("websites.txt")
     if not urls:
         return _degraded("www_traffic", "websites.txt", "no website URLs configured")
     url = random.choice(urls)
+    # httpx is required.
     if not _HAS_HTTPX:
         return _degraded("www_traffic", "httpx", "install httpx")
+    # Browser-style user agent.
     ua = ("Mozilla/5.0 (X11; Linux x86_64; rv:128.0) Gecko/20100101 Firefox/128.0")
+    # Stream the page, stopping at the byte cap.
     try:
         read = 0
         async with httpx.AsyncClient(timeout=20.0, follow_redirects=True,
@@ -240,6 +287,7 @@ async def sim_www_traffic(profile: Dict[str, str], ctx: SimCtx) -> PrimResult:
                     if read >= ctx.www_max_bytes:
                         break
         return _ok("www_traffic", f"fetched {read} bytes from {url} ({r.status_code})", "httpx")
+    # Any fetch error gives a degraded result.
     except Exception as exc:  # noqa: BLE001
         return _degraded("www_traffic", "httpx", str(exc))
 
@@ -247,16 +295,19 @@ async def sim_www_traffic(profile: Dict[str, str], ctx: SimCtx) -> PrimResult:
 # ── iperf ─────────────────────────────────────────────────────────────────────
 async def sim_iperf(profile: Dict[str, str], ctx: SimCtx) -> PrimResult:
     """``iperf3 -c <iperf_server>`` across a small port set at ``iperf_bw``."""
+    # Server and iperf3 tool are required.
     server = profile.get("iperf_server", "").strip()
     if not server:
         return _degraded("iperf", "iperf_server", "no iperf server configured")
     if not shutil.which("iperf3"):
         return _degraded("iperf", "iperf3", "install iperf3")
+    # Bandwidth, a random run time, and a set of common ports to test.
     bw = profile.get("iperf_bw", "1k")
     t = random.randint(1, max(1, ctx.iperf_max_time))
     base = 5201 + random.randint(0, 9)
     ports = [base, 443, 3260, 2049, 1194, 3389, 445, 80, 1433]
     ran = 0
+    # Run iperf3 against at most two ports, each with a timeout.
     for port in ports:
         proc = await asyncio.create_subprocess_exec(
             "iperf3", "-c", server, "-p", str(port), "-b", bw, "-t", str(t),
@@ -269,27 +320,33 @@ async def sim_iperf(profile: Dict[str, str], ctx: SimCtx) -> PrimResult:
         ran += 1
         if ran >= 2:  # bounded per call
             break
+    # Report what ran.
     return _ok("iperf", f"iperf3 -> {server} on {ran} port(s), -b {bw} -t {t}", "iperf3")
 
 
 async def sim_collab(profile: Dict[str, str], ctx: SimCtx) -> PrimResult:
     """Send bounded UDP media-like traffic to ``collab_server``."""
+    # Target server; none means degraded.
     server = (profile.get("collab_server", "") or "").strip()
     if not server:
         return _degraded("collab", "collab_server", "no collab target configured")
+    # Port set, packet size and default bitrate per collab app.
     app_profiles = {
         "teams": ([3478, 3481, 3479], 1280, 1200000),
         "zoom": ([8801, 8802, 8803], 1280, 1500000),
         "webex": ([9000, 5004, 5006], 1280, 1000000),
     }
+    # Pick the app's profile (Teams by default).
     app = (profile.get("collab_app", "") or "teams").strip().lower()
     ports, payload_size, default_bps = app_profiles.get(app, app_profiles["teams"])
+    # Bandwidth and duration settings; the duration is capped at 3 s.
     bw_raw = (profile.get("collab_bw", "") or "200k").strip().lower()
     seconds_raw = (profile.get("collab_time", "") or "120").strip()
     try:
         seconds = max(1, min(int(seconds_raw), 3))
     except ValueError:
         seconds = 3
+    # Turn "200k"/"2m" style bandwidth into bits per second.
     mult = 1
     if bw_raw.endswith("m"):
         mult = 1000 * 1000
@@ -297,15 +354,19 @@ async def sim_collab(profile: Dict[str, str], ctx: SimCtx) -> PrimResult:
     elif bw_raw.endswith("k"):
         mult = 1000
         bw_raw = bw_raw[:-1]
+    # Invalid numbers use the app default.
     try:
         bps = max(1000, int(float(bw_raw) * mult))
     except ValueError:
         bps = default_bps
 
     def _send() -> PrimResult:
+        """Send UDP packets at the target rate for the duration; return the result."""
+        # Packet and the delay between packets for the target rate.
         packet = b"x" * payload_size
         interval = max(0.005, len(packet) * 8 / float(bps))
         sent = 0
+        # Send packets round-robin across the app's ports until time runs out.
         try:
             with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
                 end = time.monotonic() + seconds
@@ -316,20 +377,26 @@ async def sim_collab(profile: Dict[str, str], ctx: SimCtx) -> PrimResult:
                     sent += len(packet)
                     time.sleep(interval)
             return _ok("collab", f"sent {sent} bytes to {server} ports={ports}", "udp")
+        # Socket errors give a degraded result.
         except Exception as exc:  # noqa: BLE001
             return _degraded("collab", "udp", str(exc))
 
+    # Run the blocking send in a worker thread.
     return await asyncio.to_thread(_send)
 
 
 # ── nmcli-based WiFi sims (assoc_fail / ssidpw_fail / auth_fail) ──────────────
 async def _nmcli(*args: str, timeout: float = 10.0) -> bool:
+    """Run ``nmcli`` with ``args``; return True if it exits 0 within the timeout."""
+    # No nmcli: fail.
     if not shutil.which("nmcli"):
         return False
+    # Run it quietly.
     proc = await asyncio.create_subprocess_exec(
         "nmcli", *args,
         stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
     )
+    # Wait for it; a timeout kills it and counts as failure.
     try:
         rc = await asyncio.wait_for(proc.wait(), timeout=timeout)
         return rc == 0
@@ -339,8 +406,11 @@ async def _nmcli(*args: str, timeout: float = 10.0) -> bool:
 
 
 def _effective_ssid(profile: Dict[str, str]) -> str:
+    """Return the SSID to use, prefixed with the site when site-based SSIDs are on."""
+    # Site and base SSID from the profile.
     wsite = profile.get("wsite", "").strip()
     ssid = profile.get("ssid", "").strip()
+    # Site-based SSIDs look like "<site>-<ssid>".
     if profile.get("site_based_ssid", "").lower() == "on" and wsite:
         return f"{wsite}-{ssid}"
     return ssid
@@ -356,43 +426,53 @@ async def sim_assoc_fail(profile: Dict[str, str], ctx: SimCtx) -> PrimResult:
     live in ssidpw_fail/auth_fail. (Previously cycled the interface up/down
     itself, which the production clients/linux/simulation.sh path never did —
     removed to match: a plain connect there is the whole simulation.)"""
+    # Needs nmcli and a wireless adapter.
     if not shutil.which("nmcli"):
         return _degraded("assoc_fail", "nmcli", "install NetworkManager (nmcli)")
     if not await _find_wireless_adapter():
         return _degraded("assoc_fail", "wlan-iface", "no wireless interface found")
+    # Bring up the saved connection, else connect with the password.
     ssid = _effective_ssid(profile)
     if not await _nmcli("connection", "up", ssid, timeout=10.0):
         await _nmcli("device", "wifi", "connect", ssid,
                      "password", profile.get("ssidpw", ""), timeout=15.0)
+    # Report the attempt.
     return _ok("assoc_fail", f"connect attempt to {ssid}", "nmcli")
 
 
 async def sim_ssidpw_fail(profile: Dict[str, str], ctx: SimCtx) -> PrimResult:
     """Wrong-PSK auth failure: attempt to connect with ``<ssidpw>_fail`` (nmcli)."""
+    # Needs nmcli and a wireless adapter.
     if not shutil.which("nmcli"):
         return _degraded("ssidpw_fail", "nmcli", "install NetworkManager (nmcli)")
     if not await _find_wireless_adapter():
         return _degraded("ssidpw_fail", "wlan-iface", "no wireless interface found")
+    # SSID and a deliberately wrong password.
     ssid = _effective_ssid(profile)
     badpw = f"{profile.get('ssidpw', '')}_fail"
     # Drop any stale PSK connections first, like delete_matching_connections().
     await _nmcli("connection", "delete", ssid, timeout=5.0)
+    # Try to connect repeatedly with the wrong password.
     for _ in range(ctx.wifi_iters):
         await _nmcli("device", "wifi", "connect", ssid, "password", badpw, timeout=5.0)
+    # Report the attempts.
     return _ok("ssidpw_fail", f"wrong-PSK attempts to {ssid} x{ctx.wifi_iters}", "nmcli")
 
 
 async def sim_auth_fail(profile: Dict[str, str], ctx: SimCtx) -> PrimResult:
     """802.1X/blocked-MAC style auth failure: toggle WLAN radio + interface (nmcli)."""
+    # Needs nmcli and a wireless adapter.
     if not shutil.which("nmcli"):
         return _degraded("auth_fail", "nmcli", "install NetworkManager (nmcli)")
     if not await _find_wireless_adapter():
         return _degraded("auth_fail", "wlan-iface", "no wireless interface found")
+    # Turn the radio off and on repeatedly.
     for _ in range(ctx.wifi_iters):
         await _nmcli("radio", "wifi", "off", timeout=5.0)
         await asyncio.sleep(0.5)
         await _nmcli("radio", "wifi", "on", timeout=5.0)
         await asyncio.sleep(0.5)
+    # Report the toggles.
     return _ok("auth_fail", f"toggled wifi radio x{ctx.wifi_iters}", "nmcli")
 
 
@@ -404,18 +484,23 @@ async def sim_mac_auth_fail(profile: Dict[str, str], ctx: SimCtx) -> PrimResult:
     ``device wifi connect`` ONCE if missing (needed to negotiate WPA2/WPA3),
     then uses ONLY ``connection up``/``down`` from there — ``device wifi
     connect`` resets the cloned MAC on every call, silently undoing the spoof."""
+    # Needs nmcli and a wireless adapter.
     if not shutil.which("nmcli"):
         return _degraded("mac_auth_fail", "nmcli", "install NetworkManager (nmcli)")
     if not await _find_wireless_adapter():
         return _degraded("mac_auth_fail", "wlan-iface", "no wireless interface found")
+    # SSID and the MAC to spoof (a fixed default if unset).
     ssid = _effective_ssid(profile)
     target_mac = (profile.get("mac_auth_fail_mac", "") or "").strip() or "02:BA:D0:00:00:01"
+    # Create the connection once if it does not exist.
     exists = await _nmcli("connection", "show", ssid, timeout=5.0)
     if not exists:
         await _nmcli("device", "wifi", "connect", ssid, "password",
                      profile.get("ssidpw", ""), timeout=15.0)
+    # Set the spoofed MAC on the connection.
     await _nmcli("connection", "modify", ssid,
                  "802-11-wireless.cloned-mac-address", target_mac, timeout=5.0)
+    # Bring the connection up and down repeatedly.
     for _ in range(ctx.wifi_iters):
         await _nmcli("connection", "up", ssid, timeout=5.0)
         await asyncio.sleep(1.0)
@@ -424,6 +509,7 @@ async def sim_mac_auth_fail(profile: Dict[str, str], ctx: SimCtx) -> PrimResult:
     # doesn't inherit the spoofed identity.
     await _nmcli("connection", "modify", ssid,
                  "802-11-wireless.cloned-mac-address", "", timeout=5.0)
+    # Report the attempts.
     return _ok("mac_auth_fail", f"spoofed MAC {target_mac} auth attempts to {ssid} x{ctx.wifi_iters}", "nmcli")
 
 
@@ -436,16 +522,19 @@ async def sim_mac_auth_fail(profile: Dict[str, str], ctx: SimCtx) -> PrimResult:
 async def _run_capture(argv, timeout: float = 3.0):
     """Async capture-stdout helper. Returns ``(stdout_text, returncode)``;
     ``("", None)`` on any failure or timeout (process is killed + reaped)."""
+    # Start the process; a missing tool or exec error gives an empty result.
     try:
         proc = await asyncio.create_subprocess_exec(
             *argv,
             stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL)
     except Exception:  # noqa: BLE001
         return "", None
+    # Wait for output within the timeout and decode it.
     try:
         out, _ = await asyncio.wait_for(proc.communicate(), timeout=timeout)
         text = out.decode("utf-8", "replace") if isinstance(out, bytes) else (out or "")
         return text, proc.returncode
+    # Timeout or read error: kill the process and reap it.
     except Exception:  # noqa: BLE001
         try:
             proc.kill()
@@ -462,8 +551,10 @@ async def _find_wired_adapter() -> Optional[str]:
     """Best-effort wired interface name (``enx*/enp*/eno*/eth*``) via ``ip -br a``.
     ``enx*`` is USB-Ethernet/wired-dongle naming (MAC-keyed) — without it a T2
     wired dongle is invisible to this check."""
+    # No ``ip`` tool: cannot look.
     if not shutil.which("ip"):
         return None
+    # List interfaces and return the first wired one.
     out, _ = await _run_capture(["ip", "-br", "a"], timeout=3.0)
     for line in out.splitlines():
         name = line.split()[0] if line.split() else ""
@@ -478,8 +569,10 @@ async def _find_wireless_adapter() -> Optional[str]:
     primitives (assoc_fail/ssidpw_fail/auth_fail/mac_auth_fail) need but
     previously lacked (they only checked that ``nmcli`` the binary exists, not
     that a radio is actually present)."""
+    # No ``ip`` tool: cannot look.
     if not shutil.which("ip"):
         return None
+    # List interfaces and return the first wireless one.
     out, _ = await _run_capture(["ip", "-br", "a"], timeout=3.0)
     for line in out.splitlines():
         name = line.split()[0] if line.split() else ""
@@ -490,21 +583,26 @@ async def _find_wireless_adapter() -> Optional[str]:
 
 async def _is_mgmt_iface(iface: str) -> bool:
     """Management-IP guard: never bounce the 169.253.x mgmt interface."""
+    # Without an interface or ``ip`` tool it cannot be the management link.
     if not iface or not shutil.which("ip"):
         return False
+    # Look for a 169.253.x address on the interface.
     out, _ = await _run_capture(["ip", "-4", "addr", "show", "dev", iface], timeout=3.0)
     return "169.253." in out
 
 
 async def sim_port_flap(profile: Dict[str, str], ctx: SimCtx) -> PrimResult:
     """Wired port link flap: bounce the wired interface up/down (ip link), mgmt-guarded."""
+    # Needs ``ip`` and a wired adapter.
     if not shutil.which("ip"):
         return _degraded("port_flap", "ip", "install iproute2 (ip)")
     iface = await _find_wired_adapter()
     if not iface:
         return _degraded("port_flap", "eth-iface", "no wired interface found")
+    # Never flap the management interface.
     if await _is_mgmt_iface(iface):
         return _ok("port_flap", f"skipped — {iface} is the mgmt interface", "ip")
+    # Take the link down and up repeatedly, pausing between steps.
     for _ in range(ctx.port_flap_iters):
         p = await asyncio.create_subprocess_exec(
             "sudo", "ip", "link", "set", "dev", iface, "down",
@@ -516,31 +614,39 @@ async def sim_port_flap(profile: Dict[str, str], ctx: SimCtx) -> PrimResult:
             stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL)
         await asyncio.wait_for(p.wait(), timeout=5.0)
         await asyncio.sleep(0.5)
+    # Report the flaps.
     return _ok("port_flap", f"flapped {iface} x{ctx.port_flap_iters}", "ip")
 
 
 # ── dhcp_fail (light) ──────────────────────────────────────────────────────────
 async def sim_dhcp_fail(profile: Dict[str, str], ctx: SimCtx) -> PrimResult:
     """Release the DHCP lease and don't renew (``dhclient -r``); best-effort."""
+    # Needs dhclient.
     if not shutil.which("dhclient"):
         return _degraded("dhcp_fail", "dhclient", "install isc-dhcp-client")
+    # Release the lease with sudo.
     proc = await asyncio.create_subprocess_exec(
         "sudo", "dhclient", "-r",
         stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL)
+    # Wait for it, killing it if it runs too long.
     try:
         await asyncio.wait_for(proc.wait(), timeout=10.0)
     except asyncio.TimeoutError:
         proc.kill()
+    # Report the release.
     return _ok("dhcp_fail", "released DHCP lease", "dhclient")
 
 
 # ── helpers ───────────────────────────────────────────────────────────────────
 async def _run_batched(cmds: list[list[str]], per_timeout: float, concurrency: int) -> int:
     """Run a list of command vectors concurrently (bounded), counting completions."""
+    # Semaphore limits concurrent commands; count completions.
     sem = asyncio.Semaphore(concurrency)
     done = 0
 
     async def _one(cmd: list[str]) -> None:
+        """Run one command within the limits and count it as done."""
+        # Run under the semaphore, killing the process on timeout.
         nonlocal done
         async with sem:
             proc = await asyncio.create_subprocess_exec(
@@ -551,6 +657,7 @@ async def _run_batched(cmds: list[list[str]], per_timeout: float, concurrency: i
                 proc.kill()
             done += 1
 
+    # Run all commands and return how many finished.
     await asyncio.gather(*(_one(c) for c in cmds))
     return done
 
