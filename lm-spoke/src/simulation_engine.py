@@ -15,19 +15,31 @@ kill-switch check → ``sim_phy`` adapter setup → ``sim_load`` skip gate → d
 enabled sims concurrently (bounded, per-sim timeout) → status beacon → sleep.
 """
 
+# Allow modern type-hint syntax without evaluating annotations at import time.
 from __future__ import annotations
 
+# Async runtime for the loop, subprocesses and timeouts.
 import asyncio
+# The status beacon is written as JSON.
 import json
+# Standard-library logging.
 import logging
+# Random sim-load threshold and offline duration.
 import random
+# Checks whether host tools (ip, nmcli, ping, apt-get) are installed.
 import shutil
+# Timestamp for the status beacon.
 import time
+# Filesystem path handling.
 from pathlib import Path
+# Type hints only.
 from typing import Any, Dict, List, Optional
 
+# Config parsing and profile resolution for simulation.conf.
 import sim_config
+# Tells whether a profile flag is "on".
 from sim_config import flag_on
+# The registry of simulation primitives and their shared context.
 from sim_primitives import PRIMITIVES, SimCtx
 
 # Library module — do NOT call basicConfig here (the process entrypoint
@@ -57,6 +69,8 @@ class SimulationEngine:
         config_dir: Path | str = Path("../configs"),
         data_dir: Path | str = Path("../data"),
     ) -> None:
+        """Set up the engine for ``hostname`` with its config and data folders."""
+        # Remember the hostname and folders; make sure the data folder exists.
         self.hostname = hostname
         self.config_dir = Path(config_dir)
         self.data_dir = Path(data_dir)
@@ -71,6 +85,7 @@ class SimulationEngine:
         self._loop_task: Optional[asyncio.Task] = None
         self._stop = False
 
+        # Shared context passed to every primitive, then load the config files.
         self.ctx = SimCtx(config_dir=self.config_dir, work_dir=self.data_dir)
         self.reload_config()
 
@@ -95,10 +110,14 @@ class SimulationEngine:
             self._profile_patch.update({k: str(v) for k, v in patch.items()})
 
     def clear_patch(self) -> None:
+        """Remove any in-memory profile patch."""
+        # Drop all patched keys.
         self._profile_patch.clear()
 
     # ── kill switch ─────────────────────────────────────────────────────────
     def kill_switch_active(self) -> bool:
+        """Return True if the kill switch is on (in memory or in kill_switch.txt)."""
+        # The in-memory switch wins.
         if self._kill_switch:
             return True
         # mtime-keyed cache. run_iteration calls this every ~5 s and /api/kill-switch
@@ -107,6 +126,7 @@ class SimulationEngine:
         # to the hub's "Request Timeout"). Re-read only when the file's mtime
         # changes (set_kill_switch writes the file → mtime changes → miss →
         # re-read); otherwise one inode-cached stat returns the cached bool.
+        # Stat the switch file to build a cache key.
         ks = self.config_dir / "kill_switch.txt"
         try:
             st = ks.stat()
@@ -114,28 +134,37 @@ class SimulationEngine:
             # (on → off) would otherwise share a key and return stale state.
             mtime = (st.st_mtime_ns, st.st_size, st.st_ino)
             exists = True
+        # Missing or unreadable file.
         except OSError:
             mtime = -1
             exists = False
+        # Reuse the cached answer if the file has not changed.
         cache = getattr(self, "_ks_cache", None)
         if cache is not None and cache[0] == mtime:
             return cache[1]
+        # Read the file: the switch is on only if it says "on".
         active = False
         if exists:
             try:
                 active = ks.read_text(encoding="utf-8").strip().lower() == "on"
+            # Unreadable file counts as off.
             except Exception:  # noqa: BLE001
                 active = False
+        # Cache the answer with its key and return it.
         self._ks_cache = (mtime, active)
         return active
 
     def set_kill_switch(self, on: bool) -> None:
+        """Turn the kill switch on or off, in memory and in kill_switch.txt."""
+        # Set the in-memory flag and write the file so it survives restarts.
         self._kill_switch = bool(on)
         ks = self.config_dir / "kill_switch.txt"
         ks.write_text("on\n" if on else "off\n", encoding="utf-8")
 
     # ── state ──────────────────────────────────────────────────────────────
     def get_current_state(self) -> Dict[str, Any]:
+        """Return this host's current simulation state (profile, status, iteration)."""
+        # Resolve the profile and build the state snapshot.
         resolved = self.resolve()
         profile = resolved["profile"]
         return {
@@ -151,6 +180,7 @@ class SimulationEngine:
     # ── one iteration ──────────────────────────────────────────────────────
     async def run_iteration(self, iter_sleep: float = 5.0) -> Dict[str, Any]:
         """Run a single outer iteration of the simulation loop."""
+        # Reload the config files and resolve this host's profile.
         self.reload_config()
         resolved = self.resolve()
         profile = resolved["profile"]
@@ -183,17 +213,21 @@ class SimulationEngine:
                     "status": "SKIPPED", "iteration": self.iteration}
 
         # Dispatch every enabled primitive concurrently (bounded, per-sim timeout).
+        # Primitives whose flag is on in the profile.
         enabled = [name for name in PRIMITIVES if flag_on(profile, name)]
         self.active_simulations = list(enabled)
         self.status = "RUNNING"
         results, errors = await self._dispatch(enabled)
 
+        # Count the iteration and write the status beacon.
         self.iteration += 1
         await self._beacon(resolved, ran=enabled, errors=errors)
 
+        # Pause between iterations.
         if iter_sleep:
             await asyncio.sleep(iter_sleep)
 
+        # Report the iteration result.
         return {
             "hostname": self.hostname,
             "bucket": sim_id,
@@ -205,24 +239,32 @@ class SimulationEngine:
 
     async def _dispatch(self, enabled: List[str]) -> tuple[List[Dict[str, Any]], List[str]]:
         """Run enabled primitives concurrently with a per-sim timeout."""
+        # Nothing enabled: nothing to run.
         if not enabled:
             return [], []
 
         async def _one(name: str) -> Dict[str, Any]:
+            """Run one primitive with a 45-second timeout; failures become degraded results."""
+            # Run the primitive with the current profile.
             try:
                 return await asyncio.wait_for(
                     PRIMITIVES[name](self.resolve()["profile"], self.ctx), timeout=45.0)
+            # Too slow: report a timeout.
             except asyncio.TimeoutError:
                 return {"name": name, "ok": False, "detail": "timeout", "degraded": True}
+            # Any other error is reported, not raised.
             except Exception as exc:  # noqa: BLE001
                 return {"name": name, "ok": False, "detail": str(exc), "degraded": True}
 
+        # Run all primitives at once.
         results = await asyncio.gather(*(_one(n) for n in enabled))
+        # Describe every failed or degraded result as an error string.
         errors = [
             f"{r.get('name')}: {r.get('detail', 'degraded')} (missing {r.get('missing', '')})".strip()
             for r in results
             if isinstance(r, dict) and (r.get("degraded") or not r.get("ok"))
         ]
+        # Return the results and the error list.
         return list(results), errors
 
     async def _setup_sim_phy(self, profile: Dict[str, str]) -> None:
@@ -231,24 +273,30 @@ class SimulationEngine:
         Best-effort: silently degrades if ``ip``/``nmcli`` or the adapters are
         absent (dev/headless hosts).
         """
+        # No ``ip`` tool: nothing can be changed.
         if not shutil.which("ip"):
             return
+        # Which PHY to simulate (wireless by default).
         phy = str(profile.get("sim_phy", "wireless")).lower()
         try:
+            # Ethernet mode: take the wireless interface down.
             if phy == "ethernet":
                 wl = await _find_iface(("wlx", "wlan"))
                 if wl:
                     await _ip_link(wl, "down")
+            # Wireless mode: take the wired interface down unless it is the management link.
             else:  # wireless → disable wired (mgmt-guarded)
                 ea = await _find_iface(("enp", "eno", "eth"))
                 if ea and not await _is_mgmt_iface(ea):
                     await _ip_link(ea, "down")
+        # Failures only log at debug level.
         except Exception as exc:  # noqa: BLE001
             logger.debug("sim_phy setup failed: %s", exc)
 
     # ── status beacon ──────────────────────────────────────────────────────
     async def _beacon(self, resolved: Dict[str, Any], ran: List[str], errors: List[str]) -> None:
         """Write a CLIENT_API.md-shaped status snapshot to data/client-status.json."""
+        # Build the snapshot: identity, connectivity, sims run, errors and config flags.
         profile = resolved["profile"]
         payload = {
             "hostname": self.hostname,
@@ -270,12 +318,14 @@ class SimulationEngine:
             await asyncio.to_thread(
                 lambda: (self.data_dir / "client-status.json").write_text(
                     json.dumps(payload, indent=2), encoding="utf-8"))
+        # A write failure only logs at debug level.
         except Exception as exc:  # noqa: BLE001
             logger.debug("beacon write failed: %s", exc)
 
     # ── loop control (CS_START/STOP_SIMULATION) ─────────────────────────────
     async def run_loop(self, iterations: int = 100, iter_sleep: float = 5.0) -> Dict[str, Any]:
         """Run *iterations* iterations (the outer cycle), then return a summary."""
+        # Run until the iteration count is reached or stop() is called.
         self._stop = False
         ran = 0
         for _ in range(iterations):
@@ -290,12 +340,14 @@ class SimulationEngine:
     def start(self, iterations: int = 100, iter_sleep: float = 5.0) -> asyncio.Task:
         """Launch run_loop as a background task (CS_START_SIMULATION)."""
         self.stop()
+        # Stop any running loop, then start a new one in the background.
         self._loop_task = asyncio.create_task(self.run_loop(iterations, iter_sleep))
         logger.info("Started simulation loop (%d iterations)", iterations)
         return self._loop_task
 
     def stop(self) -> None:
         """Cancel the running loop and arm the kill switch (CS_STOP_SIMULATION)."""
+        # Ask the loop to stop and cancel its task.
         self._stop = True
         if self._loop_task and not self._loop_task.done():
             self._loop_task.cancel()
@@ -303,8 +355,10 @@ class SimulationEngine:
 
     async def _post_cycle(self) -> None:
         """apt update/upgrade + allow_offline window — best-effort, degrades silently."""
+        # Resolve the current profile.
         resolved = self.resolve()
         profile = resolved["profile"]
+        # Unless rapid_update is on, run apt-get update (best-effort, 2-minute limit).
         if str(profile.get("rapid_update", "")).lower() != "on" and shutil.which("apt-get"):
             try:
                 p = await asyncio.create_subprocess_exec(
@@ -313,6 +367,7 @@ class SimulationEngine:
                 await asyncio.wait_for(p.wait(), timeout=120.0)
             except Exception:  # noqa: BLE001
                 pass
+        # allow_offline: take the interfaces down for a random time, capped at 30 s here.
         if str(profile.get("allow_offline", "")).lower() == "yes":
             offline = random.randint(1, 14400)
             logger.info("allow_offline: bringing interfaces down for %ds", offline)
@@ -333,16 +388,19 @@ class SimulationEngine:
 async def _run_capture(argv, timeout: float = 3.0):
     """Async capture-stdout helper. Returns ``(stdout_text, returncode)``;
     ``("", None)`` on any failure or timeout (process is killed + reaped)."""
+    # Start the process; a missing tool or exec error gives an empty result.
     try:
         proc = await asyncio.create_subprocess_exec(
             *argv,
             stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL)
     except Exception:  # noqa: BLE001 — tool missing / exec error → degrade
         return "", None
+    # Wait for output within the timeout and decode it.
     try:
         out, _ = await asyncio.wait_for(proc.communicate(), timeout=timeout)
         text = out.decode("utf-8", "replace") if isinstance(out, bytes) else (out or "")
         return text, proc.returncode
+    # Timeout or read error: kill the process and reap it.
     except Exception:  # noqa: BLE001 — timeout or read error; kill + reap
         try:
             proc.kill()
@@ -356,8 +414,11 @@ async def _run_capture(argv, timeout: float = 3.0):
 
 
 async def _find_iface(prefixes) -> Optional[str]:
+    """Return the first interface whose name starts with one of ``prefixes``, or None."""
+    # No ``ip`` tool: cannot look.
     if not shutil.which("ip"):
         return None
+    # List interfaces briefly and return the first matching name.
     out, _ = await _run_capture(["ip", "-br", "a"], timeout=3.0)
     for line in out.splitlines():
         name = line.split()[0] if line.split() else ""
@@ -367,13 +428,18 @@ async def _find_iface(prefixes) -> Optional[str]:
 
 
 async def _is_mgmt_iface(iface: str) -> bool:
+    """Return True if ``iface`` has a 169.253.x management address."""
+    # Without an interface or ``ip`` tool it cannot be the management link.
     if not iface or not shutil.which("ip"):
         return False
+    # Read the interface's IPv4 addresses and look for the management subnet.
     out, _ = await _run_capture(["ip", "-4", "addr", "show", "dev", iface], timeout=3.0)
     return "169.253." in out
 
 
 async def _ip_link(iface: str, state: str) -> None:
+    """Set ``iface`` up or down with ``sudo ip link`` (5-second limit)."""
+    # Run the command quietly and wait for it.
     p = await asyncio.create_subprocess_exec(
         "sudo", "ip", "link", "set", "dev", iface, state,
         stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL)
@@ -381,11 +447,15 @@ async def _ip_link(iface: str, state: str) -> None:
 
 
 async def _bounce_all_ifaces(down: bool) -> None:
+    """Take the wireless and wired interfaces down or up, never downing the management link."""
+    # Find the wireless and wired interfaces.
     wl = await _find_iface(("wlx", "wlan"))
     ea = await _find_iface(("enp", "eno", "eth"))
+    # Change each one found, skipping the management link when going down.
     for iface in (a for a in [wl, ea] if a):
         if down and await _is_mgmt_iface(iface):
             continue
+        # Failures are ignored.
         try:
             await _ip_link(iface, "down" if down else "up")
         except Exception:  # noqa: BLE001
@@ -393,8 +463,11 @@ async def _bounce_all_ifaces(down: bool) -> None:
 
 
 async def _connected_ssid() -> str:
+    """Return the SSID the Wi-Fi adapter is connected to, or "" if unknown."""
+    # No nmcli: SSID unknown.
     if not shutil.which("nmcli"):
         return ""
+    # List Wi-Fi networks and return the active one's SSID.
     out, _ = await _run_capture(["nmcli", "-t", "-f", "active,ssid", "dev", "wifi"],
                                 timeout=3.0)
     for line in out.splitlines():
@@ -413,15 +486,19 @@ async def _gateway_reachable() -> Optional[bool]:
     way a single -c 1 -W 1 probe did. A truly unreachable gateway still fails
     both packets and correctly reports unreachable; this only removes the
     false-negative window, not the check's ability to catch a real outage."""
+    # Without ip and ping the answer is unknown.
     if not shutil.which("ip") or not shutil.which("ping"):
         return None
+    # Find the default gateway in the routing table.
     out, _ = await _run_capture(["ip", "route"], timeout=3.0)
     gw = None
     for line in out.splitlines():
         if line.startswith("default via "):
             gw = line.split()[2]
             break
+    # No default route: unknown.
     if not gw:
         return None
+    # Ping the gateway; success means reachable.
     _, rc = await _run_capture(["ping", "-c", "2", "-W", "2", gw], timeout=6.0)
     return rc == 0

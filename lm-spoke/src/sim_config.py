@@ -21,18 +21,29 @@ per-username overrides into the file it serves via ``/api/config``. This Python
 resolver loads both files directly — the canonical behaviour the webui-local hub used.
 """
 
+# Allow modern type-hint syntax without evaluating annotations at import time.
 from __future__ import annotations
 
+# Parses the INI-style simulation.conf files.
 import configparser
+# Deep copies protect the cached parsers from callers that change them.
 import copy
+# In-memory text buffer for rendering INI text.
 import io
+# Standard-library logging.
 import logging
+# Path-like type for file arguments.
 import os
+# Regular expression for bucket names (s0-s9).
 import re
+# crc32 picks a hostname's bucket.
 import zlib
+# Filesystem path handling.
 from pathlib import Path
+# Type hints only.
 from typing import Any, Dict, Optional, Tuple
 
+# Logger for config-loading messages.
 logger = logging.getLogger("CSConfig")
 
 # Keys that may appear in [simulation]/[sX]/[username]. Used only to validate
@@ -46,6 +57,7 @@ _SIM_TOGGLE_KEYS = (
     "kill_switch",
 )
 
+# Every setting name a simulation profile may contain.
 SIM_FLAG_KEYS = (
     "kill_switch", "rapid_update", "sim_load", "github_repo", "repo_location",
     "site_based_ssid", "iperf_bw", "ssidpw_fail", "auth_fail", "mac_auth_fail",
@@ -59,11 +71,13 @@ SIM_FLAG_KEYS = (
     "central_check", "mutter_cpu_limit",
 )
 
+# Matches a bucket section name such as "s3".
 _SLOT_RE = re.compile(r"^s[0-9]$")
 
 
 def _new_parser() -> configparser.ConfigParser:
     """A case-preserving ConfigParser (keys stay as-written)."""
+    # Standard parser, but keep key names exactly as written.
     p = configparser.ConfigParser()
     p.optionxform = str  # preserve key case (sections are already case-sensitive)
     return p
@@ -71,6 +85,7 @@ def _new_parser() -> configparser.ConfigParser:
 
 def load_ini(path: os.PathLike | str) -> configparser.ConfigParser:
     """Parse an INI file, preserving key case. Missing file → empty parser."""
+    # Read the file (a missing file simply yields an empty parser).
     p = _new_parser()
     p.read(str(path), encoding="utf-8")
     return p
@@ -92,9 +107,11 @@ def merge_override(parser: configparser.ConfigParser, path: os.PathLike | str) -
     hub-managed override path effective in the engine resolver, the
     ``/api/config`` client route, and ``CS_GET_CONFIG`` readback.
     """
+    # Missing override file: nothing to merge.
     p = Path(path)
     if not p.exists():
         return
+    # Parse the override file and copy every section and key into the base parser.
     try:
         ov = _new_parser()
         ov.read_string(p.read_text(encoding="utf-8"))
@@ -103,12 +120,14 @@ def merge_override(parser: configparser.ConfigParser, path: os.PathLike | str) -
                 parser.add_section(section)
             for key, value in ov.items(section):
                 parser.set(section, key, value)
+    # A broken override file is logged and skipped.
     except Exception as exc:  # noqa: BLE001 — best-effort; never break reload
         logger.warning("Could not apply hub override %s: %s", p, exc)
 
 
 def serialize_ini(parser: configparser.ConfigParser) -> str:
     """Render a parser back to INI text (round-trips ``load_ini`` output)."""
+    # Write the parser into a string buffer and return its text.
     buf = io.StringIO()
     parser.write(buf)
     return buf.getvalue()
@@ -138,9 +157,11 @@ def _mtime_ns(path: Path) -> Tuple[int, int, int]:
     path is absent/unreadable. mtime alone is not enough: Linux stamps it from
     a coarse clock, so two writes inside one tick share an mtime and the cache
     would keep serving the first file's contents."""
+    # Read the file's change signature.
     try:
         st = path.stat()
         return (st.st_mtime_ns, st.st_size, st.st_ino)
+    # Missing or unreadable file.
     except OSError:
         return (0, 0, 0)
 
@@ -152,6 +173,7 @@ def configs_cache_key(config_dir: os.PathLike | str
     derived caches on top (client_api's /api/config render cache) can key them
     to the exact generation of the underlying config files. Cheap: one ``stat``
     per file."""
+    # One signature per input file, plus the directory path.
     d = Path(config_dir)
     return (str(d), (_mtime_ns(d / "simulation.conf"),
                      _mtime_ns(d / "user-overrides.conf"),
@@ -181,6 +203,7 @@ def load_configs(config_dir: os.PathLike | str) -> Tuple[configparser.ConfigPars
     return deep copies of the canonical merged pair; a miss returns the fresh
     objects and caches independent copies.
     """
+    # Paths of all input files, then the cache key built from their signatures.
     d = Path(config_dir)
     sim_path = d / "simulation.conf"
     user_path = d / "user-overrides.conf"
@@ -188,6 +211,7 @@ def load_configs(config_dir: os.PathLike | str) -> Tuple[configparser.ConfigPars
     huser_path = d / "hub-user-overrides.conf"
     src_path = d / "hub-config-source"
     key = configs_cache_key(d)
+    # Cache hit: return deep copies so the cached pair stays untouched.
     cached = _LOAD_CACHE.get(key)
     if cached is not None:
         return copy.deepcopy(cached[0]), copy.deepcopy(cached[1])
@@ -197,14 +221,17 @@ def load_configs(config_dir: os.PathLike | str) -> Tuple[configparser.ConfigPars
     # (default) = repo base with the hub override merged on top. In hub mode we
     # fall back to the repo base only until the hub file is first written (the
     # seed gap), so the config is never empty.
+    # Read the configured source of truth (github if unset).
     try:
         source = src_path.read_text(encoding="utf-8").strip().lower()
     except Exception:  # noqa: BLE001
         source = "github"
+    # Hub mode: use the hub files, falling back to the repo files until they exist.
     if source == "hub":
         sim_conf = load_ini(hsim_path) if hsim_path.exists() else load_ini(sim_path)
         user_conf = (load_ini(huser_path) if huser_path.exists()
                      else (load_ini(user_path) if user_path.exists() else _new_parser()))
+    # GitHub mode: repo files with the hub overrides merged on top.
     else:
         sim_conf = load_ini(sim_path)
         user_conf = load_ini(user_path) if user_path.exists() else _new_parser()
@@ -217,23 +244,29 @@ def load_configs(config_dir: os.PathLike | str) -> Tuple[configparser.ConfigPars
     for k in list(_LOAD_CACHE):
         if k[0] == key[0] and k != key:
             _LOAD_CACHE.pop(k, None)
+    # Return the freshly loaded pair.
     return sim_conf, user_conf
 
 
 def bucket_for(hostname: str) -> str:
     """Deterministic bucket ``s0``–``s9`` via ``zlib.crc32(hostname) % 10``."""
+    # Hash the hostname and keep the last digit.
     return f"s{zlib.crc32(hostname.encode()) % 10}"
 
 
 # Per-client overrides that hold a secret (the JIT 802.1X password the hub
 # delivers). Served to the client by /api/config unmasked; masked everywhere an
 # operator can see overrides (Clients view, Control Panel GET/SET replies).
+# Placeholder shown instead of a secret value.
 SECRET_OVERRIDE_KEYS = ("dot1x_password",)
 SECRET_MASK = "********"
 
 
 def mask_secret_overrides(overrides: Any) -> Dict[str, Any]:
+    """Return a copy of ``overrides`` with secret values replaced by the mask."""
+    # Copy the overrides (empty if not a dict).
     ov = dict(overrides or {}) if isinstance(overrides, dict) else {}
+    # Replace each secret that has a value.
     for k in SECRET_OVERRIDE_KEYS:
         if ov.get(k):
             ov[k] = SECRET_MASK
@@ -243,7 +276,9 @@ def mask_secret_overrides(overrides: Any) -> Dict[str, Any]:
 def strip_masked_secrets(overrides: Any) -> Dict[str, Any]:
     """Drop secret keys whose value is the mask — a UI round-tripping the
     masked overrides (Control Panel Apply) must not overwrite the real value."""
+    # Copy the overrides (empty if not a dict).
     ov = dict(overrides or {}) if isinstance(overrides, dict) else {}
+    # Remove secrets that still hold only the mask.
     for k in SECRET_OVERRIDE_KEYS:
         if ov.get(k) == SECRET_MASK:
             ov.pop(k, None)
@@ -255,10 +290,13 @@ def username_for(hostname: str) -> str:
 
     Falls back to the whole hostname when there is no ``-``.
     """
+    # Strip the part after the first "-".
     return hostname.split("-", 1)[0] if "-" in hostname else hostname
 
 
 def _section_keys(parser: configparser.ConfigParser, section: str) -> Dict[str, str]:
+    """Return a section's keys as a dict, or {} if the section is missing."""
+    # Missing section: nothing to return.
     if not parser.has_section(section):
         return {}
     return dict(parser.items(section))
@@ -273,6 +311,7 @@ def resolve_profile(
 
     Returns ``{"hostname", "username", "simulation_id", "profile": {...}}``.
     """
+    # Use an empty override parser if none was given; derive username and bucket.
     user_conf = user_conf if user_conf is not None else _new_parser()
     username = username_for(hostname)
     simulation_id = bucket_for(hostname)
@@ -291,6 +330,7 @@ def resolve_profile(
     profile.update(_section_keys(sim_conf, simulation_id))  # bucket
     profile.update(_section_keys(user_conf, username))       # per-user override
 
+    # Return the identity and the merged profile.
     return {
         "hostname": hostname,
         "username": username,
@@ -317,6 +357,7 @@ def pure_bucket_profile(
     ``simulation.conf`` bucket is the user's intent: "turn off → revert to the
     bucket default".
     """
+    # Load the config and resolve with an empty user-override parser.
     sim_conf, _ = load_configs(config_dir)
     return resolve_profile(hostname, sim_conf, _new_parser())["profile"]
 
@@ -341,10 +382,13 @@ def effective_client_fields(
     resolve error or when ``sim_conf`` is None. Shared by both the hub-telemetry
     relay (``control_plane``) and the local dashboard (``local_ui_routes``) so
     the two Clients views never diverge."""
+    # Start from the client's reported values.
     sim_id = reported_sim_id or ""
     cfg = dict(reported_config or {})
+    # No config to resolve against: keep the reported values.
     if sim_conf is None:
         return sim_id, cfg
+    # Resolve the profile from the hostname.
     try:
         resolved = resolve_profile(hostname, sim_conf, user_conf)
         sim_id = resolved.get("simulation_id") or sim_id
@@ -371,13 +415,16 @@ def effective_client_fields(
                 v = rc.get(flag)
                 if v not in (None, ""):
                     cfg[flag] = v
+    # Any resolve error keeps the reported values.
     except Exception:  # noqa: BLE001 — degrade to reported values
         pass
+    # Return the bucket and config.
     return sim_id, cfg
 
 
 def flag_on(profile: Dict[str, str], key: str) -> bool:
     """Truthy helper: a flag is "on" iff its value lowercased == ``"on"``."""
+    # Compare the trimmed, lowercased value with "on".
     return str(profile.get(key, "")).strip().lower() == "on"
 
 
@@ -393,12 +440,15 @@ def render_ini_for_client(
     (matching the ``CLIENT_API.md`` contract). Values not present in the section
     are added; existing keys are overwritten.
     """
+    # Bucket the client will pick for itself.
     sim_id = bucket_for(hostname)
+    # Write each override into that bucket section (creating it if needed).
     if overrides:
         if not sim_conf.has_section(sim_id):
             sim_conf.add_section(sim_id)
         for k, v in overrides.items():
             sim_conf.set(sim_id, k, str(v))
+    # Render the whole config as INI text.
     buf = io.StringIO()
     sim_conf.write(buf)
     return buf.getvalue()
@@ -410,6 +460,7 @@ def validate_ini_text(text: str) -> configparser.ConfigParser:
     Used by ``CS_UPDATE_CONFIG`` / ``PUT /api/config/...`` so a bad edit is
     rejected before it overwrites the canon.
     """
+    # Parse the text; a parse error becomes a ValueError.
     p = _new_parser()
     try:
         p.read_string(text)

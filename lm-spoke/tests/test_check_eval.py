@@ -20,7 +20,7 @@ from check_eval import count_for_check, normalize_counts  # noqa: E402
 # pins them in sync: bump EXPECTED_SHA when you legitimately change check_eval.py
 # (the failure message spells out the re-sync). The lm repo's test_check_eval.py
 # pins the SAME constant, so its copy can't drift either.
-EXPECTED_SHA = "1bbe785c49d4406dbc9f4453d9c3f663c9ff4b5f75af22c67e31a239db0f5ade"
+EXPECTED_SHA = "5a9f981ab495608d35d8c3c50c57a7a4524fcfac0d81363ce2ca65976d6c2b70"
 _REPO = Path(__file__).resolve().parents[2]  # cs repo root
 _CS_COPIES = [
     _REPO / "lm-spoke" / "src" / "check_eval.py",

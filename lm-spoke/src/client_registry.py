@@ -24,17 +24,27 @@ loop. A process-exit hook flushes any pending dirty state (best-effort; the
 in-memory registry stays authoritative between flushes).
 """
 
+# Allow modern type-hint syntax without evaluating annotations at import time.
 from __future__ import annotations
 
+# Async lock, background tasks and worker threads.
 import asyncio
+# Registers the flush that runs when the process exits.
 import atexit
+# The registry is saved as JSON.
 import json
+# Standard-library logging.
 import logging
+# Timestamps for last-seen and streak tracking.
 import time
+# Tracks live registries without keeping them alive.
 import weakref
+# Filesystem path handling.
 from pathlib import Path
+# Type hints only.
 from typing import Any, Callable, Dict, List, Optional
 
+# Logger for this module.
 logger = logging.getLogger("ClientRegistry")
 
 # Keep at most this many recent error strings per client (rolling window).
@@ -44,6 +54,7 @@ _MAX_RECENT_ERRORS = 20
 # flicker (see apply_status). Mirrors sim_quota_engine.OFFLINE_TTL_S — keep
 # both at 60 min.
 _GATEWAY_CONFIRM_S = 3600.0
+# Name of the saved registry file.
 _STATE_FILE = "clients.json"
 # Coalescing window for the debounced persist: at most one clients.json write
 # per this many seconds, no matter how many beacons/mutations land.
@@ -56,6 +67,8 @@ _REGISTRIES: "weakref.WeakSet[ClientRegistry]" = weakref.WeakSet()
 
 
 def _flush_all_at_exit() -> None:
+    """Write any unsaved registry changes at interpreter exit."""
+    # Flush each live registry that has unsaved changes.
     for reg in list(_REGISTRIES):
         try:
             if reg._dirty:
@@ -64,6 +77,7 @@ def _flush_all_at_exit() -> None:
             pass
 
 
+# Run the flush when Python exits.
 atexit.register(_flush_all_at_exit)
 
 
@@ -78,6 +92,8 @@ class ClientRegistry:
                  bucket_resolver: Optional[Callable[[str], Dict[str, Any]]] = None,
                  stale_prune_hours: float = 48.0,
                  ) -> None:
+        """Set up the registry in ``data_dir`` and load the saved clients."""
+        # Data folder (created if needed), client map, lock and file path.
         self.data_dir = Path(data_dir)
         self.data_dir.mkdir(parents=True, exist_ok=True)
         self.clients: Dict[str, Dict[str, Any]] = {}
@@ -101,6 +117,7 @@ class ClientRegistry:
         # short of a full Purge Clients wipe of the whole registry.
         self._stale_prune_hours = stale_prune_hours
         self._prune_task: Optional[asyncio.Task] = None
+        # Register for the exit flush, then load saved clients.
         _REGISTRIES.add(self)
         self._load()
 
@@ -108,35 +125,46 @@ class ClientRegistry:
         """Start the background stale-client prune sweep. No-op if there's no
         running loop (e.g. unit tests constructing a registry without one) —
         mirrors DemoManager.start()'s pattern."""
+        # Already running: do nothing.
         if self._prune_task is not None and not self._prune_task.done():
             return
+        # Start the hourly sweep.
         try:
             self._prune_task = asyncio.create_task(self._prune_loop())
         except RuntimeError:
             pass  # no current event loop
 
     async def _prune_loop(self) -> None:
+        """Every hour, remove clients that have not reported within the prune window."""
+        # Repeat until cancelled.
         while True:
             try:
                 await asyncio.sleep(3600)  # hourly — this is an hours-scale concern, not a hot path
                 res = await self.prune_stale(self._stale_prune_hours * 3600)
+                # Log what was removed, if anything.
                 if res["count"]:
                     logger.info("ClientRegistry: pruned %d stale client(s) (no heartbeat in %.0fh): %s",
                                res["count"], self._stale_prune_hours, res["pruned"])
+            # Stop quietly when cancelled.
             except asyncio.CancelledError:
                 return
+            # Log other errors and keep going.
             except Exception as exc:  # noqa: BLE001
                 logger.warning("client-registry prune loop error: %s", exc)
 
     # ── persistence ────────────────────────────────────────────────────────
     def _load(self) -> None:
+        """Load the saved clients from disk (empty on any problem)."""
+        # Read the file if it exists ("" is treated as empty).
         try:
             if self._path.exists():
                 raw = self._path.read_text(encoding="utf-8")
                 loaded = json.loads(raw) if raw.strip() else {}
+                # Keep only entries whose value is a dict.
                 if isinstance(loaded, dict):
                     self.clients = {str(k): v for k, v in loaded.items()
                                     if isinstance(v, dict)}
+        # A corrupt file is logged and the registry starts empty.
         except Exception as exc:  # noqa: BLE001
             logger.warning("could not load %s: %s — starting empty", self._path, exc)
             self.clients = {}
@@ -144,11 +172,13 @@ class ClientRegistry:
     def _persist(self) -> None:
         """Synchronous full write (load-time repair / atexit flush only —
         the hot path goes through the debounced ``_apersist``)."""
+        # Clear the dirty flag and write the whole map.
         try:
             self._dirty = False
             self._path.write_text(
                 json.dumps(self.clients, sort_keys=True),
                 encoding="utf-8")
+        # Write failures are only logged.
         except Exception as exc:  # noqa: BLE001
             logger.warning("could not persist %s: %s", self._path, exc)
 
@@ -163,12 +193,14 @@ class ClientRegistry:
         the in-memory ``self.clients`` (authoritative); the file is a warm-load
         snapshot, so a bounded staleness window is safe — a crash loses at most
         the last ~5 s of last_seen updates."""
+        # Mark dirty and start a flush task if one is not already pending.
         self._dirty = True
         if self._flush_task is None or self._flush_task.done():
             self._flush_task = asyncio.get_running_loop().create_task(
                 self._delayed_flush())
 
     async def _delayed_flush(self) -> None:
+        """Wait, flush, and repeat while new changes keep arriving."""
         # Loop: a mutation landing while _flush_now is writing re-marks dirty
         # but may see this task as not-done and skip re-arming — so re-check
         # after each flush instead of exiting immediately.
@@ -183,6 +215,7 @@ class ClientRegistry:
         ``json.dumps`` AND the file write run in a worker thread so neither
         the serialization CPU nor the disk I/O blocks the shared event loop
         (the lock is held across the await, so ``self.clients`` is stable)."""
+        # Hold the lock while writing; skip if nothing changed.
         async with self._lock:
             if not self._dirty:
                 return
@@ -190,14 +223,18 @@ class ClientRegistry:
                 clients = self.clients  # stable: we hold self._lock
 
                 def _write() -> None:
+                    """Write the snapshot to disk (runs in a worker thread)."""
+                    # Serialise and write the file.
                     self._path.write_text(
                         json.dumps(clients, sort_keys=True), encoding="utf-8")
 
+                # Do the write off the event loop.
                 await asyncio.to_thread(_write)
                 # Clear dirty only AFTER a successful write — a failed write must
                 # keep us dirty so the next _delayed_flush retries instead of
                 # silently losing the durable snapshot.
                 self._dirty = False
+            # A failed write stays dirty so the next flush retries.
             except Exception as exc:  # noqa: BLE001
                 logger.warning("could not persist %s: %s", self._path, exc)
 
@@ -205,6 +242,7 @@ class ClientRegistry:
         """Cancel the armed flusher and flush any pending state to disk.
         Call on orderly shutdown (tests, service stop); the atexit hook is the
         last-resort backstop for paths that skip this."""
+        # Take the pending flush task and cancel it, waiting for it to finish.
         task, self._flush_task = self._flush_task, None
         if task is not None and not task.done():
             task.cancel()
@@ -212,6 +250,7 @@ class ClientRegistry:
                 await task
             except (asyncio.CancelledError, Exception):  # noqa: BLE001
                 pass
+        # Write whatever is still unsaved.
         await self._flush_now()
 
     # ── status upsert ──────────────────────────────────────────────────────
@@ -223,14 +262,17 @@ class ClientRegistry:
         platform, simulation_id, config, status) without clobbering
         server-side fields like ``overrides``.
         """
+        # Blank hostnames are stored under a placeholder.
         hostname = str(hostname or "").strip()
         if not hostname:
             hostname = "__unknown__"
+        # Under the lock, fetch or create the entry and stamp the time.
         async with self._lock:
             entry = self.clients.get(hostname, {})
             entry["hostname"] = hostname
             entry["last_seen"] = time.time()
 
+            # Copy every reported field the client sent.
             for key in ("simulation_id", "platform", "iteration",
                         "connected_ssid", "ip", "gateway_reachable",
                         "active_simulations", "config", "status", "has_usb",
@@ -289,6 +331,7 @@ class ClientRegistry:
                 recent = list(entry.get("recent_errors", [])) + errs
                 entry["recent_errors"] = recent[-_MAX_RECENT_ERRORS:]
 
+            # Store the entry, schedule a save and return a copy.
             self.clients[hostname] = entry
             await self._apersist()
             return dict(entry)
@@ -301,10 +344,14 @@ class ClientRegistry:
         return {k: dict(v) for k, v in self.clients.items()}
 
     def get(self, hostname: str) -> Optional[Dict[str, Any]]:
+        """Return a copy of one client's entry, or None if unknown."""
+        # Look up and copy the entry.
         entry = self.clients.get(hostname)
         return dict(entry) if entry is not None else None
 
     def count(self) -> int:
+        """Return how many clients are registered."""
+        # Size of the map.
         return len(self.clients)
 
     async def delete_one(self, hostname: str) -> bool:
@@ -316,9 +363,11 @@ class ClientRegistry:
         this method existed the only way to remove ONE ghost entry was to
         Purge Clients and lose every real client's history too. Returns
         False if the hostname wasn't registered (nothing to delete)."""
+        # Blank hostnames match nothing.
         hostname = str(hostname or "").strip()
         if not hostname:
             return False
+        # Under the lock, delete the entry if it exists and schedule a save.
         async with self._lock:
             if hostname not in self.clients:
                 return False
@@ -336,10 +385,12 @@ class ClientRegistry:
         {"pruned": [hostnames...], "count": N} so the caller can log what
         was removed (never silent — an unexpectedly large prune is exactly
         the kind of thing that should be visible, not swallowed)."""
+        # Under the lock, find clients that are too old or never reported.
         now = time.time()
         async with self._lock:
             stale = [h for h, c in self.clients.items()
                      if not c.get("last_seen") or (now - float(c["last_seen"])) > max_age_s]
+            # Delete them and save if any were removed.
             for h in stale:
                 del self.clients[h]
             if stale:
@@ -353,8 +404,10 @@ class ClientRegistry:
         so callers skip pruning entirely (an empty profile would treat every
         key as "off" and wrongly prune "off" overrides — a toggle must never
         be silently dropped on an I/O hiccup)."""
+        # No resolver wired: cannot prune.
         if not self._bucket_resolver:
             return None
+        # Resolve the profile; failures return None so pruning is skipped.
         try:
             return self._bucket_resolver(hostname) or {}
         except Exception as exc:  # noqa: BLE001 — never block a toggle
@@ -376,11 +429,14 @@ class ClientRegistry:
         instant they're written); the SimQuotaEngine re-home sets
         ``wsite=<quota site>`` and that MUST survive. No-op when *cur* is
         empty or no resolver is wired (tests / standalone registry)."""
+        # Nothing to prune.
         if not cur:
             return
+        # Bucket default profile; skip pruning if it cannot be resolved.
         profile = self._bucket_profile(hostname)
         if profile is None:
             return
+        # Drop each on/off override that equals the bucket's value.
         for flag in list(cur.keys()):
             ov_val = str(cur[flag]).strip().lower()
             if ov_val not in ("on", "off"):
@@ -390,6 +446,8 @@ class ClientRegistry:
                 del cur[flag]
 
     async def set_overrides(self, hostname: str, overrides: Dict[str, Any]) -> Dict[str, Any]:
+        """Merge ``overrides`` into a client's overrides, drop redundant ones, and save."""
+        # Under the lock, fetch or create the client's entry.
         hostname = str(hostname or "").strip()
         async with self._lock:
             entry = self.clients.setdefault(hostname, {"hostname": hostname})
@@ -399,9 +457,11 @@ class ClientRegistry:
             # per click; the Control panel's "Apply" sends the full set (merge of
             # the full set == replace, so no behavior change there). clear_overrides
             # removes them all.
+            # Merge the new values in.
             cur = dict(entry.get("overrides") or {})
             if isinstance(overrides, dict):
                 cur.update(overrides)
+            # Remove overrides that equal the bucket default, then save.
             self._prune_redundant(cur, hostname)
             entry["overrides"] = cur
             self.clients[hostname] = entry
@@ -420,22 +480,27 @@ class ClientRegistry:
         on) and ``wsite`` (a re-home) on its ledger clients. Keys pruned away
         by the bucket-default match are dropped from ``engine_keys`` too
         (there's nothing to revert)."""
+        # Under the lock, fetch or create the client's entry.
         hostname = str(hostname or "").strip()
         async with self._lock:
             entry = self.clients.setdefault(hostname, {"hostname": hostname})
             entry["hostname"] = hostname
+            # Current overrides and the keys the engine owns.
             cur = dict(entry.get("overrides") or {})
             eng = list(entry.get("engine_keys") or [])
+            # Merge the new values and record each key as engine-owned.
             if isinstance(overrides, dict):
                 cur.update(overrides)
                 for k in overrides:
                     if k not in eng:
                         eng.append(k)
+            # Remove overrides that equal the bucket default.
             self._prune_redundant(cur, hostname)
             # A key pruned (matched the bucket default) is no longer an
             # override — drop it from engine_keys so reconcile doesn't try to
             # remove a key that isn't there.
             eng = [k for k in eng if k in cur]
+            # Save overrides and owned keys.
             entry["overrides"] = cur
             entry["engine_keys"] = eng
             self.clients[hostname] = entry
@@ -451,17 +516,21 @@ class ClientRegistry:
         reverting). Called by the SimQuotaEngine reconcile tail for
         engine-set keys the ledger no longer claims (the missed-_release
         leak). No-op for a key not present."""
+        # Nothing to remove.
         hostname = str(hostname or "").strip()
         keys = list(keys or [])
         if not keys:
             return {}
+        # Under the lock; unknown clients return {}.
         async with self._lock:
             entry = self.clients.get(hostname)
             if entry is None:
                 return {}
+            # Current overrides and engine-owned keys.
             cur = dict(entry.get("overrides") or {})
             eng = list(entry.get("engine_keys") or [])
             changed = False
+            # Remove each key from both lists.
             for k in keys:
                 if k in cur:
                     del cur[k]
@@ -469,11 +538,13 @@ class ClientRegistry:
                 if k in eng:
                     eng.remove(k)
                     changed = True
+            # Save only if something changed.
             if changed:
                 entry["overrides"] = cur
                 entry["engine_keys"] = eng
                 self.clients[hostname] = entry
                 await self._apersist()
+            # Return a copy of the entry.
             return dict(entry)
 
     async def prune_against_bucket(self, hostname: str) -> Dict[str, Any]:
@@ -486,28 +557,35 @@ class ClientRegistry:
         sweep. Only removes overrides that match the bucket, so the served
         config is unchanged. Non-toggle overrides (wsite/ssid/…) are never
         pruned. Also drops any engine_keys that the prune removed."""
+        # Under the lock; unknown clients return {}.
         hostname = str(hostname or "").strip()
         async with self._lock:
             entry = self.clients.get(hostname)
             if entry is None:
                 return {}
+            # No overrides: nothing to prune.
             cur = dict(entry.get("overrides") or {})
             if not cur:
                 return dict(entry)
+            # Prune and stop if nothing changed.
             before = dict(cur)
             self._prune_redundant(cur, hostname)
             if cur == before:
                 return dict(entry)
+            # Save the pruned overrides, dropping engine keys that are gone.
             entry["overrides"] = cur
             eng = entry.get("engine_keys") or []
             new_eng = [k for k in eng if k in cur]
             if new_eng != eng:
                 entry["engine_keys"] = new_eng
+            # Save and return a copy.
             self.clients[hostname] = entry
             await self._apersist()
             return dict(entry)
 
     async def clear_overrides(self, hostname: str) -> Dict[str, Any]:
+        """Remove all of a client's overrides and return its entry ({} if unknown)."""
+        # Under the lock, drop the overrides and save.
         hostname = str(hostname or "").strip()
         async with self._lock:
             entry = self.clients.get(hostname)
@@ -515,6 +593,7 @@ class ClientRegistry:
                 entry.pop("overrides", None)
                 await self._apersist()
                 return dict(entry)
+            # Unknown client.
             return {}
 
     async def record_tiers_batch(self, updates: Dict[str, Dict[str, Any]]) -> None:
@@ -532,20 +611,25 @@ class ClientRegistry:
         (no tier transitions) writes nothing. Only updates clients already in
         the registry — the join is meaningless for an unknown host.
         """
+        # Nothing to record.
         if not updates:
             return
+        # Under the lock, update each known client whose tier changed.
         async with self._lock:
             changed = False
             for hn, upd in updates.items():
                 entry = self.clients.get(hn)
                 if entry is None:
                     continue
+                # The new tier and USB state.
                 tier = upd.get("tier")
                 has_usb = upd.get("has_usb")
+                # Store them only if they differ.
                 if entry.get("tier") != tier or entry.get("last_known_has_usb") != has_usb:
                     entry["tier"] = tier
                     entry["last_known_has_usb"] = bool(has_usb) if has_usb is not None else None
                     changed = True
+            # Save only when something changed.
             if changed:
                 await self._apersist()
 
@@ -558,14 +642,17 @@ class ClientRegistry:
         naming how many clients were removed. Disk unlink offloaded via
         ``asyncio.to_thread`` for the same event-loop reason as ``_apersist``.
         """
+        # Under the lock, count and drop every client.
         async with self._lock:
             n = len(self.clients)
             self.clients = {}
             # Clear the dirty flag so a pending debounced flush can't
             # resurrect clients.json right after the unlink below.
             self._dirty = False
+            # Delete the file off the event loop; failure is only logged.
             try:
                 await asyncio.to_thread(self._path.unlink, missing_ok=True)
             except Exception as exc:  # noqa: BLE001
                 logger.warning("could not remove %s: %s", self._path, exc)
+            # Report how many clients were removed.
             return {"purged": n}

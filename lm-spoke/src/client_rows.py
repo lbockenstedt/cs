@@ -20,15 +20,22 @@ Row semantics (unchanged from both originals):
   is currently reporting; the CALLER awaits
   ``registry.record_tiers_batch(tier_updates)`` (async, change-gated).
 """
+# Allow modern type-hint syntax (e.g. "float | None") without evaluating annotations.
 from __future__ import annotations
 
+# Standard-library logging for degraded-config messages.
 import logging
+# Supplies the current time for the online check.
 import time
+# Used to locate the configs directory relative to this file.
 from pathlib import Path
+# Type hints only.
 from typing import Any, Dict, List, Tuple
 
+# Loads simulation configs and resolves each client's effective Sim-ID/Site/PHY.
 import sim_config
 
+# Dedicated logger for this module.
 logger = logging.getLogger("CSClientRows")
 
 # configs/ lives at <repo>/configs (this file is <repo>/lm-spoke/src/…) —
@@ -41,11 +48,14 @@ def _t1_exclude_hosts(spoke) -> list:
     T1 PCI card is NOT passed through — their clients run as USB/T2 and must
     never be classified/deployed as T1. Returns lowercased hostname/prefix tokens
     (empty on any error)."""
+    # Read the hub_config block from the spoke's local store (if the store exists).
     try:
         ls = getattr(spoke, "local_store", None)
         hc = ((ls.get_hub_config() or {}).get("hub_config") or {}) if ls else {}
+        # Return the non-empty entries, trimmed and lower-cased for case-insensitive matching.
         return [str(x).strip().lower() for x in (hc.get("t1_exclude_hosts") or [])
                 if str(x).strip()]
+    # Any problem reading config means "no exclusions".
     except Exception:  # noqa: BLE001
         return []
 
@@ -54,19 +64,25 @@ def _host_t1_excluded(host: str, patterns: list) -> bool:
     """True when a pxmx server ``host`` matches a ``t1_exclude_hosts`` entry —
     exact hostname OR prefix (the Setup field accepts either, e.g. ``sim-svr-05``
     or a bare prefix that covers a numbered range)."""
+    # Without a host or any patterns nothing can match.
     if not host or not patterns:
         return False
+    # Compare case-insensitively.
     h = str(host).strip().lower()
+    # Match either the exact hostname or a prefix entry.
     return any(h == p or h.startswith(p) for p in patterns)
 
 
 def _t3_exclude_hosts(spoke) -> list:
     """Same as ``_t1_exclude_hosts`` but for ``t3_exclude_hosts``."""
+    # Read the hub_config block from the spoke's local store (if the store exists).
     try:
         ls = getattr(spoke, "local_store", None)
         hc = ((ls.get_hub_config() or {}).get("hub_config") or {}) if ls else {}
+        # Return the non-empty entries, trimmed and lower-cased for case-insensitive matching.
         return [str(x).strip().lower() for x in (hc.get("t3_exclude_hosts") or [])
                 if str(x).strip()]
+    # Any problem reading config means "no exclusions".
     except Exception:  # noqa: BLE001
         return []
 
@@ -80,18 +96,23 @@ def build_client_rows(spoke, now: float | None = None
     The caller is responsible for persisting ``tier_updates`` via
     ``await spoke.registry.record_tiers_batch(tier_updates)``.
     """
+    # Default to the current time when the caller did not supply one.
     if now is None:
         now = time.time()
+    # Without a client registry there are no rows to build.
     registry = getattr(spoke, "registry", None)
     if registry is None:
         return [], {}
 
+    # The Proxmox deploy helper (may be absent on spokes without Proxmox).
     deploy = getattr(spoke, "deploy", None)
+    # Build lookups once: USB-dongle VMs, name->vmid, vmid->tier, vmid->health, name->host.
     if deploy is not None:
         usb_vmids, name_to_vmid = deploy.usb_vmid_index()
         tier_index = deploy.vm_tier_index()
         health_index = deploy.vm_health_index()
         name_to_host = deploy.name_to_host()
+    # No deploy helper: use empty lookups so every client falls back to reported values.
     else:
         usb_vmids, name_to_vmid, tier_index, health_index = set(), {}, {}, {}
         name_to_host = {}
@@ -99,35 +120,48 @@ def build_client_rows(spoke, now: float | None = None
     # Per-host T1 opt-out (hub mode): pxmx servers the operator listed do NOT
     # PCI-pass their T1 card, so their clients are USB/T2 and must never be
     # classified/deployed as T1. Only explicitly-excluded hosts are touched.
+    # Hosts the operator excluded from T1 and from T3 classification.
     excluded_t1_hosts = _t1_exclude_hosts(spoke)
     excluded_t3_hosts = _t3_exclude_hosts(spoke)
 
     # Load the sim configs ONCE per call (mtime-cached) so each client's
     # authoritative Site/PHY/Sim-ID can be resolved from its hostname.
+    # Load the simulation configs (cached by file modification time).
     try:
         _sim_conf, _user_conf = sim_config.load_configs(_CONFIGS_DIR)
+    # If configs cannot be loaded, continue using each client's reported values.
     except Exception as _e:  # noqa: BLE001 — degrade to reported values
         _sim_conf = _user_conf = None
         logger.debug("build_client_rows: config load failed: %s", _e)
 
+    # Output rows, plus tier changes the caller should persist.
     rows: List[Dict[str, Any]] = []
     tier_updates: Dict[str, Dict[str, Any]] = {}
+    # Build one row per registered client.
     for hostname, c in registry.get_all().items():
+        # When the client last checked in.
         last_seen = c.get("last_seen")
+        # Resolve the client's authoritative Sim-ID and config from its hostname.
         eff_sim_id, eff_cfg = sim_config.effective_client_fields(
             hostname, _sim_conf, _user_conf,
             c.get("simulation_id") or "", c.get("config"))
+        # Join the client to its Proxmox VM and whether that VM has a USB dongle.
         if deploy is not None:
             vmid, has_usb = deploy.client_has_usb(
                 hostname, c, usb_vmids, name_to_vmid)
+        # No deploy helper: the VM and dongle are unknown.
         else:
             vmid, has_usb = None, False
+        # Live tier and dongle health for the VM, when the VM is known.
         tier = tier_index.get(str(vmid)) if vmid else None
         health_state = health_index.get(str(vmid)) if vmid else None
+        # A live-resolved tier is authoritative, so queue it for persistence.
         if vmid and tier:
             tier_updates[hostname] = {"tier": tier, "has_usb": has_usb}
+        # By default the tier is live (not a stale fallback) with no "as of" time.
         tier_stale = False
         tier_as_of: Any = None
+        # The VM could not be resolved (see explanation below).
         if vmid is None:
             # Host/agent offline or VM aged out of proxmox_states: the live
             # join can't classify it. Fall back to the last-known authoritative
@@ -135,10 +169,12 @@ def build_client_rows(spoke, now: float | None = None
             # csClassifyClient (which prefers c.tier) keeps it T2 instead of
             # dropping to T1. Stamp tier_stale so the UI/QuotaEngine can tell an
             # ASSUMED (persisted-fallback) tier from a live-resolved one.
+            # Use the persisted tier only when no live tier exists, and mark it as stale.
             _fb_tier = c.get("tier")
             if tier is None and _fb_tier:
                 tier_stale = True
                 tier_as_of = c.get("tier_as_of") or c.get("last_seen")
+            # Fill in the tier and USB flag from the last-known persisted values.
             tier = tier or _fb_tier
             has_usb = has_usb or bool(c.get("last_known_has_usb"))
         # Per-host T1 opt-out: if this client lives on an excluded pxmx server and
@@ -146,19 +182,27 @@ def build_client_rows(spoke, now: float | None = None
         # exact case csClassifyClient renders as T1), force it to T2 so neither
         # the UI nor the quota engine ever treats/deploys it as T1. Persisted via
         # tier_updates so the registry (engine's source) agrees.
+        # Client on a T1-excluded host that would otherwise show as T1.
         if excluded_t1_hosts and tier not in ("t2", "t3") and not has_usb:
+            # Find the Proxmox host this client's VM lives on.
             _pmx_host = name_to_host.get(str(hostname).strip().lower())
+            # That host is excluded from T1: force T2 and persist it.
             if _host_t1_excluded(_pmx_host, excluded_t1_hosts):
                 tier = "t2"
                 tier_updates[hostname] = {"tier": "t2", "has_usb": has_usb}
         # Per-host T3 opt-out: mirrors T1 above. Unlike T1 (the ambiguous-default
         # fallback), T3 is explicitly resolved via vm_tier_index/persisted tier, so
         # guard directly on tier == "t3" rather than "not yet classified".
+        # Client classified T3 on a host excluded from T3.
         if excluded_t3_hosts and tier == "t3":
+            # Find the Proxmox host this client's VM lives on.
             _pmx_host = name_to_host.get(str(hostname).strip().lower())
+            # That host is excluded from T3: downgrade to T2 and persist it (same matcher as T1).
             if _host_t1_excluded(_pmx_host, excluded_t3_hosts):
                 tier = "t2"
                 tier_updates[hostname] = {"tier": "t2", "has_usb": has_usb}
+        # Assemble the row; "—" is shown for unknown text values and "online" means a heartbeat
+        # within the last 300 seconds.
         rows.append({
             "hostname": hostname, "id": hostname,
             "platform": c.get("platform") or "—",
@@ -203,4 +247,5 @@ def build_client_rows(spoke, now: float | None = None
             "config": eff_cfg,
             "overrides": sim_config.mask_secret_overrides(c.get("overrides")),
         })
+    # Return the rows and the tier updates for the caller to persist.
     return rows, tier_updates

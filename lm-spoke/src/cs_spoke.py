@@ -25,34 +25,56 @@ Retired commands (no longer sent by the LM hub): CS_START_SIMULATION,
     HTTP mode.
 """
 
+# Allow modern type-hint syntax without evaluating annotations at import time.
 from __future__ import annotations
 
+# Async loops, locks and subprocesses.
 import asyncio
+# Standard-library logging.
 import logging
+# Environment settings and file permissions.
 import os
+# Timestamps for frames and debouncing.
 import time
+# Unique message ids.
 import uuid
+# Filesystem path handling.
 from pathlib import Path
+# Type hints only.
 from typing import Any, Dict, Optional
 
+# Simulation state, profiles and kill switch.
 from simulation_engine import SimulationEngine
+# simulation.conf loading and bucket profiles.
 import sim_config
+# Per-host Proxmox state and telemetry relay payload.
 from proxmox_deploy import ProxmoxDeploy
+# Persisted command queue and cs settings store.
 from command_queue import CommandQueue, CSSettings
+# Proxmox token store and sim-tag map building.
 from token_store import TokenStore, compute_sim_tag_map, norm_hostname as _norm_hostname
+# Registry of simulation clients.
 from client_registry import ClientRegistry
+# Shared builder for client table rows.
 from client_rows import build_client_rows
+# Ephemeral demo-scenario overrides.
 from demo_scenarios import DemoManager
+# Local JSON config store.
 from local_store import LocalStore
+# Aruba Central poller.
 from central_poller import CentralPoller
+# Juniper Mist poller.
 from mist_poller import MistPoller
 import client_api  # for client_api.push_pending (live command delivery to WS agents)
+# Builds the client API FastAPI app.
 from client_api import build_client_api_app
 
+# BaseSpoke comes from the LM core package, or a local copy when standalone.
 try:
     from core.src.base_spoke import BaseSpoke
 except ImportError:
     from base_spoke import BaseSpoke  # type: ignore
+# Per-domain command handler mixins.
 from command_handlers import (
     AgentCommandsMixin,
     ClientCommandsMixin,
@@ -65,6 +87,7 @@ from command_handlers import (
 # keeps working.
 from command_handlers.handlers_agents import _deep_merge_cfg  # noqa: F401
 
+# Logger for this module.
 logger = logging.getLogger("CSSpoke")
 
 # Secret env names whose stale CLI-pinned value (unit ExecStart) was ignored at
@@ -77,6 +100,8 @@ class CSSpoke(AgentCommandsMixin, SimCommandsMixin, ConfigCommandsMixin,
     """Client simulator spoke. Owns the sim engine (+ registry/queue/deploy later)."""
 
     def __init__(self, spoke_id: str, config: Dict[str, Any] | None = None):
+        """Create the spoke and wire up all of its modules and stores."""
+        # Base spoke setup.
         super().__init__(spoke_id, config or {})
         # Resolve repo-relative dirs from this file so cwd doesn't matter.
         # data/ stays under lm-spoke/ (runtime state, gitignored). configs/ lives
@@ -101,8 +126,10 @@ class CSSpoke(AgentCommandsMixin, SimCommandsMixin, ConfigCommandsMixin,
         # stale_client_reclone.py's module docstring for why this exists and
         # how it's distinct from guest_watchdog (pxmx agent) and the dongle-
         # health ladder. Started by CSControlPlane.run().
+        # Reclone VMs whose sim client went silent.
         from stale_client_reclone import StaleClientReclone
         self.stale_client_reclone = StaleClientReclone(self, data_dir)
+        # Command queue and Proxmox deploy state.
         self.queue = CommandQueue(data_dir, self.settings)
         self.deploy = ProxmoxDeploy()
         # GitHub push (Source of Truth = GitHub): repo/token pushed by the hub via
@@ -128,6 +155,7 @@ class CSSpoke(AgentCommandsMixin, SimCommandsMixin, ConfigCommandsMixin,
         # CS_GET_SIM_TAG_HEALTH so "this server has no tags" is answerable
         # without reading spoke logs.
         self._sim_tag_skips: Dict[str, str] = {}
+        # Lock so only one sim-tag dispatch runs at a time.
         self._sim_tag_sync_lock = asyncio.Lock()
         # Sim-tag sync is DEBOUNCED off the per-frame telemetry hot path: at most
         # once per _SIM_TAG_MIN_INTERVAL. It no longer PUTs to the Proxmox API from
@@ -195,6 +223,7 @@ class CSSpoke(AgentCommandsMixin, SimCommandsMixin, ConfigCommandsMixin,
         multi-role agent's ``RoleConnection`` when simulation is hosted as a
         role, so the relay runs identically in both deployment modes.
         """
+        # The telemetry relay loop.
         return [asyncio.create_task(self._cs_telemetry_relay_loop(websocket))]
 
     # ── Process-scoped local services (both deployment modes) ────────────────
@@ -214,12 +243,14 @@ class CSSpoke(AgentCommandsMixin, SimCommandsMixin, ConfigCommandsMixin,
         for sim VMs to check in. Each loop's ``start()`` guards its own re-entry,
         so a duplicate call is harmless. Must run inside a running event loop.
         """
+        # Start each loop (each guards against double starts).
         self.demo.start()
         self.registry.start()
         self.stale_client_reclone.start()
         self.central_poller.start()
         self.central_on_prem_poller.start()
         self.mist_poller.start()
+        # Optional engines start only if present.
         if getattr(self, "sim_quota_engine", None) is not None:
             self.sim_quota_engine.start()
         if getattr(self, "repo_sync", None) is not None:
@@ -243,14 +274,18 @@ class CSSpoke(AgentCommandsMixin, SimCommandsMixin, ConfigCommandsMixin,
         ``self._api_server``) so the caller can signal shutdown. Idempotent: a
         second call while a server is already running is a no-op.
         """
+        # Already running: return the existing server.
         if getattr(self, "_api_server", None) is not None:
             return self._api_server
+        # Web server for the client API.
         import uvicorn
+        # Host and port from the environment (a stray 8000 maps to 8080).
         if host is None:
             host = os.getenv("CS_API_HOST", "0.0.0.0") or "0.0.0.0"
         if port is None:
             _p = os.getenv("CS_API_PORT", "8080") or "8080"
             port = 8080 if str(_p) == "8000" else int(_p)
+        # Build the app and start it as a background task.
         app = build_client_api_app(self)
         self._api_app = app
         server = uvicorn.Server(uvicorn.Config(app, host=host, port=int(port),
@@ -262,6 +297,7 @@ class CSSpoke(AgentCommandsMixin, SimCommandsMixin, ConfigCommandsMixin,
 
     def stop_client_api_server(self) -> None:
         """Signal the role-hosted client API server to exit (best-effort)."""
+        # Ask a running server to exit.
         server = getattr(self, "_api_server", None)
         if server is not None:
             try:
@@ -280,10 +316,13 @@ class CSSpoke(AgentCommandsMixin, SimCommandsMixin, ConfigCommandsMixin,
         exactly what the Quota Engine + UI act on, so a change to any of them
         changes the sig and forces an immediate send. Returns None on any error
         → caller treats that as "changed" and sends (fail-safe: never skip)."""
+        # Hash libraries for the signature.
         try:
             import hashlib
             import json
+            # Collect the state that matters from each host.
             parts: list = []
+            # Per-VM status, provisioning state and tags.
             for h in payload.get("proxmox_hosts") or []:
                 h = h or {}
                 hpx = h.get("proxmox") or {}
@@ -291,14 +330,17 @@ class CSSpoke(AgentCommandsMixin, SimCommandsMixin, ConfigCommandsMixin,
                     v = v or {}
                     parts.append(("vm", v.get("vmid"), v.get("status"), v.get("prov_status"),
                                   tuple(sorted(str(t) for t in (v.get("tags") or [])))))
+                # USB device states.
                 for u in h.get("usb_devices") or []:
                     u = u or {}
                     parts.append(("usb", u.get("bus_path") or u.get("bus"),
                                   u.get("vidpid"), u.get("state")))
+                # Provisioning run progress.
                 pr = hpx.get("prov_run") or {}
                 parts.append(("prov", bool(pr.get("running")),
                               tuple(sorted((str((it or {}).get("vmid")), str((it or {}).get("status")))
                                            for it in (pr.get("items") or [])))))
+                # Delete gate and quarantine.
                 dg = hpx.get("delete_gate") or {}
                 parts.append(("gate", dg.get("reason"), dg.get("threshold_exceeded")))
                 parts.append(("qt", tuple(sorted(str((q or {}).get("bus_path"))
@@ -325,22 +367,26 @@ class CSSpoke(AgentCommandsMixin, SimCommandsMixin, ConfigCommandsMixin,
                               tuple(_gw.get("reset") or []),
                               tuple(_gw.get("power_cycled") or []),
                               tuple(_gw.get("started") or [])))
+                # Provisioning state, VMID range and agent connection.
                 pv = hpx.get("provision") or {}
                 parts.append(("provn", pv.get("reason"), pv.get("halt"),
                               pv.get("loop_running"), pv.get("auto_provision_on")))
                 parts.append(("range", str(hpx.get("vmid_range")), hpx.get("connected"),
                               hpx.get("agent_version")))
+            # Client states.
             for c in payload.get("clients") or []:
                 c = c or {}
                 parts.append(("cli", c.get("hostname"), c.get("online"), c.get("status"),
                               tuple(sorted(str(s) for s in (c.get("active_simulations") or []))),
                               c.get("tier"), c.get("simulation_id")))
+            # Central and Mist status.
             cen = payload.get("central") or {}
             parts.append(("cen", cen.get("status") or cen.get("token_state"),
                           cen.get("wireless_clients"), cen.get("hardware_alerts")))
             mist = payload.get("mist") or {}
             parts.append(("mist", mist.get("status") or mist.get("token_state"),
                           mist.get("wireless_clients")))
+            # Command queue states.
             for q in payload.get("command_queue") or []:
                 q = q or {}
                 parts.append(("q", q.get("id") or q.get("cs_cmd_id"), q.get("status")))
@@ -349,8 +395,10 @@ class CSSpoke(AgentCommandsMixin, SimCommandsMixin, ConfigCommandsMixin,
             # re-apportions on the next push, not at the next heartbeat.
             parts.append(("pool", tuple(sorted(
                 (str(k), str(v)) for k, v in (payload.get("pool_by_site") or {}).items()))))
+            # Draining flag, then hash everything.
             parts.append(("drain", bool(payload.get("draining"))))
             return hashlib.sha1(json.dumps(parts, sort_keys=True, default=str).encode()).hexdigest()
+        # Any error means "changed".
         except Exception:
             return None
 
@@ -371,6 +419,7 @@ class CSSpoke(AgentCommandsMixin, SimCommandsMixin, ConfigCommandsMixin,
         sending less often is latest-wins coalescing done ON THE SPOKE — the hub
         pushes the merge work down here rather than shedding our telemetry. See
         lm/docs/backpressure-throttling.md §6 (spoke-side cooperation)."""
+        # Read the base interval from the environment.
         interval = 10
         try:
             interval = max(2, int(os.environ.get("CS_TELEMETRY_INTERVAL_S", "10")))
@@ -419,8 +468,10 @@ class CSSpoke(AgentCommandsMixin, SimCommandsMixin, ConfigCommandsMixin,
             raise
         except Exception as e:  # noqa: BLE001 — telemetry hash drift check is the backstop
             logger.debug("CS_CONFIG_REQUEST send failed: %s", e)
+        # Relay loop.
         while True:
             try:
+                # Wait until the deploy module exists.
                 cs_mod = self
                 deploy = getattr(cs_mod, "deploy", None) if cs_mod else None
                 if deploy is None:
@@ -440,6 +491,7 @@ class CSSpoke(AgentCommandsMixin, SimCommandsMixin, ConfigCommandsMixin,
                     dhcp = await asyncio.to_thread(collect_dhcp_status)
                 except Exception:
                     dhcp = None
+                # Build the relay payload.
                 payload = deploy.relay_payload(self.control_plane.spoke_id, self.control_plane.spoke_id, dhcp=dhcp)
                 # relay_payload's own "central" field is a placeholder ({}) —
                 # overlay this spoke's real CentralPoller output so a
@@ -530,6 +582,7 @@ class CSSpoke(AgentCommandsMixin, SimCommandsMixin, ConfigCommandsMixin,
                 # never delayed. Next interval is FAST right after a change, SLOW
                 # when idle. ``draining`` must always get through, so treat it as
                 # a force.
+                # Decide whether to send this tick.
                 _now = time.time()
                 _sig = self._relay_content_sig(payload)
                 _changed = (_sig is None) or (_sig != _last_sig)
@@ -560,8 +613,10 @@ class CSSpoke(AgentCommandsMixin, SimCommandsMixin, ConfigCommandsMixin,
                     _last_send_ts = _now
                     _force_send = False
                     interval = _FAST if _changed else _SLOW
+                # Nothing to send: back off.
                 else:
                     interval = _SLOW
+            # Cancellation stops the loop; other errors are logged.
             except asyncio.CancelledError:
                 raise
             except Exception as e:
@@ -591,6 +646,7 @@ class CSSpoke(AgentCommandsMixin, SimCommandsMixin, ConfigCommandsMixin,
         spoke that has no command-specific status handler. Returns the spoke
         id, ``module="simulation"``, the current simulation_id/iteration, the
         active-sim count, and the global kill-switch state."""
+        # Read the engine state and report it.
         state = self.engine.get_current_state()
         return {
             "spoke_id": self.spoke_id,
@@ -628,6 +684,7 @@ class CSSpoke(AgentCommandsMixin, SimCommandsMixin, ConfigCommandsMixin,
         # an autobump release, so re-read only when the first existing path's
         # mtime changes; otherwise one inode-cached stat returns the cached
         # string. Mirrors command_queue._sim_phy_cached.
+        # Use the first VERSION file that exists.
         vp = None
         for p in paths:
             try:
@@ -636,6 +693,7 @@ class CSSpoke(AgentCommandsMixin, SimCommandsMixin, ConfigCommandsMixin,
                     break
             except Exception:  # noqa: BLE001
                 pass
+        # Return the cached value if the file has not changed.
         if vp is not None:
             try:
                 mtime = vp.stat().st_mtime_ns
@@ -644,6 +702,7 @@ class CSSpoke(AgentCommandsMixin, SimCommandsMixin, ConfigCommandsMixin,
             cache = getattr(self, "_version_cache", None)
             if cache is not None and cache[0] == mtime:
                 return cache[1]
+            # Read the file and cache it.
             try:
                 v = vp.read_text(encoding="utf-8").strip()
                 if v:
@@ -651,6 +710,7 @@ class CSSpoke(AgentCommandsMixin, SimCommandsMixin, ConfigCommandsMixin,
                     return v
             except Exception:  # noqa: BLE001
                 pass
+        # No VERSION file found.
         return "unknown"
 
     def get_local_commit(self) -> str:
@@ -661,9 +721,11 @@ class CSSpoke(AgentCommandsMixin, SimCommandsMixin, ConfigCommandsMixin,
         there's no need to re-shell out on every call (unlike get_version's
         mtime-keyed VERSION read, which tracks a file that can change without
         a restart)."""
+        # Return the cached commit if we have one.
         cached = getattr(self, "_local_commit_cache", None)
         if cached is not None:
             return cached
+        # Ask git for the HEAD commit.
         sha = ""
         try:
             import subprocess
@@ -676,6 +738,7 @@ class CSSpoke(AgentCommandsMixin, SimCommandsMixin, ConfigCommandsMixin,
                 sha = out.stdout.strip()
         except Exception:  # noqa: BLE001
             pass
+        # Cache and return it.
         self._local_commit_cache = sha
         return sha
 
@@ -688,8 +751,10 @@ class CSSpoke(AgentCommandsMixin, SimCommandsMixin, ConfigCommandsMixin,
         ``/ws/agent`` instead of the pxmx spoke. The cs WebUI renders them; the
         cs-relevant fields are hostname / version / last_seen (no Proxmox
         nodes/vms — those live on the pxmx-dial path)."""
+        # Not connected: empty lists.
         if not self.control_plane:
             return {"status": "SUCCESS", "agents": [], "pending_agents": []}
+        # Connected agents.
         agents = []
         for aid, info in self.control_plane.connected_agents.items():
             agents.append({
@@ -699,10 +764,12 @@ class CSSpoke(AgentCommandsMixin, SimCommandsMixin, ConfigCommandsMixin,
                 "version":   info.get("version", "unknown"),
                 "status":    "connected",
             })
+        # Pending agents.
         pending = [
             {"agent_id": aid, "status": "pending"}
             for aid in self.control_plane.pending_agents
         ]
+        # Return both lists.
         return {"status": "SUCCESS", "agents": agents, "pending_agents": pending}
 
     # ── cert distribution (hub-brokered; le spoke issued/renewed a cert) ──────
@@ -731,8 +798,10 @@ class CSSpoke(AgentCommandsMixin, SimCommandsMixin, ConfigCommandsMixin,
         deploy still in progress (the agent reports SUCCESS on a slow restart
         via its fingerprint check).
         """
+        # Need a control plane.
         if not self.control_plane:
             return {"status": "ERROR", "message": "not connected to a control plane"}
+        # Work out which agents to target.
         connected = dict(self.control_plane.connected_agents or {})
         explicit = d.get("agent_id") or d.get("identifier")
         if explicit and explicit in connected:
@@ -751,6 +820,7 @@ class CSSpoke(AgentCommandsMixin, SimCommandsMixin, ConfigCommandsMixin,
                             "broadcasting to all %d connected agent(s)",
                             explicit, len(connected))
             agent_ids = list(connected.keys())
+        # No agents connected.
         if not agent_ids:
             # No agents connected at all → DEFER, don't fail. The hub retries
             # failed/deferred targets each distribution sweep, so this installs
@@ -759,9 +829,12 @@ class CSSpoke(AgentCommandsMixin, SimCommandsMixin, ConfigCommandsMixin,
             return {"status": "DEFERRED",
                     "message": "no managed pxmx agents connected — deferred, retries on reconnect"}
 
+        # Relay timeout per agent.
         relay_timeout = 620.0  # > agent 600s pvenode wait; < hub 640s timeout
 
         async def _one(aid: str) -> Dict[str, Any]:
+            """Send INSTALL_CERT to agent ``aid`` and return its per-node result."""
+            # Send the cert; an exception becomes an error result.
             try:
                 r = await self.control_plane.send_to_agent(
                     "INSTALL_CERT", d, agent_id=aid, timeout=relay_timeout)
@@ -769,16 +842,20 @@ class CSSpoke(AgentCommandsMixin, SimCommandsMixin, ConfigCommandsMixin,
                 logger.warning("INSTALL_CERT relay to %s raised: %s", aid, exc)
                 return {"agent_id": aid, "status": "ERROR",
                         "message": f"{type(exc).__name__}: {exc}"}
+            # Read the agent's reply.
             rret = (r.get("payload", {}).get("data", r)
                     if isinstance(r, dict) else {})
             if isinstance(rret, dict) and rret.get("status") == "SUCCESS":
                 return {"agent_id": aid, "status": "SUCCESS",
                         "message": rret.get("message") or "installed"}
+            # Anything else is a failure.
             return {"agent_id": aid, "status": "ERROR",
                     "message": (rret.get("message") if isinstance(rret, dict)
                                 else "INSTALL_CERT failed")}
 
+        # Relay to all target agents in parallel.
         nodes = list(await asyncio.gather(*[_one(aid) for aid in agent_ids]))
+        # Summarise the results.
         ok = sum(1 for n in nodes if n["status"] == "SUCCESS")
         total = len(nodes)
         failed = [n for n in nodes if n["status"] != "SUCCESS"]
@@ -811,12 +888,14 @@ class CSSpoke(AgentCommandsMixin, SimCommandsMixin, ConfigCommandsMixin,
         one runs at a time — but there's no min-interval, so a real tag change
         dispatches immediately instead of waiting out a debounce window. No-op
         until the client registry is wired. Never raises."""
+        # Skip if disabled, no registry, or a dispatch is already running.
         if not self._SIM_TAG_SYNC_ENABLED:
             return
         if self.registry is None:
             return  # nothing to sync until the client registry lands
         if self._sim_tag_sync_lock.locked():
             return  # a dispatch is already running — don't pile another on
+        # Under the lock, compute the desired tags.
         try:
             async with self._sim_tag_sync_lock:
                 self._sim_tag_last_ts = time.time()
@@ -840,8 +919,10 @@ class CSSpoke(AgentCommandsMixin, SimCommandsMixin, ConfigCommandsMixin,
                     if hn:
                         hn_to_aid[hn] = aid
                         hn_to_aid_norm.setdefault(_norm_hostname(hn), aid)
+                # Live per-host state and hosts we could not tag.
                 deploy_states = getattr(self.deploy, "proxmox_states", {}) or {}
                 skipped: Dict[str, str] = {}
+                # Dispatch each host's tag map to its agent.
                 for hostname, vmid_map in tag_map.items():
                     aid = (hn_to_aid.get(hostname)
                            or hn_to_aid_norm.get(_norm_hostname(hostname)))
@@ -873,8 +954,10 @@ class CSSpoke(AgentCommandsMixin, SimCommandsMixin, ConfigCommandsMixin,
                     sig = tuple(sorted(
                         (str(v), tuple(sorted(t)), _actual.get(str(v), ()))
                         for v, t in vmid_map.items()))
+                    # Skip hosts whose signature has not changed.
                     if self._sim_tag_cache.get(hostname) == sig:
                         continue
+                    # Send the tags to the agent.
                     try:
                         resp = await self.control_plane.send_to_agent(
                             "PXMX_APPLY_SIM_TAGS", {"tags": vmid_map},
@@ -889,9 +972,11 @@ class CSSpoke(AgentCommandsMixin, SimCommandsMixin, ConfigCommandsMixin,
                             logger.debug("sim-tags: agent %s busy, will re-dispatch (%s)",
                                          aid, hostname)
                             continue
+                        # Remember the signature once applied.
                         self._sim_tag_cache[hostname] = sig
                         logger.debug("sim-tags: dispatched %d VM(s) to agent %s (%s)",
                                      len(vmid_map), aid, hostname)
+                    # Record and log a failed dispatch.
                     except Exception as exc:  # noqa: BLE001 - one host must not abort the rest
                         skipped[hostname] = f"dispatch_failed: {exc}"
                         logger.debug("sim-tag dispatch to %s failed: %s", hostname, exc)
@@ -909,6 +994,7 @@ class CSSpoke(AgentCommandsMixin, SimCommandsMixin, ConfigCommandsMixin,
                         if hn not in skipped:
                             logger.info("sim-tags: host %s tagging recovered", hn)
                     self._sim_tag_skips = skipped
+        # Never raise.
         except Exception as e:  # noqa: BLE001
             logger.debug("sim-tag sync skipped: %s", e)
 
@@ -930,6 +1016,7 @@ class CSSpoke(AgentCommandsMixin, SimCommandsMixin, ConfigCommandsMixin,
         # the steady-state log. Meaningful commands emit their own INFO line in
         # their handler (e.g. "CS_CONFIG_UPDATE: applied ..."). See
         # logging-observability-contract.md (normalization / level discipline).
+        # Log at debug level, then normalise the command and data.
         logger.debug("Command: %s", command_type)
         cmd = command_type.upper()
         d = data or {}
@@ -966,12 +1053,14 @@ class CSSpoke(AgentCommandsMixin, SimCommandsMixin, ConfigCommandsMixin,
             return {"status": "NOT_IMPLEMENTED",
                     "message": f"{cmd} lands in a later phase", "command": cmd}
 
+        # Unknown command.
         return {"status": "ERROR", "message": f"Unknown command: {command_type}"}
 
     def _trigger_sim_quota_reconcile(self) -> None:
         """Immediate best-effort SimQuotaEngine reconcile on an
         effective_sim_quotas push or a sim-config change (the periodic loop also
         sweeps every 60s)."""
+        # Ask the quota engine to reconcile now, if it exists.
         eng = getattr(self, "sim_quota_engine", None)
         if eng is not None:
             eng.trigger()
@@ -984,6 +1073,7 @@ class CSSpoke(AgentCommandsMixin, SimCommandsMixin, ConfigCommandsMixin,
         re-fetches ``/api/config`` + ``/api/config/overrides`` and diffs before
         applying — idempotent, so an unchanged config is a no-op. Best-effort:
         a client offline now picks up the command on its next inbox poll."""
+        # Read every registered hostname.
         try:
             hostnames = list((self.registry.get_all() or {}).keys()) if \
                 getattr(self, "registry", None) is not None else []
@@ -991,10 +1081,12 @@ class CSSpoke(AgentCommandsMixin, SimCommandsMixin, ConfigCommandsMixin,
             logger.warning("update_now[%s]: registry read failed: %s",
                            self.spoke_id, exc)
             return
+        # Nothing to do without clients.
         if not hostnames:
             logger.debug("update_now[%s]: no registered clients — skipping",
                          self.spoke_id)
             return
+        # Queue and push update_now to all of them.
         await self._push_update_now_to(hostnames)
 
     async def _push_update_now_to(self, hostnames: List[str]) -> None:
@@ -1003,8 +1095,10 @@ class CSSpoke(AgentCommandsMixin, SimCommandsMixin, ConfigCommandsMixin,
         the per-client ``_on_client_override_changed`` (one client). Idempotent
         (CommandQueue dedups by target+action) + best-effort (an offline client
         picks up the command on its next inbox poll)."""
+        # Nothing to do without hostnames.
         if not hostnames:
             return
+        # Queue update_now for each client and push it live if connected.
         pushed = 0
         for hn in hostnames:
             try:
@@ -1012,9 +1106,11 @@ class CSSpoke(AgentCommandsMixin, SimCommandsMixin, ConfigCommandsMixin,
                                          command_type="update_now")
                 if await client_api.push_pending(self, hn):
                     pushed += 1
+            # Failures are logged and skipped.
             except Exception as exc:  # noqa: BLE001
                 logger.debug("update_now[%s]: enqueue/push for %s failed: %s",
                              self.spoke_id, hn, exc)
+        # Log a summary.
         logger.info("update_now[%s]: enqueued to %d client(s); %d live-pushed",
                     self.spoke_id, len(hostnames), pushed)
 
@@ -1033,8 +1129,10 @@ class CSSpoke(AgentCommandsMixin, SimCommandsMixin, ConfigCommandsMixin,
         there after they should have auto-cleared" symptom). Idempotent (queue
         dedups) + best-effort; wired as DemoManager's ``on_change`` callback so
         demo apply / clear / the expiry sweep all propagate too."""
+        # Ignore an empty hostname.
         if not hostname:
             return
+        # Queue and push update_now for this client.
         await self._push_update_now_to([hostname])
 
     # ── GitHub push (Source of Truth = GitHub) ───────────────────────────────
@@ -1042,14 +1140,18 @@ class CSSpoke(AgentCommandsMixin, SimCommandsMixin, ConfigCommandsMixin,
                    env: "Dict[str, str] | None" = None) -> str:
         """Run a git command in REPO_DIR (config_dir's parent). Raises on failure.
         GIT_TERMINAL_PROMPT=0 so git never blocks on a credential prompt."""
+        # Environment settings for git.
         import os
+        # Run in the repo folder with prompts disabled.
         repo_dir = self.settings.config_dir.parent
         git_env = {**os.environ, "GIT_TERMINAL_PROMPT": "0",
                    "GIT_ASKPASS": "/bin/echo", **(env or {})}
+        # Start git and wait for it.
         proc = await asyncio.create_subprocess_exec(
             "git", *args, cwd=str(repo_dir),
             stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE, env=git_env)
         out, err = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+        # Raise on a non-zero exit.
         if proc.returncode != 0:
             raise RuntimeError(f"git {' '.join(args)} failed: {err.decode().strip()}")
         return out.decode().strip()
@@ -1067,14 +1169,18 @@ class CSSpoke(AgentCommandsMixin, SimCommandsMixin, ConfigCommandsMixin,
         are gitignored/untracked and survive the reset. Serialised on _git_lock;
         never raises (a failure is logged at WARNING so it surfaces in the hub
         Logs view via the relay handler — the operator can catch it)."""
+        # Environment settings and file permissions.
         import os
+        # Unique name for the askpass script.
         import uuid as _uuid
+        # Read the GitHub settings.
         sid = self.spoke_id
         gc = self._github_config or {}
         token = str(gc.get("github_token") or "").strip()
         repo_url = str(gc.get("repo_url") or "").strip()
         branch = str(gc.get("repo_branch") or "").strip() or "main"
         repo_dir = self.settings.config_dir.parent
+        # Skip without a token, URL or git repo.
         if not token:
             logger.warning("github push[%s]: no github_token in memory — skipping "
                            "(spoke restarted since the key was delivered? re-save the "
@@ -1087,10 +1193,13 @@ class CSSpoke(AgentCommandsMixin, SimCommandsMixin, ConfigCommandsMixin,
             logger.warning("github push[%s]: %s is not a git repo — skipping",
                            sid, repo_dir)
             return False
+        # Log the start and pick an askpass script path.
         logger.info("github push[%s]: starting — repo=%s branch=%s files=%s",
                     sid, repo_url, branch, list(file_map))
         askpass = repo_dir / f".git-askpass-{_uuid.uuid4().hex}.sh"
+        # Hold the git lock for the whole push.
         try:
+            # Set a git identity if missing.
             async with self._git_lock:
                 try:
                     await self._git("config", "user.name")
@@ -1100,14 +1209,17 @@ class CSSpoke(AgentCommandsMixin, SimCommandsMixin, ConfigCommandsMixin,
                     await self._git("config", "user.email")
                 except Exception:  # noqa: BLE001
                     await self._git("config", "user.email", "client-sim@localhost")
+                # Write an askpass script that supplies the token.
                 askpass.write_text(
                     "#!/bin/sh\ncase \"$1\" in\n"
                     "  *Username*) printf '%s\\n' 'x-access-token' ;;\n"
                     "  *) printf '%s\\n' \"$GITHUB_TOKEN\" ;;\nesac\n",
                     encoding="utf-8")
                 os.chmod(askpass, 0o700)
+                # Environment that uses the askpass script.
                 push_env = {"GIT_ASKPASS": str(askpass), "GIT_TERMINAL_PROMPT": "0",
                             "GITHUB_TOKEN": token}
+                # Point origin at the tenant repo.
                 await self._git("remote", "set-url", "origin", repo_url)
                 logger.debug("github push[%s]: fetched origin", sid)
                 # Sync onto origin/branch so the commit fast-forwards, then re-apply
@@ -1115,29 +1227,35 @@ class CSSpoke(AgentCommandsMixin, SimCommandsMixin, ConfigCommandsMixin,
                 await self._git("fetch", "--prune", "origin", env=push_env)
                 await self._git("checkout", "-B", branch, f"origin/{branch}")
                 logger.debug("github push[%s]: reset to origin/%s", sid, branch)
+                # Write each file.
                 for rel, content in file_map.items():
                     p = repo_dir / rel
                     p.parent.mkdir(parents=True, exist_ok=True)
                     p.write_text(str(content), encoding="utf-8")
+                # Stage the files and see if anything changed.
                 await self._git("add", *list(file_map.keys()))
                 staged = False
                 try:
                     await self._git("diff", "--cached", "--quiet")
                 except RuntimeError:
                     staged = True
+                # No changes: nothing to push.
                 if not staged:
                     logger.info("github push[%s]: no changes vs origin for %s — nothing to push",
                                 sid, list(file_map))
                     return False
+                # Commit, push and log the new HEAD.
                 await self._git("commit", "-m", commit_message)
                 await self._git("push", "origin", f"HEAD:{branch}", env=push_env)
                 new_head = await self._git("rev-parse", "HEAD")
                 logger.info("github push[%s]: pushed %s to %s @ %s — HEAD=%s",
                             sid, list(file_map), repo_url, branch, new_head[:12])
                 return True
+        # Log failures without raising.
         except Exception as exc:  # noqa: BLE001 — never let a push crash the loop
             logger.warning("github push[%s]: FAILED — %s", sid, exc)
             return False
+        # Always remove the askpass script.
         finally:
             try:
                 askpass.unlink()

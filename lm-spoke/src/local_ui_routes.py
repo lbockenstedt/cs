@@ -23,18 +23,27 @@ spoke's own local_store.py config (no LM hub tenant store needed) — see that
 module's docstring. Auto-provisioning config (hub-config) is likewise stored
 locally and applied via the SAME _apply_hub_config path CS_CONFIG_UPDATE uses.
 """
+# Allow modern type-hint syntax without evaluating annotations at import time.
 from __future__ import annotations
 
+# Standard-library logging.
 import logging
+# Timestamps for freshness fields.
 import time
+# Filesystem path handling.
 from pathlib import Path
+# Type hints only.
 from typing import Any, Dict, Optional
 
+# FastAPI router and request objects for the HTTP routes.
 from fastapi import APIRouter, Request
 
+# INI parsing helpers for the config editor.
 import sim_config
+# Shared builder for the Clients view rows.
 from client_rows import build_client_rows
 
+# Logger for this module.
 logger = logging.getLogger("CSLocalUI")
 
 # Matches client_api.py's CONFIGS_DIR / cs_spoke.py's inline equivalent — kept
@@ -46,9 +55,12 @@ _CONFIGS_DIR = Path(__file__).resolve().parent.parent.parent / "configs"
 def build_local_ui_router(spoke) -> APIRouter:
     """``spoke`` is the CSSpoke instance driving this process (hub-connected
     or standalone) — the same object registered as the hub's "cs" module."""
+    # All routes live under /sim/api.
     router = APIRouter(prefix="/sim/api")
 
     async def _cmd(cmd: str, data: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        """Run a spoke command and return its result."""
+        # Forward to the spoke's normal command handler.
         return await spoke.handle_command(cmd, data or {})
 
     # ── Proxmox pools (sim-client Pool dropdown) ─────────────────────────────
@@ -59,6 +71,8 @@ def build_local_ui_router(spoke) -> APIRouter:
 
     @router.get("/{tenant}/pools")
     async def list_pools(tenant: str):
+        """List the Proxmox resource pools the hosts report."""
+        # Ask the spoke for pools and return them in the hub's shape (one spoke).
         d = await _cmd("CS_GET_POOLS", {})
         return {"pools": d.get("pools") or [],
                 "by_pool": d.get("by_pool") or {},
@@ -69,10 +83,13 @@ def build_local_ui_router(spoke) -> APIRouter:
 
     @router.post("/{tenant}/pools/add-existing")
     async def pool_add_existing(tenant: str, request: Request):
+        """Add existing VMs to the requested pool."""
+        # Read the body; a bad body counts as empty.
         try:
             body = await request.json()
         except Exception:  # noqa: BLE001
             body = {}
+        # Run the command with the trimmed pool name and return the result.
         d = await _cmd("CS_POOL_ADD_EXISTING",
                        {"pool": str((body or {}).get("pool") or "").strip()})
         return {"status": d.get("status") or "SUCCESS",
@@ -83,20 +100,25 @@ def build_local_ui_router(spoke) -> APIRouter:
 
     @router.get("/aggregate/clients")
     async def aggregate_clients():
+        """Return the Clients view rows for this spoke."""
         # Row shape + tier join + Site/PHY/Sim-ID resolution live in the SHARED
         # builder (client_rows.build_client_rows) so this local dashboard and
         # the hub-telemetry path (control_plane.py) can never diverge. Only the
         # local-view envelope (per-row spoke_* identity) is added here.
         rows, tier_updates = build_client_rows(spoke)
+        # Tag each row with this spoke's identity.
         for row in rows:
             row["spoke_id"] = spoke.spoke_id
             row["spoke_name"] = spoke.spoke_id
             row["spoke_online"] = True
+        # Save any tier changes found while building the rows.
         if tier_updates:
             try:
                 await spoke.registry.record_tiers_batch(tier_updates)
+            # A failed save is only logged.
             except Exception as e:  # noqa: BLE001
                 logger.debug("record_tiers_batch failed: %s", e)
+        # Return the rows.
         return {"tenant_id": "default", "clients": rows}
 
     # ── VM Server tab (per-host Proxmox telemetry) ─────────────────────────────
@@ -107,25 +129,32 @@ def build_local_ui_router(spoke) -> APIRouter:
     # shut-down agent ages out — same contract sim-views.js's Details page +
     # Telemetry Freshness panel consume on the hub. No hub hop in standalone, so
     # hub_cache_age_s is null and the frame is always "current" (cache_fresh).
+    # A host not heard from for this many seconds is stale.
     _HOST_STALE_S = 180
 
     @router.get("/aggregate/proxmox")
     async def aggregate_proxmox():
+        """Return per-host Proxmox telemetry with freshness fields worked out now."""
+        # Get the spoke's relay payload; on failure return no hosts.
         now = time.time()
         try:
             payload = spoke.deploy.relay_payload(spoke.spoke_id, spoke.spoke_id)
         except Exception as e:  # noqa: BLE001
             logger.debug("aggregate_proxmox: relay_payload failed: %s", e)
             return {"tenant_id": "default", "hosts": []}
+        # Build one entry per host.
         hosts = []
         for h in (payload.get("proxmox_hosts") or []):
+            # Host's Proxmox data and how long ago it was last seen.
             h = h or {}
             hpx = h.get("proxmox") or {}
             hls = hpx.get("last_seen")
             age = max(0, int(now - hls)) if isinstance(hls, (int, float)) and hls else None
             stale = (age is None) or age > _HOST_STALE_S
+            # Agent telemetry and its generation time.
             at = hpx.get("agent_telemetry") or {}
             gen = at.get("gen_ts")
+            # Add the host entry with counts, VMs, USB devices and freshness ages.
             hosts.append({
                 "spoke_id": spoke.spoke_id,
                 "spoke_name": h.get("hostname") or spoke.spoke_id,
@@ -162,6 +191,7 @@ def build_local_ui_router(spoke) -> APIRouter:
                     "last_disconnect_age_s":  at.get("last_disconnect_age_s"),
                 },
             })
+        # Return all hosts.
         return {"tenant_id": "default", "hosts": hosts}
 
     # ── Simulations tab (Checks/Hardware/Client Count sub-tabs) ─────────────
@@ -170,6 +200,8 @@ def build_local_ui_router(spoke) -> APIRouter:
     # own "No spokes reporting simulation data yet" empty state gracefully.
 
     def _central_spoke_entry() -> Dict[str, Any]:
+        """Return this spoke's Central status in the hub's per-spoke shape."""
+        # Build the entry.
         return {
             "spoke_id": spoke.spoke_id, "spoke_name": spoke.spoke_id,
             "spoke_online": True,
@@ -178,6 +210,8 @@ def build_local_ui_router(spoke) -> APIRouter:
 
     @router.get("/aggregate/central")
     async def aggregate_central():
+        """Return the Central status, or no spokes if Central is not configured."""
+        # No status yet: empty list.
         if not spoke.central_status:
             return {"spokes": [], "mode": "standalone"}
         return {"spokes": [_central_spoke_entry()], "mode": "standalone"}
@@ -186,16 +220,22 @@ def build_local_ui_router(spoke) -> APIRouter:
     async def aggregate_central_health(site: str = None, check: str = None):
         """30-day per-check health for the spoke's own Checks view: DAILY summaries
         for every check, or one check's HOURLY buckets with ?site=&check=."""
+        # The poller's health history (None if not running).
         h = getattr(getattr(spoke, "central_poller", None), "_health", None)
+        # No history available.
         if h is None:
             return {"daily": {}, "hourly": []}
+        # Single-tenant scope key used by the Central poller.
         from central_poller import _CC_SCOPE
+        # One check's hourly data when a site and check are given, else daily summaries.
         if site and check:
             return {"hourly": h.hourly(_CC_SCOPE, site, check)}
         return {"daily": h.summary(_CC_SCOPE)}
 
     @router.get("/aggregate/central-status")
     async def aggregate_central_status():
+        """Return the Central status plus the saved Central config."""
+        # Saved Central config, and the status (or an empty list).
         cc = spoke.local_store.get_central_config()
         data: Dict[str, Any] = (
             {"spokes": [_central_spoke_entry()], "mode": "standalone"}
@@ -214,17 +254,22 @@ def build_local_ui_router(spoke) -> APIRouter:
         standalone spoke webui — parity with the hub's
         /sim/api/aggregate/central-browse. Calls the spoke's browse directly (this
         IS the spoke), independent of site_mappings."""
+        # Ask the Central poller for its inventory.
         return await spoke.central_poller.browse()
 
     # ── Kill switch ──────────────────────────────────────────────────────────
 
     @router.get("/{tenant}/kill-switch")
     async def get_kill_switch(tenant: str):
+        """Return the kill switch state."""
+        # Ask the spoke and mark it connected.
         res = await _cmd("CS_GET_KILL_SWITCH")
         return {**res, "spoke_connected": True}
 
     @router.post("/{tenant}/kill-switch")
     async def set_kill_switch(tenant: str, request: Request):
+        """Turn the kill switch on or off."""
+        # Read the body and forward the setting.
         body = await request.json()
         return await _cmd("CS_KILL_SWITCH", {"on": bool(body.get("on"))})
 
@@ -232,14 +277,20 @@ def build_local_ui_router(spoke) -> APIRouter:
 
     @router.get("/{tenant}/demo/active")
     async def demo_active(tenant: str):
+        """Return the clients currently running a demo scenario."""
+        # Forward to the spoke.
         return await _cmd("CS_GET_DEMO_ACTIVE")
 
     @router.get("/{tenant}/demo/scenarios")
     async def demo_scenarios(tenant: str):
+        """List the available demo scenarios."""
+        # Forward to the spoke.
         return await _cmd("CS_GET_DEMO_SCENARIOS")
 
     @router.post("/{tenant}/demo/client/{hostname}/scenario")
     async def demo_set(tenant: str, hostname: str, request: Request):
+        """Start a demo scenario on one client."""
+        # Read the body and forward the scenario request.
         body = await request.json()
         return await _cmd("CS_DEMO_SCENARIO", {
             "hostname": hostname,
@@ -249,6 +300,8 @@ def build_local_ui_router(spoke) -> APIRouter:
 
     @router.delete("/{tenant}/demo/client/{hostname}/scenario")
     async def demo_clear(tenant: str, hostname: str):
+        """Stop the demo scenario on one client."""
+        # Forward to the spoke.
         return await _cmd("CS_DEMO_CLEAR", {"hostname": hostname})
 
     # ── Per-client override control panel ───────────────────────────────────
@@ -258,34 +311,49 @@ def build_local_ui_router(spoke) -> APIRouter:
     # the hub's DELETE /sim/api/{tenant}/clients → CS_PURGE_CLIENTS.
     @router.delete("/{tenant}/clients")
     async def purge_clients(tenant: str):
+        """Remove all clients from the registry."""
+        # Forward to the spoke.
         return await _cmd("CS_PURGE_CLIENTS", {})
 
     @router.get("/{tenant}/clients/{hostname}/control")
     async def get_control(tenant: str, hostname: str):
+        """Return one client's sim overrides."""
+        # Forward to the spoke.
         return await _cmd("CS_GET_CLIENT_OVERRIDES", {"hostname": hostname})
 
     @router.post("/{tenant}/clients/{hostname}/control")
     async def set_control(tenant: str, hostname: str, request: Request):
+        """Set one client's sim overrides."""
+        # Accept either {"overrides": {...}} or the overrides themselves.
         body = await request.json()
         overrides = body.get("overrides") if isinstance(body.get("overrides"), dict) else body
+        # Forward to the spoke.
         return await _cmd("CS_SET_CLIENT_OVERRIDES", {"hostname": hostname, "overrides": overrides})
 
     @router.delete("/{tenant}/clients/{hostname}/control")
     async def clear_control(tenant: str, hostname: str):
+        """Clear one client's sim overrides."""
+        # Forward to the spoke.
         return await _cmd("CS_CLEAR_CLIENT_OVERRIDES", {"hostname": hostname})
 
     @router.post("/{tenant}/clients/control-all")
     async def control_all(tenant: str, request: Request):
+        """Set the same sim overrides on every client."""
+        # Accept either {"overrides": {...}} or the overrides themselves.
         body = await request.json()
         overrides = body.get("overrides") if isinstance(body.get("overrides"), dict) else body
+        # Forward to the spoke.
         return await _cmd("CS_SET_ALL_CLIENT_OVERRIDES", {"overrides": overrides})
 
     # ── API Server tab ───────────────────────────────────────────────────────
 
     @router.get("/aggregate/api-server")
     async def aggregate_api_server():
+        """Return the API Server tab's health and services status."""
+        # Get the kill switch and repo status.
         ks = await _cmd("CS_GET_KILL_SWITCH")
         rp = await _cmd("CS_GET_REPO_STATUS")
+        # Build the single-spoke health report.
         return {"spokes": [{
             "spoke_id": spoke.spoke_id,
             "spoke_name": spoke.spoke_id,
@@ -316,15 +384,19 @@ def build_local_ui_router(spoke) -> APIRouter:
 
     @router.get("/{tenant}/config/simulation-conf-parsed")
     async def config_sim_conf_parsed(tenant: str):
+        """Return simulation.conf (with hub overrides) parsed into sections."""
+        # Get the merged config; pass errors straight back.
         res = await _cmd("CS_GET_CONFIG")
         if res.get("status") != "SUCCESS":
             return res
+        # The merged INI text.
         raw = res.get("simulation_conf") or ""
         # Re-parse the MERGED text CS_GET_CONFIG returned (base file + any
         # hub-applied override) so edits already saved show up as sections.
         # sim_config.sections_dict is the same helper client_api.py's
         # /api/config/parsed uses (that route reads the base file only —
         # this one needs the merged text CS_GET_CONFIG already computed).
+        # Parse it and return sections plus the raw text.
         parser = sim_config._new_parser()
         parser.read_string(raw)
         return {"fetched_at": time.time(), "source": "spoke",
@@ -332,22 +404,28 @@ def build_local_ui_router(spoke) -> APIRouter:
 
     @router.put("/{tenant}/config/simulation-conf")
     async def config_sim_conf_put(tenant: str, request: Request):
+        """Save new simulation.conf text."""
+        # Read the body, save the text and report one spoke synced on success.
         body = await request.json()
         res = await _cmd("CS_UPDATE_CONFIG", {"content": body.get("content") or ""})
         return {**res, "synced_spokes": 1 if res.get("status") == "SUCCESS" else 0}
 
     @router.get("/{tenant}/config/user-overrides-conf")
     async def config_user_overrides_get(tenant: str):
+        """Return user-overrides.conf exactly as stored on disk."""
         # Reads the file directly — same approach as client_api.py's existing
         # /api/config/overrides — rather than round-tripping through
         # CS_GET_CONFIG's configparser serialize, which risks reformatting
         # comments/whitespace on a file this editor is about to show verbatim.
+        # Read the file as-is ("" if missing).
         path = _CONFIGS_DIR / "user-overrides.conf"
         content = path.read_text(encoding="utf-8") if path.exists() else ""
         return {"content": content, "fetched_at": time.time(), "source": "spoke"}
 
     @router.put("/{tenant}/config/user-overrides-conf")
     async def config_user_overrides_put(tenant: str, request: Request):
+        """Save new user-overrides.conf text."""
+        # Read the body, save the text and report one spoke synced on success.
         body = await request.json()
         res = await _cmd("CS_UPDATE_USER_OVERRIDES", {"content": body.get("content") or ""})
         return {**res, "synced_spokes": 1 if res.get("status") == "SUCCESS" else 0}
@@ -359,11 +437,15 @@ def build_local_ui_router(spoke) -> APIRouter:
     # CS_CONFIG_UPDATE path the hub uses, read by sim_config.load_configs).
     @router.get("/{tenant}/config/source")
     async def get_config_source(tenant: str):
+        """Return where config comes from (hub or GitHub) and whether it can be edited."""
+        # Read the source flag file (GitHub if missing).
         try:
             src = (_CONFIGS_DIR / "hub-config-source").read_text(encoding="utf-8").strip().lower()
         except Exception:
             src = "github"
+        # Anything other than "hub" means GitHub.
         source = "hub" if src == "hub" else "github"
+        # Edits are possible in hub mode, or in GitHub mode with a token.
         gh = getattr(spoke, "_github_config", None) or {}
         has_token = bool(str(gh.get("github_token") or "").strip())
         return {"source": source, "has_token": has_token,
@@ -372,10 +454,13 @@ def build_local_ui_router(spoke) -> APIRouter:
 
     @router.post("/{tenant}/config/source")
     async def set_config_source(tenant: str, request: Request):
+        """Set where config comes from (hub or GitHub)."""
+        # Read the body; a bad body counts as empty.
         try:
             body = await request.json()
         except Exception:
             body = {}
+        # Anything other than "hub" means GitHub; save it and report success.
         source = "hub" if str((body or {}).get("source")) == "hub" else "github"
         res = await _cmd("CS_CONFIG_UPDATE", {"config_source": source})
         ok = isinstance(res, dict) and res.get("status") == "SUCCESS"
@@ -387,16 +472,22 @@ def build_local_ui_router(spoke) -> APIRouter:
 
     @router.get("/tenant/{tenant}/hub-config")
     async def get_hub_config(tenant: str):
+        """Return the auto-provisioning settings."""
+        # Forward to the spoke.
         return await _cmd("CS_GET_HUB_CONFIG")
 
     @router.put("/tenant/{tenant}/hub-config")
     async def set_hub_config(tenant: str, request: Request):
+        """Save the auto-provisioning settings."""
+        # Read the body and forward it.
         body = await request.json()
         res = await _cmd("CS_SET_HUB_CONFIG", body)
         return {"saved": res.get("status") == "SUCCESS", "pushed_to_spokes": 1}
 
     @router.post("/tenant/{tenant}/hub-config/reset")
     async def reset_hub_config(tenant: str):
+        """Reset the auto-provisioning settings to defaults."""
+        # Forward to the spoke.
         return await _cmd("CS_RESET_HUB_CONFIG")
 
     # ── Setup → Central API tab ──────────────────────────────────────────────
@@ -404,21 +495,28 @@ def build_local_ui_router(spoke) -> APIRouter:
 
     @router.post("/aggregate/central")
     async def save_central(request: Request):
+        """Save the Central API config."""
+        # Build the config from the body, adding the mode when given.
         body = await request.json()
         mode = body.get("mode")
         hub_cc = body.get("hub_central_config") or {}
         cfg = dict(hub_cc)
         if mode:
             cfg["mode"] = mode
+        # Save it and report the result.
         res = await _cmd("CS_SET_CENTRAL_CONFIG", {"central_config": cfg})
         return {"saved": res.get("status") == "SUCCESS", "pushed_to_spokes": 1}
 
     @router.get("/{tenant}/central-sites-config")
     async def get_central_sites(tenant: str):
+        """Return the Central site settings."""
+        # Forward to the spoke.
         return await _cmd("CS_GET_CENTRAL_SITES_CONFIG")
 
     @router.post("/{tenant}/central-sites-config")
     async def set_central_sites(tenant: str, request: Request):
+        """Save the Central site settings."""
+        # Read the body and forward it, reporting whether a quota wipe was blocked.
         body = await request.json()
         res = await _cmd("CS_SET_CENTRAL_SITES_CONFIG", body if isinstance(body, dict) else {})
         return {"saved": res.get("status") == "SUCCESS", "pushed_to_spokes": 1,
@@ -426,29 +524,39 @@ def build_local_ui_router(spoke) -> APIRouter:
 
     @router.get("/{tenant}/central/available")
     async def get_central_available(tenant: str):
+        """Return the Central sites and checks available to pick from."""
+        # Forward to the spoke.
         return await _cmd("CS_GET_CENTRAL_AVAILABLE")
 
     @router.get("/{tenant}/sim-quota-catalog")
     async def get_sim_quota_catalog(tenant: str):
+        """Return the sim-quota catalog."""
+        # Forward to the spoke.
         return await _cmd("CS_GET_SIM_QUOTA_CATALOG")
 
     @router.get("/{tenant}/sim-quota-state")
     async def get_sim_quota_state(tenant: str):
+        """Return the live sim-quota state."""
         # Live engine ledger for the Config → Quota State view (which clients
         # are currently assigned to each effective quota + target vs. assigned).
         return await _cmd("CS_GET_SIM_QUOTA_STATE")
 
     @router.get("/{tenant}/pxmx-site-map")
     async def get_pxmx_site_map(tenant: str):
+        """Return the Proxmox host-to-site map."""
+        # Forward to the spoke.
         return await _cmd("CS_GET_PXMX_SITE_MAP")
 
     @router.post("/{tenant}/pxmx-site-map")
     async def set_pxmx_site_map(tenant: str, request: Request):
+        """Save the Proxmox host-to-site map."""
+        # Read the body as the payload.
         body = await request.json()
         payload = body if isinstance(body, dict) else {}
         if "pxmx_site_map" not in payload and isinstance(body, dict):
             # Allow the UI to POST just the mapping object.
             payload = {"pxmx_site_map": body}
+        # Save the map and return the result and any errors.
         res = await _cmd("CS_SET_PXMX_SITE_MAP", payload)
         return {"saved": res.get("status") == "SUCCESS",
                 "pxmx_site_map": res.get("pxmx_site_map", {}),
@@ -456,6 +564,7 @@ def build_local_ui_router(spoke) -> APIRouter:
 
     @router.delete("/proxmox/host/{hostname}")
     async def delete_proxmox_host(hostname: str):
+        """Remove a stale Proxmox host."""
         # Standalone twin of the hub's DELETE /sim/api/proxmox/host/{hostname}:
         # drop a stale host from proxmox_states + its site assignment.
         res = await _cmd("CS_PURGE_HOST", {"hostname": hostname})
@@ -465,10 +574,15 @@ def build_local_ui_router(spoke) -> APIRouter:
 
     @router.get("/{tenant}/agents")
     async def get_agents(tenant: str):
+        """Return the connected agents."""
+        # Forward to the spoke.
         return await _cmd("GET_AGENTS", {})
 
     @router.post("/{tenant}/test-central")
     async def test_central(tenant: str):
+        """Test the Central connection."""
+        # Forward to the spoke.
         return await _cmd("CS_TEST_CENTRAL")
 
+    # Hand the finished router to the caller.
     return router

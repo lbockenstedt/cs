@@ -1,3 +1,9 @@
+"""Entry point and control plane for the cs (client simulator) spoke.
+
+Connects the cs spoke to the LM hub over a WebSocket, hosts pxmx agents that
+dial in directly, serves the client API / local dashboard on port 8080, and can
+also run on its own without a hub (``--standalone``).
+"""
 # ── Dependency self-heal (must run BEFORE the third-party imports below) ──────
 # A skewed auto-update / partial install can leave the venv missing a declared
 # dep (e.g. websockets) → hard crash at `import websockets` below, crash-looping
@@ -11,29 +17,45 @@
 # defect that crash-looped the cs fleet (see cs-telemetry-conditional-relay).
 # Must be the first statement (comments above are fine).
 from __future__ import annotations
+# Private os/sys handles used only by the dependency check below.
 import os as _os
 import sys as _sys
+# Load the dependency checker from lm core (package or bare module).
 try:
     from core.src.dep_guard import ensure_requirements as _ensure_requirements
 except ImportError:  # lm core not on path as a package — bare module on core/src
     from dep_guard import ensure_requirements as _ensure_requirements
+# Install anything missing from requirements.txt, then drop the helper names.
 _req = _os.path.join(_os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))),
                      "requirements.txt")
 _ensure_requirements(_req)
 del _os, _sys, _ensure_requirements, _req
 
+# Async runtime for the hub connection and background tasks.
 import asyncio
+# Unique ids.
 import uuid
+# Timestamps for agent telemetry.
 import time
+# Validates TLS certificates before applying them.
 import ssl
+# Temporary files used during certificate validation.
 import tempfile
+# WebSocket client library (imported here so a missing install fails early).
 import websockets
+# Standard-library logging.
 import logging
+# Command-line argument parsing.
 import argparse
+# Python path setup.
 import sys
+# Environment variables and file operations.
 import os
+# Filesystem path handling.
 from pathlib import Path
+# Type hints only.
 from typing import Any, Dict, Optional
+# ASGI server that runs the client API.
 import uvicorn
 
 # Sibling modules (simulation_engine, cs_spoke, sim_config, sim_primitives,
@@ -45,13 +67,16 @@ import uvicorn
 # regardless of how the process is started (-m, direct script, or import).
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+# The cs spoke module and the client API app builder.
 from cs_spoke import CSSpoke
 from client_api import build_client_api_app
+# Shared base class for hosting agents (lm core package or bare module).
 try:
     from core.src.messaging.agent_hosting import AgentHostingControlPlane
 except ImportError:
     from messaging.agent_hosting import AgentHostingControlPlane
 
+# Shared logging setup; fall back to a simple basicConfig version if lm core is not available.
 try:
     from logging_setup import configure_logging
 except ImportError:
@@ -62,10 +87,13 @@ except ImportError:
         _FMT = '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
         _DFMT = '%Y-%m-%d %H:%M:%S'
         def configure_logging(default_level=_logging.INFO, *, log_file=None, **_):
+            """Fallback logging setup: basicConfig, optionally also writing to ``log_file``."""
+            # Log to the file and the console when a file is given.
             handlers = ([_logging.FileHandler(log_file), _logging.StreamHandler()]
                         if log_file else None)
             _logging.basicConfig(level=default_level, force=True,
                                  format=_FMT, datefmt=_DFMT, handlers=handlers)
+# Set up logging and create this module's logger.
 configure_logging()
 logger = logging.getLogger("CSControlPlane")
 
@@ -84,6 +112,7 @@ class CSControlPlane(AgentHostingControlPlane):
     """
 
     # cs-specific tuning of the mixin's class attrs.
+    # Module type and the environment variables / config path the agent listener uses.
     MODULE_TYPE = "simulation"
     AGENT_PORT_ENV = "LM_CS_AGENT_PORT"
     AGENT_LOOPBACK_ENV = "LM_CS_AGENT_LOOPBACK"
@@ -91,6 +120,7 @@ class CSControlPlane(AgentHostingControlPlane):
     AGENT_CONFIG_PATH = "/etc/lm-cs-agent/config.json"
     # cs agent listener is opt-in (env-gated) so all-in-one stays relay-only.
     AGENT_LISTENER_OPT_IN = True
+    # Ports for the agent listener (loopback, public TLS, fallback).
     AGENT_LOOPBACK_PORT = 8443
     AGENT_WSS_PORT = 443
     AGENT_FALLBACK_PORT = 8767
@@ -103,8 +133,11 @@ class CSControlPlane(AgentHostingControlPlane):
                  hub_url: str = None, config: Dict[str, Any] = None,
                  onboarding_psk: str = None, tenant_id_hint: str = None,
                  api_host: str = None, api_port: int = None):
+        """Set up the control plane with hub credentials and client API host/port."""
+        # Base-class setup with the hub connection details.
         super().__init__(spoke_id, secret, hub_secret, hub_url,
                          onboarding_psk=onboarding_psk, tenant_id_hint=tenant_id_hint)
+        # Startup config passed through to CSSpoke.
         self.startup_config = config or {}
         # Client API listener (the spoke that owns the DHCP scope 169.253.1.1/24
         # is also the client API gateway on 169.253.1.1:8080). Bound 0.0.0.0 so
@@ -114,6 +147,7 @@ class CSControlPlane(AgentHostingControlPlane):
         # binding 8000 here collided with the hub and broke the WebUI. The cs
         # client API takes 8080; sim clients reach it at 169.253.1.1:8080.
         self.api_host = api_host or os.getenv("CS_API_HOST", "0.0.0.0")
+        # Port from the argument or CS_API_PORT; 8080 if invalid.
         try:
             self.api_port = int(api_port if api_port is not None
                                 else os.getenv("CS_API_PORT", "8080"))
@@ -149,6 +183,7 @@ class CSControlPlane(AgentHostingControlPlane):
     # in-process (no restart/installer change). run() re-reads the persisted cert
     # at startup so a restart keeps HTTPS. Mirrors statuspage _apply_cert +
     # _ensure_web_server and the hub's _install_cert_on_hub validation.
+    # Environment variable that overrides the TLS folder.
     _TLS_DIR_ENV = "LM_CS_TLS_DIR"
 
     def _tls_dir(self) -> Path:
@@ -156,6 +191,7 @@ class CSControlPlane(AgentHostingControlPlane):
         is <lm-spoke>/data/tls — the spoke's own data dir, always spoke-writable
         (CSSpoke already persists settings/registry/queue there), so applying a
         cert needs no installer or service-user change."""
+        # Use the override folder when set.
         d = os.getenv(self._TLS_DIR_ENV)
         if d:
             return Path(d)
@@ -165,8 +201,10 @@ class CSControlPlane(AgentHostingControlPlane):
     def _local_tls_paths(self):
         """Return (cert, key) paths if a local-webui cert is persisted on disk,
         else (None, None). Used by run() to bind HTTPS on startup."""
+        # Expected cert and key files.
         d = self._tls_dir()
         cert, key = d / "fullchain.pem", d / "privkey.pem"
+        # Return them only if both exist.
         if cert.is_file() and key.is_file():
             return str(cert), str(key)
         return None, None
@@ -181,12 +219,15 @@ class CSControlPlane(AgentHostingControlPlane):
     _ALLOW_LOCAL_CERT_ENV = "LM_CS_ALLOW_LOCAL_CERT"
 
     def _local_cert_allowed(self) -> bool:
+        """Return True if LM_CS_ALLOW_LOCAL_CERT=1 allows TLS on the client API."""
+        # Check the environment flag.
         return os.getenv(self._ALLOW_LOCAL_CERT_ENV) == "1"
 
     def _purge_local_cert(self) -> None:
         """Delete any persisted local-webui cert so the client API binds plaintext.
         Called on startup and whenever an INSTALL_CERT is refused, so a stray le
         cert can't linger and flip 8080 to HTTPS on the next restart."""
+        # Delete each cert file that exists, logging the removal.
         d = self._tls_dir()
         for name in ("fullchain.pem", "privkey.pem"):
             p = d / name
@@ -196,6 +237,7 @@ class CSControlPlane(AgentHostingControlPlane):
                     logger.warning(
                         "Removed local-webui cert %s — cs client API is "
                         "plaintext-only on the isolated sim segment", p)
+            # A failed delete is only logged.
             except OSError as exc:  # noqa: BLE001
                 logger.warning("Could not remove local-webui cert %s: %s", p, exc)
 
@@ -214,21 +256,27 @@ class CSControlPlane(AgentHostingControlPlane):
         dev) — it may not yet have the hook. Inlining the env fallback keeps
         the override correct against any base version (and mirrors the base's
         own default exactly)."""
+        # Use the applied LE cert when present.
         cert, key = self._local_tls_paths()
         if cert and key:
             return cert, key
+        # Otherwise use the installer's cert paths from the environment.
         cert = os.environ.get("LM_TLS_CERT", "").strip()
         key = os.environ.get("LM_TLS_KEY", "").strip()
         return cert, key
 
     @staticmethod
     def _atomic_write_text(path: Path, text: str) -> None:
+        """Write ``text`` to ``path`` via a temp file and an atomic rename."""
+        # Write the temp file, then swap it in.
         tmp = path.with_suffix(path.suffix + ".tmp")
         tmp.write_text(text, encoding="utf-8")
         os.replace(tmp, path)
 
     @staticmethod
     def _atomic_write_bytes(path: Path, data: bytes) -> None:
+        """Write ``data`` to ``path`` via a temp file and an atomic rename."""
+        # Write the temp file, then swap it in.
         tmp = path.with_suffix(path.suffix + ".tmp")
         tmp.write_bytes(data)
         os.replace(tmp, path)
@@ -237,19 +285,24 @@ class CSControlPlane(AgentHostingControlPlane):
         """Tear down the current 8080 uvicorn server and start a fresh one,
         optionally with TLS. Awaited so the old socket is released before the
         new bind (avoids EADDRINUSE). The app is reused (self._api_app)."""
+        # Ask the old server to stop.
         old = self._api_server
         old_task = self._api_task
         if old is not None:
             old.should_exit = True
+        # Wait up to 5 s for it to finish.
         if old_task is not None:
             try:
                 await asyncio.wait_for(old_task, timeout=5.0)
+            # A timeout or cancel during shutdown is fine.
             except Exception:  # noqa: BLE001 - shutdown timeout/Cancel is fine
                 pass
+        # Build the new server's settings, adding TLS when both files are given.
         kwargs = dict(host=self.api_host, port=self.api_port, log_config=None)
         if ssl_certfile and ssl_keyfile:
             kwargs["ssl_certfile"] = ssl_certfile
             kwargs["ssl_keyfile"] = ssl_keyfile
+        # Start the new server in the background.
         self._api_server = uvicorn.Server(uvicorn.Config(self._api_app, **kwargs))
         self._api_task = asyncio.create_task(self._api_server.serve())
 
@@ -269,10 +322,12 @@ class CSControlPlane(AgentHostingControlPlane):
                         self._ALLOW_LOCAL_CERT_ENV)
             return {"status": "SUCCESS",
                     "message": "cs client API is plaintext-only; cert not applied"}
+        # Both cert and key are required.
         if not (fullchain and privkey):
             return {"status": "ERROR", "message": "missing cert material"}
         # Validate before touching live files.
         try:
+            # Write both to temp files and load them into an SSL context.
             with tempfile.NamedTemporaryFile(mode="w", suffix=".pem", delete=False) as cf:
                 cf.write(fullchain); cp = cf.name
             with tempfile.NamedTemporaryFile(mode="wb", suffix=".pem", delete=False) as kf:
@@ -280,11 +335,13 @@ class CSControlPlane(AgentHostingControlPlane):
             try:
                 ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
                 ctx.load_cert_chain(cp, kp)
+            # Always delete the temp files.
             finally:
                 try: os.unlink(cp)
                 except OSError: pass
                 try: os.unlink(kp)
                 except OSError: pass
+        # A cert that fails to load is rejected.
         except Exception as exc:  # noqa: BLE001
             return {"status": "ERROR", "message": f"invalid cert material: {exc}"}
         # Atomic write to the TLS dir.
@@ -312,6 +369,7 @@ class CSControlPlane(AgentHostingControlPlane):
             await self._rebind_agent_server()
         except Exception as exc:  # noqa: BLE001
             logger.warning("Agent listener TLS rebind failed: %s", exc)
+        # Report success.
         logger.info("Local webui TLS applied — re-bound https://%s:%s",
                     self.api_host, self.api_port)
         return {"status": "SUCCESS", "message": "local webui HTTPS applied"}
@@ -324,6 +382,7 @@ class CSControlPlane(AgentHostingControlPlane):
         message loop starts, so awaiting send_to_agent's response here would
         just block until timeout — we only need the send to go out (the loop,
         now starting, resolves the response)."""
+        # Push the cached config in the background, if there is one.
         cfg = self._agent_config_cache.get(agent_id)
         if cfg:
             asyncio.create_task(self._repush_agent_config(agent_id, cfg))
@@ -343,14 +402,17 @@ class CSControlPlane(AgentHostingControlPlane):
         from the spoke's own live CSSettings store (always current — see
         cs_settings.usb_config_payload) right before every replay so a
         reconnect can never resurrect a stale auto-provision/exclusion value."""
+        # Refresh the USB settings from the live settings store.
         settings = getattr(self._cs_spoke, "settings", None)
         if settings is not None and isinstance(cfg.get("client_simulation"), dict):
             cfg = dict(cfg)
             cfg["client_simulation"] = dict(cfg["client_simulation"])
             cfg["client_simulation"]["usb_config"] = settings.usb_config_payload()
+        # Send the config to the agent.
         try:
             await self.send_to_agent("UPDATE_CONFIG", cfg, agent_id=agent_id)
             logger.info(f"Re-pushed cached client-sim config to agent '{agent_id}'")
+        # A failed send is only logged.
         except Exception as e:  # noqa: BLE001
             logger.warning(f"Failed to re-push config to agent '{agent_id}': {e}")
 
@@ -372,6 +434,7 @@ class CSControlPlane(AgentHostingControlPlane):
         same fields pxmx does fixes both the "cluster shows as hostname" bug
         and the freshness-based cross-agent/cross-spoke dedup (which needs
         telemetry_ts to rank a cs-hosted agent's report against others)."""
+        # Store the cluster name, nodes, VMs, metrics and receipt time.
         if rec is not None:
             rec["cluster_name"] = data.get("cluster_name", agent_id)
             rec["nodes"]        = data.get("nodes", {}).get("nodes", [])
@@ -385,6 +448,7 @@ class CSControlPlane(AgentHostingControlPlane):
         poller, launch the client-API uvicorn server, then enter the hub WS
         loop (``super().run()``). The client API is a long-lived task that
         survives hub reconnects; it is torn down in ``finally`` on shutdown."""
+        # Create the cs spoke module.
         logger.info(f"Starting CS (Client Simulator) -> {self.hub_url}")
         cs_spoke = CSSpoke(self.spoke_id, self.startup_config)
         # Wire the control-plane reference so CSSpoke's GET_AGENTS / SPOKE_RELAY
@@ -395,6 +459,7 @@ class CSControlPlane(AgentHostingControlPlane):
         # CSSettings at replay time instead of trusting a frozen cache entry —
         # see _repush_agent_config.
         self._cs_spoke = cs_spoke
+        # Register it so hub commands reach it.
         self.register_module("cs", cs_spoke)
         # Start the agent listener when LM_CS_AGENT_LISTENER=1. install_cs.sh
         # writes that env by DEFAULT (standalone cs accepts cs-dialed pxmx
@@ -409,11 +474,14 @@ class CSControlPlane(AgentHostingControlPlane):
             # and is a no-op when install_cs.sh already wrote the secret.
             # getattr-guarded so a staged self-update (cs code ahead of lm-core)
             # can't crash startup if the base method isn't present yet.
+            # Make sure an agent secret exists (only if lm core supports it).
             _ensure = getattr(self, "_ensure_agent_secret", None)
             if callable(_ensure):
                 _ensure()
+            # Start the listener.
             self._start_agent_server_task()
             logger.info("CS agent listener enabled (cs-dialed agents accepted)")
+        # Listener turned off.
         else:
             logger.info("CS agent listener disabled (relay-only; --no-agent-listener was passed)")
         # Start the always-on local service loops (demo TTL sweep, registry
@@ -434,24 +502,30 @@ class CSControlPlane(AgentHostingControlPlane):
         # binds HTTP. Only when LM_CS_ALLOW_LOCAL_CERT=1 do we honor a persisted
         # cert and bind HTTPS on startup (see _apply_local_cert / _purge_local_cert).
         if self._local_cert_allowed():
+            # TLS allowed: use the saved cert if present.
             tls_cert, tls_key = self._local_tls_paths()
             _tls_kwargs = ({"ssl_certfile": tls_cert, "ssl_keyfile": tls_key}
                            if tls_cert and tls_key else {})
+        # Default: remove any cert and serve plain HTTP.
         else:
             self._purge_local_cert()
             _tls_kwargs = {}
+        # Build the uvicorn server and start it in the background.
         self._api_server = uvicorn.Server(
             uvicorn.Config(app, host=self.api_host, port=self.api_port,
                            log_config=None, **_tls_kwargs))
         self._api_task = asyncio.create_task(self._api_server.serve())
         logger.info("CS client API on %s://%s:%s",
                     "https" if _tls_kwargs else "http", self.api_host, self.api_port)
+        # Run the hub connection loop.
         try:
             await super().run()
+        # On exit, stop the API server and wait for it.
         finally:
             self._api_server.should_exit = True
             try:
                 await self._api_task
+            # Shutdown errors only log at debug level.
             except Exception as exc:  # noqa: BLE001
                 logger.debug("CS API server shutdown: %s", exc)
 
@@ -466,6 +540,7 @@ class CSControlPlane(AgentHostingControlPlane):
         hub's Simulations view. Returned tasks are cancelled/awaited by the base
         class when the hub connection closes.
         """
+        # The cs module's own relay tasks (none if not registered).
         cs_mod = self.modules.get("cs")
         if cs_mod is None:
             return []
@@ -482,6 +557,7 @@ class CSControlPlane(AgentHostingControlPlane):
         """
         logger.info("Starting CS Module in STANDALONE MODE on %s:%s",
                     self.api_host, self.api_port)
+        # Create the spoke and the API app.
         spoke = CSSpoke(self.spoke_id, self.startup_config)
         app = build_client_api_app(spoke)
         # uvicorn.run() manages its own event loop (not yet running at this
@@ -491,8 +567,10 @@ class CSControlPlane(AgentHostingControlPlane):
         app.add_event_handler("startup", spoke.central_poller.start)
         app.add_event_handler("startup", spoke.central_on_prem_poller.start)
         app.add_event_handler("startup", spoke.mist_poller.start)
+        # Start the quota engine too, when present.
         if getattr(spoke, "sim_quota_engine", None) is not None:
             app.add_event_handler("startup", spoke.sim_quota_engine.start)
+        # Run the server (blocks until exit).
         uvicorn.run(app, host=self.api_host, port=self.api_port)
 
 def resolve_pinned_secret(name: str, cli_value: Optional[str]) -> str:
@@ -505,12 +583,15 @@ def resolve_pinned_secret(name: str, cli_value: Optional[str]) -> str:
     zero-touch each time. When both are set and differ, .env is the newer truth
     (an empty .env value means the spoke cleared it after a hub rejection).
     Records the override in ``cs_spoke.PINNED_SECRET_IGNORED`` for health."""
+    # Use the command-line value when there is no .env value.
     cli_value = cli_value or ""
     if name not in os.environ:
         return cli_value
     env_value = os.environ.get(name, "")
+    # Same value: nothing to override.
     if cli_value == env_value:
         return cli_value
+    # Different: warn, record the override and use the .env value.
     logger.warning(
         "%s passed on the command line differs from %s in .env — ignoring the "
         "pinned CLI value (stale ExecStart). Re-run install_cs.sh to drop it "
@@ -521,12 +602,15 @@ def resolve_pinned_secret(name: str, cli_value: Optional[str]) -> str:
     return env_value
 
 
+# Script entry point.
 if __name__ == "__main__":
+    # Extra imports used only when run as a script; load .env first.
     import os
     import socket
     from dotenv import load_dotenv
     load_dotenv()
 
+    # Command-line options (defaults come from the environment).
     parser = argparse.ArgumentParser(description="Lab Manager Generic Agent")
     # --id is OPTIONAL: when neither --id nor the SPOKE_ID env is supplied the
     # spoke derives its id from the current OS hostname at startup, so a
@@ -557,17 +641,21 @@ if __name__ == "__main__":
     # connects as before (pending admin approval).
     parser.add_argument("--onboarding-psk",  default=os.getenv("LM_ONBOARDING_PSK", ""))
     parser.add_argument("--tenant-id-hint",  default=os.getenv("LM_TENANT_ID_HINT", ""))
+    # Parse the arguments.
     args = parser.parse_args()
     if not args.id:
         # Derived id = the bare hostname (no "-spoke" suffix). A pinned --id /
         # SPOKE_ID still wins; only the unpinned/derived case is affected.
         args.id = socket.gethostname()
+    # Prefer newer .env secrets over stale command-line ones.
     args.secret = resolve_pinned_secret("SPOKE_SECRET", args.secret)
     args.hub_secret = resolve_pinned_secret("HUB_SECRET", args.hub_secret)
+    # Build the control plane.
     cp = CSControlPlane(args.id, args.secret, args.hub_secret, args.hub,
                         onboarding_psk=args.onboarding_psk,
                         tenant_id_hint=args.tenant_id_hint,
                         api_host=args.host, api_port=args.port)
+    # Run standalone or connect to the hub.
     if args.standalone:
         cp.run_standalone_mode()
     else:
