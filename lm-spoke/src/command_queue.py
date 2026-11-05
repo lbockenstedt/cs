@@ -60,21 +60,33 @@ Source of truth: ``cs/webui-spoke/server.py``
   - usb config:     ``_proxmox_usb_config_payload`` (4673-4724)
 """
 
+# Allow modern type-hint syntax without evaluating annotations at import time.
 from __future__ import annotations
 
+# The queue lock and off-loop disk writes use asyncio.
 import asyncio
+# The queue is saved as JSON.
 import json
+# Standard-library logging.
 import logging
+# Environment overrides for the tunables.
 import os
+# Timestamps for created/updated/expiry.
 import time
+# Unique command ids.
 import uuid
+# Filesystem path handling.
 from pathlib import Path
+# Type hints only.
 from typing import Any, Dict, List, Optional, Set, Tuple
 
+# Logger for this module.
 logger = logging.getLogger("CSCommandQueue")
 
 
 def _env_int(name: str, default: int, minimum: int = 1) -> int:
+    """Read integer env var ``name`` (at least ``minimum``), or ``default`` if unset or invalid."""
+    # Parse and floor at the minimum; fall back to the default on bad input.
     try:
         return max(minimum, int(os.environ.get(name, str(default))))
     except Exception:
@@ -82,6 +94,7 @@ def _env_int(name: str, default: int, minimum: int = 1) -> int:
 
 
 # ── tunables (env-overridable so cloud / high-latency sites can stretch them) ─
+# Maximum number of commands kept in memory.
 COMMAND_MAX = _env_int("CS_COMMAND_MAX", 100, 10)        # keep last N commands in memory
 # A pending/delivered command older than this from CREATION is marked expired.
 # Default 2h — a cloud-connected agent can be offline (link flap / NAT idle /
@@ -122,36 +135,49 @@ _VM_ACTIONS = {"start_vm", "stop_vm", "reboot_vm", "snapshot_vm", "reclone_vm", 
 # Sim VMID floor (matches ``cs_guard.SIM_VMIN`` shipped in Phase B). VMs below
 # this are not Client-Simulation VMs and must never be managed from the cs UI.
 SIM_VMIN = 90000
+# VMIDs that are always protected (the hub/system container).
 DEFAULT_PROTECTED_VMIDS: Set[int] = {1001}
 
 
 # ── helpers ──────────────────────────────────────────────────────────────────
 
 def _normalize_action(value: Any) -> str:
+    """Lowercase an action name and turn dashes into underscores."""
+    # Trim, lowercase and use underscores.
     return str(value or "").strip().lower().replace("-", "_")
 
 
 def _normalize_type(value: Any) -> Optional[str]:
+    """Clean a command type (dashes to underscores), or None if empty."""
+    # Trim, use underscores, and give None for empty values.
     normalized = str(value or "").strip().replace("-", "_")
     return normalized or None
 
 
 def _args_signature(args: Optional[Dict[str, Any]]) -> str:
+    """Return a stable JSON string for ``args``, used to spot duplicate commands."""
+    # Sorted, compact JSON (non-JSON values as text).
     try:
         return json.dumps(args or {}, sort_keys=True, separators=(",", ":"), default=str)
+    # If keys cannot be sorted, round-trip through JSON first, then sort.
     except TypeError:
         safe = json.loads(json.dumps(args or {}, default=str))
         return json.dumps(safe, sort_keys=True, separators=(",", ":"), default=str)
 
 
 def _normalize_hostname(hostname: Any) -> str:
+    """Lowercase a hostname and drop any trailing dot."""
+    # Trim, drop the trailing dot, lowercase.
     return str(hostname or "").strip().rstrip(".").lower()
 
 
 def _hostname_aliases(hostname: Any) -> Tuple[str, ...]:
+    """Return the full and short (first label) forms of a hostname."""
+    # Empty hostnames have no aliases.
     normalized = _normalize_hostname(hostname)
     if not normalized:
         return ()
+    # The full name, plus the short name when it differs.
     aliases = [normalized]
     short = normalized.split(".", 1)[0]
     if short and short not in aliases:
@@ -160,15 +186,20 @@ def _hostname_aliases(hostname: Any) -> Tuple[str, ...]:
 
 
 def _hostnames_match(left: Any, right: Any) -> bool:
+    """Return True if two hostnames share a full or short alias."""
+    # Match on any common alias.
     la = set(_hostname_aliases(left))
     return bool(la and la.intersection(_hostname_aliases(right)))
 
 
 def _write_atomic(path: Path, text: str) -> None:
+    """Write ``text`` to ``path`` atomically via a temp file."""
+    # Write the temp file, then swap it in.
     tmp = path.with_suffix(path.suffix + ".tmp")
     try:
         tmp.write_text(text, encoding="utf-8")
         tmp.replace(path)
+    # On failure remove the temp file and re-raise.
     except Exception:
         tmp.unlink(missing_ok=True)
         raise
@@ -187,6 +218,8 @@ class CommandQueue:
     def __init__(self, data_dir: Path, settings: CSSettings,
                  protected_vmids: Optional[Set[int]] = None,
                  sim_vmin: int = SIM_VMIN) -> None:
+        """Set up the queue in ``data_dir`` and load any saved commands."""
+        # Paths, settings, async lock and the VMID floor.
         self.data_dir = data_dir
         self.path = data_dir / "command_queue.json"
         self.settings = settings
@@ -199,24 +232,31 @@ class CommandQueue:
         else:
             cfg_set = settings.protected_vmids() if settings else set()
             self.protected_vmids = cfg_set or set(DEFAULT_PROTECTED_VMIDS)
+        # Load saved commands from disk.
         self.commands: List[Dict[str, Any]] = []
         self._load()
 
     # ── persistence ────────────────────────────────────────────────────────
 
     def _load(self) -> None:
+        """Load commands from ``command_queue.json``; failures only log a warning."""
+        # Read the file if it exists, keeping only dict entries.
         try:
             if self.path.exists():
                 loaded = json.loads(self.path.read_text(encoding="utf-8") or "[]")
                 if isinstance(loaded, list):
                     self.commands = [c for c in loaded if isinstance(c, dict)]
+        # Log and keep the empty list if it is unreadable.
         except Exception as exc:  # noqa: BLE001
             logger.warning("Command queue load failed (%s): %s", self.path, exc)
 
     def _save(self) -> None:
+        """Save commands to disk synchronously; failures only log a warning."""
+        # Make sure the folder exists, then write atomically.
         try:
             self.data_dir.mkdir(parents=True, exist_ok=True)
             _write_atomic(self.path, json.dumps(self.commands, default=str))
+        # Log and continue on failure.
         except Exception as exc:  # noqa: BLE001
             logger.warning("Command queue save failed (%s): %s", self.path, exc)
 
@@ -228,10 +268,12 @@ class CommandQueue:
         synchronous write on a contended disk stalled the whole shared event
         loop (hub connection + uvicorn API), producing the hub's 5s/30s Request
         Timeouts. See logging/observability + cs-svr-02 starvation notes."""
+        # Snapshot on the loop, write in a worker thread.
         try:
             self.data_dir.mkdir(parents=True, exist_ok=True)
             text = json.dumps(self.commands, default=str)
             await asyncio.to_thread(_write_atomic, self.path, text)
+        # Log and continue on failure.
         except Exception as exc:  # noqa: BLE001
             logger.warning("Command queue save failed (%s): %s", self.path, exc)
 
@@ -239,6 +281,8 @@ class CommandQueue:
 
     def _make_command(self, target: str, action: str, args: Optional[dict],
                       command_type: Optional[str]) -> Dict[str, Any]:
+        """Build a new pending command dict with timestamps and expiry."""
+        # All timestamps start at now.
         now = time.time()
         return {
             "id": str(uuid.uuid4()),
@@ -271,12 +315,17 @@ class CommandQueue:
 
     @staticmethod
     def _serialize_for_agent(cmd: Dict[str, Any]) -> Dict[str, Any]:
+        """Return the fields of ``cmd`` that the agent needs."""
+        # Only id, action, args and type.
         return {"id": cmd["id"], "action": cmd["action"],
                 "args": cmd.get("args", {}), "type": cmd.get("type")}
 
     def _find_active_duplicate(self, target: str, action: str,
                                args: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """Return a pending command with the same target, action and args, if any."""
+        # Compare argument signatures.
         sig = _args_signature(args)
+        # Skip commands for a different target or action.
         for cmd in self.commands:
             if cmd.get("target") != target or cmd.get("action") != action:
                 continue
@@ -286,13 +335,18 @@ class CommandQueue:
             # duplicate would silently swallow that retry.
             if cmd.get("status") != "pending":
                 continue
+            # Same args means it is a duplicate.
             if _args_signature(cmd.get("args", {})) == sig:
                 return cmd
+        # No duplicate found.
         return None
 
     def _cleanup(self, now: Optional[float] = None) -> Tuple[int, int]:
+        """Expire old active commands, purge old finished ones and trim the queue."""
+        # Default the time to now.
         now = now if now is not None else time.time()
         expired = 0
+        # Mark pending/delivered commands past the expiry age as expired.
         for cmd in self.commands:
             if cmd.get("status") in {"pending", "delivered"} and \
                     (now - float(cmd.get("created_at", now))) > COMMAND_EXPIRE_SECS:
@@ -300,6 +354,7 @@ class CommandQueue:
                 cmd["updated_at"] = now
                 cmd["purge_after"] = now + COMMAND_RESULT_RETENTION_SECS
                 expired += 1
+        # Drop finished commands past their retention time.
         before = len(self.commands)
         self.commands[:] = [
             cmd for cmd in self.commands
@@ -308,13 +363,17 @@ class CommandQueue:
                            cmd.get("updated_at", cmd.get("created_at", now)) +
                            COMMAND_RESULT_RETENTION_SECS)
         ]
+        # Count what was removed, then trim to the size cap.
         purged = before - len(self.commands)
         self._trim()
         return expired, purged
 
     def _trim(self) -> None:
+        """Trim the queue to COMMAND_MAX, dropping the oldest finished commands first."""
+        # Nothing to do if under the cap.
         if len(self.commands) <= COMMAND_MAX:
             return
+        # Remove finished commands from the front until under the cap.
         terminal = {"completed", "failed", "expired"}
         idx = 0
         while len(self.commands) > COMMAND_MAX and idx < len(self.commands):
@@ -322,6 +381,7 @@ class CommandQueue:
                 del self.commands[idx]
                 continue
             idx += 1
+        # Still over the cap: drop the oldest remaining commands.
         if len(self.commands) > COMMAND_MAX:
             del self.commands[:len(self.commands) - COMMAND_MAX]
 
@@ -329,13 +389,16 @@ class CommandQueue:
 
     def _refused(self, target: str, action: str, args: Dict[str, Any]) -> Optional[str]:
         """Return a refusal reason if the command must not be enqueued, else None."""
+        # Only proxmox VM actions are checked.
         if target != "proxmox" or action not in _VM_ACTIONS:
             return None
+        # A missing or non-numeric vmid is left for the agent to check.
         vmid = args.get("vmid")
         try:
             v = int(vmid)
         except (TypeError, ValueError):
             return None  # agent validates; do not block ambiguous enqueue
+        # Protected and out-of-range VMIDs are refused.
         if v in self.protected_vmids:
             return f"VM {v} is protected (hub/system container)"
         if v < self.sim_vmin:
@@ -350,17 +413,20 @@ class CommandQueue:
         """Idempotently enqueue a command. Returns
         ``{command, created, expired, purged}``. Raises ``ValueError`` if the
         safeguard refuses the command (so the spoke surfaces a 403-style ERROR)."""
+        # Under the lock, normalise the inputs.
         async with self.lock:
             ntarget = _normalize_hostname(target) or str(target or "").strip()
             naction = _normalize_action(action)
             ntype = _normalize_type(command_type)
             nargs = dict(args or {})
 
+            # Refuse commands the safeguard rejects.
             reason = self._refused("proxmox" if ntarget == "proxmox" else ntarget,
                                    naction, nargs)
             if reason:
                 raise ValueError(reason)
 
+            # Clean up, then return any existing pending duplicate instead.
             now = time.time()
             expired, purged = self._cleanup(now)
             existing = self._find_active_duplicate(ntarget, naction, nargs)
@@ -368,6 +434,7 @@ class CommandQueue:
                 return {"command": existing, "created": False,
                         "expired": expired, "purged": purged}
 
+            # Create, add, trim and save the new command.
             cmd = self._make_command(ntarget, naction, nargs, ntype)
             self.commands.append(cmd)
             self._trim()
@@ -376,10 +443,13 @@ class CommandQueue:
                     "expired": expired, "purged": purged}
 
     def _command_matches_agent(self, cmd: Dict[str, Any], hostname: str) -> bool:
+        """Return True if ``cmd`` is meant for the agent on ``hostname``."""
+        # Exact target match, or a "proxmox" target (any agent).
         if cmd.get("target") == hostname:
             return True
         if cmd.get("target") == "proxmox":
             return True
+        # Otherwise compare hostname aliases.
         return _hostnames_match(cmd.get("target", ""), hostname)
 
     async def poll_agent_inbox(self, hostname: str,
@@ -398,6 +468,7 @@ class CommandQueue:
         re-send behavior (re-send every STALE_DELIVERED_SECS until the command
         expires). A running long op that streams CS_PROGRESS never hits this:
         ``touch_command`` refreshes ``updated_at`` on each progress frame."""
+        # Normalise the hostname, then clean up under the lock.
         hn = _normalize_hostname(hostname)
         async with self.lock:
             now = time.time()
@@ -481,6 +552,7 @@ class CommandQueue:
                     cmd["purge_after"] = now + COMMAND_RESULT_RETENTION_SECS
                     verify_gave_up += 1
 
+            # Collect this host's pending commands and mark them delivered.
             pending = [c for c in self.commands
                        if c.get("status") == "pending" and self._command_matches_agent(c, hn)]
             delivered_ids = [c["id"] for c in pending]
@@ -489,10 +561,12 @@ class CommandQueue:
                     cmd["status"] = "delivered"
                     cmd["updated_at"] = now
 
+            # Save if anything changed.
             if reset or delivered_ids or expired or purged or gave_up \
                     or verify_requeued or verify_gave_up:
                 await self._asave()
 
+            # Report the commands for the agent plus the counts.
             return {
                 "commands": [self._serialize_for_agent(c) for c in pending],
                 "expired": expired,
@@ -508,15 +582,18 @@ class CommandQueue:
                           message: Any = None, result: Any = None) -> Dict[str, Any]:
         """Idempotent terminal update. ``status`` must be ``completed`` or
         ``failed`` (long-op ``CS_COMMAND_RESULT`` in Phase E maps here)."""
+        # Only completed or failed are allowed.
         status = str(status or "").strip().lower()
         if status not in ("completed", "failed"):
             return {"ok": False, "message": "status must be 'completed' or 'failed'"}
+        # Under the lock, find the command.
         cmd_id = str(cmd_id or "").strip()
         async with self.lock:
             self._cleanup()
             cmd = next((c for c in self.commands if c.get("id") == cmd_id), None)
             if not cmd:
                 return {"ok": False, "message": "Command not found"}
+            # Record the result, message and timestamps, then save.
             cmd["status"] = status
             cmd["message"] = str(message) if message is not None else (cmd.get("message") or "")
             cmd["result"] = result if result is not None else cmd.get("result")
@@ -543,19 +620,23 @@ class CommandQueue:
         if a re-deliver races a requeue. ``max_retries <= 0`` means "never
         retry" → the first timeout fails the command (preserves the old
         behavior for a site that wants fail-fast)."""
+        # Under the lock, find the command.
         cmd_id = str(cmd_id or "").strip()
         async with self.lock:
             self._cleanup()
             cmd = next((c for c in self.commands if c.get("id") == cmd_id), None)
             if not cmd:
                 return {"ok": False, "message": "Command not found"}
+            # Finished commands are left as they are.
             cur = str(cmd.get("status", "")).lower()
             if cur in ("completed", "failed", "expired"):
                 return {"ok": True, "id": cmd_id, "status": cur,
                         "requeued": False, "attempts": int(cmd.get("relay_attempts", 0))}
+            # Count this attempt.
             attempts = int(cmd.get("relay_attempts", 0)) + 1
             cmd["relay_attempts"] = attempts
             now = time.time()
+            # Still within budget: back to pending for re-delivery.
             if max_retries > 0 and attempts < max_retries:
                 cmd["status"] = "pending"
                 cmd["updated_at"] = now
@@ -593,25 +674,32 @@ class CommandQueue:
         crash reverts to the last persisted ``updated_at`` — worst case a
         single re-send on restart, which the agent's ``_pending_delete_vmids``
         guard dedups."""
+        # Under the lock, find the command.
         cmd_id = str(cmd_id or "").strip()
         async with self.lock:
             cmd = next((c for c in self.commands if c.get("id") == cmd_id), None)
             if not cmd:
                 return {"ok": False, "message": "Command not found"}
+            # Only delivered commands are refreshed.
             if cmd.get("status") != "delivered":
                 return {"ok": True, "id": cmd_id, "status": cmd.get("status"),
                         "touched": False}
+            # Refresh the stale-reset timer.
             now = time.time()
             cmd["updated_at"] = now
             # Real agent contact (ACCEPTED / progress) → refresh last_contact,
             # the timestamp the delete-verify sweep watches.
             cmd["last_contact"] = now
+            # Keep the latest progress message.
             if message:
                 cmd["message"] = str(message)
+            # Report that it was refreshed (in memory only).
             return {"ok": True, "id": cmd_id, "status": "delivered",
                     "touched": True}
 
     async def list_commands(self) -> List[Dict[str, Any]]:
+        """Clean up and return copies of all commands."""
+        # Under the lock, clean up first.
         async with self.lock:
             self._cleanup()
             # Hand back copies so callers can't mutate the live list.
@@ -623,20 +711,24 @@ class CommandQueue:
         ``DELETE /api/commands/pending?target=`` (pre-teardown expiry so
         in-flight commands don't fire against a gone VM). Terminal commands
         (completed/failed/expired) are left for their retention window."""
+        # Under the lock, expire matching pending/delivered commands.
         async with self.lock:
             now = time.time()
             ntarget = _normalize_hostname(target) if target else None
             cleared = 0
             for cmd in self.commands:
+                # Skip finished commands and other targets.
                 if cmd.get("status") not in {"pending", "delivered"}:
                     continue
                 if ntarget and not self._command_matches_agent(cmd, ntarget):
                     continue
+                # Expire the command with an operator message.
                 cmd["status"] = "expired"
                 cmd["message"] = "cleared by operator"
                 cmd["updated_at"] = now
                 cmd["purge_after"] = now + COMMAND_RESULT_RETENTION_SECS
                 cleared += 1
+            # Save if anything was cleared.
             if cleared:
                 await self._asave()
             return {"cleared": cleared, "remaining": len(self.commands)}
@@ -644,28 +736,37 @@ class CommandQueue:
     async def delete_command(self, cmd_id: str) -> Dict[str, Any]:
         """Remove a single command (any status). Mirrors the legacy
         ``DELETE /api/commands/{cmd_id}`` per-row delete."""
+        # An id is required.
         cmd_id = str(cmd_id or "").strip()
         if not cmd_id:
             return {"ok": False, "message": "missing 'id'"}
+        # Under the lock, remove the command with that id.
         async with self.lock:
             before = len(self.commands)
             self.commands[:] = [c for c in self.commands if c.get("id") != cmd_id]
             removed = before - len(self.commands)
+            # Save if anything was removed.
             if removed:
                 await self._asave()
             return {"ok": bool(removed), "id": cmd_id, "removed": removed}
 
     async def get_usb_config(self, hostname: Optional[str] = None) -> Dict[str, Any]:
+        """Return the USB config payload for ``hostname`` from the settings store."""
+        # Delegate to CSSettings.
         return self.settings.usb_config_payload(hostname)
 
 
 # ── small parsing helpers (ports of legacy setting coercions) ───────────────
 
 def _parse_json_list(value: Any) -> List[Any]:
+    """Return ``value`` as a list: lists pass through, JSON text is parsed, anything else gives [].
+    """
+    # Lists pass through; None gives [].
     if isinstance(value, list):
         return value
     if value is None:
         return []
+    # Parse JSON text; anything else gives [].
     try:
         parsed = json.loads(str(value))
         return parsed if isinstance(parsed, list) else []
@@ -674,40 +775,53 @@ def _parse_json_list(value: Any) -> List[Any]:
 
 
 def _setting_int(value: Any, minimum: Optional[int] = None) -> int:
+    """Parse ``value`` as an int (0 if invalid), raised to ``minimum`` if given."""
+    # Parse, falling back to 0.
     try:
         n = int(str(value).strip())
     except Exception:
         n = 0
+    # Apply the floor.
     if minimum is not None and n < minimum:
         n = minimum
     return n
 
 
 def _setting_bool(value: Any) -> bool:
+    """Interpret ``value`` as a boolean ("1", "true", "on", "yes" are true)."""
+    # Real booleans pass through.
     if isinstance(value, bool):
         return value
+    # Otherwise check for a truthy word.
     return str(value or "").strip().lower() in {"1", "true", "on", "yes"}
 
 
 def _normalize_toggle(value: Any) -> str:
+    """Return "on" or "off" for a truthy/falsy value."""
+    # Map the boolean to on/off.
     return "on" if _setting_bool(value) else "off"
 
 
 def _sanitize_vm_set_override(value: Any) -> int:
+    """Parse a VM-set override count (0 if invalid, never negative)."""
+    # Parse, falling back to 0.
     try:
         n = int(str(value or "0").strip() or "0")
     except Exception:
         n = 0
+    # Never negative.
     return max(0, n)
 
 
 def _parse_int_ranges(raw: Any) -> Set[int]:
     """Parse ``"1001,1000-1002"`` into ``{1000,1001,1002}`` (legacy format)."""
+    # Split on commas and skip empty parts.
     out: Set[int] = set()
     for token in str(raw or "").split(","):
         token = token.strip()
         if not token:
             continue
+        # "lo-hi" adds the whole range (bad ranges are skipped).
         if "-" in token:
             lo_s, hi_s = token.split("-", 1)
             try:
@@ -715,11 +829,13 @@ def _parse_int_ranges(raw: Any) -> Set[int]:
                 out.update(range(min(lo, hi), max(lo, hi) + 1))
             except ValueError:
                 continue
+        # A single number is added (bad numbers are skipped).
         else:
             try:
                 out.add(int(token))
             except ValueError:
                 continue
+    # Return the collected VMIDs.
     return out
 
 # ── CSSettings re-export ─────────────────────────────────────────────────────
