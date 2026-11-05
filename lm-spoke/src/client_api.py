@@ -33,15 +33,23 @@ linux agent, running on-segment, fetches ``/api/client/key`` first when it
 wants to pass a key along.
 """
 
+# Allow modern type-hint syntax without evaluating annotations at import time.
 from __future__ import annotations
 
+# Deep-copy the cached config parser before changing it.
 import copy
+# Check whether a caller is on the sim segment.
 import ipaddress
+# Standard-library logging.
 import logging
+# Constant-time key comparison.
 import secrets
+# Filesystem path handling.
 from pathlib import Path
+# Type hints only.
 from typing import Any, Dict, List, Optional
 
+# FastAPI routing, errors, query params and WebSocket support.
 from fastapi import (
     Depends,
     FastAPI,
@@ -51,13 +59,16 @@ from fastapi import (
     WebSocket,
     WebSocketDisconnect,
 )
+# Serves the dashboard's static files.
 from fastapi.staticfiles import StaticFiles
 # Response classes are canonically starlette's; fastapi re-exports them in newer
 # versions but not all, so import from the source for cross-version safety.
 from starlette.responses import (FileResponse, HTMLResponse, JSONResponse,
                                  PlainTextResponse)
 
+# Loads and renders simulation.conf.
 import sim_config
+# Scores host load for client back-pressure.
 import resource_pressure
 
 # Client's normal status-report interval (s); throttle scales UP from here.
@@ -73,10 +84,12 @@ def _client_throttle_interval(spoke) -> Optional[int]:
     scorer, and scales the client report interval. Returns an int > base when
     throttling, else None (calm → clients keep their normal cadence). Best-effort:
     None on any error."""
+    # Read node CPU/mem from each Proxmox host the agent reports.
     try:
         deploy = getattr(spoke, "deploy", None)
         states = getattr(deploy, "proxmox_states", None) or {}
         cpu = mem = None
+        # Keep the highest CPU and memory use seen across hosts.
         for st in states.values():
             node = (st or {}).get("node") or {}
             c = node.get("cpu_percent")
@@ -88,21 +101,28 @@ def _client_throttle_interval(spoke) -> Optional[int]:
                     mem = max(mem or 0.0, float(mu) / float(mt) * 100.0)
                 except (TypeError, ValueError, ZeroDivisionError):
                     pass
+        # Turn load into a report interval; only return it when it is a slowdown.
         pressure = resource_pressure.pressure_score(cpu_pct=cpu, mem_pct=mem)
         interval = resource_pressure.throttle_interval(_CLIENT_BASE_INTERVAL_S, pressure)
         return int(round(interval)) if interval > _CLIENT_BASE_INTERVAL_S else None
+    # Any error means no throttle.
     except Exception:  # noqa: BLE001
         return None
+# Router for the local dashboard pages.
 from local_ui_routes import build_local_ui_router
 
+# Logger for this module.
 logger = logging.getLogger("CSClientAPI")
 
+# Folder holding the dashboard's static files.
 _STATIC_DIR = Path(__file__).resolve().parent.parent / "static"
 
 # lm-spoke/src/client_api.py → src → lm-spoke → <repo root>
 REPO = Path(__file__).resolve().parent.parent.parent
+# Config and client-script folders in the repo.
 CONFIGS_DIR = REPO / "configs"
 CLIENTS_DIR = REPO / "clients"
+# Platforms that have client scripts.
 _VALID_PLATFORMS = ("linux", "windows", "t3")
 
 # Files a platform serves from ANOTHER platform's dir, so a single canonical copy
@@ -127,6 +147,8 @@ _SIM_SEGMENT = ipaddress.ip_network("169.253.1.0/24")
 
 
 def _on_sim_segment(host: Optional[str]) -> bool:
+    """Return True if ``host`` is an IP address on the sim client segment."""
+    # Non-IP values are never on the segment.
     try:
         addr = ipaddress.ip_address(host)
     except (ValueError, TypeError):
@@ -138,6 +160,7 @@ def _on_sim_segment(host: Optional[str]) -> bool:
     mapped = getattr(addr, "ipv4_mapped", None)
     if mapped is not None:
         addr = mapped
+    # Check membership (mismatched IP versions give False).
     try:
         return addr in _SIM_SEGMENT
     except TypeError:
@@ -145,6 +168,8 @@ def _on_sim_segment(host: Optional[str]) -> bool:
 
 
 def _client_key(spoke) -> str:
+    """Return the configured client API key (empty if unset)."""
+    # Read it from settings.
     return str(spoke.settings.get("client_api_key", "") or "")
 
 
@@ -154,8 +179,10 @@ def _key_ok(spoke, provided: Optional[str], remote_host: Optional[str] = None) -
     client_api_key, which CSSettings never leaves empty (see
     cs_settings._ensure_client_api_key) — so an off-segment caller can no
     longer skip auth just because no key was ever configured."""
+    # Sim-segment callers need no key.
     if _on_sim_segment(remote_host):
         return True
+    # Everyone else must match the configured key.
     key = _client_key(spoke)
     if not key:
         return False
@@ -166,10 +193,13 @@ def _require_key_dep(spoke):
     """FastAPI dependency: reject 401 unless the caller is on the sim segment
     or presents the correct client_api_key."""
     def _dep(request: Request) -> None:
+        """Raise 401 unless the request is from the sim segment or has the right key."""
+        # Key from the header or the query string.
         remote_host = request.client.host if request.client else None
         provided = request.headers.get("x-client-key") or request.query_params.get("api_key")
         if not _key_ok(spoke, provided, remote_host):
             raise HTTPException(status_code=401, detail="invalid client api key")
+    # Return the dependency.
     return _dep
 
 
@@ -177,10 +207,12 @@ def _exclusive_sim_ids() -> set:
     """The sim_ids that are EXCLUSIVE (``multi_capable=False``) — a failure sim
     that monopolizes its client (dhcp_fail, dns_fail, assoc_fail, auth_fail,
     ssidpw_fail, port_flap). Per ``SIM_META`` in ``sim_quota``."""
+    # Load the sim metadata (none if unavailable).
     try:
         from sim_quota import SIM_META
     except Exception:  # noqa: BLE001
         return set()
+    # Sims that are not multi-capable are exclusive.
     return {s for s, m in SIM_META.items() if not bool(m.get("multi_capable"))}
 
 
@@ -202,21 +234,26 @@ def _exclusive_sim_active(hostname: str, base_sim, overrides: Dict[str, str], us
     no pin) — that client's ``ambient_pct`` stayed enabled, letting the
     client's own ambient rotation stack a shareable sim (e.g. ping_test) on
     top of a bucket-default exclusive one (e.g. ssidpw_fail)."""
+    # Nothing exclusive means nothing to check.
     excl = _exclusive_sim_ids()
     if not excl:
         return False
+    # The user's own override section, if any.
     human = user_conf if (user_conf is not None and uname and user_conf.has_section(uname)) else None
+    # The client's bucket-default profile.
     bucket: Dict[str, str] = {}
     if base_sim is not None and hostname:
         try:
             bucket = sim_config.resolve_profile(hostname, base_sim, None).get("profile") or {}
         except Exception:  # noqa: BLE001
             bucket = {}
+    # Check each exclusive sim, highest-priority layer first.
     for sim_id in excl:
         if human is not None and human.has_option(uname, sim_id):
             if str(human.get(uname, sim_id, fallback="")).strip().lower() == "on":
                 return True
             continue  # human explicitly set this key (even off) — wins, skip engine/bucket
+        # Then the engine/registry override, then the bucket default.
         if str(overrides.get(sim_id, "")).strip().lower() == "on":
             return True
         if str(bucket.get(sim_id, "")).strip().lower() == "on":
@@ -232,18 +269,21 @@ def resolve_script_path(platform: str, filename: str) -> Path:
     platform is unknown, the resolved file escapes the platform directory, or
     the file does not exist.
     """
+    # Unknown platforms are rejected.
     if platform not in _VALID_PLATFORMS:
         raise HTTPException(status_code=404, detail=f"unknown platform: {platform}")
     # A cross-platform file (e.g. the T3 IoT catalog served to linux) resolves
     # from its SOURCE platform dir; the traversal guard below then checks against
     # that source dir. filename is a bare name here, so it stays inside it.
     src_platform = _CROSS_PLATFORM_FILES.get(platform, {}).get(filename, platform)
+    # Resolve the path and make sure it stays inside the platform folder.
     sd = (CLIENTS_DIR / src_platform).resolve()
     candidate = (sd / filename).resolve()
     try:
         candidate.relative_to(sd)
     except ValueError:
         raise HTTPException(status_code=404, detail="not found")
+    # The file must exist.
     if not candidate.is_file():
         raise HTTPException(status_code=404, detail="not found")
     return candidate
@@ -255,18 +295,21 @@ async def push_pending(spoke, hostname: str) -> bool:
     any pending commands to it immediately. Called from ``CS_QUEUE_COMMAND`` so a
     command queued by the hub reaches a connected agent without waiting for the
     agent's next ``sync``. Returns True if a frame was sent."""
+    # Skip if there is no hostname or no live WebSocket.
     hn = str(hostname or "").strip()
     if not hn:
         return False
     ws = client_ws_connections.get(hn)
     if ws is None:
         return False
+    # Collect pending commands and push them.
     try:
         res = await spoke.queue.poll_agent_inbox(hn)
         cmds = res.get("commands") or []
         if cmds:
             await ws.send_json({"type": "commands", "commands": cmds})
             return True
+    # Errors are only logged.
     except Exception as exc:  # noqa: BLE001 — don't kill the enqueue path
         logger.debug("push_pending(%s) failed: %s", hn, exc)
     return False
@@ -284,12 +327,15 @@ def build_client_api_app(spoke) -> FastAPI:
     script download). The local dashboard at ``/`` (``local_ui_routes.py``) and
     ``/static/*`` are mounted here too. A client-API key (``_require_key_dep``)
     gates mutating routes when set; absent = open (the t3 agent path)."""
+    # Create the app and the key-check dependency.
     app = FastAPI(title="cs spoke client API", docs_url=None, redoc_url=None)
     require_key = _require_key_dep(spoke)
 
     # ── health / kill switch ───────────────────────────────────────────────
     @app.get("/api/health")
     async def api_health() -> Dict[str, Any]:
+        """Report spoke health, version and client count."""
+        # Imported here to avoid a circular import.
         import cs_spoke
         return {
             "status": "ok",
@@ -303,11 +349,15 @@ def build_client_api_app(spoke) -> FastAPI:
 
     @app.get("/api/kill-switch")
     async def api_kill_switch() -> PlainTextResponse:
+        """Return "on" or "off" for the kill switch."""
+        # Plain-text kill switch state.
         return PlainTextResponse("on" if spoke.engine.kill_switch_active() else "off")
 
     # ── status beacon (client → spoke) ─────────────────────────────────────
     @app.post("/api/status")
     async def api_status(body: Dict[str, Any]) -> Dict[str, Any]:
+        """Record a client's status beacon and return any throttle interval."""
+        # Upsert the client in the registry.
         hostname = str(body.get("hostname") or "").strip()
         entry = await spoke.registry.apply_status(hostname or "__unknown__", body)
         # Back-pressure: return a throttle interval (s) when the Proxmox host is
@@ -319,6 +369,7 @@ def build_client_api_app(spoke) -> FastAPI:
     # ── client key (auth bootstrap) ────────────────────────────────────────
     @app.get("/api/client/key")
     async def api_client_key(request: Request) -> Dict[str, str]:
+        """Return the shared client API key to sim-segment callers only."""
         # Only the sim segment may bootstrap the shared key from here — an
         # off-segment caller has no legitimate reason to fetch it (see
         # _on_sim_segment / module docstring).
@@ -342,11 +393,14 @@ def build_client_api_app(spoke) -> FastAPI:
     # The per-request mutation SEQUENCE below is unchanged from the uncached
     # code, so a rendered response is byte-identical to the old path (pinned by
     # tests/test_config_render_cache.py).
+    # Cached base config, rendered text per host, and the cache size cap.
     _cfg_base: Dict[str, Any] = {"key": None, "sim": None, "user": None}
     _cfg_text_cache: Dict[str, tuple] = {}
     _CFG_TEXT_CACHE_MAX = 5000
 
     def _config_base(base_key):
+        """Return the merged (sim, user) config parsers, reloading only when the files change."""
+        # Rebuild when the files' cache key changes.
         if _cfg_base["key"] != base_key:
             sim_conf, user_conf = sim_config.load_configs(CONFIGS_DIR)
             # Merge the file-based user-overrides.conf [username] sections INTO
@@ -360,10 +414,12 @@ def build_client_api_app(spoke) -> FastAPI:
                     sim_conf.add_section(section)
                 for k, v in user_conf.items(section):
                     sim_conf.set(section, k, v)
+            # Store the new base and drop rendered text.
             _cfg_base["key"] = base_key
             _cfg_base["sim"] = sim_conf
             _cfg_base["user"] = user_conf
             _cfg_text_cache.clear()
+        # Return the canonical parsers.
         return _cfg_base["sim"], _cfg_base["user"]
 
     def _local_store_fingerprint():
@@ -371,9 +427,11 @@ def build_client_api_app(spoke) -> FastAPI:
         store, flattened for the render-cache key. A read failure returns a
         unique object so that request bypasses (and does not poison) the
         cache."""
+        # No local store: fixed fingerprint.
         ls = getattr(spoke, "local_store", None)
         if ls is None:
             return ("no-local-store",)
+        # Flatten every value the overlay reads.
         try:
             return (
                 tuple(sorted((str(k), bool(v)) for k, v in (ls.get_random_pool() or {}).items())),
@@ -386,15 +444,19 @@ def build_client_api_app(spoke) -> FastAPI:
                 # T3 IoT detection list — re-render the served conf when it changes.
                 tuple(str(x) for x in (((ls.get_hub_config() or {}).get("hub_config") or {}).get("t3_pci_vidpids") or [])),
             )
+        # On error, a unique object so this request skips the cache.
         except Exception:  # noqa: BLE001
             return object()
 
     @app.get("/api/config")
     async def api_config(hostname: str = Query("")) -> PlainTextResponse:
+        """Serve the rendered simulation.conf for ``hostname`` with all live overrides applied."""
+        # Get the cached base config.
         base_key = sim_config.configs_cache_key(CONFIGS_DIR)
         # base_sim is canonical (deep-copied before mutation below);
         # user_conf is canonical and READ-ONLY from here on.
         base_sim, user_conf = _config_base(base_key)
+        # Start from the client's registry overrides.
         overrides: Dict[str, str] = {}
         if hostname and spoke.registry is not None:
             entry = spoke.registry.get(hostname)
@@ -415,6 +477,9 @@ def build_client_api_app(spoke) -> FastAPI:
         # [username] wsite still win.
         _TENANT_POOL = "Tenant-Wide Pool"
         def _physical_site(host: str) -> str:
+            """Return the real site of the pxmx server hosting ``host`` ("" if none or tenant pool).
+            """
+            # Look up the hosting server and its mapped site.
             try:
                 deploy = getattr(spoke, "deploy", None)
                 n2h = deploy.name_to_host() if deploy is not None else {}
@@ -422,10 +487,12 @@ def build_client_api_app(spoke) -> FastAPI:
                 if srv:
                     s = str(spoke.local_store.get_pxmx_site_map().get(srv) or "").strip()
                     return "" if s == _TENANT_POOL else s   # tenant pool = not physical
+            # Any error means no physical site.
             except Exception:  # noqa: BLE001
                 pass
             return ""
         resolved_site = str(overrides.get("wsite") or "").strip()  # engine placement wins
+        # Pin the client to its server's physical site, if any.
         try:
             if hostname:
                 phys = _physical_site(hostname)
@@ -437,6 +504,7 @@ def build_client_api_app(spoke) -> FastAPI:
                     # as "BAR-CC-BRIDGE", which no AP broadcasts.
                     overrides.setdefault("site_based_ssid", "off")
                     resolved_site = resolved_site or phys
+        # Errors here are ignored.
         except Exception:  # noqa: BLE001
             pass
         if not resolved_site and hostname:  # fall back to a human/bucket wsite
@@ -459,10 +527,12 @@ def build_client_api_app(spoke) -> FastAPI:
         # Deliver the ambient random-pool policy for this site + the randomizable
         # sim set as [simulation] globals the client rotation reads (Slice 5).
         try:
+            # Read the pool settings and make sure [simulation] exists.
             pool_map = spoke.local_store.get_random_pool()
             rand_sims = spoke.local_store.get_randomizable_sims()
             if not sim_conf.has_section("simulation"):
                 sim_conf.add_section("simulation")
+            # Set random_pool for this client's site.
             pool_on = bool(pool_map.get(resolved_site, pool_map.get("*", False)))
             sim_conf.set("simulation", "random_pool", "on" if pool_on else "off")
             # Knob-floor learner: overlay the hub-learned [simulation] intensity
@@ -472,6 +542,7 @@ def build_client_api_app(spoke) -> FastAPI:
             # base simulation.conf value (same live-overlay pattern as ambient_pct).
             for _kk, _kv in (spoke.local_store.get_sim_knob_overrides() or {}).items():
                 sim_conf.set("simulation", str(_kk), str(_kv))
+            # Publish the randomisable sims.
             if rand_sims:
                 sim_conf.set("simulation", "randomizable_sims",
                              " ".join(str(s) for s in rand_sims))
@@ -494,6 +565,7 @@ def build_client_api_app(spoke) -> FastAPI:
             # gate `RANDOM % 100 < ambient_pct` is then always false → inactive.
             _uname = sim_config.username_for(hostname) if hostname else ""
             if _exclusive_sim_active(hostname, base_sim, overrides, user_conf, _uname):
+                # Exclusive sim active: turn ambient off.
                 sim_conf.set("simulation", "ambient_pct", "0")
             elif control_on:
                 # Scale THIS client's level by its site's load weight (default 1),
@@ -510,8 +582,10 @@ def build_client_api_app(spoke) -> FastAPI:
                         sim_conf.add_section("ambient_weights")
                     for _sim, _w in weights.items():
                         sim_conf.set("ambient_weights", str(_sim), str(_w))
+            # Otherwise use the uniform level.
             else:
                 sim_conf.set("simulation", "ambient_pct", str(base_pct))
+        # Errors here are ignored.
         except Exception:  # noqa: BLE001
             pass
         # T3 IoT-fleet detection list: deliver the hub-config t3_pci_vidpids into
@@ -520,15 +594,19 @@ def build_client_api_app(spoke) -> FastAPI:
         # allow-list the pxmx agent provisions against — one source of truth.
         # Space-joined "vid:pid" tokens (the guest parses a space/comma list).
         try:
+            # Read the T3 list from the hub config.
             _hc = (spoke.local_store.get_hub_config() or {}).get("hub_config") or {}
             _t3 = _hc.get("t3_pci_vidpids") or []
+            # Accept a single string too.
             if isinstance(_t3, str):
                 _t3 = [_t3]
             _t3_str = " ".join(str(x).strip() for x in _t3 if str(x).strip())
+            # Write it into [simulation] if non-empty.
             if _t3_str:
                 if not sim_conf.has_section("simulation"):
                     sim_conf.add_section("simulation")
                 sim_conf.set("simulation", "t3_pci_vidpids", _t3_str)
+        # Errors here are ignored.
         except Exception:  # noqa: BLE001
             pass
         # Deliver the engine/registry overrides into the client's [username]
@@ -547,9 +625,11 @@ def build_client_api_app(spoke) -> FastAPI:
         # user-overrides.conf [username] is preserved — the engine never fights a
         # human pin.
         if hostname and overrides:
+            # Find the keys the user set by hand.
             uname = sim_config.username_for(hostname)
             human_keys = (set(user_conf.options(uname))
                           if user_conf.has_section(uname) else set())
+            # Write the remaining overrides into the [username] section.
             if not sim_conf.has_section(uname):
                 sim_conf.add_section(uname)
             for k, v in overrides.items():
@@ -565,13 +645,16 @@ def build_client_api_app(spoke) -> FastAPI:
         # keeps the buckets + bake exactly as before (GitHub-synced deployments
         # still resolve their sims from the bucket).
         ws_on = str(sim_conf.get("simulation", "web_server", fallback="") or "").strip().lower() == "on"
+        # Hub mode: drop the bucket sections and render without baking overrides.
         if ws_on:
             for _b in (f"s{i}" for i in range(10)):
                 if sim_conf.has_section(_b):
                     sim_conf.remove_section(_b)
             text = sim_config.render_ini_for_client(sim_conf, hostname, None)
+        # Standalone: render with the overrides baked into the bucket.
         else:
             text = sim_config.render_ini_for_client(sim_conf, hostname, overrides or None)
+        # Cache the text (clearing when full) and return it.
         if len(_cfg_text_cache) >= _CFG_TEXT_CACHE_MAX:
             _cfg_text_cache.clear()
         _cfg_text_cache[hostname] = (_cache_key, text)
@@ -579,22 +662,29 @@ def build_client_api_app(spoke) -> FastAPI:
 
     @app.get("/api/config/overrides")
     async def api_config_overrides() -> PlainTextResponse:
+        """Return the raw user-overrides.conf text (empty if missing)."""
+        # Read the file if it exists.
         path = CONFIGS_DIR / "user-overrides.conf"
         return PlainTextResponse(path.read_text(encoding="utf-8") if path.exists() else "")
 
     @app.get("/api/config/parsed")
     async def api_config_parsed() -> JSONResponse:
+        """Return simulation.conf parsed into sections as JSON."""
+        # Parse and convert to a dict.
         parser = sim_config.load_ini(CONFIGS_DIR / "simulation.conf")
         return JSONResponse(sim_config.sections_dict(parser))
 
     # ── scripts ────────────────────────────────────────────────────────────
     def _scripts_dir(platform: str) -> Path:
+        """Return the scripts folder for ``platform`` (404 if unknown)."""
+        # Reject unknown platforms.
         if platform not in _VALID_PLATFORMS:
             raise HTTPException(status_code=404, detail=f"unknown platform: {platform}")
         return (CLIENTS_DIR / platform).resolve()
 
     @app.get("/api/scripts/list")
     async def api_scripts_list(platform: str = Query(...)) -> List[str]:
+        """List the script file names for ``platform`` as a bare JSON array."""
         # MUST return a BARE JSON ARRAY (["agent.sh", ...]), NOT
         # {"platform":.., "scripts":[..]}. The linux update.sh
         # (tr -d '[]"' | tr ',') and windows update.ps1
@@ -603,14 +693,17 @@ def build_client_api_app(spoke) -> FastAPI:
         # "{platform:linux" and fail EVERY script sync ("sync incomplete").
         # Matches the original webui-spoke endpoint (list[str]).
         sd = _scripts_dir(platform)
+        # No folder means no scripts.
         if not sd.is_dir():
             return []
+        # Every file in the platform folder.
         names = {p.name for p in sd.iterdir() if p.is_file()}
         # Advertise cross-platform files (e.g. the T3 IoT catalog served to linux)
         # so update.sh downloads them via /api/scripts/{platform}/{name} too.
         for _fname, _src in _CROSS_PLATFORM_FILES.get(platform, {}).items():
             if (CLIENTS_DIR / _src / _fname).is_file():
                 names.add(_fname)
+        # Sorted list.
         return sorted(names)
 
     @app.get("/api/scripts/manifest")
@@ -629,10 +722,13 @@ def build_client_api_app(spoke) -> FastAPI:
         this doesn't re-hash unchanged files each time. Returns {} for an unknown/
         empty platform → update.sh treats {} as 'no manifest' and falls back to the
         VERSION gate (old-spoke compatibility)."""
+        # Hashing library for the manifest.
         import hashlib
+        # Return {} if there is no folder.
         sd = _scripts_dir(platform)
         if not sd.is_dir():
             return {}
+        # The files the client mirrors.
         files = [p for p in sorted(sd.iterdir())
                  if p.is_file()
                  and p.name != "kill_switch.txt"
@@ -646,53 +742,70 @@ def build_client_api_app(spoke) -> FastAPI:
             _p = CLIENTS_DIR / _src / _fname
             if _p.is_file():
                 files.append(_p)
+        # Newest file time, used as the cache key.
         try:
             newest = max((p.stat().st_mtime for p in files), default=0.0)
         except OSError:
             newest = 0.0
+        # Return the cached manifest when nothing changed.
         cache = api_scripts_manifest._cache  # type: ignore[attr-defined]
         hit = cache.get(platform)
         if hit and hit[0] == newest:
             return hit[1]
+        # Hash each file (skipping unreadable ones).
         out: Dict[str, str] = {}
         for p in files:
             try:
                 out[p.name] = hashlib.sha256(p.read_bytes()).hexdigest()
             except OSError:
                 continue
+        # Cache and return.
         cache[platform] = (newest, out)
         return out
+    # Cache store on the function itself.
     api_scripts_manifest._cache = {}  # type: ignore[attr-defined]
 
     @app.get("/api/scripts/{platform}/{filename:path}")
     async def api_scripts_get(platform: str, filename: str) -> FileResponse:
+        """Serve one client script file (guarded against path traversal)."""
+        # Resolve safely and send the file.
         return FileResponse(str(resolve_script_path(platform, filename)))
 
     # ── registry / control ─────────────────────────────────────────────────
     @app.get("/api/clients")
     async def api_clients() -> Dict[str, Any]:
+        """Return all registered clients."""
+        # Empty when there is no registry.
         return spoke.registry.get_all() if spoke.registry is not None else {}
 
     @app.post("/api/clients/{hostname}/control", dependencies=[Depends(require_key)])
     async def api_clients_control(hostname: str, body: Dict[str, Any]) -> Dict[str, Any]:
+        """Set per-client overrides for ``hostname``."""
+        # Overrides must be an object.
         overrides = body.get("overrides", {})
         if not isinstance(overrides, dict):
             raise HTTPException(status_code=400, detail="'overrides' must be an object")
+        # Save them and return the entry.
         entry = await spoke.registry.set_overrides(hostname, overrides)
         return {"status": "ok", "client": entry}
 
     @app.delete("/api/clients/{hostname}/control", dependencies=[Depends(require_key)])
     async def api_clients_control_delete(hostname: str) -> Dict[str, Any]:
+        """Clear all overrides for ``hostname``."""
+        # Clear and confirm.
         await spoke.registry.clear_overrides(hostname)
         return {"status": "ok"}
 
     # ── command queue (HTTP fallback / admin) ──────────────────────────────
     @app.post("/api/commands", dependencies=[Depends(require_key)])
     async def api_commands_post(body: Dict[str, Any]) -> Dict[str, Any]:
+        """Queue a command and push it to the target agent if connected."""
+        # Read the target and action (action required).
         target = str(body.get("target") or "proxmox")
         action = str(body.get("action") or "").strip()
         if not action:
             raise HTTPException(status_code=400, detail="missing 'action'")
+        # Enqueue; safeguard refusals become 400.
         try:
             res = await spoke.queue.enqueue(target, action,
                                              body.get("args") or {},
@@ -705,14 +818,20 @@ def build_client_api_app(spoke) -> FastAPI:
 
     @app.get("/api/commands", dependencies=[Depends(require_key)])
     async def api_commands_list() -> Dict[str, Any]:
+        """Return all queued commands."""
+        # List them.
         return {"commands": await spoke.queue.list_commands()}
 
     @app.get("/api/inbox", dependencies=[Depends(require_key)])
     async def api_inbox(hostname: str = Query(...)) -> Dict[str, Any]:
+        """Poll the inbox for ``hostname`` (marks commands delivered)."""
+        # Delegate to the queue.
         return await spoke.queue.poll_agent_inbox(hostname)
 
     @app.post("/api/inbox/ack", dependencies=[Depends(require_key)])
     async def api_inbox_ack(body: Dict[str, Any]) -> Dict[str, Any]:
+        """Acknowledge a command result."""
+        # Record the ack; unknown ids give 404.
         res = await spoke.queue.ack_command(body.get("id"), body.get("status"),
                                              body.get("message"), body.get("result"))
         if not res.get("ok"):
@@ -725,6 +844,7 @@ def build_client_api_app(spoke) -> FastAPI:
                         hostname: str = Query(""),
                         platform: str = Query(""),
                         api_key: Optional[str] = Query(None)) -> None:
+        """Main agent WebSocket: status beacons, acks and live command push."""
         # Auth: sim-segment callers are trusted (t3 sends no key); else
         # compare_digest against client_api_key, close 4403 on mismatch.
         remote_host = ws.client.host if ws.client else None
@@ -732,6 +852,7 @@ def build_client_api_app(spoke) -> FastAPI:
             await ws.close(code=4403)
             return
 
+        # Accept and register the connection.
         hn = str(hostname or "").strip() or "__unknown__"
         await ws.accept()
         client_ws_connections[hn] = ws
@@ -746,6 +867,7 @@ def build_client_api_app(spoke) -> FastAPI:
                 _sq()
             except Exception as exc:  # noqa: BLE001
                 logger.debug("client WS connect: sim-quota nudge failed: %s", exc)
+        # Greet the client with the version.
         try:
             await ws.send_json({"type": "hello", "hostname": hn,
                                 "version": spoke.get_version()})
@@ -758,15 +880,18 @@ def build_client_api_app(spoke) -> FastAPI:
             # Push any pending commands immediately (marks them delivered).
             await push_pending(spoke, hn)
 
+            # Handle messages until disconnect.
             while True:
                 msg = await ws.receive_json()
                 mtype = str(msg.get("type") or "").lower()
+                # Status beacon: record it, ack it and refresh the throttle.
                 if mtype == "status":
                     await spoke.registry.apply_status(hn, msg.get("payload") or {})
                     await ws.send_json({"type": "status_ack"})
                     _thr = _client_throttle_interval(spoke)
                     if _thr:
                         await ws.send_json({"type": "throttle", "interval": _thr})
+                # Command ack: record it and confirm.
                 elif mtype == "ack":
                     p = msg.get("payload") or {}
                     res = await spoke.queue.ack_command(
@@ -774,15 +899,20 @@ def build_client_api_app(spoke) -> FastAPI:
                         p.get("message"), p.get("result"))
                     await ws.send_json({"type": "ack_ok", "id": p.get("id"),
                                         "ok": bool(res.get("ok"))})
+                # Sync request: push pending commands.
                 elif mtype == "sync":
                     await push_pending(spoke, hn)
+                # Keep-alive ping.
                 elif mtype == "ping":
                     await ws.send_json({"type": "pong"})
                 # unknown types ignored (agents only act on "commands")
+        # Normal disconnect is logged.
         except WebSocketDisconnect:
             logger.info("client WS disconnected: %s", hn)
+        # Other errors are logged at debug level.
         except Exception as exc:  # noqa: BLE001
             logger.debug("client WS error (%s): %s", hn, exc)
+        # Remove this connection if it is still the registered one.
         finally:
             if client_ws_connections.get(hn) is ws:
                 client_ws_connections.pop(hn, None)
@@ -803,23 +933,33 @@ def build_client_api_app(spoke) -> FastAPI:
     # ── mgmt (kept from standalone, folded in so standalone == hub) ────────
     @app.get("/status")
     async def mgmt_status() -> Dict[str, Any]:
+        """Return the engine's current state."""
+        # Delegate to the engine.
         return spoke.engine.get_current_state()
 
     @app.post("/simulate/trigger")
     async def mgmt_trigger() -> Dict[str, Any]:
+        """Run one simulation iteration now."""
+        # Delegate to the engine.
         return await spoke.engine.run_iteration()
 
     @app.post("/config")
     async def mgmt_config_post(body: Dict[str, Any]) -> Dict[str, Any]:
+        """Update the engine config and return the new state."""
+        # Apply, then report.
         spoke.engine.update_config(body)
         return spoke.engine.get_current_state()
 
     @app.get("/config")
     async def mgmt_config_get() -> Dict[str, Any]:
+        """Return the engine's current config/state."""
+        # Delegate to the engine.
         return spoke.engine.get_current_state()
 
     @app.get("/version")
     async def mgmt_version() -> Dict[str, str]:
+        """Return the spoke version."""
+        # Version from the spoke.
         return {"version": spoke.get_version()}
 
     # ── local standalone dashboard (Simulations/Clients — see local_ui_routes.py
@@ -828,11 +968,13 @@ def build_client_api_app(spoke) -> FastAPI:
     # surface either way, per run_standalone_mode's design) so a small
     # deployment gets a working local UI without needing an LM hub at all.
     app.include_router(build_local_ui_router(spoke))
+    # Mount static files and the dashboard if the folder exists.
     if _STATIC_DIR.is_dir():
         app.mount("/static", StaticFiles(directory=str(_STATIC_DIR)), name="static")
 
         @app.get("/")
         async def dashboard() -> HTMLResponse:
+            """Serve the dashboard HTML with a cache-busting version for sim-views.js."""
             # Serve dashboard.html with a cache-busting version stamped into the
             # sim-views.js <script src>. Without it the un-versioned
             # /static/sim-views.js is held by the browser cache, so a JS change
@@ -842,10 +984,12 @@ def build_client_api_app(spoke) -> FastAPI:
             # repo pull that updates the file. Mirrors the hub's
             # index.html ?v=__WEBUI_VERSION__ scheme.
             html = (_STATIC_DIR / "dashboard.html").read_text(encoding="utf-8")
+            # Version is the JS file's mtime ("0" if missing).
             try:
                 ver = str(int((_STATIC_DIR / "sim-views.js").stat().st_mtime))
             except OSError:
                 ver = "0"
             return HTMLResponse(html.replace("__CS_VERSION__", ver))
 
+    # Return the app.
     return app

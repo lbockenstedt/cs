@@ -1,5 +1,12 @@
+"""Superadmin API routes for the hub.
+
+Covers tenants (create, delete, Aruba and notification settings, Central tenant discovery),
+users and their tenant roles, pending spoke approval, hub login provider settings, and the
+hub's own git-based self-update. Most routes require a superadmin.
+"""
 from __future__ import annotations
 
+# Standard library imports.
 import logging
 import os
 import shutil
@@ -11,6 +18,7 @@ from pathlib import Path
 from typing import Any, Literal, Optional, Union
 import uuid
 
+# Hub modules and FastAPI/pydantic.
 from ..ws import ws_broadcast
 
 from fastapi import APIRouter, Depends, HTTPException, Request, status
@@ -22,6 +30,7 @@ from ..config import get_settings
 from ..crypto import encrypt_dict, encrypt_str, decrypt_str, generate_api_key
 from ..data_models import Command, Spoke, Tenant, User
 
+# Router for these routes, and the module logger.
 router = APIRouter()
 logger = logging.getLogger(__name__)
 
@@ -64,17 +73,21 @@ def _find_git() -> str:
 def _run_hub_self_update_bg() -> None:
     """Run git pull + pip install in a background thread, then restart via systemd."""
     global _hub_update_state
+    # Repo root and the venv's pip.
     base = _hub_base_dir()
     venv_pip = base / "venv" / "bin" / "pip"
 
     def _log(line: str) -> None:
+        """Add a line to the update log and the server log."""
         _hub_update_state["log"].append(line)
         logger.info("hub-self-update: %s", line)
 
     try:
+        # Reset the state and mark the update as running.
         _hub_update_state.update({"in_progress": True, "log": [], "error": None, "started_at": datetime.now(timezone.utc).isoformat(), "finished_at": None})
 
         # ── Step 1: git pull ──────────────────────────────────────────────────
+        # Pull the latest code; stop on failure.
         _log(f"Working dir: {base}")
         git_bin = _find_git()
         _log(f"git binary: {git_bin}")
@@ -82,6 +95,7 @@ def _run_hub_self_update_bg() -> None:
             [git_bin, "pull", "--ff-only"],
             capture_output=True, text=True, cwd=str(base), timeout=120
         )
+        # Log git's output.
         for l in (result.stdout + result.stderr).splitlines():
             _log(l)
         if result.returncode != 0:
@@ -89,12 +103,14 @@ def _run_hub_self_update_bg() -> None:
             return
 
         # ── Step 2: pip install -r requirements.txt ───────────────────────────
+        # Install requirements if there is a venv.
         if venv_pip.exists():
             _log("Running pip install -r requirements.txt …")
             result = subprocess.run(
                 [str(venv_pip), "install", "--quiet", "-r", str(base / "requirements.txt")],
                 capture_output=True, text=True, cwd=str(base), timeout=300
             )
+            # Log pip's output; stop on failure.
             for l in (result.stdout + result.stderr).splitlines():
                 _log(l)
             if result.returncode != 0:
@@ -103,19 +119,25 @@ def _run_hub_self_update_bg() -> None:
         else:
             _log("No venv found — skipping pip install")
 
+        # Mark the update finished.
         _log("Update complete. Scheduling service restart in 3 seconds…")
         _hub_update_state.update({"in_progress": False, "error": None, "finished_at": datetime.now(timezone.utc).isoformat()})
 
         # ── Step 3: deferred restart so the response can reach the client ─────
         def _restart():
+            """Restart the hub's systemd service after a short delay."""
+            # Wait so the HTTP response can be sent, then restart the hub service.
             time.sleep(3)
+            # Use sudo -n when not running as root.
             is_root = os.geteuid() == 0
             cmd = ["systemctl", "restart", "hub"]
             if not is_root:
                 cmd = ["sudo", "-n"] + cmd
             subprocess.run(cmd, check=False)
+        # Run the restart in a daemon thread.
         threading.Thread(target=_restart, daemon=True).start()
 
+    # Record timeouts and other errors in the state.
     except subprocess.TimeoutExpired as exc:
         _hub_update_state.update({"error": f"Command timed out: {exc}", "in_progress": False, "finished_at": datetime.now(timezone.utc).isoformat()})
     except Exception as exc:
@@ -124,17 +146,20 @@ def _run_hub_self_update_bg() -> None:
 
 
 class TenantCreateRequest(BaseModel):
+    """Request body for creating a tenant."""
     name: str
     aruba_cid: Optional[str] = None
     aruba_config: dict[str, Any] = Field(default_factory=dict)
 
 
 class ArubaConfigRequest(BaseModel):
+    """Request body for setting a tenant's Aruba Central details."""
     aruba_cid: Optional[str] = None
     config: dict[str, Any] = Field(default_factory=dict)
 
 
 class ArubaTenantDiscoveryRequest(BaseModel):
+    """Request body for discovering tenants from an Aruba Central account."""
     cluster_url: str
     client_id: str = ""
     client_secret: str = ""
@@ -144,6 +169,7 @@ class ArubaTenantDiscoveryRequest(BaseModel):
 
 
 class NotificationConfigRequest(BaseModel):
+    """Request body for a tenant's notification settings (Teams and email)."""
     teams_webhook_url: str = ""
     smtp_host: str = ""
     smtp_port: int = 587
@@ -155,21 +181,25 @@ class NotificationConfigRequest(BaseModel):
 
 
 class ApprovePendingSpokeRequest(BaseModel):
+    """Request body for approving a pending spoke into a tenant."""
     tenant_id: str
     label: Optional[str] = None
 
 
 class CreateUserRequest(BaseModel):
+    """Request body for creating a user."""
     username: str
     password: str
 
 
 class AssignRoleRequest(BaseModel):
+    """Request body for giving a user a role in a tenant."""
     tenant_id: str
     role: Literal["admin", "viewer", "operator", "demo"]
 
 
 class HubAuthConfigRequest(BaseModel):
+    """Request body for the hub's login provider settings (local, LDAP, RADIUS or TACACS+)."""
     auth_provider: str
     auth_ldap_url: str = ""
     auth_ldap_bind_dn: str = ""
@@ -192,9 +222,16 @@ class HubAuthConfigRequest(BaseModel):
 
 
 def _normalize_notification_config(payload: NotificationConfigRequest) -> dict[str, Any]:
+    """Convert a notification request into the stored config dict.
+
+    Accepts a comma-separated string of emails as well as a list. The Teams URL is stored
+    under both key names used by readers.
+    """
+    # Split a comma-separated email string into a list.
     to_emails = payload.to_emails
     if isinstance(to_emails, str):
         to_emails = [item.strip() for item in to_emails.split(",") if item.strip()]
+    # Build the config dict.
     return {
         "enabled": payload.enabled,
         "teams_webhook": payload.teams_webhook_url,
@@ -209,6 +246,7 @@ def _normalize_notification_config(payload: NotificationConfigRequest) -> dict[s
 
 
 def _tenant_response(tenant: Tenant) -> dict[str, Any]:
+    """Return a tenant as an API response (no secrets)."""
     return {
         "id": tenant.id,
         "name": tenant.name,
@@ -223,6 +261,7 @@ def _tenant_response(tenant: Tenant) -> dict[str, Any]:
 
 
 def _user_response(user: User) -> dict[str, Any]:
+    """Return a user as an API response (no password hash)."""
     return {
         "id": user.id,
         "username": user.username,
@@ -243,12 +282,14 @@ def _build_approval_config_payload(
     """Build config_update payload for a newly approved spoke.
     If hub_config_enabled, seed hub_config from first spoke or push existing hub_config.
     Returns (payload_dict, updated_tenant_or_None)."""
+    # Relay connection settings every spoke needs.
     base = {
         "relay_spoke_id": spoke_id,
         "relay_api_key": plain_key,
         "relay_tenant_id": tenant_id,
         "relay_server_url": relay_server_url,
     }
+    # Hub-managed config off: just the relay settings.
     if not tenant.hub_config_enabled:
         return base, None
 
@@ -259,6 +300,7 @@ def _build_approval_config_payload(
         base.update(tenant.hub_config)
         return base, tenant
 
+    # Later spokes get the tenant's stored hub config.
     # Subsequent spoke — overwrite with hub's canonical config
     base.update(tenant.hub_config)
     return base, None
@@ -271,6 +313,11 @@ def _ensure_tenant_spoke_name_available(
     spoke_id: str,
     hostname: str,
 ) -> None:
+    """Raise 409 if another spoke in the tenant (approved or pending) already uses this name.
+
+    A spoke with the same hostname is treated as the same machine and is not a conflict.
+    """
+    # Check approved spokes.
     approved_conflict = store.find_spoke_name_conflict(
         tenant_id,
         spoke_name,
@@ -288,6 +335,7 @@ def _ensure_tenant_spoke_name_available(
             },
         )
 
+    # Check pending spokes.
     pending_conflict = store.find_pending_spoke_name_conflict(
         tenant_id,
         spoke_name,
@@ -308,43 +356,59 @@ def _ensure_tenant_spoke_name_available(
 
 @router.post("/superadmin/tenants", status_code=status.HTTP_201_CREATED)
 def create_tenant(payload: TenantCreateRequest, current_user: User = Depends(auth.require_superadmin)):
+    """Create a tenant (superadmins).
+
+    The Aruba customer id becomes the tenant id when given (409 if taken); otherwise a
+    random id is used. Any Aruba config is stored encrypted.
+    """
+    # Use the Aruba customer id as the tenant id when given; it must be unused.
     tenant_id = payload.aruba_cid or None
     if tenant_id and store.get_tenant(tenant_id):
         raise HTTPException(status_code=409, detail="Tenant already exists")
 
+    # Build the tenant.
     tenant = Tenant(
         id=tenant_id or str(uuid.uuid4()),
         name=payload.name,
         aruba_cid=payload.aruba_cid,
         created_by=current_user.username,
     )
+    # Store the Aruba config encrypted.
     if payload.aruba_config:
         tenant.aruba_config_enc = encrypt_dict(payload.aruba_config)
+    # Save and return it.
     store.save_tenant(tenant)
     return _tenant_response(tenant)
 
 
 @router.get("/superadmin/tenants")
 def list_tenants(_: User = Depends(auth.require_superadmin)):
+    """List all tenants (superadmins)."""
     return [_tenant_response(tenant) for tenant in store.list_tenants()]
 
 
 @router.get("/superadmin/tenants/{tenant_id}")
 def get_tenant_detail(tenant_id: str, _: User = Depends(auth.require_superadmin)):
+    """Return one tenant (superadmins)."""
+    # Load the tenant (404 if missing).
     tenant = store.get_tenant(tenant_id)
     if not tenant:
         raise HTTPException(status_code=404, detail="Tenant not found")
+    # Return it.
     return _tenant_response(tenant)
 
 
 @router.delete("/superadmin/tenants/{tenant_id}")
 def delete_tenant(tenant_id: str, _: User = Depends(auth.require_superadmin)):
     """Soft delete a tenant — marks as deleted but preserves data for 30-day recovery period."""
+    # Load the tenant (404 if missing).
     tenant = store.get_tenant(tenant_id)
     if not tenant:
         raise HTTPException(status_code=404, detail="Tenant not found")
+    # Already deleted is an error.
     if tenant.deleted_at:
         raise HTTPException(status_code=400, detail="Tenant already deleted")
+    # Soft-delete it.
     store.delete_tenant(tenant_id)
     return {"status": "deleted", "message": "Tenant soft-deleted. Recoverable for 30 days."}
 
@@ -352,6 +416,7 @@ def delete_tenant(tenant_id: str, _: User = Depends(auth.require_superadmin)):
 @router.post("/superadmin/tenants/{tenant_id}/restore")
 def restore_tenant(tenant_id: str, _: User = Depends(auth.require_superadmin)):
     """Restore a soft-deleted tenant."""
+    # Undelete it (404 if missing or not deleted).
     restored = store.restore_tenant(tenant_id)
     if not restored:
         raise HTTPException(status_code=404, detail="Tenant not found or not deleted")
@@ -361,6 +426,7 @@ def restore_tenant(tenant_id: str, _: User = Depends(auth.require_superadmin)):
 @router.get("/superadmin/deleted-tenants")
 def get_deleted_tenants(_: User = Depends(auth.require_superadmin)):
     """List soft-deleted tenants (recoverable for 30 days)."""
+    # Deleted tenants only.
     all_tenants = store.list_tenants(include_deleted=True)
     deleted = [_tenant_response(t) for t in all_tenants if t.deleted_at]
     return deleted
@@ -372,14 +438,18 @@ def update_tenant_aruba(
     payload: ArubaConfigRequest,
     _: User = Depends(auth.require_superadmin),
 ):
+    """Set a tenant's Aruba customer id and/or Central config (superadmins)."""
+    # Load the tenant (404 if missing).
     tenant = store.get_tenant(tenant_id)
     if not tenant:
         raise HTTPException(status_code=404, detail="Tenant not found")
 
+    # Update only the fields that were sent; the config is stored encrypted.
     if payload.aruba_cid:
         tenant.aruba_cid = payload.aruba_cid
     if payload.config:
         tenant.aruba_config_enc = encrypt_dict(payload.config)
+    # Save and return it.
     store.save_tenant(tenant)
     return _tenant_response(tenant)
 
@@ -389,6 +459,11 @@ async def discover_aruba_tenants(
     payload: ArubaTenantDiscoveryRequest,
     current_user: User = Depends(auth.require_superadmin),
 ):
+    """List the tenants visible to an Aruba Central account (superadmins).
+
+    With auto_import, any tenant not already on the hub is created.
+    """
+    # Client built from the supplied credentials.
     client = ArubaClient(
         {
             "cluster_url": payload.cluster_url,
@@ -398,7 +473,9 @@ async def discover_aruba_tenants(
             "api_version": payload.api_version,
         }
     )
+    # Ask Central for its tenants.
     tenants = await client.discover_tenants()
+    # Optionally create hub tenants for new ones.
     if payload.auto_import:
         for item in tenants:
             tenant_id = item.get("cid")
@@ -411,6 +488,7 @@ async def discover_aruba_tenants(
                         created_by=current_user.username,
                     )
                 )
+    # Return the list.
     return tenants
 
 
@@ -420,15 +498,19 @@ def update_tenant_notification_config(
     payload: NotificationConfigRequest,
     _: User = Depends(auth.require_superadmin),
 ):
+    """Save a tenant's notification settings, encrypted (superadmins)."""
+    # Load the tenant (404 if missing).
     tenant = store.get_tenant(tenant_id)
     if not tenant:
         raise HTTPException(status_code=404, detail="Tenant not found")
+    # Normalise, encrypt and save.
     tenant.notification_config_enc = encrypt_dict(_normalize_notification_config(payload))
     store.save_tenant(tenant)
     return {"status": "saved"}
 
 
 class HubConfigRequest(BaseModel):
+    """Request body for turning hub-managed spoke config on or off and setting that config."""
     hub_config_enabled: bool
     hub_config: dict[str, Any] = Field(default_factory=dict)
 
@@ -436,6 +518,8 @@ class HubConfigRequest(BaseModel):
 # ── Onboarding PSK ────────────────────────────────────────────────────────────
 
 def _psk_require_tenant_admin(tenant_id: str, current_user: User = Depends(auth.get_current_user)) -> str:
+    """FastAPI dependency: allow superadmins and tenant admins; return the tenant id."""
+    # Must have access to the tenant and be an admin of it (or a superadmin).
     auth.require_tenant_access(tenant_id, current_user)
     if not current_user.is_superadmin and current_user.get_role(tenant_id) != "admin":
         raise HTTPException(status_code=403, detail="Admin role required")
@@ -444,6 +528,7 @@ def _psk_require_tenant_admin(tenant_id: str, current_user: User = Depends(auth.
 
 def _migrate_legacy_psk(tenant) -> None:
     """Move legacy onboarding_psk_enc into the list if not already there."""
+    # Only if the old single PSK is set and not already in the list.
     if tenant.onboarding_psk_enc and tenant.onboarding_psk_enc not in tenant.onboarding_psks_enc:
         tenant.onboarding_psks_enc.insert(0, tenant.onboarding_psk_enc)
         tenant.onboarding_psk_enc = ""
@@ -451,7 +536,9 @@ def _migrate_legacy_psk(tenant) -> None:
 
 def _get_tenant_psks(tenant) -> list[str]:
     """Return all decrypted PSKs for a tenant (migrating legacy field if needed)."""
+    # Move any legacy PSK into the list first.
     _migrate_legacy_psk(tenant)
+    # Decrypt each; skip any that fail.
     psks = []
     for enc in tenant.onboarding_psks_enc:
         try:
@@ -462,6 +549,9 @@ def _get_tenant_psks(tenant) -> list[str]:
 
 
 def _safe_decrypt_eq(enc: str, plain: str) -> bool:
+    """Return True if an encrypted PSK decrypts to the given value (False if it cannot be
+    decrypted).
+    """
     try:
         return decrypt_str(enc) == plain
     except Exception:
@@ -473,9 +563,11 @@ def get_onboarding_psks(
     tenant_id: str = Depends(_psk_require_tenant_admin),
 ):
     """Return all onboarding PSKs for this tenant (values visible to tenant admins)."""
+    # Load the tenant (404 if missing).
     tenant = store.get_tenant(tenant_id)
     if not tenant:
         raise HTTPException(status_code=404, detail="Tenant not found")
+    # Return the PSKs.
     psks = _get_tenant_psks(tenant)
     return {"psks": psks, "has_psk": bool(psks)}
 
@@ -488,12 +580,15 @@ def generate_onboarding_psk(
 
     Multiple PSKs may coexist — any valid PSK auto-approves a spoke registration.
     """
+    # Load the tenant (404 if missing).
     tenant = store.get_tenant(tenant_id)
     if not tenant:
         raise HTTPException(status_code=404, detail="Tenant not found")
+    # Create a new PSK and add it (encrypted) to the list.
     plain_psk = generate_api_key()
     _migrate_legacy_psk(tenant)
     tenant.onboarding_psks_enc.append(encrypt_str(plain_psk))
+    # Save and return the new PSK and the full list.
     store.save_tenant(tenant)
     return {"psk": plain_psk, "psks": _get_tenant_psks(tenant)}
 
@@ -504,10 +599,13 @@ def revoke_onboarding_psk(
     body: dict = None,
 ):
     """Revoke one specific PSK (pass {\"psk\": \"<value>\"} in body) or all PSKs if no body."""
+    # Load the tenant (404 if missing).
     tenant = store.get_tenant(tenant_id)
     if not tenant:
         raise HTTPException(status_code=404, detail="Tenant not found")
+    # Include any legacy PSK.
     _migrate_legacy_psk(tenant)
+    # Remove the given PSK, or all of them if none was given.
     psk_to_revoke = (body or {}).get("psk", "").strip()
     if psk_to_revoke:
         tenant.onboarding_psks_enc = [
@@ -517,6 +615,7 @@ def revoke_onboarding_psk(
     else:
         tenant.onboarding_psks_enc = []
         tenant.onboarding_psk_enc = ""
+    # Save and return what is left.
     store.save_tenant(tenant)
     return {"psks": _get_tenant_psks(tenant), "has_psk": bool(tenant.onboarding_psks_enc)}
 
@@ -526,11 +625,15 @@ def get_tenant_hub_config(
     tenant_id: str,
     current_user: User = Depends(auth.require_superadmin),
 ):
+    """Return a tenant's hub-managed config, USB list and processing modes (superadmins)."""
+    # Load the tenant (404 if missing).
     tenant = store.get_tenant(tenant_id)
     if not tenant:
         raise HTTPException(status_code=404, detail="Tenant not found")
+    # Config plus the tenant's USB list.
     hub_config = dict(tenant.hub_config or {})
     hub_config["usb_vidpids"] = store.get_tenant_usb_vidpids(tenant_id)
+    # Return it.
     return {
         "hub_config_enabled": tenant.hub_config_enabled,
         "hub_config": hub_config,
@@ -545,19 +648,28 @@ async def update_tenant_hub_config(
     request: Request,
     current_user: User = Depends(auth.require_superadmin),
 ):
+    """Save a tenant's hub-managed config and push it, or a clear, to its spokes (superadmins).
+
+    When enabled, each approved spoke gets a new config version and a config_update.
+    When disabled, spokes that had hub config get a config_clear.
+    """
+    # Load the tenant (404 if missing).
     tenant = store.get_tenant(tenant_id)
     if not tenant:
         raise HTTPException(status_code=404, detail="Tenant not found")
+    # Store the flag and config; a USB list in the config is also saved on the tenant.
     tenant.hub_config_enabled = payload.hub_config_enabled
     tenant.hub_config = payload.hub_config or {}
     if isinstance(tenant.hub_config.get("usb_vidpids"), list):
         tenant.usb_vidpids = [dict(item) for item in tenant.hub_config.get("usb_vidpids") if isinstance(item, dict)]
     store.save_tenant(tenant)
 
+    # Update each approved spoke.
     pushed_count = 0
     for spoke in store.list_spokes(tenant_id):
         if spoke.status != "approved":
             continue
+        # Enabled with config: bump the version and queue an update.
         if tenant.hub_config_enabled and tenant.hub_config:
             spoke.config_version += 1
             store.save_spoke(spoke)
@@ -565,6 +677,7 @@ async def update_tenant_hub_config(
             pushed_count += 1
             continue
 
+        # Disabled: clear hub config from spokes that had it.
         if spoke.config_version > 0:
             spoke.config_version = 0
             spoke.applied_config_version = 0
@@ -572,14 +685,17 @@ async def update_tenant_hub_config(
             store.ensure_config_clear_command(tenant_id, spoke.id)
             pushed_count += 1
 
+    # Report how many spokes were updated.
     return {"status": "saved", "hub_config_enabled": tenant.hub_config_enabled, "pushed_to_spokes": pushed_count}
 
 
 class GlobalUsbRequest(BaseModel):
+    """Request body for the platform-wide approved USB device list."""
     usb_vidpids: list[dict[str, Any]] = Field(default_factory=list)
 
 
 class GlobalUsbIgnoredRequest(BaseModel):
+    """Request body for the platform-wide ignored USB device list."""
     usb_vidpids: list[dict[str, Any]] = Field(default_factory=list)
 
 
@@ -596,6 +712,7 @@ def update_global_usb_vidpids(
 ):
     """Replace the platform-wide USB device list and trigger a spoke config push
     for every tenant that has hub-config enabled so spokes pick up the new devices."""
+    # Save the list.
     store.set_global_usb_vidpids(payload.usb_vidpids)
 
     # Trigger a config push to all approved spokes across all tenants.
@@ -611,6 +728,7 @@ def update_global_usb_vidpids(
             store.ensure_config_update_command(tenant.id, spoke.id)
             pushed_count += 1
 
+    # Report how many spokes were updated.
     return {"status": "saved", "pushed_to_spokes": pushed_count}
 
 
@@ -628,8 +746,10 @@ def update_global_usb_ignored_vidpids(
     """Replace the platform-wide USB ignored list and push to all approved spokes.
     Globally ignored VIDs are merged with any tenant-level ignored VIDs and sent
     as usb_ignored_vidpids in the hub config payload."""
+    # Save the list.
     store.set_global_usb_ignored_vidpids(payload.usb_vidpids)
 
+    # Queue a config update for every approved spoke in every tenant.
     pushed_count = 0
     for tenant in store.list_tenants():
         for spoke in store.list_spokes(tenant.id):
@@ -640,6 +760,7 @@ def update_global_usb_ignored_vidpids(
             store.ensure_config_update_command(tenant.id, spoke.id)
             pushed_count += 1
 
+    # Report how many spokes were updated.
     return {"status": "saved", "pushed_to_spokes": pushed_count}
 
 
@@ -657,6 +778,7 @@ def get_discovered_usb_vidpids(_: User = Depends(auth.require_superadmin)):
 
 @router.get("/superadmin/gkill-state")
 def get_gkill_state(_: User = Depends(auth.require_superadmin)):
+    """Return the gkill background task's current state (superadmins)."""
     from .. import tasks
 
     return tasks.gkill_state
@@ -664,11 +786,14 @@ def get_gkill_state(_: User = Depends(auth.require_superadmin)):
 
 @router.get("/superadmin/auth-providers")
 def get_auth_provider_status(_: User = Depends(auth.require_superadmin)):
+    """List the login providers, whether each is enabled and built, and the active one."""
     from ..auth_providers import get_enabled_providers
 
+    # Settings, enabled providers and the stored login config.
     settings = get_settings()
     enabled = set(get_enabled_providers())
     config = store.load_auth_config()
+    # One entry per provider.
     return {
         "providers": [
             {
@@ -708,6 +833,7 @@ def get_auth_provider_status(_: User = Depends(auth.require_superadmin)):
 
 @router.get("/superadmin/auth-config")
 def get_auth_config(_: User = Depends(auth.require_superadmin)):
+    """Return the hub's login provider settings; secrets are shown only as set/not-set."""
     config = store.load_auth_config()
     return {
         "auth_provider": config.auth_provider,
@@ -734,7 +860,13 @@ def get_auth_config(_: User = Depends(auth.require_superadmin)):
 
 @router.post("/superadmin/auth-config")
 def save_auth_config_endpoint(payload: HubAuthConfigRequest, _: User = Depends(auth.require_superadmin)):
+    """Save the hub's login provider settings (superadmins).
+
+    Secrets are encrypted and only replaced when a new value is sent.
+    """
+    # Load the current config.
     config = store.load_auth_config()
+    # Copy each field; secrets only when given.
     config.auth_provider = payload.auth_provider
     config.auth_ldap_url = payload.auth_ldap_url
     config.auth_ldap_bind_dn = payload.auth_ldap_bind_dn
@@ -757,14 +889,20 @@ def save_auth_config_endpoint(payload: HubAuthConfigRequest, _: User = Depends(a
         config.auth_tacacs_secret_enc = encrypt_str(payload.auth_tacacs_secret)
     config.auth_tacacs_superadmin_priv = payload.auth_tacacs_superadmin_priv
     config.auth_default_role = payload.auth_default_role
+    # Save.
     store.save_auth_config(config)
     return {"status": "ok"}
 
 
 @router.post("/superadmin/auth-test")
 async def test_auth_config_endpoint(payload: dict, _: User = Depends(auth.require_superadmin)):
+    """Try logging in with a provider using the saved settings (superadmins).
+
+    The body gives the provider (default: the active one), username and password.
+    """
     from ..auth_providers import test_auth_provider
 
+    # Test with the saved settings.
     config = store.load_auth_config()
     return await test_auth_provider(
         payload.get("provider", config.auth_provider),
@@ -776,6 +914,7 @@ async def test_auth_config_endpoint(payload: dict, _: User = Depends(auth.requir
 
 @router.get("/superadmin/pending-spokes")
 def list_pending_spokes(_: User = Depends(auth.require_superadmin)):
+    """List all pending spoke registrations (superadmins)."""
     return store.list_pending_spokes()
 
 
@@ -786,14 +925,21 @@ async def approve_pending_spoke(
     request: Request,
     _: User = Depends(auth.require_superadmin),
 ):
+    """Approve a pending spoke into a tenant (superadmins) and send its first config.
+
+    Returns the spoke's API key; it is shown only this once.
+    """
+    # Load the pending registration (404 if missing).
     pending = store.get_pending_spoke(spoke_id)
     if not pending:
         raise HTTPException(status_code=404, detail="Pending spoke not found")
 
+    # Target tenant (404 if missing).
     tenant = store.get_tenant(payload.tenant_id)
     if not tenant:
         raise HTTPException(status_code=404, detail="Tenant not found")
 
+    # The spoke name must be free in that tenant.
     _ensure_tenant_spoke_name_available(
         payload.tenant_id,
         pending.spoke_name,
@@ -801,6 +947,7 @@ async def approve_pending_spoke(
         hostname=pending.hostname,
     )
 
+    # Create the approved spoke from the pending details and tenant defaults.
     spoke = Spoke(
         id=pending.id,
         tenant_id=payload.tenant_id,
@@ -813,11 +960,14 @@ async def approve_pending_spoke(
         status="approved",
         last_seen=pending.last_seen,
     )
+    # New API key; only the encrypted form is stored.
     plain_key = generate_api_key()
     spoke.api_key_enc = encrypt_str(plain_key)
+    # Save it and remove the pending entry.
     store.save_spoke(spoke)
     store.delete_pending_spoke(spoke_id)
 
+    # Send the relay settings (and hub config if enabled) to the spoke as its first config.
     relay_server_url = str(request.base_url).rstrip("/")
     cmd_payload, _ = _build_approval_config_payload(
         tenant, pending.seed_config, plain_key, spoke.id, payload.tenant_id, relay_server_url
@@ -831,6 +981,7 @@ async def approve_pending_spoke(
             expires_at=datetime.now(timezone.utc) + timedelta(hours=24),
         )
     )
+    # Tell browsers.
     await ws_broadcast({
         "type": "spoke_approved",
         "tenant_id": payload.tenant_id,
@@ -839,6 +990,7 @@ async def approve_pending_spoke(
         "spoke_name": spoke.spoke_name,
     })
 
+    # Return the key.
     return {
         "spoke_id": spoke.id,
         "api_key": plain_key,
@@ -848,9 +1000,12 @@ async def approve_pending_spoke(
 
 @router.delete("/superadmin/pending-spokes/{spoke_id}")
 def delete_pending_spoke(spoke_id: str, _: User = Depends(auth.require_superadmin)):
+    """Discard a pending spoke registration (superadmins)."""
+    # Load the pending registration (404 if missing).
     pending = store.get_pending_spoke(spoke_id)
     if not pending:
         raise HTTPException(status_code=404, detail="Pending spoke not found")
+    # Delete it.
     store.delete_pending_spoke(spoke_id)
     return {"status": "deleted"}
 
@@ -865,6 +1020,7 @@ def list_tenant_pending_spokes(
     current_user: User = Depends(auth.require_tenant_access),
 ):
     """Return pending spokes that pre-registered for this tenant, plus unclaimed spokes with no tenant hint or a stale hint pointing to a deleted tenant."""
+    # Pending spokes for this tenant, with no tenant, or for a tenant that no longer exists.
     all_pending = store.list_pending_spokes()
     return [
         p for p in all_pending
@@ -883,6 +1039,7 @@ async def tenant_approve_pending_spoke(
     label: Optional[str] = None,
 ):
     """Tenant admin approves a spoke pre-registered for their tenant."""
+    # Load the pending registration (404 if missing).
     pending = store.get_pending_spoke(spoke_id)
     if not pending:
         raise HTTPException(status_code=404, detail="Pending spoke not found")
@@ -891,10 +1048,12 @@ async def tenant_approve_pending_spoke(
     if pending.tenant_hint and pending.tenant_hint != tenant_id and store.get_tenant(pending.tenant_hint):
         raise HTTPException(status_code=403, detail="This spoke was pre-registered for a different tenant")
 
+    # Load the tenant (404 if missing).
     tenant = store.get_tenant(tenant_id)
     if not tenant:
         raise HTTPException(status_code=404, detail="Tenant not found")
 
+    # The spoke name must be free in this tenant.
     _ensure_tenant_spoke_name_available(
         tenant_id,
         pending.spoke_name,
@@ -902,6 +1061,7 @@ async def tenant_approve_pending_spoke(
         hostname=pending.hostname,
     )
 
+    # Create the approved spoke; the label defaults to the one given at registration.
     label = label if label is not None else pending.label
     spoke = Spoke(
         id=pending.id,
@@ -915,15 +1075,19 @@ async def tenant_approve_pending_spoke(
         status="approved",
         last_seen=pending.last_seen,
     )
+    # New API key; only the encrypted form is stored.
     plain_key = generate_api_key()
     spoke.api_key_enc = encrypt_str(plain_key)
+    # Save it and remove the pending entry.
     store.save_spoke(spoke)
     store.delete_pending_spoke(spoke_id)
 
+    # Send the relay settings (and hub config if enabled) to the spoke as its first config.
     relay_server_url = str(request.base_url).rstrip("/")
     cmd_payload, _ = _build_approval_config_payload(
         tenant, pending.seed_config, plain_key, spoke.id, tenant_id, relay_server_url
     )
+    # Queue the first config for the spoke.
     store.enqueue_command(
         Command(
             spoke_id=spoke.id,
@@ -933,6 +1097,7 @@ async def tenant_approve_pending_spoke(
             expires_at=datetime.now(timezone.utc) + timedelta(hours=24),
         )
     )
+    # Tell browsers.
     await ws_broadcast({
         "type": "spoke_approved",
         "tenant_id": tenant_id,
@@ -941,6 +1106,7 @@ async def tenant_approve_pending_spoke(
         "spoke_name": spoke.spoke_name,
     })
 
+    # Return the key.
     return {
         "spoke_id": spoke.id,
         "api_key": plain_key,
@@ -955,25 +1121,32 @@ def tenant_reject_pending_spoke(
     current_user: User = Depends(auth.require_tenant_admin),
 ):
     """Tenant admin rejects/removes a spoke pre-registered for their tenant."""
+    # Load the pending registration (404 if missing).
     pending = store.get_pending_spoke(spoke_id)
     if not pending:
         raise HTTPException(status_code=404, detail="Pending spoke not found")
+    # Only spokes for this tenant, with no tenant, or for a deleted tenant.
     if pending.tenant_hint and pending.tenant_hint != tenant_id and store.get_tenant(pending.tenant_hint):
         raise HTTPException(status_code=403, detail="This spoke was pre-registered for a different tenant")
+    # Delete it.
     store.delete_pending_spoke(spoke_id)
     return {"status": "rejected"}
 
 
 @router.get("/superadmin/users")
 def list_users(_: User = Depends(auth.require_superadmin)):
+    """List all users (superadmins)."""
     return [_user_response(user) for user in store.list_users()]
 
 
 @router.post("/superadmin/users", status_code=status.HTTP_201_CREATED)
 def create_user(payload: CreateUserRequest, _: User = Depends(auth.require_superadmin)):
+    """Create a non-superadmin user with no tenant roles (superadmins); 409 if the name is taken."""
+    # Username must be free.
     if store.get_user(payload.username):
         raise HTTPException(status_code=409, detail="Username already exists")
 
+    # Create with a hashed password and save.
     user = User(
         username=payload.username,
         hashed_password=auth.hash_password(payload.password),
@@ -986,9 +1159,12 @@ def create_user(payload: CreateUserRequest, _: User = Depends(auth.require_super
 
 @router.delete("/superadmin/users/{user_id}")
 def delete_user(user_id: str, _: User = Depends(auth.require_superadmin)):
+    """Delete a user (superadmins)."""
+    # Load the user (404 if missing).
     user = store.get_user_by_id(user_id)
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
+    # Delete it.
     store.delete_user(user_id)
     return {"status": "deleted"}
 
@@ -999,12 +1175,16 @@ def assign_tenant_role(
     payload: AssignRoleRequest,
     _: User = Depends(auth.require_superadmin),
 ):
+    """Give a user a role in a tenant (superadmins). "operator" is stored as "viewer"."""
+    # Load the user (404 if missing).
     user = store.get_user_by_id(user_id)
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
+    # The tenant must exist.
     if not store.get_tenant(payload.tenant_id):
         raise HTTPException(status_code=404, detail="Tenant not found")
 
+    # Store the role, mapping operator to viewer.
     normalized_role = "viewer" if payload.role == "operator" else payload.role
     user.tenant_roles.append({"tenant_id": payload.tenant_id, "role": normalized_role})
     store.save_user(user)
@@ -1013,13 +1193,17 @@ def assign_tenant_role(
 
 @router.delete("/superadmin/users/{user_id}/roles/{tenant_id}")
 def remove_tenant_role(user_id: str, tenant_id: str, _: User = Depends(auth.require_superadmin)):
+    """Remove a user's role in a tenant (superadmins); 404 if they had none."""
+    # Load the user (404 if missing).
     user = store.get_user_by_id(user_id)
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
 
+    # Drop the tenant's role; nothing removed means 404.
     updated_roles = [tr for tr in user.tenant_roles if tr["tenant_id"] != tenant_id]
     if len(updated_roles) == len(user.tenant_roles):
         raise HTTPException(status_code=404, detail="Tenant role not found")
+    # Save and return the user.
     user.tenant_roles = updated_roles
     store.save_user(user)
     return _user_response(user)
@@ -1028,6 +1212,7 @@ def remove_tenant_role(user_id: str, tenant_id: str, _: User = Depends(auth.requ
 # ── QA API Key management (superadmin only) ───────────────────────────────────
 
 class _QAKeyCreateRequest(BaseModel):
+    """Request body for creating a QA API key."""
     tenant_id: str
     description: str = ""
 
@@ -1042,17 +1227,21 @@ def create_qa_api_key(
     The raw key is returned **once** in this response and cannot be retrieved
     again.  Store it securely — it is the only credential the QA runner needs.
     """
+    # Imports used only here.
     import hashlib
     from ..data_models import QAApiKey
     from ..crypto import generate_api_key
 
+    # Tenant must exist.
     tenant = store.get_tenant(body.tenant_id)
     if not tenant:
         raise HTTPException(status_code=404, detail="Tenant not found")
 
+    # New key; only its SHA-256 hash is stored.
     raw_key = generate_api_key()
     key_hash = hashlib.sha256(raw_key.encode()).hexdigest()
 
+    # Save the key record.
     qa_key = QAApiKey(
         tenant_id=body.tenant_id,
         description=body.description,
@@ -1061,6 +1250,7 @@ def create_qa_api_key(
     )
     store.save_qa_api_key(qa_key)
 
+    # Return the details and the key itself.
     return {
         "id": qa_key.id,
         "tenant_id": qa_key.tenant_id,
@@ -1079,6 +1269,7 @@ def list_qa_api_keys(
     _: User = Depends(auth.require_superadmin),
 ):
     """List QA API keys (metadata only — raw keys are never returned)."""
+    # Key details without the hash.
     keys = store.list_qa_api_keys(tenant_id=tenant_id)
     return {
         "keys": [
@@ -1101,6 +1292,7 @@ def delete_qa_api_key(
     _: User = Depends(auth.require_superadmin),
 ):
     """Revoke a QA API key by ID."""
+    # Delete it (404 if missing).
     deleted = store.delete_qa_api_key(key_id)
     if not deleted:
         raise HTTPException(status_code=404, detail="QA API key not found")
@@ -1110,6 +1302,7 @@ def delete_qa_api_key(
 @router.get("/superadmin/hub-update-status")
 def get_hub_update_status(current_user: User = Depends(auth.require_superadmin)):
     """Return current hub version, latest git commit info, and update state."""
+    # Repo root and whether this is a container.
     base = _hub_base_dir()
     containerized = _is_container()
 
@@ -1120,8 +1313,10 @@ def get_hub_update_status(current_user: User = Depends(auth.require_superadmin))
         if version_file.exists()
         else os.environ.get("APP_VERSION", "unknown")
     )
+    # Branch set by the Docker build, if any.
     app_branch = os.environ.get("APP_BRANCH", "")
 
+    # Containers cannot self-update; say so.
     if containerized:
         return {
             "current_version": current_version,
@@ -1142,21 +1337,25 @@ def get_hub_update_status(current_user: User = Depends(auth.require_superadmin))
     # Git info (non-fatal) — native/systemd installs only
     git_info: dict[str, Any] = {}
     try:
+        # Local commit hash and subject.
         git_bin = _find_git()
         r = subprocess.run([git_bin, "log", "-1", "--format=%H %s %ai"], capture_output=True, text=True, cwd=str(base), timeout=10)
         if r.returncode == 0 and r.stdout.strip():
             parts = r.stdout.strip().split(" ", 2)
             git_info["local_commit"] = parts[0] if parts else ""
             git_info["local_subject"] = " ".join(parts[1:]) if len(parts) > 1 else ""
+        # Fetch and list commits on origin not yet pulled.
         subprocess.run([git_bin, "fetch", "--quiet", "origin"], capture_output=True, cwd=str(base), timeout=15)
         r2 = subprocess.run([git_bin, "log", "HEAD..origin/HEAD", "--oneline"], capture_output=True, text=True, cwd=str(base), timeout=10)
         ahead_lines = [l for l in r2.stdout.splitlines() if l.strip()]
         git_info["commits_behind"] = len(ahead_lines)
         git_info["pending_commits"] = ahead_lines[:10]
         git_info["update_available"] = len(ahead_lines) > 0
+    # Git errors are reported, not raised.
     except Exception as exc:
         git_info["error"] = str(exc)
 
+    # Version, update state and git details.
     return {
         "current_version": current_version,
         "app_branch": app_branch,
@@ -1178,6 +1377,7 @@ def trigger_hub_self_update(current_user: User = Depends(auth.require_superadmin
     The hub will restart ~3 seconds after the pip step completes.
     Not available when the hub is running as a container.
     """
+    # Not available in a container.
     if _is_container():
         raise HTTPException(
             status_code=400,
@@ -1186,8 +1386,10 @@ def trigger_hub_self_update(current_user: User = Depends(auth.require_superadmin
                 "Run redeploy-prod.sh to build and deploy a new container image."
             ),
         )
+    # Only one update at a time.
     if _hub_update_state["in_progress"]:
         raise HTTPException(status_code=409, detail="Update already in progress")
+    # Run the update in a background thread and return straight away.
     t = threading.Thread(target=_run_hub_self_update_bg, daemon=True)
     t.start()
     return {"ok": True, "detail": "Hub self-update started. Poll /superadmin/hub-update-status for progress. The hub will restart when complete."}

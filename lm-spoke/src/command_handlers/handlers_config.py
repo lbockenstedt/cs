@@ -9,23 +9,31 @@ dict, or ``None`` when the command is not one of its own (``handle_command``
 then tries the next domain — command sets are disjoint).
 """
 
+# Allow modern type-hint syntax without evaluating annotations at import time.
 from __future__ import annotations
 
+# Hashing and JSON for config value hashes.
 import hashlib
 import json
+# Logging, async tasks and timing.
 import logging
 import asyncio
 import time
+# Filesystem path handling.
 from pathlib import Path
 
+# Kea DHCP diagnostics, sim config INI helpers and sim-tag diagnostics.
 import dhcp_health
 import sim_config
 import sim_tag_health
+# Type hints only.
 from typing import Any, Dict, Optional
 
+# Shares the CSSpoke logger.
 logger = logging.getLogger("CSSpoke")
 
 
+# Envelope keys that are not config values themselves.
 _CS_CONFIG_META_KEYS = ("config_hash", "full_config")
 
 # Keys whose apply branch reads/rewrites state owned by another key, so when the
@@ -41,6 +49,7 @@ _CS_CONFIG_COUPLED = {
 
 
 def cs_value_hash(value: Any) -> str:
+    """Return a stable SHA-256 hash of a JSON-serialisable config value."""
     return hashlib.sha256(
         json.dumps(value, sort_keys=True, default=str).encode()).hexdigest()
 
@@ -48,11 +57,14 @@ def cs_value_hash(value: Any) -> str:
 def cs_config_diff(patch: Dict[str, Any], applied_hashes: Optional[Dict[str, str]]) -> Dict[str, Any]:
     """Subset of ``patch`` whose value differs from the last-applied hash (an
     unseen key counts as changed), plus the coupled dependants of any kept key."""
+    # A non-dict patch has nothing to diff.
     if not isinstance(patch, dict):
         return {}
+    # Keep keys whose hash differs from the last-applied one.
     applied_hashes = applied_hashes or {}
     result = {k: v for k, v in patch.items()
               if cs_value_hash(v) != applied_hashes.get(k)}
+    # Pull in the coupled dependants of each kept key.
     for key in list(result):
         for dep in _CS_CONFIG_COUPLED.get(key, ()):
             if dep in patch and dep not in result:
@@ -61,6 +73,8 @@ def cs_config_diff(patch: Dict[str, Any], applied_hashes: Optional[Dict[str, str
 
 
 def _atomic_write(path: Path, text: str) -> None:
+    """Write text to ``path`` atomically via a temp file and rename."""
+    # Make the folder, write a temp file, then swap it into place.
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(".tmp")
     tmp.write_text(text, encoding="utf-8")
@@ -117,6 +131,7 @@ class ConfigCommandsMixin:
 
     async def _dispatch_config(self, cmd: str, d: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         """Run the handler for ``cmd`` from ``_CONFIG_COMMANDS``; None if it is not one of ours."""
+        # Look up the handler name and call it.
         handler = self._CONFIG_COMMANDS.get(cmd)
         if handler is None:
             return None
@@ -129,6 +144,8 @@ class ConfigCommandsMixin:
     # (clients/linux, the same dir /api/scripts serves) + the tenant's
     # github_config branch. Best-effort; never raises.
     async def _cmd_get_repo_status(self, d):
+        """Report which branch, commit and script versions this spoke serves."""
+        # Locate the served scripts folder and the GitHub settings.
         import re as _re
         try:
             repo_root = self.settings.config_dir.parent
@@ -136,9 +153,14 @@ class ConfigCommandsMixin:
             gc = getattr(self, "_github_config", None) or {}
 
             def _script_ver(fn: str):
+                """Return the ``version=`` value from the first lines of a script, or None if
+                missing.
+                """
+                # A missing script has no version.
                 p = linux / fn
                 if not p.is_file():
                     return None
+                # Look for the version line near the top.
                 try:
                     for line in p.read_text(errors="replace").splitlines()[:5]:
                         m = _re.match(r"^version=(\S+)", line)
@@ -148,6 +170,7 @@ class ConfigCommandsMixin:
                     return "?"
                 return "?"
 
+            # Read the served VERSION file if present.
             served_version = None
             vf = linux / "VERSION"
             if vf.is_file():
@@ -155,12 +178,14 @@ class ConfigCommandsMixin:
                     served_version = vf.read_text(errors="replace").strip()
                 except Exception:  # noqa: BLE001
                     served_version = None
+            # Ask git for the current commit and branch.
             head = checked_out = ""
             try:
                 head = (await self._git("rev-parse", "--short", "HEAD")).strip()
                 checked_out = (await self._git("rev-parse", "--abbrev-ref", "HEAD")).strip()
             except Exception:  # noqa: BLE001 — git may be absent / non-repo dir
                 pass
+            # Build the status reply.
             return {"status": "SUCCESS", "repo": {
                 "configured_branch": str(gc.get("repo_branch") or "main"),
                 "checked_out_branch": checked_out,
@@ -176,17 +201,20 @@ class ConfigCommandsMixin:
                 },
                 "dns_latency_present": (linux / "dns_latency.sh").is_file(),
             }}
+        # Report the error inside a success reply so the UI can show it.
         except Exception as exc:  # noqa: BLE001
             logger.warning("CS_GET_REPO_STATUS failed: %s", exc)
             return {"status": "SUCCESS", "repo": {"error": str(exc)}}
 
     # ── config ─────────────────────────────────────────────────────────
     async def _cmd_get_config(self, d):
+        """Return the merged simulation and user-override configs as INI text."""
         # Return the MERGED config (base repo file + hub-managed override
         # layered on top) so the hub's Sim Config editor reads back the
         # effective config, not the raw base. Without the merge, edits saved
         # via CS_CONFIG_UPDATE (which writes hub-*-overrides.conf) would be
         # invisible on Refresh. Mirrors legacy GET /api/config + /api/config/overrides.
+        # Load and merge the configs, then serialise them.
         base = Path(__file__).resolve().parent.parent.parent / "configs"
         sim_conf, user_conf = sim_config.load_configs(base)
         return {"status": "SUCCESS", "mode": "local",
@@ -194,13 +222,17 @@ class ConfigCommandsMixin:
                 "user_overrides": sim_config.serialize_ini(user_conf)}
 
     async def _cmd_update_config(self, d):
+        """Replace simulation.conf with the given INI text after validating it."""
+        # Require content.
         content = d.get("content")
         if content is None:
             return {"status": "ERROR", "message": "missing 'content'"}
+        # Reject invalid INI text.
         try:
             sim_config.validate_ini_text(content)
         except ValueError as exc:
             return {"status": "ERROR", "message": str(exc)}
+        # Write the file and reload the engine.
         base = Path(__file__).resolve().parent.parent.parent / "configs"
         (base / "simulation.conf").write_text(content, encoding="utf-8")
         self.engine.reload_config()
@@ -210,13 +242,17 @@ class ConfigCommandsMixin:
         return {"status": "SUCCESS", "message": "simulation.conf updated"}
 
     async def _cmd_update_user_overrides(self, d):
+        """Replace user-overrides.conf with the given INI text after validating it."""
+        # Require content.
         content = d.get("content")
         if content is None:
             return {"status": "ERROR", "message": "missing 'content'"}
+        # Reject invalid INI text.
         try:
             sim_config.validate_ini_text(content)
         except ValueError as exc:
             return {"status": "ERROR", "message": str(exc)}
+        # Write the file and reload the engine.
         base = Path(__file__).resolve().parent.parent.parent / "configs"
         (base / "user-overrides.conf").write_text(content, encoding="utf-8")
         self.engine.reload_config()
@@ -226,6 +262,7 @@ class ConfigCommandsMixin:
         return {"status": "SUCCESS", "message": "user-overrides.conf updated"}
 
     async def _cmd_config_update(self, d):
+        """Apply a hub-pushed provisioning config update."""
         # Hub pushes hub-owned provisioning config (usb_vidpids,
         # usb_ignored_vidpids, usb_auto_provision, template ids, VLAN
         # ranges, reclone concurrency, ... + optional sim/user-overrides
@@ -244,9 +281,12 @@ class ConfigCommandsMixin:
     # already uses, so a locally-saved hub_config flows to the settings
     # store (and any cs-dialed pxmx agent) exactly like a hub-pushed one.
     async def _cmd_get_hub_config(self, d):
+        """Return the locally stored hub config."""
         return {"status": "SUCCESS", **self.local_store.get_hub_config()}
 
     async def _cmd_set_hub_config(self, d):
+        """Save the hub config locally and apply it when enabled."""
+        # Store the settings, then apply them if enabled.
         enabled = bool(d.get("hub_config_enabled", False))
         hc = d.get("hub_config") or {}
         self.local_store.set_hub_config(enabled, hc)
@@ -254,22 +294,29 @@ class ConfigCommandsMixin:
         return {"status": "SUCCESS", "applied": applied}
 
     async def _cmd_reset_hub_config(self, d):
+        """Restore the default hub config and re-apply it when enabled."""
+        # Reset the store, then apply the result if enabled.
         result = self.local_store.reset_hub_config()
         if result.get("hub_config_enabled"):
             self._apply_hub_config(result.get("hub_config") or {})
         return {"status": "SUCCESS", **result}
 
     async def _cmd_get_central_config(self, d):
+        """Return the stored Central API config."""
         return {"status": "SUCCESS", "central_config": self.local_store.get_central_config()}
 
     async def _cmd_set_central_config(self, d):
+        """Merge and save a Central API config patch."""
         self._merge_central_config(d.get("central_config") or {})
         return {"status": "SUCCESS"}
 
     async def _cmd_get_central_sites_config(self, d):
+        """Return the stored Central sites config."""
         return {"status": "SUCCESS", **self.local_store.get_central_sites_config()}
 
     async def _cmd_set_central_sites_config(self, d):
+        """Validate and save the Central sites config, then reload the poller."""
+        # Treat a non-dict payload as empty.
         cfg = d if isinstance(d, dict) else {}
         # Validate sim_quotas against the sims this tenant's simulation.conf
         # actually offers; drop unknown/invalid entries and surface errors so
@@ -277,7 +324,9 @@ class ConfigCommandsMixin:
         # (monitored_checks/hardware_checks/site_mappings) passes through
         # unchanged — sim_quotas is an additive field.
         wipe_blocked = False
+        # Validate quotas against the sims simulation.conf offers.
         try:
+            # Load the sim quota helpers.
             import sim_quota
             sims = [s["sim_id"] for s in sim_quota.available_sims(self.settings.config_dir)]
             clean, errs = sim_quota.validate_sim_quotas(cfg.get("sim_quotas"), sims)
@@ -294,20 +343,26 @@ class ConfigCommandsMixin:
                              "save would drop %d quota(s) to 0 (stale sim_ids or empty send) "
                              "without force_sim_quotas_clear; existing quotas preserved",
                              len(existing_quotas))
+            # Store the cleaned quotas.
             cfg = {**cfg, "sim_quotas": clean}
+        # Validation errors never block the save.
         except Exception as exc:  # noqa: BLE001 — never block the save
             logger.warning("sim_quotas validate failed: %s", exc)
+        # Save and reload the poller.
         self.local_store.set_central_sites_config(cfg)
         self.central_poller.reload()
         return {"status": "SUCCESS", "sim_quotas_wipe_blocked": wipe_blocked}
 
     async def _cmd_get_central_available(self, d):
+        """Return the Central checks available for monitoring."""
         return await self.central_poller.available_checks()
 
     async def _cmd_test_central(self, d):
+        """Test the Central API connection."""
         return await self.central_poller.test_connection()
 
     async def _cmd_central_browse(self, d):
+        """Browse Central sites and devices."""
         return await self.central_poller.browse()
 
     # ── Aruba Central On-Prem (twin of the Central handlers above — a SECOND
@@ -316,22 +371,28 @@ class ConfigCommandsMixin:
     # (self.central_on_prem_poller) reads/writes its own slots so cloud Central
     # and on-prem never step on each other.
     async def _cmd_get_central_on_prem_config(self, d):
+        """Return the stored Central On-Prem API config."""
         return {"status": "SUCCESS",
                 "central_on_prem_config": self.local_store.get_central_on_prem_config()}
 
     async def _cmd_set_central_on_prem_config(self, d):
+        """Merge and save a Central On-Prem API config patch."""
         self._merge_central_on_prem_config(d.get("central_on_prem_config") or {})
         return {"status": "SUCCESS"}
 
     async def _cmd_get_central_on_prem_sites_config(self, d):
+        """Return the stored Central On-Prem sites config."""
         return {"status": "SUCCESS", **self.local_store.get_central_on_prem_sites_config()}
 
     async def _cmd_set_central_on_prem_sites_config(self, d):
+        """Validate and save the Central On-Prem sites config, then reload its poller."""
+        # Treat a non-dict payload as empty.
         cfg = d if isinstance(d, dict) else {}
         # Validate sim_quotas against this tenant's simulation.conf sims
         # (same drop-unknown + surface-errors pass as the Central twin). The
         # rows here carry Central On-Prem:-prefixed alert_ids.
         wipe_blocked = False
+        # Validate quotas, then guard against an accidental wipe.
         try:
             import sim_quota
             sims = [s["sim_id"] for s in sim_quota.available_sims(self.settings.config_dir)]
@@ -345,30 +406,39 @@ class ConfigCommandsMixin:
                              "save would drop %d quota(s) to 0 (stale sim_ids or empty send) "
                              "without force_sim_quotas_clear; existing quotas preserved",
                              len(existing_quotas))
+            # Store the cleaned quotas.
             cfg = {**cfg, "sim_quotas": clean}
+        # Validation errors never block the save.
         except Exception as exc:  # noqa: BLE001 — never block the save
             logger.warning("sim_quotas validate failed (central_on_prem): %s", exc)
+        # Save and reload the poller.
         self.local_store.set_central_on_prem_sites_config(cfg)
         self.central_on_prem_poller.reload()
         return {"status": "SUCCESS", "sim_quotas_wipe_blocked": wipe_blocked}
 
     async def _cmd_get_central_on_prem_available(self, d):
+        """Return the Central On-Prem checks available for monitoring."""
         return await self.central_on_prem_poller.available_checks()
 
     async def _cmd_test_central_on_prem(self, d):
+        """Test the Central On-Prem API connection."""
         return await self.central_on_prem_poller.test_connection()
 
     async def _cmd_central_on_prem_browse(self, d):
+        """Browse Central On-Prem sites and devices."""
         return await self.central_on_prem_poller.browse()
 
     async def _cmd_get_central_on_prem_health(self, d):
+        """Return hourly health for one check, or the daily summary."""
         # 30-day per-check health for a DISTRIBUTED on-prem Central tenant
         # (twin of CS_GET_HEALTH / CS_GET_MIST_HEALTH). Daily summaries ride
         # in central_on_prem_status already; this serves the on-hover HOURLY
         # breakdown for one check.
+        # No health tracker yet.
         h = getattr(self.central_on_prem_poller, "_health", None)
         if h is None:
             return {"hourly": []}
+        # Hourly data for one site and check, else the daily summary.
         site = d.get("site")
         check = d.get("check")
         from central_poller import _CC_SCOPE
@@ -378,20 +448,26 @@ class ConfigCommandsMixin:
 
     # ── Juniper Mist API (twin of the Central handlers above) ──────────
     async def _cmd_get_mist_config(self, d):
+        """Return the stored Mist API config."""
         return {"status": "SUCCESS", "mist_config": self.local_store.get_mist_config()}
 
     async def _cmd_set_mist_config(self, d):
+        """Merge and save a Mist API config patch."""
         self._merge_mist_config(d.get("mist_config") or {})
         return {"status": "SUCCESS"}
 
     async def _cmd_get_mist_sites_config(self, d):
+        """Return the stored Mist sites config."""
         return {"status": "SUCCESS", **self.local_store.get_mist_sites_config()}
 
     async def _cmd_set_mist_sites_config(self, d):
+        """Validate and save the Mist sites config, then reload the poller."""
+        # Treat a non-dict payload as empty.
         cfg = d if isinstance(d, dict) else {}
         # Validate sim_quotas against this tenant's simulation.conf sims
         # (same drop-unknown + surface-errors pass as the Central twin).
         wipe_blocked = False
+        # Validate quotas, then guard against an accidental wipe.
         try:
             import sim_quota
             sims = [s["sim_id"] for s in sim_quota.available_sims(self.settings.config_dir)]
@@ -405,29 +481,38 @@ class ConfigCommandsMixin:
                              "save would drop %d quota(s) to 0 (stale sim_ids or empty send) "
                              "without force_sim_quotas_clear; existing quotas preserved",
                              len(existing_quotas))
+            # Store the cleaned quotas.
             cfg = {**cfg, "sim_quotas": clean}
+        # Validation errors never block the save.
         except Exception as exc:  # noqa: BLE001 — never block the save
             logger.warning("sim_quotas validate failed (mist): %s", exc)
+        # Save and reload the poller.
         self.local_store.set_mist_sites_config(cfg)
         self.mist_poller.reload()
         return {"status": "SUCCESS", "sim_quotas_wipe_blocked": wipe_blocked}
 
     async def _cmd_get_mist_available(self, d):
+        """Return the Mist checks available for monitoring."""
         return await self.mist_poller.available_checks()
 
     async def _cmd_test_mist(self, d):
+        """Test the Mist API connection."""
         return await self.mist_poller.test_connection()
 
     async def _cmd_mist_browse(self, d):
+        """Browse Mist sites and devices."""
         return await self.mist_poller.browse()
 
     async def _cmd_get_mist_health(self, d):
+        """Return Mist hourly health for one check, or the daily summary."""
         # 30-day per-check health for a DISTRIBUTED Mist tenant (twin of
         # CS_GET_HEALTH). Daily summaries ride in mist_status already; this
         # serves the on-hover HOURLY breakdown for one check.
+        # No health tracker yet.
         h = getattr(self.mist_poller, "_health", None)
         if h is None:
             return {"hourly": []}
+        # Hourly data for one site and check, else the daily summary.
         site = d.get("site")
         check = d.get("check")
         from central_poller import _CC_SCOPE
@@ -436,12 +521,15 @@ class ConfigCommandsMixin:
         return {"daily": h.summary(_CC_SCOPE)}
 
     async def _cmd_get_health(self, d):
+        """Return Central hourly health for one check, or the daily summary."""
         # 30-day per-check health for a DISTRIBUTED tenant. Daily summaries ride
         # in central_status already; this serves the on-hover HOURLY breakdown
         # for one check (site+check in the payload).
+        # No health tracker yet.
         h = getattr(self.central_poller, "_health", None)
         if h is None:
             return {"hourly": []}
+        # Hourly data for one site and check, else the daily summary.
         site = d.get("site")
         check = d.get("check")
         from central_poller import _CC_SCOPE
@@ -450,32 +538,38 @@ class ConfigCommandsMixin:
         return {"daily": h.summary(_CC_SCOPE)}
 
     async def _cmd_get_sim_quota_catalog(self, d):
+        """Return the sims, sites and suggested links for the Sim-Quota UI."""
         # The Sim-Quota UI (Config → Sim Quotas) renders against this: the
         # sims/sites derived from this tenant's simulation.conf + the global
         # suggested alert→sim linkage. Sims come from simulation.conf, not
         # a hardcoded list, so a tenant that adds a flag to its buckets sees
         # it here automatically.
         try:
+            # Build the catalog from simulation.conf and the site mappings.
             import sim_quota
             csc = self.local_store.get_central_sites_config() or {}
             cat = sim_quota.sim_quota_catalog(
                 self.settings.config_dir, csc.get("site_mappings"))
             return {"status": "SUCCESS", **cat}
+        # Report failures with empty lists.
         except Exception as exc:  # noqa: BLE001
             logger.warning("CS_GET_SIM_QUOTA_CATALOG failed: %s", exc)
             return {"status": "ERROR", "message": f"{type(exc).__name__}: {exc}",
                     "sims": [], "sites": [], "suggested": {}, "meta": {}}
 
     async def _cmd_get_sim_quota_state(self, d):
+        """Return the quota engine's ledger, warnings and live check status."""
         # Engine ledger snapshot for the quota-state view (Chunk 4): which
         # clients are currently assigned to each effective quota. The
         # monitored_checks slice from central_sites_config is included so the
         # UI can join alert/insight IDs to their friendly names (a quota row
         # stores only the bare id).
+        # Read the engine's state, if the engine exists.
         eng = getattr(self, "sim_quota_engine", None)
         snap = eng.snapshot() if eng is not None else {}
         placement_warnings = eng.placement_warnings() if eng is not None else []
         quota_diag = eng.quota_diagnostics() if eng is not None else []
+        # Monitored checks give friendly names for alert ids.
         csc = self.local_store.get_central_sites_config()
         monitored = csc.get("monitored_checks") or []
         # Live per-check firing status from the Central poller's last cycle —
@@ -487,6 +581,7 @@ class ConfigCommandsMixin:
         # isn't configured or no poll has run yet. INVERTED semantics live in
         # the poller: status "ok" == the expected error IS present == firing.
         cs = getattr(self, "central_status", None) or {}
+        # Build the reply.
         return {"status": "SUCCESS",
                 "effective": self.local_store.get_effective_sim_quotas(),
                 "ledger": snap,
@@ -497,18 +592,24 @@ class ConfigCommandsMixin:
                 "check_status": cs.get("status") or {}}
 
     async def _cmd_reset_sim_quota(self, d):
+        """Clear the quota ledger and reconcile from scratch."""
         # Clear the engine ledger + engine-set overrides and reconcile fresh —
         # a clean re-shuffle (operator "Reset & Reshuffle" button).
+        # Need the engine.
         eng = getattr(self, "sim_quota_engine", None)
         if eng is None:
             return {"status": "ERROR", "message": "sim quota engine unavailable"}
+        # Reset and report the actions taken.
         actions = await eng.reset()
         return {"status": "SUCCESS", "actions": actions}
 
     async def _cmd_get_sim_tag_health(self, d):
+        """Report why Proxmox servers show missing or stale sim tags."""
         # Why a Proxmox server shows no / stale sim- tags; see sim_tag_health.
+        # Hostname helpers.
         import socket
         from token_store import norm_hostname
+        # Per-host state, skip reasons and connected agents.
         deploy = getattr(self, "deploy", None)
         states = (getattr(deploy, "proxmox_states", {}) or {}) if deploy else {}
         skips = dict(getattr(self, "_sim_tag_skips", {}) or {})
@@ -516,12 +617,15 @@ class ConfigCommandsMixin:
         agents = (getattr(cp, "connected_agents", {}) or {}) if cp else {}
         connected = {str((a or {}).get("hostname") or "").strip() for a in agents.values()} - {""}
         connected_norm = {norm_hostname(h) for h in connected}
+        # Index the registered clients.
         reg = getattr(self, "registry", None)
         try:
             clients = sim_tag_health.client_index((reg.get_all() if reg else {}) or {})
         except Exception:  # noqa: BLE001
             clients = {}
+        # Ask each agent where it is pointed.
         pointing = await self._agent_pointing(agents)
+        # Build a report for each host.
         hosts = [
             sim_tag_health.host_report(
                 hn, st, clients,
@@ -530,6 +634,7 @@ class ConfigCommandsMixin:
                 points_at=pointing.get(norm_hostname(hn)))
             for hn, st in states.items()
         ]
+        # Build the reply.
         return {"status": "SUCCESS",
                 "connected_agents": sorted(connected),
                 "live_window_s": sim_tag_health.TAG_LIVE_WINDOW_S,
@@ -549,55 +654,69 @@ class ConfigCommandsMixin:
         spoke can ask its own agents, so the fleet picture comes from asking
         every spoke: a host that appears under none has an agent connected nowhere.
         """
+        # Hostname normaliser.
         from token_store import norm_hostname
         pointing: Dict[str, str] = {}
+        # Ask each connected agent for its identity.
         for agent_id, info in agents.items():
             hostname = str((info or {}).get("hostname") or "").strip()
+            # Skip agents with no hostname.
             if not hostname:
                 continue
+            # Record where the agent says it points.
             try:
                 reply = await self.control_plane.send_to_agent(
                     "PXMX_GET_IDENTITY", {}, agent_id=agent_id, timeout=10.0)
                 where = sim_tag_health.pointing_from_identity(reply)
                 if where is not None:
                     pointing[norm_hostname(hostname)] = where
+            # Record the error instead.
             except Exception as exc:  # noqa: BLE001 — diagnostics only
                 pointing[norm_hostname(hostname)] = f"(unknown: {exc})"
         return pointing
 
     async def _cmd_get_dhcp_health(self, d):
+        """Return Kea sim-DHCP diagnostics."""
         # Kea sim-DHCP diagnostics; see dhcp_health for what each signal means.
         return dhcp_health.collect()
 
     async def _cmd_get_pools(self, d):
+        """List Proxmox pools across all agents and which hosts have each."""
         # Proxmox resource pools available across this spoke's pxmx agents,
         # for the sim-client Pool dropdown. Unioned across agents: pools are
         # cluster-wide, but a fleet of STANDALONE nodes each has its own set,
         # and an operator picking a pool that only exists on some hosts would
         # get clone failures on the rest — so the response also reports WHICH
         # hosts have each pool, and the UI can flag a partial one.
+        # Results by pool, plus hosts that answered or failed.
         by_pool: Dict[str, list] = {}
         hosts_ok, hosts_err = [], {}
+        # Get the agent list.
         try:
             agents = self._get_agents().get("agents", [])
         except Exception as exc:  # noqa: BLE001
             return {"status": "ERROR", "message": f"agent list failed: {exc}",
                     "pools": [], "by_pool": {}}
+        # Ask each agent for its pools.
         for a in agents:
             aid = a.get("agent_id")
             hn = str(a.get("hostname") or aid or "?")
+            # Skip agents without an id.
             if not aid:
                 continue
             try:
                 r = await self.control_plane.send_to_agent(
                     "PXMX_LIST_POOLS", {}, agent_id=aid, timeout=15.0)
+            # One failing agent must not blank the list.
             except Exception as exc:  # noqa: BLE001 — one agent must not blank the list
                 hosts_err[hn] = str(exc)
                 continue
+            # Unwrap the reply and record errors.
             d = (r or {}).get("payload", {}).get("data", r) if isinstance(r, dict) else {}
             if not isinstance(d, dict) or d.get("status") == "ERROR":
                 hosts_err[hn] = str((d or {}).get("message") or "error")
                 continue
+            # Record the success.
             hosts_ok.append(hn)
             # The agent's PXMX_LIST_POOLS returns [{poolid, comment}, ...]
             # (vm_inventory.list_pools, via the Proxmox API). Tolerate a bare
@@ -607,6 +726,7 @@ class ConfigCommandsMixin:
                        if isinstance(p, dict) else str(p or "").strip())
                 if pid:
                     by_pool.setdefault(pid, []).append(hn)
+        # Build the reply.
         return {"status": "SUCCESS",
                 "pools": sorted(by_pool),
                 "by_pool": {k: sorted(v) for k, v in by_pool.items()},
@@ -614,46 +734,57 @@ class ConfigCommandsMixin:
                 "selected": str(self.settings.get("sim_pool", "") or "").strip()}
 
     async def _cmd_pool_add_existing(self, d):
+        """Add already-provisioned sim VMs to the configured pool on every agent."""
         # Retrofit: put already-provisioned sim VMs into the configured pool
         # (new clones get it via qm clone --pool). Fans out to every agent;
         # the agent guards to the sim VMID range so this can never sweep a
         # non-sim VM into the pool.
+        # Work out the pool name.
         pool = str((data or {}).get("pool")
                    or self.settings.get("sim_pool", "") or "").strip()
         if not pool:
             return {"status": "ERROR", "message": "no pool configured"}
+        # Get the agent list.
         added, errors = 0, {}
         try:
             agents = self._get_agents().get("agents", [])
         except Exception as exc:  # noqa: BLE001
             return {"status": "ERROR", "message": f"agent list failed: {exc}"}
+        # Ask each agent to add its sim VMs to the pool.
         for a in agents:
             aid = a.get("agent_id")
             hn = str(a.get("hostname") or aid or "?")
+            # Skip agents without an id.
             if not aid:
                 continue
             try:
                 r = await self.control_plane.send_to_agent(
                     "PXMX_POOL_ADD_VMS", {"pool": pool}, agent_id=aid, timeout=60.0)
+            # Record agent errors.
             except Exception as exc:  # noqa: BLE001
                 errors[hn] = str(exc)
                 continue
+            # Count added VMs, or record the error.
             d = (r or {}).get("payload", {}).get("data", r) if isinstance(r, dict) else {}
             if isinstance(d, dict) and d.get("status") == "SUCCESS":
                 added += int(d.get("added") or 0)
             else:
                 errors[hn] = str((d or {}).get("message") or "error")
+        # SUCCESS when no host failed, else PARTIAL.
         return {"status": "SUCCESS" if not errors else "PARTIAL",
                 "pool": pool, "added": added, "errors": errors}
 
     async def _cmd_get_pxmx_site_map(self, d):
+        """Return the server-to-site map plus known agents, including offline ones."""
         # Operator-assigned pxmx server → site map (Config → PXMX Sites). The
         # engine resolves a client's site via its hosting server's entry.
         # Also return the currently-connected pxmx agents so the UI can list
         # assignable servers + flag servers whose agent has dropped.
+        # Get the connected agents.
         agents = []
         try:
             agents = self._get_agents().get("agents", [])
+        # Log failures and carry on.
         except Exception as exc:  # noqa: BLE001
             logger.warning("CS_GET_PXMX_SITE_MAP: agents list failed: %s", exc)
         # _get_agents() lists only CONNECTED (+ pending) agents, so a server
@@ -668,6 +799,7 @@ class ConfigCommandsMixin:
         # server keeps its identity. Marked status=offline so the editor can
         # flag them rather than imply they are live.
         try:
+            # Add offline hosts still known from telemetry.
             _seen = {a.get("agent_id") or a.get("hostname") for a in agents}
             _states = getattr(getattr(self, "deploy", None), "proxmox_states", {}) or {}
             for _hn, _st in _states.items():
@@ -681,21 +813,26 @@ class ConfigCommandsMixin:
                     "version":   (_st or {}).get("version", "unknown"),
                     "status":    "offline",
                 })
+        # Never fail the read.
         except Exception as exc:  # noqa: BLE001 — never fail the map read
             logger.warning("CS_GET_PXMX_SITE_MAP: offline-host merge failed: %s", exc)
+        # Build the reply.
         return {"status": "SUCCESS",
                 "pxmx_site_map": self.local_store.get_pxmx_site_map(),
                 "agents": agents}
 
     async def _cmd_set_pxmx_site_map(self, d):
+        """Validate and save the server-to-site map, then reconcile quotas."""
         # Validate each assigned site against the sites this tenant's
         # simulation.conf + Central site_mappings actually offer; drop
         # unknown sites (keep the host mapping so the operator can fix the
         # typo in-place) and surface errors. Unknown HOSTS are kept too — a
         # server may be temporarily disconnected but still assigned.
+        # Accept the map nested or as the payload itself.
         raw = d.get("pxmx_site_map") if isinstance(d, dict) else None
         raw = raw if isinstance(raw, dict) else (d if isinstance(d, dict) else {})
         errs: list = []
+        # Build the set of valid sites.
         try:
             import sim_quota
             csc = self.local_store.get_central_sites_config() or {}
@@ -713,6 +850,7 @@ class ConfigCommandsMixin:
                     v = str(lk.get(f) or "").strip()
                     if v:
                         valid.add(v)
+            # Clean each entry, recording unknown sites.
             clean = {}
             for host, site in raw.items():
                 h = str(host).strip()
@@ -722,10 +860,12 @@ class ConfigCommandsMixin:
                 if s and valid and s not in valid:
                     errs.append(f"{h}: unknown site '{s}'")
                 clean[h] = s
+        # On error, save the map without validation.
         except Exception as exc:  # noqa: BLE001 — never block the save
             logger.warning("CS_SET_PXMX_SITE_MAP: validate failed: %s", exc)
             clean = {str(k).strip(): str(v or "").strip()
                      for k, v in raw.items() if str(k).strip()}
+        # Save the map.
         saved = self.local_store.set_pxmx_site_map(clean)
         # Re-resolve sites on the next sweep — the engine reads the map at
         # the top of each reconcile, so just nudge it now for promptness.
@@ -761,6 +901,7 @@ class ConfigCommandsMixin:
         "vm_image_2_template_spec": "image2_template_spec",
     }
 
+    # Start from the stored config.
     def _merge_central_config(self, cfg: Dict[str, Any]) -> Dict[str, Any]:
         """Sentinel-merge a Central API config patch into local_store and rebuild
         the poller's ArubaClient. Shared by CS_SET_CENTRAL_CONFIG (standalone
@@ -774,11 +915,13 @@ class ConfigCommandsMixin:
         written (first-time provisioning of a placeholder field)."""
         current = self.local_store.get_central_config()
         merged = dict(current)
+        # Merge non-empty values, and new keys even when empty.
         for k, v in (cfg or {}).items():
             if v not in (None, ""):
                 merged[k] = v
             elif k not in current:
                 merged[k] = v
+        # Save and reload the poller.
         self.local_store.set_central_config(merged)
         self.central_poller.reload()
         return merged
@@ -794,13 +937,16 @@ class ConfigCommandsMixin:
         save — e.g. changing only the region host, or a hub push that omits
         unchanged secrets — never wipes the token). A new key with an empty
         value is still written (first-time provisioning of a placeholder field)."""
+        # Start from the stored config.
         current = self.local_store.get_mist_config()
         merged = dict(current)
+        # Merge non-empty values, and new keys even when empty.
         for k, v in (cfg or {}).items():
             if v not in (None, ""):
                 merged[k] = v
             elif k not in current:
                 merged[k] = v
+        # Save and reload the poller.
         self.local_store.set_mist_config(merged)
         self.mist_poller.reload()
         return merged
@@ -817,13 +963,16 @@ class ConfigCommandsMixin:
         save — e.g. changing only Mode, or a hub push that omits unchanged
         secrets — never wipes creds). A new key with an empty value is still
         written (first-time provisioning of a placeholder field)."""
+        # Start from the stored config.
         current = self.local_store.get_central_on_prem_config()
         merged = dict(current)
+        # Merge non-empty values, and new keys even when empty.
         for k, v in (cfg or {}).items():
             if v not in (None, ""):
                 merged[k] = v
             elif k not in current:
                 merged[k] = v
+        # Save and reload the poller.
         self.local_store.set_central_on_prem_config(merged)
         self.central_on_prem_poller.reload()
         return merged
@@ -836,24 +985,32 @@ class ConfigCommandsMixin:
         update_now / quota-reconcile / repo-sync side effects for unchanged
         config. The hub's ``config_hash`` from the last full push is reported
         back in CS_TELEMETRY (``cs_config_hash``) for drift detection."""
+        # Split config values from envelope keys.
         d = d if isinstance(d, dict) else {}
         full = bool(d.get("full_config"))
         cfg_hash = d.get("config_hash")
         patch = {k: v for k, v in d.items() if k not in _CS_CONFIG_META_KEYS}
+        # A full push applies only changed keys.
         to_apply = cs_config_diff(patch, self._cs_applied_hashes()) if full else patch
         applied = self._apply_hub_config(to_apply) if to_apply else []
+        # Record hashes of every received value.
         hashes = self._cs_applied_hashes()
         for k, v in patch.items():
             hashes[k] = cs_value_hash(v)
+        # Remember the hub's hash for drift detection.
         if full and isinstance(cfg_hash, str):
             self._cs_config_hash = cfg_hash
+        # Log full pushes.
         if full:
             logger.info("CS_CONFIG_UPDATE[full]: %d key(s) received, %d changed",
                         len(patch), len(to_apply))
+        # Reply with the applied keys and current hash.
         return {"status": "SUCCESS", "applied": applied,
                 "config_hash": getattr(self, "_cs_config_hash", "") or ""}
 
     def _cs_applied_hashes(self) -> Dict[str, str]:
+        """Return the per-key hash map of applied values, creating it if needed."""
+        # Create the map on first use.
         h = getattr(self, "_cs_applied_value_hashes", None)
         if h is None:
             h = {}
@@ -911,8 +1068,10 @@ class ConfigCommandsMixin:
         legacy-only and this spoke has no consumer for them.
         Returns the list of applied keys (for the hub log / reply).
         """
+        # Nothing to apply.
         if not isinstance(patch, dict) or not patch:
             return []
+        # Apply each group of keys.
         applied: list = []
         self._apply_poller_configs(patch, applied)
         self._apply_store_keys(patch, applied)
@@ -926,6 +1085,7 @@ class ConfigCommandsMixin:
             applied.append("github_config")
         self._apply_conf_overrides(patch, applied)
         self._apply_config_source(patch, applied)
+        # Save the settings changes.
         if applied:
             self.settings.update(update)
         logger.info("CS_CONFIG_UPDATE: applied %s",
@@ -953,6 +1113,7 @@ class ConfigCommandsMixin:
         hardware_checks, site_mappings, sim_quotas) are stored and the poller
         reloaded so a hub-side Config -> Sim Quotas save reaches this spoke.
         """
+        # Central credentials.
         self._apply_creds(patch, "central_config", self._merge_central_config, applied)
         # Hub processing modes: a "centralized" feature is polled by the HUB, so
         # its spoke poller goes idle (pollers check local_store.hub_polls each
@@ -967,6 +1128,7 @@ class ConfigCommandsMixin:
                 if self.local_store.hub_polls(feature):
                     setattr(self, attr, {})
             applied.append("processing_modes")
+        # Site configs and credentials for each poller.
         self._apply_sites(patch, "central_sites_config", "central_poller", applied)
         self._apply_creds(patch, "mist_config", self._merge_mist_config, applied)
         self._apply_sites(patch, "mist_sites_config", "mist_poller", applied)
@@ -977,12 +1139,16 @@ class ConfigCommandsMixin:
 
     @staticmethod
     def _apply_creds(patch, key, merge, applied) -> None:
+        """Merge provider credentials when ``key`` is present in the patch."""
+        # Merge the value and record the key.
         if key in patch:
             value = patch.get(key)
             merge(value if isinstance(value, dict) else {})
             applied.append(key)
 
     def _apply_sites(self, patch, key, poller_attr, applied) -> None:
+        """Store a sites config and reload its poller when ``key`` is a dict in the patch."""
+        # Store, reload and record the key.
         value = patch.get(key)
         if key in patch and isinstance(value, dict):
             getattr(self.local_store, f"set_{key}")(value)
@@ -990,15 +1156,19 @@ class ConfigCommandsMixin:
             applied.append(key)
 
     def _apply_store_keys(self, patch: Dict[str, Any], applied: list) -> None:
+        """Store each simple hub key on local_store, checking or coercing its type."""
+        # Skip keys not in the patch.
         for key, kind in self._HUB_STORE_KEYS:
             if key not in patch:
                 continue
+            # Type-check or coerce the value.
             value = patch[key]
             if isinstance(kind, type):
                 if not isinstance(value, kind):
                     continue
             elif kind is not None:
                 value = kind(value)
+            # Store and record it.
             getattr(self.local_store, f"set_{key}")(value)
             applied.append(key)
 
@@ -1015,12 +1185,14 @@ class ConfigCommandsMixin:
         ambient spread; a quota preempts a background T1 when it needs one.
         Unknown values are dropped so the engine's 't1_first' default stands.
         """
+        # Merge the quarantine exclusion sims.
         qt = patch.get("qt_exclude_sims")
         if "qt_exclude_sims" in patch and isinstance(qt, list):
             csc = self.local_store.get_central_sites_config() or {}
             csc["qt_exclude_sims"] = [str(s) for s in qt if str(s).strip()]
             self.local_store.set_central_sites_config(csc)
             applied.append("qt_exclude_sims")
+        # Merge a known tier priority.
         tp = str(patch.get("tier_priority") or "").strip().lower()
         if "tier_priority" in patch and tp in self._TIER_PRIORITIES:
             csc = self.local_store.get_central_sites_config() or {}
@@ -1031,11 +1203,14 @@ class ConfigCommandsMixin:
     def _settings_update_from_patch(self, patch: Dict[str, Any], applied: list) -> Dict[str, Any]:
         """CSSettings keys from the patch: direct keys, renamed keys, and the
         N-image ``vm_image_{i}_*`` keys from the VM Images UI."""
+        # Mark the settings as hub-managed.
         update: Dict[str, Any] = {"hub_managed": True}
+        # Direct keys.
         for key in self._HUB_DIRECT_KEYS:
             if key in patch:
                 update[key] = patch[key]
                 applied.append(key)
+        # Renamed keys.
         for hub_key, settings_key in self._HUB_KEY_REMAP.items():
             if hub_key in patch:
                 update[settings_key] = patch[hub_key]
@@ -1046,6 +1221,7 @@ class ConfigCommandsMixin:
         if "vm_image_count" in patch:
             update["vm_image_count"] = patch["vm_image_count"]
             applied.append("vm_image_count")
+        # Per-image pct and template keys.
         for key, value in patch.items():
             index, _, field = key[len("vm_image_"):].partition("_")
             if not key.startswith("vm_image_") or not field or not index.isdigit():
@@ -1062,6 +1238,7 @@ class ConfigCommandsMixin:
     def _apply_relay_timeouts(self, patch: Dict[str, Any], applied: list) -> None:
         """Spoke-side send_to_agent long-op / fast windows (Setup -> General).
         Not a CSSettings/agent key: read by the SPOKE_RELAY forward."""
+        # Set each timeout (at least 1 second) and ignore bad values.
         for key, attr in (("agent_relay_timeout_long_s", "_relay_timeout_long"),
                           ("agent_relay_timeout_fast_s", "_relay_timeout_fast")):
             if key in patch:
@@ -1074,8 +1251,10 @@ class ConfigCommandsMixin:
     def _config_source_for(self, patch: Dict[str, Any]) -> str:
         """Effective Source of Truth for this write: the patch value, else the
         persisted flag, else 'github'."""
+        # The patch value wins.
         if "config_source" in patch:
             return "hub" if str(patch.get("config_source")).lower() == "hub" else "github"
+        # Else the saved flag, else github.
         try:
             return (self.settings.config_dir / "hub-config-source").read_text(
                 encoding="utf-8").strip().lower()
@@ -1096,16 +1275,20 @@ class ConfigCommandsMixin:
         AND a token-less github_config, so the edit lands as a hub override and
         the hub alone does the commit. Do NOT let an attached spoke push.
         """
+        # Override keys in this patch.
         overrides = [o for o in (
             ("sim_conf_override", "hub-sim-overrides.conf", "simulation.conf"),
             ("user_conf_override", "hub-user-overrides.conf", "user-overrides.conf"),
         ) if o[0] in patch]
+        # Nothing to write.
         if not overrides:
             return
+        # Config folder, source and token.
         cfg_dir = self.settings.config_dir
         source = self._config_source_for(patch)
         has_token = bool(str((self._github_config or {}).get("github_token") or "").strip())
         push_map = {}  # repo-relative path -> content
+        # Write each override.
         for override_key, hub_filename, repo_filename in overrides:
             text = patch[override_key]
             if source == "github" and text is not None and not has_token:
@@ -1121,6 +1304,7 @@ class ConfigCommandsMixin:
                     "sync. Re-save the GitHub credentials (Setup → Sim Config → "
                     "GitHub) to re-deliver the token.",
                     self.spoke_id, repo_filename)
+            # GitHub source with a token: write the repo file and queue a push.
             if source == "github" and has_token and text is not None:
                 try:
                     _atomic_write(cfg_dir / repo_filename, str(text))
@@ -1133,6 +1317,7 @@ class ConfigCommandsMixin:
                     logger.warning("CS_CONFIG_UPDATE[%s]: %s (github) write failed: %s",
                                    self.spoke_id, repo_filename, exc)
                 continue
+            # Otherwise write or clear the hub override file.
             override_path = cfg_dir / hub_filename
             try:
                 if text is None:
@@ -1142,8 +1327,10 @@ class ConfigCommandsMixin:
                 else:
                     _atomic_write(override_path, str(text))
                     applied.append(f"{override_key}:updated")
+            # Log write failures.
             except Exception as exc:  # noqa: BLE001
                 logger.warning("CS_CONFIG_UPDATE: %s write failed: %s", override_path, exc)
+        # Push any repo files.
         if push_map:
             self._schedule_github_push(push_map)
         # Clients only pick up the new INI when update.sh runs, which happens
@@ -1154,33 +1341,41 @@ class ConfigCommandsMixin:
 
     def _schedule_github_push(self, push_map: Dict[str, str]) -> None:
         """Fire-and-forget git commit+push (_apply_hub_config is sync)."""
+        # Start the push task and keep a reference.
         try:
             task = asyncio.get_event_loop().create_task(
                 self._push_files_to_github(push_map, "WebUI: update simulation config"))
             self._gh_push_tasks.add(task)
 
             def _push_done(t, _set=self._gh_push_tasks) -> None:
+                """Drop the task and log if it was cancelled or raised."""
+                # Forget the task.
                 _set.discard(t)
                 if t.cancelled():
                     logger.warning("github push[%s]: task cancelled before completion",
                                    self.spoke_id)
                     return
+                # Log a raised exception.
                 exc = t.exception()  # defensive — _push_files_to_github catches its own
                 if exc:
                     logger.warning("github push[%s]: task raised %r", self.spoke_id, exc)
+            # Register the callback and log.
             task.add_done_callback(_push_done)
             logger.info("CS_CONFIG_UPDATE[%s]: scheduled github push for %s",
                         self.spoke_id, list(push_map))
+        # Log scheduling failures.
         except Exception as exc:  # noqa: BLE001
             logger.warning("CS_CONFIG_UPDATE[%s]: github push schedule failed: %s",
                            self.spoke_id, exc)
 
     def _schedule_client_refresh(self) -> None:
         """Fire-and-forget ``update_now`` to every client (kill_switch pattern)."""
+        # Start the refresh task and drop it when done.
         try:
             task = asyncio.get_event_loop().create_task(self._push_config_refresh_to_clients())
             self._gh_push_tasks.add(task)
             task.add_done_callback(lambda t, _set=self._gh_push_tasks: _set.discard(t))
+        # Log scheduling failures.
         except Exception as exc:  # noqa: BLE001
             logger.warning("CS_CONFIG_UPDATE[%s]: update_now schedule failed: %s",
                            self.spoke_id, exc)
@@ -1190,11 +1385,14 @@ class ConfigCommandsMixin:
         In 'hub' mode sim_config.load_configs uses the hub override files as the
         WHOLE config and ignores the repo base, so a repo pull can never revert
         hub edits. 'github' (default) keeps the repo-base merge."""
+        # Nothing to do.
         if "config_source" not in patch:
             return
+        # Normalise and write the flag.
         src = "hub" if str(patch.get("config_source")).lower() == "hub" else "github"
         try:
             (self.settings.config_dir / "hub-config-source").write_text(src, encoding="utf-8")
             applied.append(f"config_source:{src}")
+        # Log write failures.
         except Exception as exc:  # noqa: BLE001
             logger.warning("CS_CONFIG_UPDATE: config_source write failed: %s", exc)

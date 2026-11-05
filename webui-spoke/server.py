@@ -1,5 +1,13 @@
+"""Client-Sim spoke WebUI server: the FastAPI app, shared state and background tasks.
+
+It stores settings, tracks simulated clients, queues Proxmox agent commands, keeps a relay link
+to the hub, and serves the dashboard. Routers and services modules import their shared state and
+helpers from here.
+"""
+# Postpone annotation evaluation so modern type hints are never evaluated at runtime.
 from __future__ import annotations
 
+# Standard library modules used across the server (async tasks, files, shells, crypto, time).
 import asyncio
 import configparser
 import contextlib
@@ -26,13 +34,16 @@ import time
 import uuid
 from dataclasses import dataclass
 
+# Local modules: ACME certificate helper and the shared runtime state object.
 import acme as spoke_acme
 import state
+# asynccontextmanager builds the app lifespan; datetime, Path and Any are used throughout.
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
+# httpx is optional; without it, network features (Central, hub HTTP) are limited.
 try:
     import httpx
     _HTTPX_AVAILABLE = True
@@ -40,6 +51,7 @@ except ImportError:
     httpx = None
     _HTTPX_AVAILABLE = False
 
+# websockets is optional; without it, the hub relay websocket cannot be used.
 try:
     import websockets
     from websockets.exceptions import InvalidStatus as WebSocketInvalidStatus
@@ -49,12 +61,14 @@ except ImportError:
     WebSocketInvalidStatus = Exception
     _WEBSOCKETS_AVAILABLE = False
 
+# FastAPI, Starlette middleware and pydantic models for the web app.
 from fastapi import FastAPI, HTTPException, Query, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse, JSONResponse
 from starlette.middleware.base import BaseHTTPMiddleware
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
+# Use the shared logging setup if available; otherwise fall back to a simple basicConfig.
 try:
     from logging_setup import configure_logging
 except ImportError:
@@ -65,15 +79,18 @@ except ImportError:
         _FMT = '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
         _DFMT = '%Y-%m-%d %H:%M:%S'
         def configure_logging(default_level=_logging.INFO, *, log_file=None, **_):
+            """Fallback logging setup: log to stderr, plus a file if log_file is given."""
             handlers = ([_logging.FileHandler(log_file), _logging.StreamHandler()]
                         if log_file else None)
             _logging.basicConfig(level=default_level, force=True,
                                  format=_FMT, datefmt=_DFMT, handlers=handlers)
+# Set up logging and get this app's logger; warn if httpx is missing.
 configure_logging()
 logger = logging.getLogger("client_sim_dashboard")
 if not _HTTPX_AVAILABLE:
     logger.warning("httpx not installed — network-backed features may be limited. Install with: pip install httpx")
 
+# Paths of the files this server keeps its state in, next to this script.
 BASE_DIR = Path(__file__).resolve().parent
 STATIC_DIR = BASE_DIR / "static"
 SETTINGS_FILE = BASE_DIR / "settings.json"
@@ -96,6 +113,7 @@ CLIENT_COUNT_7DAY_FILE = BASE_DIR / "client_count_7day.json"
 CLIENT_COUNT_7DAY_WINDOW = 7 * 24 * 3600   # 7 days of hourly history
 CLIENT_HISTORY_DAYS = 7          # remove clients not seen within this many days
 CLIENT_SAVE_INTERVAL = 60        # seconds between periodic disk saves
+# Client-Sim repo location and URLs (overridable by environment variables).
 REPO_DIR = Path(os.getenv("REPO_DIR", "/app/client-sim")).resolve()
 REPO_URL = os.getenv("REPO_URL", "https://github.com/lbockenstedt/cs.git")
 CLIENT_SIM_REPO_RAW = os.getenv("CLIENT_SIM_REPO_RAW", "https://raw.githubusercontent.com/lbockenstedt/cs")
@@ -105,6 +123,7 @@ CS_WEBUI_REPO_RAW = os.getenv("CS_WEBUI_REPO_RAW", "https://raw.githubuserconten
 def _detect_own_vmid() -> int | None:
     """Detect this process's Proxmox container/VM ID from /proc/self/cgroup.
     Returns the integer VMID if running inside a Proxmox LXC container, else None."""
+    # The cgroup path contains /lxc/<id> or /qemu/<id> inside Proxmox guests.
     try:
         cgroup = Path("/proc/self/cgroup").read_text(encoding="utf-8")
         m = re.search(r'/(?:lxc|qemu)/(\d+)', cgroup)
@@ -115,6 +134,7 @@ def _detect_own_vmid() -> int | None:
     return None
 
 
+# Our own VMID, detected once at import time.
 WEBUI_VMID: int | None = _detect_own_vmid()
 
 # VMIDs that must never be started, stopped, rebooted, recloned, snapshotted,
@@ -140,12 +160,14 @@ from services.vmid import (  # noqa: E402
 
 def _is_protected_vmid(vmid: int | str | None) -> bool:
     """Return True if this VMID must never be touched by any UI action."""
+    # No VMID is never protected; a non-number is not protected either.
     if vmid is None:
         return False
     try:
         v = int(vmid)
     except (TypeError, ValueError):
         return False
+    # Built-in protected VMIDs, and our own container.
     if v in _HARDCODED_PROTECTED_VMIDS:
         return True
     if WEBUI_VMID is not None and v == WEBUI_VMID:
@@ -182,6 +204,7 @@ from services.credential_store import (  # noqa: E402
 
 
 # Installer version — written by install-lxc.sh at install time
+# INSTALLER_VERSION comes from a file written by the installer ("dev" if missing).
 _version_file = BASE_DIR / "INSTALLER_VERSION"
 INSTALLER_VERSION: str = _version_file.read_text().strip() if _version_file.exists() else "dev"
 # App version — from VERSION file in repo root
@@ -193,6 +216,7 @@ class UpstreamJSONError(RuntimeError):
     """Raised when an upstream service returns malformed JSON."""
 
 
+# Repo branch and timing settings (seconds unless noted).
 REPO_BRANCH = os.getenv("REPO_BRANCH", "main")
 OFFLINE_TIMEOUT = int(os.getenv("OFFLINE_TIMEOUT", "300"))
 # Max error entries kept per client in memory.
@@ -202,6 +226,7 @@ SYNC_INTERVAL = 300
 HEARTBEAT_INTERVAL = 30
 RELAY_INTERVAL_DEFAULT = 5    # base interval in seconds
 CENTRAL_POLL_INTERVAL = 900   # 15 minutes
+# Settings keys the hub may set through the relay.
 HUB_RELAY_KEYS = {
     "relay_server_url",
     "relay_api_key",
@@ -228,6 +253,7 @@ HUB_CONFIG_OWNED_KEYS: frozenset[str] = frozenset({
     "guest_agent_reclone_after_minutes",
     "watchdog_reboot_enabled",
 })
+# Hub notification setting names mapped to our setting names.
 HUB_NOTIFICATION_KEY_MAP = {
     "teams_webhook_url": "teams_webhook_url",
     "smtp_host": "smtp_host",
@@ -237,6 +263,7 @@ HUB_NOTIFICATION_KEY_MAP = {
     "smtp_from": "smtp_from",
     "smtp_to": "smtp_to",
 }
+# History, update check and VM watchdog timings.
 HISTORY_HOURS = 24
 UPDATE_CHECK_INTERVAL = 86400  # 24 hours
 VM_WATCHDOG_TIMEOUT_SECS = 86400
@@ -245,6 +272,7 @@ VM_WATCHDOG_INTERVAL_SECS = 1800
 # Self-update: the installer lives inside the synced repo
 _INSTALLER_PATH = REPO_DIR / "install-lxc.sh"
 
+# Self-update status shown in the UI.
 update_state: dict[str, Any] = {
     "current_version": INSTALLER_VERSION,
     "available_version": None,
@@ -260,6 +288,7 @@ update_state: dict[str, Any] = {
 
 # ── Runtime settings (persisted to settings.json) ────────────────────────────
 def _load_persisted_settings() -> dict[str, Any]:
+    """Load settings.json and decrypt its secrets; returns {} if missing or unreadable."""
     try:
         raw = json.loads(SETTINGS_FILE.read_text(encoding="utf-8"))
         return _decrypt_settings(raw)
@@ -267,17 +296,21 @@ def _load_persisted_settings() -> dict[str, Any]:
         return {}
 
 
+# Settings cache, refreshed after the TTL or when settings are saved.
 state._settings_cache = {}
 state._settings_cache_time = 0.0
 _SETTINGS_CACHE_TTL: float = 30.0  # seconds
 
 
 def _invalidate_settings_cache() -> None:
+    """Clear the settings cache so the next read reloads it."""
     state._settings_cache = {}
     state._settings_cache_time = 0.0
 
 
 def _save_settings() -> None:
+    """Save settings to settings.json with secrets encrypted; logs a warning on failure."""
+    # Clear the cache first so readers see the new values.
     _invalidate_settings_cache()
     try:
         SETTINGS_FILE.write_text(json.dumps(_encrypt_settings(settings), indent=2), encoding="utf-8")
@@ -287,6 +320,7 @@ def _save_settings() -> None:
 
 def _get_machine_id() -> str:
     """Return a stable machine identifier for clone detection (Linux/LXC)."""
+    # Try the standard machine-id files in order.
     for path in ("/etc/machine-id", "/var/lib/dbus/machine-id"):
         try:
             val = Path(path).read_text().strip()
@@ -298,6 +332,7 @@ def _get_machine_id() -> str:
 
 
 def _candidate_relay_spoke_id(persisted: dict[str, Any]) -> str:
+    """Return the spoke id saved in settings (or older key names, or SPOKE_ID env), or ""."""
     return str(
         persisted.get("relay_spoke_id")
         or persisted.get("relay_island_id")
@@ -308,9 +343,12 @@ def _candidate_relay_spoke_id(persisted: dict[str, Any]) -> str:
 
 
 def _is_uuid(value: str) -> bool:
+    """Return True if the value is a UUID in canonical lowercase form."""
+    # Blank is not a UUID.
     candidate = str(value or "").strip().lower()
     if not candidate:
         return False
+    # Round-trip through uuid.UUID; a match means canonical form.
     try:
         return str(uuid.UUID(candidate)) == candidate
     except (TypeError, ValueError, AttributeError):
@@ -318,6 +356,12 @@ def _is_uuid(value: str) -> bool:
 
 
 def _relay_spoke_id_needs_rotation(value: str, persisted: dict[str, Any] | None = None) -> bool:
+    """Return True if the spoke id must be replaced with a new UUID.
+
+    That is when it is blank, not a UUID (e.g. a branch or version string), or when the
+    container looks cloned.
+    """
+    # A blank id always needs a new one.
     candidate = str(value or "").strip()
     if not candidate:
         return True
@@ -342,6 +386,7 @@ def _relay_spoke_id_needs_rotation(value: str, persisted: dict[str, Any] | None 
             return True
         return False
 
+    # Not a UUID: log why (branch name, version string or other), then rotate.
     persisted = persisted or _persisted
     bad_values = {"main", "master"}
     repo_branch = str(persisted.get("repo_branch") or REPO_BRANCH or "").strip().lower()
@@ -359,10 +404,16 @@ def _relay_spoke_id_needs_rotation(value: str, persisted: dict[str, Any] | None 
 
 
 def _ensure_relay_spoke_id(persisted: dict[str, Any] | None = None) -> str:
+    """Return the spoke id, creating and saving a new UUID if the current one needs rotating.
+
+    Also records our hostname and machine id so clones can be detected later.
+    """
+    # Start from settings or saved values; replace it if it needs rotating.
     persisted = persisted or _persisted
     candidate = str(settings.get("relay_spoke_id") or _candidate_relay_spoke_id(persisted)).strip()
     if _relay_spoke_id_needs_rotation(candidate, persisted):
         candidate = str(uuid.uuid4())
+    # New or changed id: save it with our hostname and machine id.
     machine_id = _get_machine_id()
     if settings.get("relay_spoke_id") != candidate or _candidate_relay_spoke_id(persisted) != candidate:
         settings["relay_spoke_id"] = candidate
@@ -386,6 +437,7 @@ def _ensure_relay_spoke_id(persisted: dict[str, Any] | None = None) -> str:
 
 
 # ── State snapshot cache (JSON file, no DB) ──────────────────────────────────
+# Time of the last state cache write, and the minimum gap between writes.
 state._state_cache_last_save = 0.0
 STATE_CACHE_MIN_INTERVAL = 10.0  # max one write per 10 s
 
@@ -417,6 +469,7 @@ _user_overrides_conf_content_cache: dict[str, Any] = {"content": "", "mtime_ns":
 def _refresh_sim_conf_content() -> None:
     """Stat + conditionally re-read simulation.conf into _sim_conf_content_cache.
     Designed to run inside asyncio.to_thread — never call from the event loop directly."""
+    # Re-read the file only when its mtime changed.
     path = REPO_DIR / "configs" / "simulation.conf"
     try:
         st = path.stat()
@@ -425,16 +478,19 @@ def _refresh_sim_conf_content() -> None:
             _sim_conf_content_cache["mtime_ns"] = st.st_mtime_ns
             _sim_conf_content_cache["error"] = None
     except FileNotFoundError:
+        # A missing file means empty content, not an error.
         _sim_conf_content_cache["content"] = ""
         _sim_conf_content_cache["mtime_ns"] = -1
         _sim_conf_content_cache["error"] = None
     except Exception as exc:
+        # Other errors are kept so telemetry can report them.
         _sim_conf_content_cache["error"] = str(exc)
 
 
 def _refresh_user_overrides_conf_content() -> None:
     """Stat + conditionally re-read user-overrides.conf into _user_overrides_conf_content_cache.
     Designed to run inside asyncio.to_thread — never call from the event loop directly."""
+    # Re-read the file only when its mtime changed.
     path = REPO_DIR / "configs" / "user-overrides.conf"
     try:
         st = path.stat()
@@ -443,16 +499,19 @@ def _refresh_user_overrides_conf_content() -> None:
             _user_overrides_conf_content_cache["mtime_ns"] = st.st_mtime_ns
             _user_overrides_conf_content_cache["error"] = None
     except FileNotFoundError:
+        # A missing file means empty content, not an error.
         _user_overrides_conf_content_cache["content"] = ""
         _user_overrides_conf_content_cache["mtime_ns"] = -1
         _user_overrides_conf_content_cache["error"] = None
     except Exception as exc:
+        # Other errors are kept so telemetry can report them.
         _user_overrides_conf_content_cache["error"] = str(exc)
 
 
 async def _sim_conf_content_refresh_loop() -> None:
     """Background task: keep _sim_conf_content_cache fresh without blocking the event loop."""
     while True:
+        # Refresh in a thread; record any error and retry in 30 s.
         try:
             await asyncio.to_thread(_refresh_sim_conf_content)
         except Exception as exc:
@@ -463,6 +522,7 @@ async def _sim_conf_content_refresh_loop() -> None:
 async def _user_overrides_conf_content_refresh_loop() -> None:
     """Background task: keep _user_overrides_conf_content_cache fresh without blocking the event loop."""
     while True:
+        # Refresh in a thread; record any error and retry in 30 s.
         try:
             await asyncio.to_thread(_refresh_user_overrides_conf_content)
         except Exception as exc:
@@ -471,6 +531,8 @@ async def _user_overrides_conf_content_refresh_loop() -> None:
 
 
 def _atomic_write_json(path: Path, payload: Any, *, indent: int | None = None) -> None:
+    """Write JSON to a temp file, then rename it over the target so readers never see half a file.
+    """
     tmp_path = path.with_name(f"{path.name}.tmp")
     tmp_path.write_text(json.dumps(payload, indent=indent, default=str), encoding="utf-8")
     tmp_path.replace(path)
@@ -480,8 +542,10 @@ def _write_atomic_str(path: Path, serialized: str) -> None:
     """Write a pre-serialised JSON string atomically using a unique tmp file.
     Safe to call from a thread-pool worker (unique tmp name avoids races when
     multiple saves for the same file are dispatched concurrently)."""
+    # Unique temp file name, so parallel saves don't clash.
     import uuid as _uuid_mod
     tmp = path.with_name(f"{path.name}.{_uuid_mod.uuid4().hex}.tmp")
+    # Write and rename; on failure delete the temp file and re-raise.
     try:
         tmp.write_text(serialized, encoding="utf-8")
         tmp.replace(path)
@@ -497,8 +561,10 @@ def _merge_ini_override(parser: "configparser.ConfigParser", override_path: "Pat
     base file loaded.  The override file uses the same INI format as
     simulation.conf / user-overrides.conf — no format changes.
     """
+    # Nothing to merge if there is no override file.
     if not override_path.exists():
         return
+    # Copy every section and key from the override into the parser; errors are only logged.
     try:
         override_parser = configparser.ConfigParser()
         override_parser.read_string(override_path.read_text(encoding="utf-8"))
@@ -512,6 +578,7 @@ def _merge_ini_override(parser: "configparser.ConfigParser", override_path: "Pat
 
 
 def _save_relay_state() -> None:
+    """Save relay_state to disk; logs a warning on failure."""
     try:
         _atomic_write_json(RELAY_STATE_FILE, relay_state)
     except Exception as exc:
@@ -519,15 +586,19 @@ def _save_relay_state() -> None:
 
 
 def _load_relay_state() -> None:
+    """Restore relay_state from disk at startup; logs a warning on failure."""
     try:
+        # Nothing saved yet.
         if not RELAY_STATE_FILE.exists():
             return
+        # Load the file and copy over only keys we know.
         raw = json.loads(RELAY_STATE_FILE.read_text(encoding="utf-8"))
         if not isinstance(raw, dict):
             raise ValueError("relay state must be an object")
         for key in relay_state:
             if key in raw:
                 relay_state[key] = raw[key]
+        # We start disconnected; re-register with the hub if the relay is enabled.
         relay_state["connected"] = False
         state.relay_registration_refresh_needed = bool(relay_state.get("enabled"))
         _save_relay_state()
@@ -537,12 +608,14 @@ def _load_relay_state() -> None:
 
 
 def _normalize_relay_enabled(value: Any) -> str:
+    """Return "on" or "off" for a relay-enabled setting given as text or boolean."""
     if isinstance(value, str):
         return "on" if value.lower() == "on" else "off"
     return "on" if value else "off"
 
 
 def _clamp_relay_interval(value: Any) -> int:
+    """Return the relay interval in seconds, clamped to 5..86400 (default if invalid)."""
     try:
         interval = int(value)
     except (TypeError, ValueError):
@@ -551,17 +624,22 @@ def _clamp_relay_interval(value: Any) -> int:
 
 
 def _relay_registration_status_from_settings() -> str:
+    """Return the hub registration status (unregistered, pending or approved) from settings."""
+    # Relay off or no hub URL: not registered.
     relay_on = settings.get("relay_enabled") == "on" and bool(settings.get("relay_server_url"))
     if not relay_on:
         return "unregistered"
+    # Hub-issued API key and tenant: approved.
     if settings.get("relay_api_key") and settings.get("relay_tenant_id"):
         return "approved"
+    # We have a spoke id but no key yet: waiting for approval.
     if settings.get("relay_spoke_id"):
         return "pending"
     return "unregistered"
 
 
 def _default_central_api_settings() -> dict[str, Any]:
+    """Return the default Central API settings (classic mode, all fields blank)."""
     return {
         "mode": "classic",
         "classic": {
@@ -579,6 +657,7 @@ def _default_central_api_settings() -> dict[str, Any]:
 
 
 def _central_runtime_defaults() -> dict[str, str]:
+    """Return blank runtime Central connection settings (classic API)."""
     return {
         "api_version": "classic",
         "cluster_url": "",
@@ -591,16 +670,24 @@ def _central_runtime_defaults() -> dict[str, str]:
 
 
 def _normalize_central_api_settings(raw: Any, legacy: Any = None) -> dict[str, Any]:
+    """Return Central API settings with every field present and cleaned up.
+
+    Values missing from raw fall back to the older single-config format (legacy), then to
+    defaults.
+    """
+    # Only dicts are trusted.
     data = raw if isinstance(raw, dict) else {}
     legacy_cfg = legacy if isinstance(legacy, dict) else {}
     defaults = _default_central_api_settings()
     raw_classic = data.get("classic") if isinstance(data.get("classic"), dict) else {}
     raw_central = data.get("central") if isinstance(data.get("central"), dict) else {}
 
+    # Mode: as given, or "central" if the old config used the new Central API.
     mode = str(data.get("mode") or ("central" if legacy_cfg.get("api_version") == "new_central" else "classic")).strip().lower()
     if mode not in {"classic", "central"}:
         mode = "classic"
 
+    # Older config values only apply when it used the new Central API.
     legacy_central = legacy_cfg if legacy_cfg.get("api_version") == "new_central" else {}
     return {
         "mode": mode,
@@ -619,8 +706,14 @@ def _normalize_central_api_settings(raw: Any, legacy: Any = None) -> dict[str, A
 
 
 def _build_runtime_central_config(central_api_cfg: dict[str, Any], legacy_cfg: Any = None) -> dict[str, str]:
+    """Return the runtime Central connection settings for the chosen API mode.
+
+    Classic mode keeps the saved older config if it has tokens and no newer values were entered.
+    """
+    # Older runtime settings, filled with defaults.
     legacy = {**_central_runtime_defaults(), **(legacy_cfg if isinstance(legacy_cfg, dict) else {})}
     mode = str(central_api_cfg.get("mode", "classic")).strip().lower()
+    # New Central: use its URL and client credentials.
     if mode == "central":
         central_cfg = central_api_cfg.get("central", {}) if isinstance(central_api_cfg.get("central"), dict) else {}
         return {
@@ -632,11 +725,13 @@ def _build_runtime_central_config(central_api_cfg: dict[str, Any], legacy_cfg: A
             "customer_id": str(central_cfg.get("customer_id", "")).strip(),
         }
 
+    # Classic: keep the older config if it has tokens and nothing new was entered.
     classic_cfg = central_api_cfg.get("classic", {}) if isinstance(central_api_cfg.get("classic"), dict) else {}
     classic_has_explicit_values = any(str(classic_cfg.get(key, "")).strip() for key in ("url", "username")) or bool(classic_cfg.get("password"))
     if legacy.get("api_version") == "classic" and not classic_has_explicit_values and (legacy.get("access_token") or legacy.get("refresh_token")):
         return legacy
 
+    # Otherwise classic with just the URL.
     return {
         **_central_runtime_defaults(),
         "api_version": "classic",
@@ -644,6 +739,7 @@ def _build_runtime_central_config(central_api_cfg: dict[str, Any], legacy_cfg: A
     }
 
 
+# Load saved settings and build the live settings dict, filling defaults for missing keys.
 _persisted = _load_persisted_settings()
 _persisted_central_api = _normalize_central_api_settings(_persisted.get("central_api", {}), _persisted.get("central_config", {}))
 settings: dict[str, Any] = {
@@ -751,15 +847,19 @@ settings: dict[str, Any] = {
     "auth_tacacs_secret": _persisted.get("auth_tacacs_secret", ""),
     "auth_tacacs_admin_priv": _persisted.get("auth_tacacs_admin_priv", 15),
 }
+# Work out the template specs and primary template IDs for both VM images.
 settings["vm_image_1_template_spec"] = _resolved_template_spec(settings, 1)
 settings["vm_image_2_template_spec"] = _resolved_template_spec(settings, 2)
 settings["vm_image_1_template_id"] = _primary_template_id(settings["vm_image_1_template_spec"], _legacy_template_id(settings, 1))
 settings["vm_image_2_template_id"] = _primary_template_id(settings["vm_image_2_template_spec"], _legacy_template_id(settings, 2))
+# Make sure we have a valid spoke id.
 _ensure_relay_spoke_id(_persisted)
 
 
 def _ensure_secret_settings(*keys: str) -> None:
+    """Make sure each named setting has a value, generating a random secret where blank."""
     changed = False
+    # Keep existing values; generate a random secret for blank ones.
     for key in keys:
         value = str(settings.get(key, "") or "").strip()
         if value:
@@ -767,10 +867,12 @@ def _ensure_secret_settings(*keys: str) -> None:
             continue
         settings[key] = secrets.token_urlsafe(32)
         changed = True
+    # Save only if something was generated.
     if changed:
         _save_settings()
 
 
+# The client API key and admin websocket token must always exist.
 _ensure_secret_settings("client_api_key", "admin_ws_token")
 
 # Initialise in-memory token from persisted values so a restart
@@ -793,6 +895,7 @@ else:
     }
 
 
+# Allowed platforms and the keys allowed in each simulation.conf section.
 ALLOWED_PLATFORMS = {"linux", "windows"}
 SIMULATION_SECTION_KEYS = {
     "wsite",
@@ -843,9 +946,11 @@ ALLOWED_CONFIG_SECTIONS = {"simulation", "address", "server", *(f"s{i}" for i in
 # ── Aruba Central state ───────────────────────────────────────────────────────
 # central_token is declared above, initialised from persisted settings.
 # {wsite: {check_id: {status, count, ts, check_name, check_type}}}
+# Aruba Central state: check results, client counts and history.
 state.central_status = {}
 state.central_wireless_clients = {}   # wsite → client count from Central API
 # wsite → list of (timestamp_float, client_count_int) samples (rolling 60 min)
+# Rolling client count samples per site, and the rules for flagging a drop.
 _client_count_samples: dict[str, list[tuple[float, int]]] = {}
 CLIENT_COUNT_WINDOW = 3600   # seconds of history to keep
 CLIENT_COUNT_MIN_SAMPLES = 3  # minimum samples before flagging
@@ -854,6 +959,7 @@ state.central_history = []   # in-memory 24-h window
 state.central_auth_error = None          # last auth/token failure message
 history_lock = asyncio.Lock()
 # Browse data for distributed mode — populated each poll cycle (new_central only)
+# Browse data and its server-side cache for the Central browse view.
 state.central_browse_alerts = []
 state.central_browse_insights = []
 state.central_browse_devices_by_site = {}
@@ -947,6 +1053,7 @@ _ALERT_DEVICE_TYPE: dict[str, str] = {
 
 def _auto_device_type(alert_id: str) -> str:
     """Guess device type from alert_type prefix."""
+    # Return the device type of the first matching prefix.
     upper = alert_id.upper()
     for prefix, dtype in _ALERT_DEVICE_TYPE.items():
         if upper.startswith(prefix):
@@ -962,6 +1069,7 @@ from services.history import _history_cutoff, _load_history, _append_and_trim_hi
 # ── Client history persistence ────────────────────────────────────────────────
 
 def _client_history_cutoff() -> datetime:
+    """Return the time before which client records are too old to keep."""
     return datetime.now(tz=timezone.utc) - timedelta(days=CLIENT_HISTORY_DAYS)
 
 
@@ -971,9 +1079,11 @@ def _client_history_raw_records() -> dict[str, dict[str, Any]]:
     Prefers the append-only JSONL store (last line per hostname wins); falls
     back to the legacy full-snapshot ``client_history.json`` for migration.
     """
+    # JSONL store: read every line; the last line for each hostname wins.
     if CLIENT_HISTORY_JSONL.exists():
         raw: dict[str, dict[str, Any]] = {}
         for line in CLIENT_HISTORY_JSONL.read_text(encoding="utf-8").splitlines():
+            # Skip blank lines and lines that are not valid JSON.
             line = line.strip()
             if not line:
                 continue
@@ -986,6 +1096,7 @@ def _client_history_raw_records() -> dict[str, dict[str, Any]]:
             except json.JSONDecodeError:
                 pass
         return raw
+    # Otherwise read the older single-snapshot file, if any.
     if CLIENT_HISTORY_FILE.exists():
         legacy = json.loads(CLIENT_HISTORY_FILE.read_text(encoding="utf-8"))
         return legacy if isinstance(legacy, dict) else {}
@@ -995,9 +1106,11 @@ def _client_history_raw_records() -> dict[str, dict[str, Any]]:
 def _load_client_history() -> dict[str, dict[str, Any]]:
     """Load persisted client records from disk, dropping entries older than 7 days."""
     try:
+        # Read the raw records; nothing saved means no history.
         raw = _client_history_raw_records()
         if not raw:
             return {}
+        # Keep only records seen within the history window, with last_seen as a datetime.
         cutoff = _client_history_cutoff()
         kept: dict[str, dict[str, Any]] = {}
         for hostname, record in raw.items():
@@ -1018,6 +1131,7 @@ def _load_client_history() -> dict[str, dict[str, Any]]:
                     len(kept), len(raw) - len(kept))
         return kept
     except Exception as exc:
+        # Any error is logged and treated as no history.
         logger.warning("Could not load client history: %s", exc)
         return {}
 
@@ -1034,6 +1148,7 @@ _client_history_io_lock = threading.Lock()
 def _client_history_line(hostname: str, c: dict[str, Any]) -> str | None:
     """One JSONL line for *hostname*, or None when the entry is expired
     (same 7-day pruning rule the old full-snapshot writer applied)."""
+    # Records too old are not saved; datetimes are stored as ISO text.
     cutoff = _client_history_cutoff()
     ls = c.get("last_seen")
     if isinstance(ls, datetime):
@@ -1044,7 +1159,9 @@ def _client_history_line(hostname: str, c: dict[str, Any]) -> str | None:
         entry = dict(c)
         entry["last_seen"] = ls.isoformat()
     else:
+        # No datetime: store the record as is.
         entry = dict(c)
+    # Sorted keys make the line stable, so unchanged records give identical text.
     return json.dumps({"hostname": hostname, "record": entry},
                       default=str, sort_keys=True)
 
@@ -1062,6 +1179,7 @@ def _save_client_history() -> None:
     CLIENT_HISTORY_DAYS are never persisted and are dropped on load/compact.
     """
     try:
+        # Under the file lock: build the current line for each live client.
         with _client_history_io_lock:
             snapshot = list(clients.items())
             lines: dict[str, str] = {}
@@ -1069,6 +1187,7 @@ def _save_client_history() -> None:
                 line = _client_history_line(hostname, c)
                 if line is not None:
                     lines[hostname] = line
+            # Clients removed since the last flush, and clients whose line changed.
             removed = set(_client_history_flushed) - set(lines)
             changed = {h: l for h, l in lines.items()
                        if _client_history_flushed.get(h) != l}
@@ -1077,10 +1196,12 @@ def _save_client_history() -> None:
                 # rewrite the whole (small) per-client snapshot atomically.
                 _compact_client_history_locked(lines)
             elif changed:
+                # Otherwise append only the changed lines and remember them.
                 with CLIENT_HISTORY_JSONL.open("a", encoding="utf-8") as fh:
                     for line in changed.values():
                         fh.write(line + "\n")
                 _client_history_flushed.update(changed)
+                # Compact once the file grows too large.
                 if CLIENT_HISTORY_JSONL.stat().st_size > CLIENT_HISTORY_MAX_BYTES:
                     _compact_client_history_locked(lines)
     except Exception as exc:
@@ -1091,12 +1212,15 @@ def _compact_client_history_locked(lines: dict[str, str]) -> None:
     """Rewrite the JSONL store as exactly one line per live client (atomic:
     temp + replace). Caller holds _client_history_io_lock. Also retires the
     legacy full-snapshot file so stale purged clients can't resurrect."""
+    # Write all lines to a temp file and rename it over the store.
     tmp = CLIENT_HISTORY_JSONL.with_suffix(CLIENT_HISTORY_JSONL.suffix + ".tmp")
     tmp.write_text(("\n".join(lines.values()) + "\n") if lines else "",
                    encoding="utf-8")
     tmp.replace(CLIENT_HISTORY_JSONL)
+    # Everything on disk now matches these lines.
     _client_history_flushed.clear()
     _client_history_flushed.update(lines)
+    # Delete the older snapshot file so it can't bring back purged clients.
     try:
         CLIENT_HISTORY_FILE.unlink(missing_ok=True)
     except OSError:
@@ -1105,12 +1229,14 @@ def _compact_client_history_locked(lines: dict[str, str]) -> None:
 
 async def client_history_saver() -> None:
     """Background task: flush clients to disk every CLIENT_SAVE_INTERVAL seconds."""
+    # Wait one interval first, then save in a thread every interval.
     await asyncio.sleep(CLIENT_SAVE_INTERVAL)
     while True:
         try:
             await asyncio.to_thread(_save_client_history)
             _update_service_health("client_history_saver", ok=True)
         except asyncio.CancelledError:
+            # Cancellation must stop the task; other errors are recorded and logged.
             raise
         except Exception as exc:
             _update_service_health("client_history_saver", ok=False, error=str(exc))
@@ -1120,6 +1246,7 @@ async def client_history_saver() -> None:
 
 def _can_refresh() -> bool:
     """True when we can obtain a fresh token automatically."""
+    # Needs a URL and client credentials.
     cfg = _central_cfg()
     if not cfg.get("cluster_url") or not cfg.get("client_id") or not cfg.get("client_secret"):
         return False
@@ -1133,9 +1260,12 @@ _NEW_CENTRAL_TOKEN_URL = "https://sso.common.cloud.hpe.com/as/token.oauth2"
 
 
 def _parse_bearer_token(authorization: str | None) -> str:
+    """Return the token from an "Authorization: Bearer <token>" header, or "" if there is none."""
+    # Blank header: no token.
     value = str(authorization or "").strip()
     if not value:
         return ""
+    # Only the Bearer scheme is accepted.
     scheme, _, token = value.partition(" ")
     if scheme.lower() != "bearer":
         return ""
@@ -1143,6 +1273,7 @@ def _parse_bearer_token(authorization: str | None) -> str:
 
 
 def _parse_upstream_json(resp: httpx.Response) -> Any:
+    """Return the response's JSON; raises UpstreamJSONError if the body is not valid JSON."""
     try:
         return resp.json()
     except ValueError as exc:
@@ -1151,12 +1282,14 @@ def _parse_upstream_json(resp: httpx.Response) -> Any:
 
 
 def _valid_shared_client_key(provided_key: str) -> bool:
+    """Return True if the key matches our shared client API key (constant-time compare)."""
     expected_key = str(settings.get("client_api_key", "") or "").strip()
     candidate = str(provided_key or "").strip()
     return bool(expected_key and candidate) and secrets.compare_digest(candidate, expected_key)
 
 
 def _require_shared_client_key(provided_key: str, context: str) -> None:
+    """Raise HTTP 403 unless the key matches our shared client API key; context goes in the log."""
     if _valid_shared_client_key(provided_key):
         return
     logger.warning("Rejected %s with invalid shared client API key", context)
@@ -1170,6 +1303,7 @@ async def _fetch_nc_browse_for_spoke(client: httpx.AsyncClient) -> None:
     this spoke's assigned sites.  Results are stored in the module-level
     central_browse_* variables so they can be included in the telemetry sent to hub."""
 
+    # Central URL and auth headers.
     cfg = _central_cfg()
     base_url = cfg["cluster_url"].rstrip("/")
     headers = _central_headers()
@@ -1178,6 +1312,7 @@ async def _fetch_nc_browse_for_spoke(client: httpx.AsyncClient) -> None:
     # the browse tab can show Monitor buttons for sites not yet configured).
     central_sites: list[str] = []
     try:
+        # New Central has one sites-health endpoint.
         if _is_new_central_api():
             resp = await client.get(
                 f"{base_url}/network-monitoring/v1alpha1/sites-health",
@@ -1191,6 +1326,7 @@ async def _fetch_nc_browse_for_spoke(client: httpx.AsyncClient) -> None:
                     if (item.get("siteName") or item.get("site_name") or item.get("name"))
                 ]
         else:
+            # Classic Central: try the known sites endpoints until one works.
             for path, params in [
                 ("/monitoring/v2/sites", {"limit": 1000, "offset": 0}),
                 ("/monitoring/v1/sites", {"limit": 1000, "offset": 0}),
@@ -1214,22 +1350,27 @@ async def _fetch_nc_browse_for_spoke(client: httpx.AsyncClient) -> None:
         site_mappings: dict[str, str] = settings.get("site_mappings", {})
         central_sites = [s for s in site_mappings.values() if s]
 
+    # No sites at all: nothing to fetch.
     if not central_sites:
         return
 
     def _sev_map(s: str) -> str:
+        """Map a Central severity to error, warning or info."""
         s = (s or "").lower()
         return "error" if s == "critical" else "warning" if s in ("major", "minor") else "info"
 
+    # Results collected for every site, stored at the end.
     new_alerts: list[dict[str, Any]] = []
     new_insights: list[dict[str, Any]] = []
     new_devices_by_site: dict[str, list[dict[str, Any]]] = {}
     new_clients_by_site: dict[str, dict[str, Any]] = {}
     new_clients: list[dict[str, Any]] = []
 
+    # Fetch browse data for each site.
     for central_site in central_sites:
         # ── Alerts for this site ──────────────────────────────────────────────
         try:
+            # Page through the site's active alerts, at most 20 pages.
             filt = f"status eq 'Active' and siteName eq '{central_site}'"
             cursor: str | None = None
             seen: set[tuple[str, str]] = set()
@@ -1238,13 +1379,16 @@ async def _fetch_nc_browse_for_spoke(client: httpx.AsyncClient) -> None:
                 if cursor:
                     params["next"] = cursor
                 resp = await client.get(f"{base_url}/network-notifications/v1/alerts", headers=headers, params=params, timeout=30)
+                # On 401, refresh the token and retry once.
                 if resp.status_code == 401 and _can_refresh():
                     ok, _ = await _refresh_central_token(client)
                     if ok:
                         headers = _central_headers()
                     resp = await client.get(f"{base_url}/network-notifications/v1/alerts", headers=headers, params=params, timeout=30)
+                # Stop paging on any error.
                 if resp.status_code != 200:
                     break
+                # Add each alert once per name and site.
                 body = resp.json()
                 for item in body.get("items", []):
                     name = (item.get("name") or item.get("alertType") or "").strip()
@@ -1262,14 +1406,17 @@ async def _fetch_nc_browse_for_spoke(client: httpx.AsyncClient) -> None:
                         "detail": item.get("summary") or "",
                         "ts": item.get("createdAt") or "",
                     })
+                # Follow the next-page cursor until there is none.
                 cursor = body.get("next")
                 if not cursor:
                     break
         except Exception as exc:
+            # A failure here only skips this site's alerts.
             logger.warning("NC browse alerts fetch failed for site %s: %s", central_site, exc)
 
         # ── Insights for this site ────────────────────────────────────────────
         try:
+            # Page through insights (at most 10 pages), keeping those that affect this site.
             cursor = None
             for _ in range(10):
                 params = {"limit": 100}
@@ -1284,6 +1431,8 @@ async def _fetch_nc_browse_for_spoke(client: httpx.AsyncClient) -> None:
                         site = (site_info.get("siteName") or "").strip()
                         if site.lower() != central_site.lower():
                             continue
+                        # Timestamps in milliseconds become ISO text; anything else is kept as
+                        # given.
                         ts_raw = item.get("timestamp") or item.get("ts") or ""
                         try:
                             ts_val = datetime.utcfromtimestamp(int(ts_raw) / 1000).isoformat() if str(ts_raw).isdigit() else str(ts_raw)
@@ -1306,6 +1455,7 @@ async def _fetch_nc_browse_for_spoke(client: httpx.AsyncClient) -> None:
 
         # ── Devices for this site ─────────────────────────────────────────────
         try:
+            # Page through the site's devices, at most 20 pages.
             cursor = None
             site_devs: list[dict[str, Any]] = []
             for _ in range(20):
@@ -1330,6 +1480,7 @@ async def _fetch_nc_browse_for_spoke(client: httpx.AsyncClient) -> None:
                 cursor = body.get("next")
                 if not cursor:
                     break
+            # Store the devices if the site has any.
             if site_devs:
                 new_devices_by_site[central_site] = site_devs
         except Exception as exc:
@@ -1337,6 +1488,7 @@ async def _fetch_nc_browse_for_spoke(client: httpx.AsyncClient) -> None:
 
         # ── Clients for this site ─────────────────────────────────────────────
         try:
+            # Page through connected clients (at most 50 pages), counting wired and wireless.
             filt = f"status eq 'Connected' and siteName eq '{central_site}'"
             cursor = None
             total = wired = wireless = 0
@@ -1373,10 +1525,12 @@ async def _fetch_nc_browse_for_spoke(client: httpx.AsyncClient) -> None:
                 cursor = body.get("next")
                 if not cursor:
                     break
+            # Store this site's client counts.
             new_clients_by_site[central_site] = {"total": total, "wired": wired, "wireless": wireless}
         except Exception as exc:
             logger.warning("NC browse clients fetch failed for site %s: %s", central_site, exc)
 
+    # Replace the browse data and clear the cached browse response.
     state.central_browse_alerts = new_alerts
     state.central_browse_insights = new_insights
     state.central_browse_devices_by_site = new_devices_by_site
@@ -1391,6 +1545,7 @@ async def _fetch_nc_browse_for_spoke(client: httpx.AsyncClient) -> None:
 def _save_client_count_baseline() -> None:
     """Persist per-site hourly averages to disk (restart recovery) and
     append a snapshot to the 7-day hourly history used as the alarm baseline."""
+    # Build a snapshot of the hourly average for each site with enough samples.
     snapshot: dict[str, Any] = {}
     now = time.time()
     cutoff_7day = now - CLIENT_COUNT_7DAY_WINDOW
@@ -1403,6 +1558,7 @@ def _save_client_count_baseline() -> None:
         hist = _client_count_hourly_history.setdefault(wsite, [])
         hist.append((now, avg))
         _client_count_hourly_history[wsite] = [(ts, v) for ts, v in hist if ts >= cutoff_7day]
+    # Save the snapshot as the restart baseline.
     if snapshot:
         try:
             CLIENT_COUNT_BASELINE_FILE.write_text(json.dumps(snapshot, indent=2), encoding="utf-8")
@@ -1430,6 +1586,7 @@ async def hourly_baseline_saver() -> None:
     last 60 minutes of live samples.  Running independently of the Central poll
     loop means the file is always at most ~1 hour old regardless of poll frequency.
     """
+    # Cancellation must stop the task; other errors are recorded and logged.
     await asyncio.sleep(3600)   # wait one full hour before first write
     while True:
         try:
@@ -1458,16 +1615,19 @@ async def sim_client_count_sampler() -> None:
     """
     while True:
         await asyncio.sleep(SIM_CLIENT_SAMPLE_INTERVAL)
+        # Copy the clients under the lock.
         try:
             now = time.time()
             cutoff_cc = now - CLIENT_COUNT_WINDOW
             async with state_lock:
                 active_snap = {h: dict(c) for h, c in clients.items()}
 
+            # Count simulated clients per site; nothing to do without any.
             counts = _sim_clients_per_wsite(active_snap)
             if not counts:
                 continue
 
+            # Add a sample for each site, dropping samples older than the window.
             updated = False
             for wsite_val, count in counts.items():
                 existing = _client_count_samples.get(wsite_val, [])
@@ -1481,6 +1641,7 @@ async def sim_client_count_sampler() -> None:
                 ]
                 updated = True
 
+            # If anything changed, save the baseline and state cache and tell UIs.
             if updated:
                 _save_client_count_baseline()
                 _save_state_cache()
@@ -1490,6 +1651,7 @@ async def sim_client_count_sampler() -> None:
                 })
             _update_service_health("sim_client_sampler", ok=True)
         except asyncio.CancelledError:
+            # Cancellation must stop the task; other errors are recorded and logged.
             raise
         except Exception as exc:
             _update_service_health("sim_client_sampler", ok=False, error=str(exc))
@@ -1509,6 +1671,7 @@ def _client_count_payload() -> dict[str, Any]:
     suppress the alarm — it stays active until counts recover to near-normal.
     Falls back to 1-hour average when insufficient 7-day history exists
     (first day of operation or after data loss)."""
+    # Build the status for each site that has samples.
     site_mappings = settings.get("site_mappings", {})
     result: dict[str, Any] = {}
     for wsite, samples in _client_count_samples.items():
@@ -1556,6 +1719,7 @@ def _client_count_payload() -> dict[str, Any]:
                 }
             continue
 
+        # Enough live samples: compare the hourly average with the baseline.
         hourly_avg = sum(s[1] for s in samples) / len(samples)
         # Use 7-day baseline when available; fall back to hourly avg on first day.
         baseline = baseline_7day if has_7day else hourly_avg
@@ -1566,6 +1730,7 @@ def _client_count_payload() -> dict[str, Any]:
             # Compare smoothed current (hourly avg) against the 7-day stable baseline.
             drop_pct = (baseline - hourly_avg) / baseline * 100.0
             status = "DEGRADED" if drop_pct >= CLIENT_COUNT_DROP_PCT else "OK"
+        # Store this site's status.
         result[wsite] = {
             "site_name": site_name,
             "current": current,
@@ -1582,10 +1747,14 @@ def _client_count_payload() -> dict[str, Any]:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):  # noqa: ARG001
+    """App lifespan: load saved state and start background tasks on startup; stop them on shutdown.
+    """
+    # Log the startup banner and record a debug event.
     logger.info("=" * 60)
     logger.info("Client Simulator  v%s  starting up", INSTALLER_VERSION)
     logger.info("=" * 60)
     _debug_event("server_start", f"v{INSTALLER_VERSION} ui:v{APP_VERSION}")
+    # Load the history, caches and saved state from disk.
     state.central_history = await asyncio.to_thread(_load_history)
     _load_state_cache()
     _load_commands()
@@ -1594,11 +1763,13 @@ async def lifespan(app: FastAPI):  # noqa: ARG001
     _load_update_state()
     _load_vm_watchdog()
     _load_resource_cache()
+    # Clear any provisioning halt if auto-provisioning is off.
     if not _autoprov_enabled():
         _clear_provision_halt_state()
     # Refresh cs-webui frontend files before accepting requests (non-blocking,
     # awaited once so the fix is in place before the first page load).
     await asyncio.wait_for(refresh_webui_frontend(), timeout=60)
+    # Start the long-running background tasks.
     background_tasks["sync_repo"] = asyncio.create_task(sync_repo())
     background_tasks["heartbeat"] = asyncio.create_task(heartbeat_check())
     background_tasks["central_token"] = asyncio.create_task(central_token_manager())
@@ -1609,6 +1780,7 @@ async def lifespan(app: FastAPI):  # noqa: ARG001
     # to the LM hub (lm/core) as module_type "Client-Sim" and relays its full
     # state there (replacing the legacy webui-hub relay destination). The
     # standalone spoke UI is unaffected either way.
+    # LM hub enabled: use the LM relay bridge, or the old relay if it fails to build.
     if _normalize_relay_enabled(settings.get("lm_hub_enabled", "off")) != "off":
         try:
             from lm_relay import build_lm_control_plane
@@ -1622,8 +1794,10 @@ async def lifespan(app: FastAPI):  # noqa: ARG001
         else:
             background_tasks["relay"] = asyncio.create_task(relay_loop())
     else:
+        # Otherwise use the old hub relay.
         background_tasks["relay"] = asyncio.create_task(relay_loop())
     background_tasks["hub_isolation_monitor"] = asyncio.create_task(hub_isolation_monitor())  # Watch the timeout in the background so the UI updates when isolation flips without waiting for another relay message.
+    # Start the remaining background tasks.
     background_tasks["sim_conf_refresh"] = asyncio.create_task(_sim_conf_content_refresh_loop())
     background_tasks["user_overrides_conf_refresh"] = asyncio.create_task(_user_overrides_conf_content_refresh_loop())
     background_tasks["client_history_saver"] = asyncio.create_task(client_history_saver())
@@ -1638,9 +1812,11 @@ async def lifespan(app: FastAPI):  # noqa: ARG001
     background_tasks["demo_expiry"] = asyncio.create_task(_demo_expiry_task())
     background_tasks["vm_sim_tag_sync"] = asyncio.create_task(_vm_sim_tag_sync_loop())
     background_tasks["loop_lag_monitor"] = asyncio.create_task(_event_loop_lag_monitor())
+    # The app runs here until shutdown.
     yield
     # Flush client history to disk on shutdown
     await asyncio.to_thread(_save_client_history)
+    # Cancel every task and wait for each to finish.
     for task in background_tasks.values():
         task.cancel()
     for task in background_tasks.values():
@@ -1656,43 +1832,56 @@ _SPOKE_SESSION_COOKIE = "spoke_session"
 
 @dataclass
 class SpokeUser:
+    """A signed-in WebUI user: name, role (admin or viewer), auth provider and display name."""
     username: str
     role: str
     auth_provider: str
     display_name: str = ""
 
 
+# Open sessions: token mapped to (user, expiry time).
 _spoke_sessions: dict[str, tuple[SpokeUser, float]] = {}  # token → (user, expiry)
 
 
 def _get_session_ttl() -> int:
+    """Return the session lifetime in seconds (setting in minutes, clamped to 5..1440)."""
     return max(5, min(1440, int(settings.get("session_timeout_minutes", 30)))) * 60
 
 
 def _admin_password() -> str:
+    """Return the admin password from settings or the ADMIN_PASSWORD env var ("" if unset)."""
     return str(settings.get("admin_password", "") or os.getenv("ADMIN_PASSWORD", "") or "").strip()
 
 
 def _normalize_spoke_auth_provider(value: Any) -> str:
+    """Return the auth provider (local, ldap, radius or tacacs); anything else means local."""
     provider = str(value or "local").strip().lower()
     return provider if provider in {"local", "ldap", "radius", "tacacs"} else "local"
 
 
+# Local user roles and password hashing settings (PBKDF2-SHA256).
 _LOCAL_USER_ROLES = {"admin", "viewer"}
 _LOCAL_PASSWORD_SCHEME = "pbkdf2_sha256"
 _LOCAL_PASSWORD_ITERATIONS = 200_000
 
 
 def _normalize_local_role(value: Any) -> str:
+    """Return the role if it is admin or viewer; anything else becomes viewer."""
     role = str(value or "viewer").strip().lower()
     return role if role in _LOCAL_USER_ROLES else "viewer"
 
 
 def _normalize_local_users(value: Any) -> list[dict[str, str]]:
+    """Return a cleaned list of local users.
+
+    Entries without a name or hash, duplicates, and the reserved "admin" name are dropped.
+    """
+    # Anything but a list gives no users.
     users: list[dict[str, str]] = []
     if not isinstance(value, list):
         return users
     seen: set[str] = set()
+    # Skip bad entries, entries missing a name or hash, "admin" and duplicates.
     for entry in value:
         if not isinstance(entry, dict):
             continue
@@ -1704,6 +1893,7 @@ def _normalize_local_users(value: Any) -> list[dict[str, str]]:
         if username_key == "admin" or username_key in seen:
             continue
         seen.add(username_key)
+        # Keep only the name, hash and a valid role.
         users.append({
             "username": username,
             "password_hash": password_hash,
@@ -1713,6 +1903,7 @@ def _normalize_local_users(value: Any) -> list[dict[str, str]]:
 
 
 def _get_local_users() -> list[dict[str, str]]:
+    """Return the local users, saving the cleaned list back into settings if it changed."""
     users = _normalize_local_users(settings.get("local_users", []))
     if users != settings.get("local_users", []):
         settings["local_users"] = users
@@ -1720,16 +1911,20 @@ def _get_local_users() -> list[dict[str, str]]:
 
 
 def _hash_local_password(password: str) -> str:
+    """Hash a password as pbkdf2_sha256$iterations$salt$digest with a random salt."""
     salt = secrets.token_bytes(16)
     derived = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, _LOCAL_PASSWORD_ITERATIONS)
     return f"{_LOCAL_PASSWORD_SCHEME}${_LOCAL_PASSWORD_ITERATIONS}${salt.hex()}${derived.hex()}"
 
 
 def _verify_local_password(password: str, password_hash: str) -> bool:
+    """Return True if the password matches the stored hash; any bad hash gives False."""
     try:
+        # Split the stored hash; only our scheme is accepted.
         scheme, iterations_raw, salt_hex, digest_hex = str(password_hash or "").split("$", 3)
         if scheme != _LOCAL_PASSWORD_SCHEME:
             return False
+        # Hash the password with the same salt and iterations, then compare in constant time.
         derived = hashlib.pbkdf2_hmac(
             "sha256",
             str(password or "").encode("utf-8"),
@@ -1742,15 +1937,22 @@ def _verify_local_password(password: str, password_hash: str) -> bool:
 
 
 def _check_credentials(username: str, password: str) -> SpokeUser | None:
+    """Check a local login; returns the user, or None if the name or password is wrong.
+
+    A blank name or "admin" is checked against the admin password first.
+    """
+    # A password is always required.
     candidate = str(username or "").strip()
     supplied_password = str(password or "")
     if not supplied_password:
         return None
 
+    # Admin login with the admin password.
     admin_password = _admin_password()
     if candidate.lower() in {"", "admin"} and admin_password and secrets.compare_digest(supplied_password.strip(), admin_password):
         return SpokeUser(username="admin", role="admin", auth_provider="local")
 
+    # Otherwise look the name up in the local users (case-insensitive) and check the hash.
     if not candidate:
         return None
     candidate_key = candidate.lower()
@@ -1769,6 +1971,8 @@ def _check_credentials(username: str, password: str) -> SpokeUser | None:
 
 
 def _spoke_auth_required() -> bool:
+    """Return True if login is required (an admin password, local users, or an external provider).
+    """
     return bool(
         _admin_password()
         or _get_local_users()
@@ -1777,13 +1981,20 @@ def _spoke_auth_required() -> bool:
 
 
 async def require_auth(request: Request) -> SpokeUser:
+    """FastAPI dependency: return the signed-in user, or raise 401.
+
+    With no auth configured, everyone is treated as admin.
+    """
+    # The middleware may already have found the user.
     user = getattr(request.state, "spoke_user", None)
     if isinstance(user, SpokeUser):
         return user
+    # No auth configured: everyone is admin.
     if not _spoke_auth_required():
         user = SpokeUser(username="admin", role="admin", auth_provider="local")
         request.state.spoke_user = user
         return user
+    # Otherwise the session cookie must be valid.
     token = request.cookies.get(_SPOKE_SESSION_COOKIE, "")
     user = _validate_spoke_session(token)
     if not user:
@@ -1793,9 +2004,12 @@ async def require_auth(request: Request) -> SpokeUser:
 
 
 def _create_spoke_session(user: SpokeUser) -> str:
+    """Create a session for the user and return its token; also removes expired sessions."""
+    # Random token valid for the session lifetime.
     token = secrets.token_urlsafe(32)
     now = time.time()
     _spoke_sessions[token] = (user, now + _get_session_ttl())
+    # Drop expired sessions while we are here.
     expired = [stored_token for stored_token, (_, expiry) in list(_spoke_sessions.items()) if now >= expiry]
     for stored_token in expired:
         _spoke_sessions.pop(stored_token, None)
@@ -1803,11 +2017,14 @@ def _create_spoke_session(user: SpokeUser) -> str:
 
 
 def _validate_spoke_session(token: str) -> SpokeUser | None:
+    """Return the user for a session token, or None if unknown or expired."""
+    # Unknown or blank token.
     if not token:
         return None
     entry = _spoke_sessions.get(token)
     if entry is None:
         return None
+    # Expired sessions are removed.
     user, expiry = entry
     if time.time() >= expiry:
         _spoke_sessions.pop(token, None)
@@ -1821,6 +2038,7 @@ def _ldap_authenticate_sync(username: str, password: str) -> "SpokeUser | None":
         from ldap3 import ALL, Connection, Server
         from ldap3.utils.conv import escape_filter_chars
 
+        # LDAP URL and bind DN are required.
         s = settings
         if not s.get("auth_ldap_url") or not s.get("auth_ldap_bind_dn"):
             return None
@@ -1840,7 +2058,9 @@ def _ldap_authenticate_sync(username: str, password: str) -> "SpokeUser | None":
                 search_filter=search_filter,
                 attributes=["cn", "mail", "memberOf", "displayName"],
             )
+            # No matching user.
             if not conn.entries:
+                # Get the user's DN, display name and groups.
                 return None
             entry = conn.entries[0]
             user_dn = entry.entry_dn
@@ -1851,6 +2071,7 @@ def _ldap_authenticate_sync(username: str, password: str) -> "SpokeUser | None":
             if not user_conn.bound:
                 return None
 
+        # Role: admin group match is admin; with no viewer group set everyone is admin.
         admin_group = str(s.get("auth_ldap_group_admin", "") or "")
         viewer_group = str(s.get("auth_ldap_group_viewer", "") or "")
         role = "viewer"
@@ -1865,6 +2086,7 @@ def _ldap_authenticate_sync(username: str, password: str) -> "SpokeUser | None":
 
         return SpokeUser(username=username, role=role, auth_provider="ldap", display_name=display_name)
     except ImportError:
+        # ldap3 missing or any other error means login fails.
         logger.warning("ldap3 not installed — LDAP auth unavailable")
         return None
     except Exception as exc:
@@ -1886,16 +2108,19 @@ def _radius_authenticate_sync(username: str, password: str) -> "SpokeUser | None
         import pyrad.dictionary
         import pyrad.packet
 
+        # RADIUS host and secret are required.
         s = settings
         if not s.get("auth_radius_host") or not s.get("auth_radius_secret"):
             return None
 
+        # Minimal RADIUS dictionary with just the attributes we use.
         dict_src = """
 ATTRIBUTE User-Name      1  string
 ATTRIBUTE User-Password  2  string
 ATTRIBUTE Filter-Id      11 string
 ATTRIBUTE Class          25 string
 """
+        # RADIUS client with a 10 s timeout.
         dictionary = pyrad.dictionary.Dictionary(io.StringIO(dict_src))
         client = pyrad.client.Client(
             server=s["auth_radius_host"],
@@ -1905,6 +2130,7 @@ ATTRIBUTE Class          25 string
         )
         client.timeout = 10
 
+        # Send an Access-Request with the encrypted password; anything but Accept fails.
         req = client.CreateAuthPacket(code=pyrad.packet.AccessRequest, User_Name=username)
         req["User-Password"] = req.PwCrypt(password)
         reply = client.SendPacket(req)
@@ -1912,6 +2138,7 @@ ATTRIBUTE Class          25 string
         if reply.code != pyrad.packet.AccessAccept:
             return None
 
+        # Role comes from the configured reply attribute; admin by default.
         role_attr = str(s.get("auth_radius_role_attr", "Filter-Id") or "Filter-Id")
         admin_val = str(s.get("auth_radius_admin_val", "admin") or "admin").lower()
         role = "admin"
@@ -1928,6 +2155,7 @@ ATTRIBUTE Class          25 string
 
         return SpokeUser(username=username, role=role, auth_provider="radius", display_name=display_name)
     except ImportError:
+        # pyrad missing or any other error means login fails.
         logger.warning("pyrad not installed — RADIUS auth unavailable")
         return None
     except Exception as exc:
@@ -1936,6 +2164,7 @@ ATTRIBUTE Class          25 string
 
 
 async def _radius_authenticate(username: str, password: str) -> "SpokeUser | None":
+    """Authenticate against RADIUS (in a thread). Returns SpokeUser or None."""
     return await asyncio.to_thread(_radius_authenticate_sync, username, password)
 
 
@@ -1944,10 +2173,12 @@ def _tacacs_authenticate_sync(username: str, password: str) -> "SpokeUser | None
     try:
         import tacacs_plus.client as tacacs
 
+        # TACACS+ host and secret are required.
         s = settings
         if not s.get("auth_tacacs_host") or not s.get("auth_tacacs_secret"):
             return None
 
+        # TACACS+ client with a 10 s timeout.
         client = tacacs.TACACSClient(
             host=s["auth_tacacs_host"],
             port=int(s.get("auth_tacacs_port", 49)),
@@ -1955,10 +2186,12 @@ def _tacacs_authenticate_sync(username: str, password: str) -> "SpokeUser | None
             timeout=10,
         )
 
+        # Check the password; an invalid login fails.
         authen = client.authenticate(username, password)
         if not getattr(authen, "valid", False):
             return None
 
+        # Ask for shell authorization and read the priv-lvl it returns (1 if none).
         admin_priv = int(s.get("auth_tacacs_admin_priv", 15))
         author = client.authorize(username, arguments=[b"service=shell", b"cmd="])
         priv_level = 1
@@ -1969,9 +2202,11 @@ def _tacacs_authenticate_sync(username: str, password: str) -> "SpokeUser | None
                 except Exception:
                     pass
 
+        # At or above the admin privilege level means admin.
         role = "admin" if priv_level >= admin_priv else "viewer"
         return SpokeUser(username=username, role=role, auth_provider="tacacs")
     except ImportError:
+        # tacacs-plus missing or any other error means login fails.
         logger.warning("tacacs-plus not installed — TACACS+ auth unavailable")
         return None
     except Exception as exc:
@@ -1980,14 +2215,18 @@ def _tacacs_authenticate_sync(username: str, password: str) -> "SpokeUser | None
 
 
 async def _tacacs_authenticate(username: str, password: str) -> "SpokeUser | None":
+    """Authenticate against TACACS+ (in a thread). Returns SpokeUser or None."""
     return await asyncio.to_thread(_tacacs_authenticate_sync, username, password)
 
 
+# The FastAPI app, with lifespan handling startup and shutdown.
 app = FastAPI(title="Client Simulator", lifespan=lifespan)
 
 # Prevent browser caching on all responses
 class NoCacheMiddleware(BaseHTTPMiddleware):
+    """Middleware that tells browsers never to cache any response."""
     async def dispatch(self, request: Request, call_next):
+        """Run the request, then add no-cache headers to the response."""
         response = await call_next(request)
         response.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
         response.headers["Pragma"] = "no-cache"
@@ -1995,6 +2234,10 @@ class NoCacheMiddleware(BaseHTTPMiddleware):
         return response
 
 class SpokeAuthMiddleware(BaseHTTPMiddleware):
+    """Middleware that requires a valid session for API requests when login is enabled.
+
+    Also refreshes the session on each request and blocks viewers from changing data.
+    """
     _PUBLIC_PREFIXES = ("/static/", "/api/auth/")
     # Paths accessible by simulation client devices (no browser session required)
     _PUBLIC_PATHS = ("/ws", "/ws/client", "/ws/proxmox", "/api/health", "/api/status", "/api/client/key")
@@ -2002,8 +2245,11 @@ class SpokeAuthMiddleware(BaseHTTPMiddleware):
     _PROXMOX_PUBLIC_PATHS = ("/api/proxmox/register", "/api/proxmox/key")
 
     async def dispatch(self, request: Request, call_next):
+        """Let public, agent and signed-in requests through; reject the rest with 401 or 403."""
+        # No auth configured: let everything through.
         if not _spoke_auth_required():
             return await call_next(request)
+        # The dashboard page, static files, auth routes, device paths and CORS preflight are public.
         path = request.url.path
         if (path == "/" or path.startswith(self._PUBLIC_PREFIXES) or path in self._PUBLIC_PATHS or request.method == "OPTIONS"):
             return await call_next(request)
@@ -2014,13 +2260,16 @@ class SpokeAuthMiddleware(BaseHTTPMiddleware):
         api_key = request.headers.get("X-API-Key", "")
         if api_key and api_key in approved_proxmox_agents.values():
             return await call_next(request)
+        # Otherwise a valid session cookie is required.
         token = request.cookies.get(_SPOKE_SESSION_COOKIE, "")
         user = _validate_spoke_session(token)
         if not user:
             return JSONResponse({"detail": "Unauthorized"}, status_code=401)
+        # Extend the session and remember the user for the route.
         ttl = _get_session_ttl()
         _spoke_sessions[token] = (user, time.time() + ttl)
         request.state.spoke_user = user
+        # Viewers may not send changing requests to the API.
         if (
             user.role == "viewer"
             and path.startswith("/api/")
@@ -2030,10 +2279,12 @@ class SpokeAuthMiddleware(BaseHTTPMiddleware):
             response = JSONResponse({"detail": "Viewer role cannot modify data"}, status_code=403)
             response.set_cookie(_SPOKE_SESSION_COOKIE, token, httponly=True, samesite="strict", max_age=ttl)
             return response
+        # Run the request and refresh the session cookie.
         response = await call_next(request)
         response.set_cookie(_SPOKE_SESSION_COOKIE, token, httponly=True, samesite="strict", max_age=ttl)
         return response
 
+# Register the middleware and load saved client records.
 app.add_middleware(SpokeAuthMiddleware)
 app.add_middleware(NoCacheMiddleware)
 clients: dict[str, dict[str, Any]] = _load_client_history()
@@ -2044,14 +2295,17 @@ COMMAND_MAX = 100                 # keep last N commands in memory
 COMMAND_EXPIRE_SECS = 900         # pending/delivered commands expire after 15 minutes
 COMMAND_RESULT_RETENTION_SECS = 86400  # keep completed/expired results for 24 hours
 
+# Open websockets: UIs, clients and the Proxmox agent.
 ws_connections: list[WebSocket] = []
 client_ws_connections: dict[str, WebSocket] = {}
 state.proxmox_ws_connection = None
 state.proxmox_ws_hostname = None
 state.proxmox_ws_disconnect_task = None
+# Grace period before marking a disconnected agent offline; ACME challenge state.
 PROXMOX_WS_GRACE_SECS = 30
 _acme_challenges: dict[str, str] = {}
 _acme_status: dict[str, Any] = {"running": False, "last_result": None, "last_error": None}
+# Lock for shared state, plus repo sync and kill switch status.
 state_lock = asyncio.Lock()
 repo_state = {"synced": False, "error": None, "last_sync": None}
 gkill_switch_state: dict[str, Any] = {"value": "off", "last_fetched": None, "error": None}
@@ -2063,6 +2317,7 @@ _command_trace: list[dict[str, Any]] = []
 
 def _trace(event: str, **kwargs: Any) -> None:
     """Append a timestamped event to the command trace ring buffer."""
+    # Add the entry and drop the oldest ones beyond the limit.
     entry = {"t": datetime.now(timezone.utc).isoformat(), "event": event, **kwargs}
     _command_trace.append(entry)
     if len(_command_trace) > _COMMAND_TRACE_MAX:
@@ -2070,6 +2325,7 @@ def _trace(event: str, **kwargs: Any) -> None:
 # Queues for proxmox token provision responses relayed from agent → spoke → hub
 _proxmox_token_provision_queues: dict[str, asyncio.Queue] = {}
 GKILL_SWITCH_URL = "https://raw.githubusercontent.com/lbockenstedt/cs/main/configs/kill_switch.txt"
+# Hub relay status shown in the UI and sent in telemetry.
 relay_state: dict[str, Any] = {
     "enabled": settings.get("relay_enabled") == "on" and bool(settings.get("relay_server_url")),
     "connected": False,
@@ -2084,16 +2340,19 @@ relay_state: dict[str, Any] = {
     "telemetry_build_ms": None, # how long the last _build_relay_telemetry_payload call took
     "hub_loop_lag_ms": None,    # hub event-loop lag reported in the last telemetry_ack
 }
+# Re-register with the hub at startup if the relay is enabled.
 state.relay_registration_refresh_needed = bool(relay_state["enabled"])
 # Capped registration diagnostic log — last 50 attempts
 _RELAY_DIAG_MAX = 50
 relay_diag_log: list[dict[str, Any]] = []
+# Hub websocket send function and our spoke id there; None while disconnected.
 state._relay_ws_send_json = None
 state._relay_ws_spoke_id = None
 # LM-hub control plane (build_lm_control_plane) — set in lifespan when
 # lm_hub_enabled=on. Used to forward client debug-log frames up to the hub as
 # CS_DEBUG_LOG (see _relay_client_debug_log_to_hub). None in legacy-relay mode.
 state._lm_control_plane = None
+# Open remote shell sessions, repo version and the reseed flag.
 _shell_sessions: dict[str, dict[str, Any]] = {}
 state._repo_ver = None
 state._proxmox_reseed_in_progress = False
@@ -2104,6 +2363,7 @@ state._hub_monitored_items = {"items": [], "has_sites": False, "assigned_sites":
 
 def _relay_diag_append(event: str, **kwargs: Any) -> None:
     """Append one entry to relay_diag_log, keeping the list capped."""
+    # Add the entry and drop the oldest beyond the limit.
     entry = {"ts": datetime.now().strftime("%Y-%m-%d %H:%M:%S"), "event": event, **kwargs}
     relay_diag_log.append(entry)
     if len(relay_diag_log) > _RELAY_DIAG_MAX:
@@ -2111,6 +2371,7 @@ def _relay_diag_append(event: str, **kwargs: Any) -> None:
 
 
 def _default_provision_run_state() -> dict[str, Any]:
+    """Return an empty provisioning run state (not running, no items)."""
     return {
         "running": False,
         "started_at": None,
@@ -2123,6 +2384,7 @@ def _default_provision_run_state() -> dict[str, Any]:
     }
 
 
+# Latest Proxmox state shown in the UI.
 proxmox_state: dict[str, Any] = {
     "connected": False,
     "last_seen": None,
@@ -2161,6 +2423,7 @@ _AUTOPROV_GATE_LOG_INTERVAL = 120.0
 
 def _autoprov_gate_log(reason_key: str, msg: str, *args: object) -> None:
     """Log an auto-provision gate decision at most once per _AUTOPROV_GATE_LOG_INTERVAL seconds."""
+    # Log only if this reason was not logged within the interval.
     now = time.time()
     if now - _autoprov_gate_log_ts.get(reason_key, 0.0) >= _AUTOPROV_GATE_LOG_INTERVAL:
         _autoprov_gate_log_ts[reason_key] = now
@@ -2184,6 +2447,7 @@ _SIM_TAG_PREFIX = "sim-"
 
 def _merge_sim_tags(current_tags_str: str, desired_sim_tags: list[str]) -> str:
     """Replace only sim-prefixed tags while preserving any manual Proxmox tags."""
+    # Keep non-sim tags, then add the wanted sim tags sorted and without duplicates.
     existing = [t.strip() for t in current_tags_str.split(';') if t.strip()]
     non_sim = [t for t in existing if not t.lower().startswith(_SIM_TAG_PREFIX)]
     merged = non_sim + sorted(set(t for t in desired_sim_tags if t))
@@ -2191,6 +2455,7 @@ def _merge_sim_tags(current_tags_str: str, desired_sim_tags: list[str]) -> str:
 
 
 def _sanitize_vm_set_override(value: Any) -> int:
+    """Return the VM set override (1..99), or 0 when not set or invalid."""
     try:
         bucket = int(value or 0)
     except (TypeError, ValueError):
@@ -2199,6 +2464,8 @@ def _sanitize_vm_set_override(value: Any) -> int:
 
 
 def _hostname_vm_set_number(hostname: Any) -> int:
+    """Return the VM set number from the digits at the end of the hostname (1 if none)."""
+    # No trailing digits means set 1.
     match = re.search(r"(\d+)$", _normalize_proxmox_hostname(hostname))
     if not match:
         return 1
@@ -2211,18 +2478,23 @@ def _hostname_vm_set_number(hostname: Any) -> int:
 
 async def _apply_sim_tags_for_vm(vmid: int, agent_hostname: str, desired_sim_tags: list[str], current_tags_str: str = "") -> None:
     """Call Proxmox REST API to update simulation tags on a single VM."""
+    # Skip if these tags were already applied to this VM.
     desired_set = frozenset(t for t in desired_sim_tags if t)
     cache_key = (agent_hostname, vmid)
     if state._vm_applied_sim_tags.get(cache_key) == desired_set:
         return  # no change since last apply
+    # Need a token and host to call the API.
     api_token = _get_proxmox_token_for_host(agent_hostname)
     if not api_token or not agent_hostname:
         return
+    # Build the VM config URL from the node's short host name and the token header.
     node_data = proxmox_states.get(agent_hostname, {}).get("node") or {}
     node = str(node_data.get("hostname") or agent_hostname).split(".")[0]
     url = f"https://{agent_hostname}:8006/api2/json/nodes/{node}/qemu/{vmid}/config"
     headers = {"Authorization": f"PVEAPIToken={api_token}"}
+    # Merge our sim tags with the VM's other tags.
     merged = _merge_sim_tags(current_tags_str, list(desired_set))
+    # Save the tags (Proxmox usually has a self-signed cert); remember them on success.
     try:
         async with httpx.AsyncClient(verify=False, timeout=8) as hc:
             resp = await hc.put(url, headers=headers, data={"tags": merged})
@@ -2232,14 +2504,17 @@ async def _apply_sim_tags_for_vm(vmid: int, agent_hostname: str, desired_sim_tag
         else:
             logger.debug("VM %s tag update failed: HTTP %s", vmid, resp.status_code)
     except Exception as exc:
+        # Errors are only logged at debug level; the next sweep retries.
         logger.debug("VM %s tag update error: %s", vmid, exc)
 
 
 async def _sync_sim_tags_for_client(client_hostname: str) -> None:
     """Immediately sync simulation tags for the VM matching this client hostname."""
+    # Nothing to do without a Proxmox token.
     if not _has_any_proxmox_token():
         return
     norm = client_hostname.strip().lower()
+    # Under the lock: find the client and its sim tags (none if offline).
     async with state_lock:
         client_data = clients.get(client_hostname) or clients.get(norm)
         if not client_data:
@@ -2249,6 +2524,7 @@ async def _sync_sim_tags_for_client(client_hostname: str) -> None:
         found_vmid: int | None = None
         found_agent: str | None = None
         current_tags = ""
+        # Find the client's VM (not a template or container) on any agent.
         for agent_hn, st in proxmox_states.items():
             for vm in (st.get("vms") or []):
                 if str(vm.get("name") or "").strip().lower() == norm and not vm.get("is_template") and vm.get("type") != "lxc":
@@ -2258,14 +2534,17 @@ async def _sync_sim_tags_for_client(client_hostname: str) -> None:
                     break
             if found_vmid:
                 break
+    # Apply the tags outside the lock.
     if found_vmid and found_agent:
         await _apply_sim_tags_for_vm(found_vmid, found_agent, sim_tags, current_tags)
 
 
 async def _sync_all_vm_sim_tags() -> None:
     """Sweep all known VMs and reconcile their simulation tags against live client data."""
+    # Nothing to do without a Proxmox token.
     if not _has_any_proxmox_token():
         return
+    # Under the lock: sim tags for each client (none if offline) and every agent's VMs.
     async with state_lock:
         now_dt = utcnow()
         client_sim_map: dict[str, tuple[list[str], str]] = {}  # norm_hostname → (sim_tags, current_tags)
@@ -2278,6 +2557,7 @@ async def _sync_all_vm_sim_tags() -> None:
             for hn, st in proxmox_states.items()
             for vm in (st.get("vms") or [])
         ]
+    # Update tags on each managed client VM (skipping templates and containers).
     for agent_hn, vm in agent_vms:
         vmid = vm.get("vmid")
         vm_name = str(vm.get("name") or "").strip().lower()
@@ -2293,6 +2573,7 @@ async def _sync_all_vm_sim_tags() -> None:
 async def _vm_sim_tag_sync_loop() -> None:
     """Background loop: sync simulation tags every 60 seconds."""
     while True:
+        # Every 60 s; errors are logged and the loop keeps going.
         await asyncio.sleep(60)
         try:
             await _sync_all_vm_sim_tags()
@@ -2340,6 +2621,7 @@ async def _broadcast_server_pressure() -> None:
     # Push throttle directive to all connected sim-client WS sessions concurrently
     throttle_msg = json.dumps({"type": "throttle", "interval": _server_pressure["throttle_interval"]})
     async def _send_one(ws: WebSocket) -> None:
+        """Send the throttle message to one client, ignoring errors (3 s limit)."""
         try:
             await asyncio.wait_for(ws.send_text(throttle_msg), timeout=3.0)
         except Exception:
@@ -2350,12 +2632,15 @@ async def _broadcast_server_pressure() -> None:
 
 async def _event_loop_lag_monitor() -> None:
     """Background task: measures asyncio event-loop lag and manages backpressure."""
+    # Imported here; only this task needs it.
     import random
     while True:
+        # Sleep 1 s and measure how much longer it really took.
         t0 = time.monotonic()
         await asyncio.sleep(1.0)
         lag = time.monotonic() - t0 - 1.0  # positive means loop was blocked
 
+        # Keep the last few samples.
         _loop_lag_samples.append(lag)
         if len(_loop_lag_samples) > _LOOP_LAG_WINDOW:
             _loop_lag_samples.pop(0)
@@ -2363,6 +2648,7 @@ async def _event_loop_lag_monitor() -> None:
         if len(_loop_lag_samples) < 3:
             continue  # not enough data yet
 
+        # Average the last 5 samples.
         avg_lag = sum(_loop_lag_samples[-5:]) / min(5, len(_loop_lag_samples))
         now = time.monotonic()
 
@@ -2393,6 +2679,7 @@ async def _event_loop_lag_monitor() -> None:
         else:
             new_level = current_level
 
+        # On a level change, update the pressure state, log it and tell everyone.
         if new_level != current_level:
             interval = next(i for _, i, l in _BP_LEVELS if l == new_level)
             _server_pressure.update({
@@ -2417,6 +2704,7 @@ def _resource_1h_average(samples: list[tuple[float, float]]) -> float | None:
     Older samples outside the 1-hour window are already pruned by
     _record_resource_samples(), so this always reflects recent history.
     """
+    # No samples: no average.
     if not samples:
         return None
     cutoff = time.time() - _RESOURCE_SAMPLE_WINDOW
@@ -2430,21 +2718,25 @@ def _resource_estimated_average(samples: list[tuple[float, float]]) -> float | N
     Used to show a live estimate in the UI while the 1-hour window fills.
     Returns None only when no samples have been recorded yet.
     """
+    # Plain average of all samples.
     vals = [v for _, v in samples]
     return sum(vals) / len(vals) if vals else None
 
 
 def _record_resource_samples(node: dict[str, Any], now: float) -> None:
     """Append a CPU and memory sample from the latest node telemetry."""
+    # Values from the node telemetry and the window start.
     cpu_pct = node.get("cpu_percent")
     mem_used = node.get("mem_used_kb")
     mem_total = node.get("mem_total_kb")
     cutoff = now - _RESOURCE_SAMPLE_WINDOW
+    # Add a CPU sample and drop samples older than the window.
     if cpu_pct is not None:
         if not state._resource_samples_started:
             state._resource_samples_started = now
         state._cpu_samples.append((now, float(cpu_pct)))
         state._cpu_samples[:] = [(ts, v) for ts, v in state._cpu_samples if ts >= cutoff]
+    # Add a memory sample as a percentage, if both values are valid.
     try:
         if mem_used is not None and mem_total:
             mem_total_f = float(mem_total)
@@ -2456,7 +2748,9 @@ def _record_resource_samples(node: dict[str, Any], now: float) -> None:
                 state._mem_samples[:] = [(ts, v) for ts, v in state._mem_samples if ts >= cutoff]
     except (TypeError, ValueError, ZeroDivisionError):
         pass
+    # Save to disk (rate-limited).
     _save_resource_cache()
+# Limit disk saves to once a minute.
 _RESOURCE_CACHE_SAVE_INTERVAL = 60.0  # persist at most once per minute
 state._resource_cache_last_saved = 0.0
 
@@ -2464,8 +2758,10 @@ state._resource_cache_last_saved = 0.0
 def _load_resource_cache() -> None:
     """Restore resource samples from disk so restarts don't reset the 1-hour window."""
     try:
+        # Nothing saved yet.
         if not RESOURCE_CACHE_FILE.exists():
             return
+        # Load samples still inside the window, and when sampling started.
         data = json.loads(RESOURCE_CACHE_FILE.read_text())
         cutoff = time.time() - _RESOURCE_SAMPLE_WINDOW
         loaded_cpu = [(float(ts), float(v)) for ts, v in (data.get("cpu_samples") or []) if float(ts) >= cutoff]
@@ -2491,15 +2787,18 @@ def _load_resource_cache() -> None:
             time.time() - state._resource_samples_started if state._resource_samples_started else 0,
         )
     except Exception:
+        # A bad cache is ignored.
         logger.debug("Could not load resource cache from %s", RESOURCE_CACHE_FILE, exc_info=True)
 
 
 def _save_resource_cache(force: bool = False) -> None:
     """Persist resource samples so the 1-hour window survives service restarts."""
+    # Rate-limit saves unless forced.
     now = time.time()
     if not force and (now - state._resource_cache_last_saved) < _RESOURCE_CACHE_SAVE_INTERVAL:
         return
     state._resource_cache_last_saved = now
+    # Save the samples and key state; errors are only logged at debug level.
     try:
         _atomic_write_json(RESOURCE_CACHE_FILE, {
             "cpu_samples": state._cpu_samples,
@@ -2520,6 +2819,7 @@ def _save_resource_cache(force: bool = False) -> None:
 
 
 # Ring buffer: last 500 agent log lines
+# Agent log and watchdog log buffers.
 proxmox_log_buffer: list[str] = []
 PROXMOX_LOG_MAX = 500
 proxmox_watchdog_log: list[dict[str, Any]] = []
@@ -2532,6 +2832,7 @@ _server_start_time: float = time.time()
 
 def _debug_event(event: str, detail: str = "", **extra: Any) -> None:
     """Append a timestamped debug event to the ring buffer."""
+    # Add the entry and drop the oldest beyond the limit.
     entry: dict[str, Any] = {"ts": time.time(), "event": event, "detail": detail, **extra}
     _debug_log.append(entry)
     if len(_debug_log) > _DEBUG_LOG_MAX:
@@ -2539,6 +2840,7 @@ def _debug_event(event: str, detail: str = "", **extra: Any) -> None:
 # Pending/approved Proxmox agent registry
 pending_proxmox_agents: dict[str, dict[str, Any]] = {}
 approved_proxmox_agents: dict[str, str] = dict(settings.get("proxmox_approved_agents", {}))
+# Fleet reclone run status.
 reclone_state: dict[str, Any] = {
     "status": "idle",
     "type": None,
@@ -2551,6 +2853,7 @@ reclone_state: dict[str, Any] = {
     "last_run": None,
     "started_at": None,
 }
+# VM watchdog entries and the "Update All" status.
 vm_watchdog: dict[str, dict[str, Any]] = {}
 state.update_all_state = {
     "running": False,
@@ -2562,6 +2865,7 @@ state.update_all_state = {
     "started_at": None,
     "error": None,
 }
+# Hub sites, background tasks, service health and other shared state.
 relay_sites: dict[str, dict[str, Any]] = {}
 background_tasks: dict[str, asyncio.Task[Any]] = {}
 service_health: dict[str, dict[str, Any]] = {}
@@ -2570,6 +2874,7 @@ state.last_schedule_trigger = None
 state._hub_repo_sync_task = None  # dedup guard for fire-and-forget repo_sync
 
 class ClientStatus(BaseModel):
+    """Status report a simulated client sends with each check-in."""
     hostname: str
     simulation_id: str
     platform: str
@@ -2587,12 +2892,14 @@ class ClientStatus(BaseModel):
 
 
 class ClientControlResponse(BaseModel):
+    """Response with a client's record and its current overrides."""
     hostname: str
     overrides: dict[str, str]
     client: dict[str, Any]
 
 
 class SettingsUpdate(BaseModel):
+    """Settings update from the UI; fields left as None are not changed."""
     proxmox_config: dict[str, Any] | None = None
     repo_branch: str | None = None
     github_token: str | None = None
@@ -2669,24 +2976,29 @@ class SettingsUpdate(BaseModel):
 
 
 class SimulationConfigUpdate(BaseModel):
+    """Changes to one section of simulation.conf."""
     section: str
     updates: dict[str, str] = Field(default_factory=dict)
 
 
 class OverridesSaveRequest(BaseModel):
+    """Override flags to save for one user."""
     username: str
     flags: dict[str, str] = Field(default_factory=dict)
 
 
 def utcnow() -> datetime:
+    """Return the current time in UTC."""
     return datetime.now(timezone.utc)
 
 
 def iso_utcnow() -> str:
+    """Return the current UTC time as ISO text ending in Z."""
     return utcnow().isoformat().replace("+00:00", "Z")
 
 
 def compute_online(last_seen: datetime) -> bool:
+    """Return True if last_seen is within OFFLINE_TIMEOUT seconds of now."""
     return (utcnow() - last_seen).total_seconds() <= OFFLINE_TIMEOUT
 
 
@@ -2697,10 +3009,12 @@ def _hostname_has_usb(hostname: str) -> bool:
     paths that classify every client (current_clients / telemetry relay), use
     ``_build_usb_index()`` once + ``_has_usb_from_index()`` per client instead,
     which turns O(clients × vms) into O(clients + vms)."""
+    # VM list and USB state from the latest telemetry.
     vms: list[dict[str, Any]] = proxmox_state.get("vms") or []
     usb_state: list[dict[str, Any]] = proxmox_state.get("usb_state") or []
     norm = hostname.strip().lower()
     vmid: str | None = None
+    # Find the VM with this name; a USB line in its config means it has USB.
     for vm in vms:
         if str(vm.get("name") or "").strip().lower() == norm:
             raw = vm.get("vmid")
@@ -2710,6 +3024,7 @@ def _hostname_has_usb(hostname: str) -> bool:
             if vm.get("has_usb_config") or vm.get("reclone_bus_path"):
                 return True
             break
+    # Otherwise check whether its VMID has a USB entry.
     if not usb_state:
         return False
     usb_vmids = {
@@ -2735,10 +3050,12 @@ def _build_usb_index() -> dict[str, bool]:
     consulted via ``_has_usb_from_index`` per client — the per-client
     ``_hostname_has_usb`` rescanned the whole VM/USB list for every client,
     making ``current_clients()`` / the telemetry relay O(clients × vms)."""
+    # VM list and USB state from the latest telemetry.
     vms: list[dict[str, Any]] = proxmox_state.get("vms") or []
     usb_state: list[dict[str, Any]] = proxmox_state.get("usb_state") or []
     index: dict[str, bool] = {}
     name_to_vmid: dict[str, str] = {}
+    # Mark each VM by name, noting its VMID and whether its config has USB.
     for vm in vms:
         name = str(vm.get("name") or "").strip().lower()
         if not name:
@@ -2752,6 +3069,7 @@ def _build_usb_index() -> dict[str, bool]:
             index[name] = True
         elif name not in index:
             index[name] = False
+    # Also mark VMs whose VMID or hostname appears in the USB state.
     if usb_state:
         usb_vmids = {
             str(d.get("vmid")).strip()
@@ -2777,9 +3095,15 @@ def _has_usb_from_index(hostname: str, index: dict[str, bool]) -> bool:
 
 def serialize_client(hostname: str, client: dict[str, Any],
                      usb_index: dict[str, bool] | None = None) -> dict[str, Any]:
+    """Return a client's record in the form the UI and hub expect.
+
+    Pass usb_index when serializing many clients so USB lookups are fast.
+    """
+    # Config, overrides, and the two merged (overrides win).
     config = {key: str(value) for key, value in client.get("config", {}).items()}
     overrides = {key: str(value) for key, value in client.get("overrides", {}).items()}
     effective_config = {**config, **overrides}
+    # Online if seen within the offline timeout.
     last_seen = client["last_seen"]
     online = compute_online(last_seen)
 
@@ -2809,6 +3133,7 @@ def serialize_client(hostname: str, client: dict[str, Any],
 
 
 async def current_clients() -> list[dict[str, Any]]:
+    """Return every client's record, sorted by hostname."""
     async with state_lock:
         # Build the USB index once (one pass over vms+usb_state) and reuse it
         # for every client — was O(clients × vms), now O(clients + vms).
@@ -2818,16 +3143,20 @@ async def current_clients() -> list[dict[str, Any]]:
 
 
 def _normalize_toggle(value: Any) -> str:
+    """Return "on" or "off" for a toggle given as text or boolean."""
     if isinstance(value, str):
         return "on" if value.lower() == "on" else "off"
     return "on" if value else "off"
 
 
 def _parse_json_list(value: Any) -> list[Any]:
+    """Return the value as a list, parsing JSON text if needed; [] if empty or invalid."""
+    # Lists pass through; blank means empty.
     if isinstance(value, list):
         return value
     if value in (None, ""):
         return []
+    # Parse text as JSON; anything but a list gives [].
     try:
         parsed = json.loads(str(value))
     except Exception:
@@ -2836,6 +3165,7 @@ def _parse_json_list(value: Any) -> list[Any]:
 
 
 def _ensure_json_list(value: str, field_name: str) -> str:
+    """Check that the text is a JSON array and return it re-serialized; raises 422 otherwise."""
     try:
         parsed = json.loads(value or "[]")
     except Exception as exc:
@@ -2846,6 +3176,7 @@ def _ensure_json_list(value: str, field_name: str) -> str:
 
 
 def _setting_int(key: str, default: int, minimum: int = 0) -> int:
+    """Return a setting as an int of at least minimum; default if missing or invalid."""
     try:
         value = int(str(settings.get(key, default)).strip())
     except (TypeError, ValueError, AttributeError):
@@ -2854,6 +3185,7 @@ def _setting_int(key: str, default: int, minimum: int = 0) -> int:
 
 
 def _setting_bool(key: str, default: bool = False) -> bool:
+    """Return a setting as a boolean (1, true, yes or on mean True)."""
     value = settings.get(key, default)
     if isinstance(value, str):
         return value.strip().lower() in {"1", "true", "yes", "on"}
@@ -2861,10 +3193,15 @@ def _setting_bool(key: str, default: bool = False) -> bool:
 
 
 def _parse_ts(value: Any) -> float | None:
+    """Return a timestamp in epoch seconds from a number, numeric text or ISO text; None if
+    invalid.
+    """
+    # Blank gives None; numbers are used as is.
     if value in (None, ""):
         return None
     if isinstance(value, (int, float)):
         return float(value)
+    # Text: try a number first, then an ISO date.
     if isinstance(value, str):
         raw = value.strip()
         if not raw:
@@ -2881,9 +3218,15 @@ def _parse_ts(value: Any) -> float | None:
 
 
 def _client_last_seen_for_hostname(hostname: Any, client_seen: dict[str, Any] | None = None) -> datetime | None:
+    """Return when the client with this hostname was last seen (case-insensitive), or None.
+
+    client_seen can supply a prebuilt hostname to last-seen map.
+    """
+    # Blank hostname matches nothing.
     normalized = str(hostname or "").strip().lower()
     if not normalized:
         return None
+    # Use the given map, or build one from the clients.
     seen_map = client_seen or {name: info.get("last_seen") for name, info in clients.items()}
     for candidate, last_seen in seen_map.items():
         if str(candidate or "").strip().lower() == normalized and isinstance(last_seen, datetime):
@@ -2892,6 +3235,8 @@ def _client_last_seen_for_hostname(hostname: Any, client_seen: dict[str, Any] | 
 
 
 def _vm_has_checked_in(hostname: Any, clone_completed_at: float | None, client_seen: dict[str, Any] | None = None) -> bool:
+    """Return True if the client has checked in since its clone was completed."""
+    # Unknown clone time means not checked in.
     if clone_completed_at is None:
         return False
     last_seen = _client_last_seen_for_hostname(hostname, client_seen)
@@ -2899,12 +3244,15 @@ def _vm_has_checked_in(hostname: Any, clone_completed_at: float | None, client_s
 
 
 def _vm_pending_checkin(vm: dict[str, Any], client_seen: dict[str, Any] | None = None) -> bool:
+    """Return True if the VM was cloned recently and its client has not checked in since."""
+    # VMs without a VMID or watchdog entry are not waiting.
     vmid_key = _vm_watchdog_key(vm.get("vmid"))
     if vmid_key is None:
         return False
     entry = vm_watchdog.get(vmid_key)
     if not entry:
         return False
+    # Compare the clone time with when the client was last seen.
     clone_completed_at = _parse_ts(entry.get("clone_completed_at"))
     hostname = str(entry.get("hostname") or vm.get("name") or "").strip()
     return not _vm_has_checked_in(hostname, clone_completed_at, client_seen)
@@ -2916,10 +3264,14 @@ proxmox_states: dict[str, dict[str, Any]] = {}
 
 
 def _autoprov_enabled() -> bool:
+    """Return True if USB auto-provisioning is on."""
     return _normalize_toggle(settings.get("usb_auto_provision", "off")) == "on"
 
 
 def _current_provision_halt(state: dict[str, Any] | None = None) -> Any:
+    """Return the provisioning halt from state (default: proxmox_state); None if auto-provisioning
+    is off.
+    """
     if not _autoprov_enabled():
         return None
     source = proxmox_state if state is None else state
@@ -2927,6 +3279,7 @@ def _current_provision_halt(state: dict[str, Any] | None = None) -> Any:
 
 
 def _clear_provision_halt_state() -> None:
+    """Clear the provisioning halt everywhere and save the change."""
     proxmox_state["provision_halt"] = None
     for state in proxmox_states.values():
         state["provision_halt"] = None
@@ -2936,6 +3289,7 @@ def _clear_provision_halt_state() -> None:
 
 def _client_os_counts() -> dict[str, int]:
     """Count connected clients by platform (linux/windows)."""
+    # Count clients by platform; other platforms are ignored.
     counts: dict[str, int] = {"linux": 0, "windows": 0}
     for c in clients.values():
         platform = str(c.get("platform", "")).lower()
@@ -2946,6 +3300,7 @@ def _client_os_counts() -> dict[str, int]:
 
 def _read_local_kill_switch() -> str:
     """Read kill_switch from the repo's configs/simulation.conf without full parse."""
+    # Find the kill_switch line; any unreadable value or error means "off".
     try:
         conf = (REPO_DIR / "configs" / "simulation.conf").read_text(encoding="utf-8")
         for line in conf.splitlines():
@@ -2958,6 +3313,11 @@ def _read_local_kill_switch() -> str:
 
 
 def _prepare_delete_vm_args(args: dict[str, Any] | None, strict: bool = True) -> dict[str, Any]:
+    """Check delete_vm args and return them with vmid, vm_type and vm_name filled in.
+
+    Raises an HTTP error for a bad VMID, templates, protected VMs, or (when strict) unknown VMs.
+    """
+    # Args must be an object with a valid integer VMID.
     if not isinstance(args, dict):
         raise HTTPException(status_code=422, detail="args must be an object")
     try:
@@ -2965,6 +3325,7 @@ def _prepare_delete_vm_args(args: dict[str, Any] | None, strict: bool = True) ->
     except (TypeError, ValueError):
         raise HTTPException(status_code=422, detail="A valid vmid is required") from None
 
+    # Look the VM up in the Proxmox inventory.
     vm = _find_proxmox_vm(vmid)
     if vm is None:
         # Allow re-delete of a VM that's already in pending-delete state (idempotent)
@@ -2985,11 +3346,13 @@ def _prepare_delete_vm_args(args: dict[str, Any] | None, strict: bool = True) ->
                 " (inventory not loaded)" if proxmox_state.get("vms") is None else "",
             )
             return {"vmid": vmid, "vm_type": str(args.get("vm_type") or "qemu")}
+    # Templates and protected VMs can't be deleted.
     if vm.get("is_template"):
         raise HTTPException(status_code=400, detail="Templates cannot be deleted from the VM list")
     if _is_protected_vmid(vmid):
         raise HTTPException(status_code=403, detail=f"VM {vmid} is protected and cannot be managed from this UI")
 
+    # Fill in the VMID, a valid VM type and the VM name.
     prepared = dict(args)
     prepared["vmid"] = vmid
     vm_type = str(vm.get("type") or "qemu").strip().lower()
@@ -3015,6 +3378,11 @@ def _derive_provision_run_item_status(
     usb_entry: dict[str, Any],
     vm_by_vmid: dict[str, dict[str, Any]],
 ) -> str:
+    """Return the provisioning step for a USB entry: cloning, configuring or done.
+
+    A VM that is still provisioning is "configuring" once it is running, else "cloning".
+    """
+    # Not provisioning means done.
     if str(usb_entry.get("prov_status") or "").strip().lower() != "provisioning":
         return "done"
     vm = vm_by_vmid.get(str(usb_entry.get("vmid"))) or {}
@@ -3023,6 +3391,7 @@ def _derive_provision_run_item_status(
 
 
 def _unlock_template_result(cmd: dict[str, Any]) -> dict[str, Any]:
+    """Return the hub result for a queued template unlock command."""
     return {
         "success": True,
         "queued": True,
@@ -3034,12 +3403,19 @@ def _unlock_template_result(cmd: dict[str, Any]) -> dict[str, Any]:
 
 
 async def auto_recovery_check() -> None:
+    """Background task: every 30 min, queue reclones for VMs silent longer than vm_silent_timeout.
+
+    Templates, VMIDs at or below 9000, VMs being deleted and VMs already queued are skipped.
+    """
+    # Wait 30 minutes first, then check every 30 minutes.
     await asyncio.sleep(1800)
     while True:
         try:
+            # Timeout in hours (at least 1) and the reclones queued in this pass.
             timeout_hours = _setting_int("vm_silent_timeout", 24, 1)
             now = time.time()
             triggered: list[int] = []
+            # Check each VM; skip ones without a VMID, templates and low VMIDs.
             for vm in list(proxmox_state.get("vms") or []):
                 vmid = vm.get("vmid")
                 if vmid is None:
@@ -3049,14 +3425,17 @@ async def auto_recovery_check() -> None:
                 # Skip VMs that are being intentionally deleted
                 if int(vmid) in _pending_delete_vmids:
                     continue
+                # Skip VMs seen within the timeout or already waiting for a reclone.
                 last_seen = _parse_ts(vm.get("last_seen"))
                 if last_seen is None or (now - last_seen) <= timeout_hours * 3600:
                     continue
                 vmid_int = int(vmid)
                 if _has_pending_reclone(vmid_int):
                     continue
+                # Queue a reclone and note it.
                 await _queue_proxmox_command("reclone_vm", {"vmid": vmid_int}, command_type="auto-recovery")
                 triggered.append(vmid_int)
+            # Log each queued VM (keeping the last 50), save, and tell UIs.
             if triggered:
                 vmid_list = ", ".join(str(v) for v in triggered)
                 for vmid_int in triggered:
@@ -3080,6 +3459,7 @@ async def auto_recovery_check() -> None:
                 await _broadcast_proxmox_state()
             _update_service_health("auto_recovery", ok=True)
         except asyncio.CancelledError:
+            # Cancellation must stop the task; other errors are recorded and logged.
             raise
         except Exception as exc:
             _update_service_health("auto_recovery", ok=False, error=str(exc))
@@ -3088,22 +3468,31 @@ async def auto_recovery_check() -> None:
 
 
 async def schedule_check() -> None:
+    """Background task: each minute, start the scheduled fleet reclone when its time comes.
+
+    Runs at most once per scheduled minute and never while a reclone is running.
+    """
+    # Weekday names in Python's weekday() order; check every 60 s.
     day_names = ["monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"]
     await asyncio.sleep(60)
     while True:
         try:
+            # Only when the schedule is on and no reclone is running.
             if _normalize_toggle(settings.get("reclone_schedule_enabled", "off")) == "on" and reclone_state.get("status") != "running":
                 parsed = _parse_reclone_schedule(settings.get("reclone_schedule_cron", "sunday 02:00"))
                 if parsed:
                     day, hour, minute = parsed
+                    # It is the scheduled day, hour and minute.
                     now = datetime.now()
                     if day_names[now.weekday()] == day and now.hour == hour and now.minute == minute:
+                        # Only trigger once for this minute.
                         trigger_key = now.strftime("%Y-%m-%d %H:%M")
                         if state.last_schedule_trigger != trigger_key:
                             state.last_schedule_trigger = trigger_key
                             asyncio.create_task(_run_rolling_reclone("scheduled"))
             _update_service_health("schedule_check", ok=True)
         except asyncio.CancelledError:
+            # Cancellation must stop the task; other errors are recorded and logged.
             raise
         except Exception as exc:
             _update_service_health("schedule_check", ok=False, error=str(exc))
@@ -3117,13 +3506,16 @@ async def gkill_switch_poller() -> None:
     """Fetch the global kill switch from solutions-hpe/main every 5 minutes.
     Serves as the authoritative value for /api/kill-switch — never relies on
     a local file so a forked repo cannot override it."""
+    # One HTTP client reused for every fetch.
     async with httpx.AsyncClient(timeout=10) as client:
         while True:
             try:
+                # Read the value; anything but on or off means off.
                 resp = await client.get(GKILL_SWITCH_URL)
                 value = resp.text.strip().lower()
                 if value not in ("on", "off"):
                     value = "off"
+                # Store it, and tell UIs if it changed.
                 prev = gkill_switch_state["value"]
                 gkill_switch_state["value"] = value
                 gkill_switch_state["last_fetched"] = time.time()
@@ -3133,6 +3525,7 @@ async def gkill_switch_poller() -> None:
                     await broadcast({"type": "gkill_switch_update", "value": value})
                 _update_service_health("gkill_switch", ok=True)
             except asyncio.CancelledError:
+                # Cancellation must stop the task; other errors are recorded and logged.
                 raise
             except Exception as exc:
                 gkill_switch_state["error"] = str(exc)
@@ -3144,9 +3537,12 @@ async def gkill_switch_poller() -> None:
 
 
 async def broadcast(message: dict[str, Any]) -> None:
+    """Send a message to every open UI websocket, dropping any that fail."""
+    # No UIs connected.
     if not ws_connections:
         return
 
+    # Serialize once, then send to each socket, noting the ones that fail.
     payload = json.dumps(message, default=str)
     stale: list[WebSocket] = []
     for websocket in list(ws_connections):
@@ -3155,16 +3551,19 @@ async def broadcast(message: dict[str, Any]) -> None:
         except Exception:
             stale.append(websocket)
 
+    # Remove failed sockets.
     for websocket in stale:
         with contextlib.suppress(ValueError):
             ws_connections.remove(websocket)
 
 
 async def broadcast_full_state() -> None:
+    """Send the full client list to every UI."""
     await broadcast({"type": "full_state", "clients": await current_clients()})
 
 
 def _relay_status_payload() -> dict[str, Any]:  # Build the relay status payload once so REST and websocket updates expose identical isolation data.
+    """Return the relay status for the UI, including spoke id and hub isolation details."""
     return {  # Merge relay, spoke, and isolation fields so the browser can render complete hub status from one payload.
         **dict(relay_state),  # Preserve the existing relay status fields so current UI behavior keeps working.
         "spoke_id": settings.get("relay_spoke_id", ""),  # Include the spoke identifier so live relay broadcasts keep the setup status grid populated.
@@ -3177,6 +3576,7 @@ def _relay_status_payload() -> dict[str, Any]:  # Build the relay status payload
 
 
 async def _broadcast_relay_state() -> None:
+    """Save the relay state and send its status to every UI."""
     _save_relay_state()
     await broadcast({"type": "relay_status", **_relay_status_payload()})
 
@@ -3220,6 +3620,7 @@ def _build_registration_config() -> dict[str, Any]:
 
 
 def _relay_ws_url(server_url: str, tenant_id: str, spoke_id: str, api_key: str) -> str:
+    """Return the hub websocket URL for this spoke (https becomes wss, http becomes ws)."""
     hub_base = _relay_hub_base_url(server_url, tenant_id)
     if hub_base.startswith("https://"):
         hub_base = "wss://" + hub_base[len("https://"):]
@@ -3229,6 +3630,8 @@ def _relay_ws_url(server_url: str, tenant_id: str, spoke_id: str, api_key: str) 
 
 
 async def _build_relay_telemetry_payload(spoke_id: str) -> dict[str, Any]:
+    """Build the telemetry message sent to the hub: clients, Proxmox, Central and status data."""
+    # Copy what we need under the lock.
     async with state_lock:
         proxmox_vms = list(proxmox_state.get("vms") or [])
         usb_state = list(proxmox_state.get("usb_state", []))
@@ -3238,6 +3641,7 @@ async def _build_relay_telemetry_payload(spoke_id: str) -> dict[str, Any]:
         usb_index = _build_usb_index()
         clients_snapshot = [serialize_client(hostname, clients[hostname], usb_index=usb_index)
                             for hostname in sorted(clients)]
+    # USB lists (outside the lock, as the original code does).
     present_usb = list(proxmox_state.get("present_usb", []))
     unknown_usb = list(proxmox_state.get("unknown_usb", []))
 
@@ -3276,6 +3680,7 @@ async def _build_relay_telemetry_payload(spoke_id: str) -> dict[str, Any]:
     sim_conf_content = _sim_conf_content_cache["content"]
     user_overrides_conf_content = _user_overrides_conf_content_cache["content"]
 
+    # The telemetry message.
     return {
         "spoke_id": spoke_id,
         "spoke_name": settings.get("relay_spoke_name", "").strip() or socket.gethostname(),
@@ -3388,20 +3793,24 @@ async def _build_relay_telemetry_payload(spoke_id: str) -> dict[str, Any]:
 
 # ── VNC relay ─────────────────────────────────────────────────────────────────
 
+# Open VNC sessions (frame queues) and one-time direct console sessions.
 _vnc_sessions: dict[str, asyncio.Queue] = {}
 _direct_console_sessions: dict[str, dict[str, Any]] = {}
 _DIRECT_CONSOLE_TTL = 60  # seconds until session token expires
 
 async def _handle_log_fetch(message: dict[str, Any]) -> None:
     """Fetch log lines from journal/agent/watchdog/install and send back to hub."""
+    # Read the request: id, log source and line count (10..2000, default 200).
     request_id = str(message.get("request_id") or "").strip()
     source = str(message.get("source") or "journal").strip().lower()
     lines = min(max(int(message.get("lines") or 200), 10), 2000)
 
+    # No request id: nobody to reply to.
     if not request_id:
         return
 
     async def _send_response(log_lines: list[str], error: str | None = None) -> None:
+        """Send the log lines (or an error) back to the hub, if the relay is connected."""
         if state._relay_ws_send_json is None:
             return
         out: dict[str, Any] = {
@@ -3418,6 +3827,7 @@ async def _handle_log_fetch(message: dict[str, Any]) -> None:
         await state._relay_ws_send_json(out)
 
     try:
+        # Agent logs come from the in-memory buffer.
         if source == "agent":
             log_lines = [str(l) for l in proxmox_log_buffer[-lines:]]
             if not log_lines:
@@ -3425,6 +3835,7 @@ async def _handle_log_fetch(message: dict[str, Any]) -> None:
             await _send_response(log_lines)
             return
 
+        # Watchdog and install logs are files; anything else means the journal.
         if source == "watchdog":
             log_path = Path("/var/log/proxmox-watchdog.log")
         elif source == "install":
@@ -3432,6 +3843,7 @@ async def _handle_log_fetch(message: dict[str, Any]) -> None:
         else:
             log_path = None
 
+        # Log file: send its last lines, or a note if it is missing or empty.
         if log_path is not None:
             if not log_path.exists():
                 await _send_response([f"[INFO] {log_path} does not exist yet."])
@@ -3447,6 +3859,7 @@ async def _handle_log_fetch(message: dict[str, Any]) -> None:
             return
 
         # journal
+        # Journal: send the last lines of the dashboard service, or a warning if empty.
         proc = await asyncio.create_subprocess_exec(
             "journalctl", "-u", "client-sim-dashboard", "--no-pager", "-n", str(lines),
             "--output=short-iso",
@@ -3463,16 +3876,19 @@ async def _handle_log_fetch(message: dict[str, Any]) -> None:
         return
 
     except Exception as exc:
+        # Any error is sent back as the error.
         await _send_response([], error=str(exc))
 
 
 async def _relay_shell_message(message: dict[str, Any]) -> None:
+    """Send a shell message to the hub; raises RuntimeError if the relay is not connected."""
     if state._relay_ws_send_json is None:
         raise RuntimeError("Hub relay is not connected")
     await state._relay_ws_send_json(message)
 
 
 def _resize_shell_fd(fd: int, cols: int, rows: int) -> None:
+    """Set the terminal size of a pty (at least 1x1; defaults 80x24)."""
     safe_cols = max(int(cols or 80), 1)
     safe_rows = max(int(rows or 24), 1)
     winsize = struct.pack("HHHH", safe_rows, safe_cols, 0, 0)
@@ -3480,13 +3896,17 @@ def _resize_shell_fd(fd: int, cols: int, rows: int) -> None:
 
 
 async def _terminate_shell_process(proc: subprocess.Popen[Any]) -> int | None:
+    """Stop a shell's process group (HUP, then TERM, then KILL) and return its exit code."""
+    # Already exited.
     if proc.poll() is not None:
         return proc.returncode
+    # Send SIGHUP and wait up to 2 s.
     with contextlib.suppress(ProcessLookupError):
         os.killpg(proc.pid, signal.SIGHUP)
     try:
         return await asyncio.wait_for(asyncio.to_thread(proc.wait), timeout=2)
     except asyncio.TimeoutError:
+        # Still running: SIGTERM and wait 3 s, then SIGKILL.
         with contextlib.suppress(ProcessLookupError):
             os.killpg(proc.pid, signal.SIGTERM)
         try:
@@ -3500,10 +3920,13 @@ async def _terminate_shell_process(proc: subprocess.Popen[Any]) -> int | None:
 
 
 async def _cleanup_shell_session(session_id: str, *, exit_code: int | None = None, notify_exit: bool = True) -> None:
+    """Close a shell session: stop its reader and process, close the pty, and tell the hub."""
+    # Unknown session: nothing to do.
     session = _shell_sessions.pop(session_id, None)
     if not session:
         return
 
+    # Cancel the reader task, unless that is the task calling us.
     current_task = asyncio.current_task()
     reader_task = session.get("reader_task")
     if reader_task is not None and reader_task is not current_task and not reader_task.done():
@@ -3511,6 +3934,7 @@ async def _cleanup_shell_session(session_id: str, *, exit_code: int | None = Non
         with contextlib.suppress(asyncio.CancelledError):
             await reader_task
 
+    # Stop the process (or just reap it if we already know the exit code).
     proc = session.get("process")
     if proc is not None:
         if exit_code is None:
@@ -3519,11 +3943,13 @@ async def _cleanup_shell_session(session_id: str, *, exit_code: int | None = Non
             with contextlib.suppress(Exception):
                 await asyncio.to_thread(proc.wait)
 
+    # Close the pty.
     master_fd = session.get("pty_fd")
     if isinstance(master_fd, int):
         with contextlib.suppress(OSError):
             os.close(master_fd)
 
+    # Tell the hub the shell has exited.
     if notify_exit and state._relay_ws_send_json is not None:
         with contextlib.suppress(Exception):
             await _relay_shell_message({
@@ -3534,30 +3960,41 @@ async def _cleanup_shell_session(session_id: str, *, exit_code: int | None = Non
 
 
 async def _close_all_shell_sessions(*, notify_exit: bool = False) -> None:
+    """Close every open shell session."""
     for session_id in list(_shell_sessions):
         await _cleanup_shell_session(session_id, notify_exit=notify_exit)
 
 
 async def _shell_reader_loop(session_id: str) -> None:
+    """Read output from a shell's pty and send it to the hub until the shell ends.
+
+    Always cleans up the session when it stops.
+    """
+    # Session already gone.
     session = _shell_sessions.get(session_id)
     if not session:
         return
 
+    # The shell process and pty, plus exit tracking.
     proc = session["process"]
     pty_fd = session["pty_fd"]
     notify_exit = True
     exit_code: int | None = None
     try:
+        # Wait until the pty has data, then read it.
         while True:
             await _wait_for_fd_readable(pty_fd)
             try:
                 data = os.read(pty_fd, 4096)
             except OSError as exc:
+                # EIO or EBADF mean the shell closed the pty.
                 if exc.errno in {errno.EIO, errno.EBADF}:
                     break
                 raise
+            # End of output.
             if not data:
                 break
+            # Send the output to the hub; if that fails, stop (the hub can't hear an exit either).
             try:
                 await _relay_shell_message({
                     "type": "shell_data",
@@ -3568,27 +4005,37 @@ async def _shell_reader_loop(session_id: str) -> None:
                 notify_exit = False
                 logger.warning("Shell relay send failed for session %s: %s", session_id, exc)
                 break
+        # Get the exit code, waiting for the process if needed.
         exit_code = proc.poll()
         if exit_code is None:
             exit_code = await asyncio.to_thread(proc.wait)
     except asyncio.CancelledError:
+        # Cancellation must propagate; other errors are logged.
         raise
     except Exception as exc:
         logger.warning("Shell reader failed for session %s: %s", session_id, exc)
         exit_code = proc.poll()
     finally:
+        # Always clean up.
         await _cleanup_shell_session(session_id, exit_code=exit_code, notify_exit=notify_exit)
 
 
 async def _start_shell_session(command: dict[str, Any]) -> str:
+    """Start an interactive bash in a new pty for the hub and return the session id.
+
+    Any existing session with the same id is closed first.
+    """
+    # Use the hub's session id, or make one; close any old session with that id.
     requested_session_id = str(command.get("session_id") or "").strip()
     session_id = requested_session_id or str(uuid.uuid4())
     await _cleanup_shell_session(session_id, notify_exit=False)
 
+    # bash must be available.
     shell_path = shutil.which("bash") or "/bin/bash"
     if not Path(shell_path).exists():
         raise RuntimeError("bash is not installed on the spoke host")
 
+    # Open a pty and start bash on it in its own session (process group).
     pty_fd, child_fd = pty.openpty()
     try:
         os.set_blocking(pty_fd, False)
@@ -3605,6 +4052,7 @@ async def _start_shell_session(command: dict[str, Any]) -> str:
             close_fds=True,
         )
     except Exception:
+        # On failure close our end; always close the child's end in this process.
         with contextlib.suppress(OSError):
             os.close(pty_fd)
         raise
@@ -3612,6 +4060,7 @@ async def _start_shell_session(command: dict[str, Any]) -> str:
         with contextlib.suppress(OSError):
             os.close(child_fd)
 
+    # Set the terminal size, register the session and start reading its output.
     cols = int(command.get("cols") or 80)
     rows = int(command.get("rows") or 24)
     _resize_shell_fd(pty_fd, cols, rows)
@@ -3622,14 +4071,21 @@ async def _start_shell_session(command: dict[str, Any]) -> str:
     }
     reader_task = asyncio.create_task(_shell_reader_loop(session_id))
     _shell_sessions[session_id]["reader_task"] = reader_task
+    # Tell the hub the shell is ready.
     await _relay_shell_message({"type": "shell_started", "session_id": session_id})
     return session_id
 
 
 async def _handle_shell_relay_message(message: dict[str, Any]) -> None:
+    """Handle a shell message from the hub: start, input, resize or exit.
+
+    Raises RuntimeError for unknown sessions or message types.
+    """
+    # Message type and session id.
     msg_type = str(message.get("type") or "").strip().lower()
     session_id = str(message.get("session_id") or "").strip()
 
+    # Start: open a shell, or report the failure to the hub as an exit.
     if msg_type == "shell_start":
         try:
             await _start_shell_session(message)
@@ -3643,12 +4099,14 @@ async def _handle_shell_relay_message(message: dict[str, Any]) -> None:
             })
         return
 
+    # Other messages need a known session (exit for an unknown one is ignored).
     session = _shell_sessions.get(session_id)
     if not session:
         if msg_type == "shell_exit":
             return
         raise RuntimeError(f"Unknown shell session: {session_id}")
 
+    # Input goes to the pty; resize changes its size; exit closes the session.
     pty_fd = session["pty_fd"]
     if msg_type == "shell_input":
         data = message.get("data")
@@ -3665,9 +4123,16 @@ async def _handle_shell_relay_message(message: dict[str, Any]) -> None:
 
 
 async def _apply_relay_command_batch(remote_cmds: list[dict[str, Any]], ack_fn) -> None:
+    """Process a batch of commands from the hub, acknowledging each through ack_fn.
+
+    Each command type is handled in its own branch below; Proxmox commands are queued for the
+    agent.
+    """
+    # Tracking for queued commands, so the queue is saved and broadcast once.
     commands_changed = False
     serialized_commands: list[dict[str, Any]] | None = None
     queued_targets: list[str] = []
+    # Read each command's fields (some may be inside payload) and trace it.
     for rc in remote_cmds:
         cmd_id = rc.get("id", "")
         cmd_type = rc.get("type", "")
@@ -3680,6 +4145,7 @@ async def _apply_relay_command_batch(remote_cmds: list[dict[str, Any]], ack_fn) 
                args={k: v for k, v in (args or {}).items() if k in {"vmid", "vm_type", "vm_name"}},
                cmd_id=cmd_id)
 
+        # Backup and reseed go straight to the Proxmox agent.
         if cmd_type in {"backup", "reseed"}:
             try:
                 result = await _forward_hub_passthrough_to_proxmox(cmd_type, payload_data)
@@ -3695,6 +4161,7 @@ async def _apply_relay_command_batch(remote_cmds: list[dict[str, Any]], ack_fn) 
                 await ack_fn(cmd_id, "executed", result)
             continue
 
+        # Commands blocked during a reseed are refused.
         if _hub_command_blocked_by_reseed(cmd_type, target, normalized_action):
             logger.warning("Rejecting hub %s command while reseed is in progress", cmd_type or normalized_action or target)
             if cmd_id:
@@ -3707,12 +4174,14 @@ async def _apply_relay_command_batch(remote_cmds: list[dict[str, Any]], ack_fn) 
                 await ack_fn(cmd_id, "executed", result)  # Ack the skipped command so the hub inbox does not keep replaying a push we refuse while isolated.
             continue  # Stop before any config mutation because isolation means the current config must keep running unchanged.
 
+        # Apply a config push from the hub.
         if cmd_type == "config_update":
             result = await _apply_hub_config(payload_data)
             if cmd_id:
                 await ack_fn(cmd_id, "executed", result)
             continue
 
+        # Hub releases config control: we manage our own config again.
         if cmd_type == "config_clear":
             settings["hub_managed"] = False
             _save_settings()
@@ -3728,6 +4197,7 @@ async def _apply_relay_command_batch(remote_cmds: list[dict[str, Any]], ack_fn) 
                 })
             continue
 
+        # Set the global kill switch.
         if cmd_type == "gkill_switch":
             new_val = (payload_data.get("value") or action or "").strip()
             if new_val in ("on", "off"):
@@ -3743,6 +4213,7 @@ async def _apply_relay_command_batch(remote_cmds: list[dict[str, Any]], ack_fn) 
                 })
             continue
 
+        # Start a repo sync in the background unless one is already running.
         if cmd_type == "repo_sync":
             already_running = state._hub_repo_sync_task is not None and not state._hub_repo_sync_task.done()
             if cmd_id:
@@ -3757,18 +4228,21 @@ async def _apply_relay_command_batch(remote_cmds: list[dict[str, Any]], ack_fn) 
                 state._hub_repo_sync_task = asyncio.create_task(_run_hub_repo_sync())
             continue
 
+        # Start a self-update in the background.
         if cmd_type == "self_update":
             if cmd_id:
                 await ack_fn(cmd_id, "executed", {"task_type": "self_update", "detail": "Self-update triggered"})
             asyncio.create_task(_run_self_update())
             continue
 
+        # Refresh the WebUI files in the background.
         if cmd_type == "refresh_webui":
             asyncio.create_task(refresh_webui_frontend())
             if cmd_id:
                 await ack_fn(cmd_id, "executed", {"task_type": "refresh_webui", "detail": "WebUI refresh triggered"})
             continue
 
+        # Queue an update for the Proxmox agent.
         if cmd_type == "proxmox_agent_update":
             try:
                 result = await _queue_proxmox_agent_update()
@@ -3778,6 +4252,7 @@ async def _apply_relay_command_batch(remote_cmds: list[dict[str, Any]], ack_fn) 
                 await ack_fn(cmd_id, "executed", result)
             continue
 
+        # Approve a Proxmox agent (giving it a new key) or confirm it is already approved.
         if cmd_type == "proxmox_approve_agent":
             hostname = str(payload_data.get("hostname") or "").strip()
             try:
@@ -3798,6 +4273,7 @@ async def _apply_relay_command_batch(remote_cmds: list[dict[str, Any]], ack_fn) 
                         if pending_hostname:
                             pending_proxmox_agents.pop(pending_hostname, None)
                             pending_payload = _pending_proxmox_payload()
+                # Tell UIs about the change and build the result.
                 if pending_payload is not None:
                     await broadcast({"type": "proxmox_pending_update", "pending": pending_payload})
                 await _broadcast_proxmox_state()
@@ -3808,6 +4284,7 @@ async def _apply_relay_command_batch(remote_cmds: list[dict[str, Any]], ack_fn) 
                 await ack_fn(cmd_id, "executed", result)
             continue
 
+        # Revoke a Proxmox agent: remove its key and save.
         if cmd_type == "proxmox_revoke_agent":
             hostname = str(payload_data.get("hostname") or "").strip()
             try:
@@ -3824,11 +4301,13 @@ async def _apply_relay_command_batch(remote_cmds: list[dict[str, Any]], ack_fn) 
                 await ack_fn(cmd_id, "executed", result)
             continue
 
+        # Run a one-off command on the Proxmox agent, falling back to its inbox queue.
         if cmd_type == "proxmox_agent_command":
             import uuid as _uuid_mod
             _action = (payload_data or {}).get("action", "")
             _args = (payload_data or {}).get("args", {})
             try:
+                # Send it straight over the agent's websocket with a new command id.
                 result = await _forward_hub_passthrough_to_proxmox("command", {
                     "id": str(_uuid_mod.uuid4()),
                     "action": _action,
@@ -3850,11 +4329,13 @@ async def _apply_relay_command_batch(remote_cmds: list[dict[str, Any]], ack_fn) 
                 except Exception as exc2:
                     result = {"success": False, "task_type": "proxmox_agent_command", "detail": str(exc2)}
             except Exception as exc:
+                # Any other error fails the command.
                 result = {"success": False, "task_type": "proxmox_agent_command", "detail": str(exc)}
             if cmd_id:
                 await ack_fn(cmd_id, "executed", result)
             continue
 
+        # Queue a template unlock for the agent.
         if cmd_type == "unlock_template":
             try:
                 cmd = await _queue_unlock_template_command("unlock_template")
@@ -3865,6 +4346,7 @@ async def _apply_relay_command_batch(remote_cmds: list[dict[str, Any]], ack_fn) 
                 await ack_fn(cmd_id, "executed", result)
             continue
 
+        # Reset the reclone status to idle, unless a run is in progress.
         if cmd_type == "clear_reclone_state":
             _status = reclone_state.get("status", "idle")
             if _status != "running":
@@ -3880,11 +4362,13 @@ async def _apply_relay_command_batch(remote_cmds: list[dict[str, Any]], ack_fn) 
                 await ack_fn(cmd_id, "executed", result)
             continue
 
+        # Start a fleet reclone (optionally setting its concurrency).
         if cmd_type == "proxmox_reclone_all":
             try:
                 concurrency = int(payload_data.get("concurrency", 0) or 0)
                 if concurrency > 0:
                     settings["reclone_concurrency"] = str(concurrency)
+                # Only one run at a time.
                 if reclone_state.get("status") == "running":
                     result = {
                         "success": True,
@@ -3894,6 +4378,7 @@ async def _apply_relay_command_batch(remote_cmds: list[dict[str, Any]], ack_fn) 
                         "timestamp": datetime.now(timezone.utc).isoformat(),
                     }
                 else:
+                    # Nothing to reclone and no dongles to provision: report why.
                     eligible = _reclone_targets_for_run()
                     unassigned_dongles = _proxmox_unassigned_present_usb()
                     if not eligible and not unassigned_dongles:
@@ -3908,6 +4393,7 @@ async def _apply_relay_command_batch(remote_cmds: list[dict[str, Any]], ack_fn) 
                             "timestamp": datetime.now(timezone.utc).isoformat(),
                         }
                     else:
+                        # Otherwise start the run in the background.
                         asyncio.create_task(_run_rolling_reclone("fleet"))
                         result = {
                             "success": True,
@@ -3920,6 +4406,7 @@ async def _apply_relay_command_batch(remote_cmds: list[dict[str, Any]], ack_fn) 
                             "timestamp": datetime.now(timezone.utc).isoformat(),
                         }
             except Exception as exc:
+                # Any error fails the command.
                 logger.exception("Hub proxmox_reclone_all failed")
                 result = {
                     "success": False,
@@ -3932,9 +4419,11 @@ async def _apply_relay_command_batch(remote_cmds: list[dict[str, Any]], ack_fn) 
                 await ack_fn(cmd_id, "executed", result)
             continue
 
+        # Any other command needs a target and an action.
         if not target or not action:
             _trace("hub_relay_skip", reason="empty target or action", target=target, action=action)
             continue
+        # Queue it for the target (or for every client if the target is "all").
         try:
             async with state_lock:
                 if target == "all":
@@ -3946,6 +4435,7 @@ async def _apply_relay_command_batch(remote_cmds: list[dict[str, Any]], ack_fn) 
                     queued_targets.append(target)
                     _enqueue_command_locked(target, action, args, command_type=cmd_type, relay=True)
                 serialized_commands = _serialize_commands()
+            # Trace whether the target is connected, then ack the command as queued.
             agent_connected = state.proxmox_ws_connection is not None if target == "proxmox" else bool(client_ws_connections.get(target))
             _trace("hub_relay_enqueued", target=target, action=action, cmd_id=cmd_id,
                    agent_connected=agent_connected)
@@ -3953,6 +4443,7 @@ async def _apply_relay_command_batch(remote_cmds: list[dict[str, Any]], ack_fn) 
             if cmd_id:
                 await ack_fn(cmd_id, "queued", None)
         except Exception as exc:
+            # Queueing failed: ack with the error.
             logger.warning("Hub relay: failed to enqueue %s/%s %s: %s", target, action, args, exc)
             _trace("hub_relay_enqueue_err", target=target, action=action, error=str(exc))
             if cmd_id:
@@ -3963,6 +4454,7 @@ async def _apply_relay_command_batch(remote_cmds: list[dict[str, Any]], ack_fn) 
                     "timestamp": datetime.now(timezone.utc).isoformat(),
                 })
 
+    # Tell UIs about new commands and push them to connected targets.
     if commands_changed and serialized_commands is not None:
         await broadcast({"type": "commands_update", "commands": serialized_commands})
         await _push_pending_commands_for_targets(queued_targets)
@@ -3971,21 +4463,26 @@ async def _apply_relay_command_batch(remote_cmds: list[dict[str, Any]], ack_fn) 
 async def _apply_hub_config(payload: dict[str, Any]) -> dict[str, Any]:
     """Apply a config_update command payload pushed from hub.
     Returns an ack result dict."""
+    # The config may be under "config" or be the payload itself.
     raw_config = payload.get("config") if isinstance(payload.get("config"), dict) else payload
     config_payload = raw_config if isinstance(raw_config, dict) else {}
     config_version = int(payload.get("config_version") or payload.get("__config_version") or 0)
     if _hub_isolated():  # Refuse fresh hub config while isolated so the spoke keeps running its last known-good config during hub outages.
         return _hub_config_isolation_result("config_update")  # Return an explicit skip result so callers can ack the safeguard instead of pretending the config applied.
+    # Track changed keys; the hub now manages our config.
     changed: list[str] = []
     settings["hub_managed"] = True
 
+    # Central API settings: None clears them; a dict is merged in.
     central_changed = False
     central_api_payload = config_payload.get("central_api") if "central_api" in config_payload else ...
     if central_api_payload is not ...:
+        # Cleared: use defaults and let the hub poll Central.
         if central_api_payload is None:
             settings["central_api"] = _default_central_api_settings()
             settings["hub_aruba_polling_mode"] = "centralized"
         elif isinstance(central_api_payload, dict):
+            # Merge the mode and the classic and new Central fields; we poll Central ourselves.
             merged_api = _normalize_central_api_settings(settings.get("central_api", {}), settings.get("central_config", {}))
             mode = str(central_api_payload.get("mode", merged_api.get("mode", "classic"))).strip().lower()
             merged_api["mode"] = mode if mode in {"classic", "central"} else "classic"
@@ -4008,6 +4505,7 @@ async def _apply_hub_config(payload: dict[str, Any]) -> dict[str, Any]:
         changed.append("central_api")
         central_changed = True
 
+    # Runtime Central config: None resets it; a dict is merged in.
     central_config_payload = config_payload.get("central_config") if "central_config" in config_payload else ...
     if central_config_payload is not ...:
         if central_config_payload is None:
@@ -4035,6 +4533,7 @@ async def _apply_hub_config(payload: dict[str, Any]) -> dict[str, Any]:
         changed.append("central_config")
         central_changed = True
 
+    # When Central settings changed, keep the two Central configs in sync and reset the token.
     if central_changed:
         merged_api = _normalize_central_api_settings(settings.get("central_api", {}), settings.get("central_config", {}))
         merged_cfg = dict(settings.get("central_config", {}))
@@ -4050,6 +4549,7 @@ async def _apply_hub_config(payload: dict[str, Any]) -> dict[str, Any]:
             central_token["refresh_token"] = None
             central_token["expires_at"] = 0.0
         else:
+            # Classic: use the pasted token from the config, valid for 2 hours.
             merged_api["mode"] = "classic"
             merged_api["classic"].update({
                 "url": str(merged_cfg.get("cluster_url", "")).strip(),
@@ -4060,6 +4560,7 @@ async def _apply_hub_config(payload: dict[str, Any]) -> dict[str, Any]:
         settings["central_api"] = merged_api
         settings["central_config"] = merged_cfg
 
+    # Notification settings, nested or top-level, mapped to our names (None clears a value).
     notifications = copy.deepcopy(settings.get("notifications", {}))
     notification_changed = False
     if isinstance(config_payload.get("notifications"), dict):
@@ -4079,6 +4580,7 @@ async def _apply_hub_config(payload: dict[str, Any]) -> dict[str, Any]:
         settings["notifications"] = notifications
 
     # ── github_config (Wave 2 Setup → GitHub) ────────────────────────────────
+    # GitHub settings: None clears them; a dict is merged in (None values become blank).
     github_payload = config_payload.get("github_config") if "github_config" in config_payload else ...
     if github_payload is not ...:
         if github_payload is None:
@@ -4098,6 +4600,7 @@ async def _apply_hub_config(payload: dict[str, Any]) -> dict[str, Any]:
     # ── security_config (Wave 2 Setup → Security: spoke-local dashboard auth) ─
     security_payload = config_payload.get("security_config") if "security_config" in config_payload else ...
     if security_payload is not ...:
+        # Security settings: None clears them; a dict is merged in.
         if security_payload is None:
             settings["security_config"] = {"session_timeout_minutes": "", "auth_provider": ""}
         elif isinstance(security_payload, dict):
@@ -4111,6 +4614,7 @@ async def _apply_hub_config(payload: dict[str, Any]) -> dict[str, Any]:
 
     # ── central_sites_config (Wave 2 Setup → Central API / Wave 3 Central) ──
     csc_payload = config_payload.get("central_sites_config") if "central_sites_config" in config_payload else ...
+    # Central sites settings: None clears them; a dict replaces them.
     if csc_payload is not ...:
         if csc_payload is None:
             settings["central_sites_config"] = {}
@@ -4136,6 +4640,7 @@ async def _apply_hub_config(payload: dict[str, Any]) -> dict[str, Any]:
                     changed.append("hardware_checks")
         changed.append("central_sites_config")
 
+    # Copy every other plain key; keys handled above or relay keys are skipped.
     for key, value in config_payload.items():
         if key in HUB_RELAY_KEYS or key in {"command", "config", "config_version", "__config_version", "central_api", "central_config", "central_sites_config", "notifications", "github_config", "security_config", "sim_conf_override", "user_conf_override", *HUB_NOTIFICATION_KEY_MAP.keys()}:
             continue
@@ -4149,6 +4654,7 @@ async def _apply_hub_config(payload: dict[str, Any]) -> dict[str, Any]:
                 # Spoke is not hub-managed — leave the local allowlist untouched.
                 continue
             # Hub-managed: fall through and let the hub value replace the local one.
+        # On/off toggles are normalized; None becomes blank.
         if key in {"usb_auto_provision", "reclone_schedule_enabled", "spoke_tls"}:
             settings[key] = _normalize_relay_enabled(value)
         elif value is None:
@@ -4175,6 +4681,7 @@ async def _apply_hub_config(payload: dict[str, Any]) -> dict[str, Any]:
     # The hub pushes optional INI text for simulation.conf and user-overrides.conf.
     # None = no override (spoke uses its GitHub-pulled files as-is).
     # Non-None string = write to hub-*-overrides.conf so the spoke merges it on top.
+    # Write or remove each override file the hub sent.
     for override_key, override_filename in (
         ("sim_conf_override",  "hub-sim-overrides.conf"),
         ("user_conf_override", "hub-user-overrides.conf"),
@@ -4184,12 +4691,14 @@ async def _apply_hub_config(payload: dict[str, Any]) -> dict[str, Any]:
         override_text = config_payload[override_key]
         override_path = REPO_DIR / "configs" / override_filename
         try:
+            # None removes the file.
             if override_text is None:
                 # Hub cleared the override — remove local file so GitHub file applies.
                 if override_path.exists():
                     override_path.unlink()
                     changed.append(f"{override_key}:cleared")
             else:
+                # Text is written through a temp file and renamed into place.
                 override_path.parent.mkdir(parents=True, exist_ok=True)
                 tmp = override_path.with_suffix(".tmp")
                 tmp.write_text(str(override_text), encoding="utf-8")
@@ -4201,6 +4710,7 @@ async def _apply_hub_config(payload: dict[str, Any]) -> dict[str, Any]:
     # Invalidate simulation.conf INI cache so the merged result is recomputed.
     _sim_conf_cache["sim_mtime"] = -1.0
 
+    # Save, tell UIs and return the result.
     _save_settings()
     await broadcast({"type": "settings_update", "settings": await api_settings_get()})
     logger.info("Applied hub config_update v%s: %s", config_version or "?", changed)
@@ -4215,16 +4725,19 @@ async def _apply_hub_config(payload: dict[str, Any]) -> dict[str, Any]:
 async def relay_sync_once() -> None:
     """One relay cycle: register if needed, check approval if pending,
     then post telemetry, fetch inbox, process commands, and ack each."""
+    # Relay off or no hub URL: mark disabled and stop.
     if settings.get("relay_enabled") != "on" or not settings.get("relay_server_url"):
         relay_state["enabled"] = False
         _save_relay_state()
         return
 
+    # httpx is required for the HTTP relay.
     if not _HTTPX_AVAILABLE or httpx is None:
         relay_state.update({"enabled": True, "connected": False, "error": "httpx not installed"})
         await _broadcast_relay_state()
         return
 
+    # Hub URL, spoke id and credentials.
     relay_state["enabled"] = True
     server_url = settings["relay_server_url"].rstrip("/")
     spoke_id = _ensure_relay_spoke_id()
@@ -4237,6 +4750,7 @@ async def relay_sync_once() -> None:
         await _broadcast_relay_state()
         return
 
+    # After startup or a reset, ask the hub for our current registration first.
     if state.relay_registration_refresh_needed:
         await _hub_check_approval(server_url, spoke_id)
         spoke_id = settings.get("relay_spoke_id", spoke_id)
@@ -4256,11 +4770,13 @@ async def relay_sync_once() -> None:
 
     # ── Phase 3: Approved — full relay cycle ───────────────────────────────────
     relay_state["registration_status"] = "approved"
+    # Build the hub URLs for this spoke.
     headers = {"X-API-Key": api_key}
     hub_base = _relay_hub_base_url(server_url, tenant_id)
     base = f"{hub_base}/api/{tenant_id}/spokes/{spoke_id}"
 
     try:
+        # Build telemetry, then send it and fetch our inbox.
         telemetry = await _build_relay_telemetry_payload(spoke_id)
 
         async with httpx.AsyncClient(timeout=10, verify=_hub_tls_verify()) as hc:
@@ -4285,12 +4801,15 @@ async def relay_sync_once() -> None:
                     state._hub_monitored_items = mon_resp.json()
             except Exception as _mon_exc:
                 logger.debug("Monitored items fetch failed: %s", _mon_exc)
+            # Read the commands from the inbox; anything but a list means none.
             resp.raise_for_status()
             remote_cmds = _parse_upstream_json(resp)
 
         if not isinstance(remote_cmds, list):
             remote_cmds = []
 
+        # Process each command, acking it to the hub; most branches match
+        # _apply_relay_command_batch.
         commands_changed = False
         serialized_commands: list[dict[str, Any]] | None = None
         queued_targets: list[str] = []
@@ -4303,6 +4822,7 @@ async def relay_sync_once() -> None:
             normalized_action = _normalize_command_action(action)
             args = rc.get("args", {}) or payload_data.get("args", {})
 
+            # Backup and reseed go straight to the Proxmox agent.
             if cmd_type in {"backup", "reseed"}:
                 try:
                     result = await _forward_hub_passthrough_to_proxmox(cmd_type, payload_data)
@@ -4324,6 +4844,7 @@ async def relay_sync_once() -> None:
                         ack_resp.raise_for_status()
                 continue
 
+            # Commands blocked during a reseed are refused.
             if _hub_command_blocked_by_reseed(cmd_type, target, normalized_action):
                 logger.warning("Rejecting hub %s command while reseed is in progress", cmd_type or normalized_action or target)
                 if cmd_id:
@@ -4361,6 +4882,7 @@ async def relay_sync_once() -> None:
                         ack_resp.raise_for_status()
                 continue
 
+            # Hub releases config control: we manage our own config again.
             if cmd_type == "config_clear":
                 settings["hub_managed"] = False
                 _save_settings()
@@ -4404,6 +4926,7 @@ async def relay_sync_once() -> None:
                         ack_resp.raise_for_status()
                 continue
 
+            # Run a repo sync now and report the result.
             if cmd_type == "repo_sync":
                 try:
                     result = await _run_hub_repo_sync()
@@ -4425,6 +4948,7 @@ async def relay_sync_once() -> None:
                         ack_resp.raise_for_status()
                 continue
 
+            # Ack first, then start the self-update in the background.
             if cmd_type == "self_update":
                 if cmd_id:
                     async with httpx.AsyncClient(timeout=10, verify=_hub_tls_verify()) as hc_ack:
@@ -4437,6 +4961,7 @@ async def relay_sync_once() -> None:
                 asyncio.create_task(_run_self_update())
                 continue
 
+            # Refresh the WebUI files in the background.
             if cmd_type == "refresh_webui":
                 asyncio.create_task(refresh_webui_frontend())
                 if cmd_id:
@@ -4449,6 +4974,7 @@ async def relay_sync_once() -> None:
                         ack_resp.raise_for_status()
                 continue
 
+            # Queue an update for the Proxmox agent.
             if cmd_type == "proxmox_agent_update":
                 try:
                     result = await _queue_proxmox_agent_update()
@@ -4464,6 +4990,7 @@ async def relay_sync_once() -> None:
                         ack_resp.raise_for_status()
                 continue
 
+            # Run a one-off command on the Proxmox agent, falling back to its inbox queue.
             if cmd_type == "proxmox_agent_command":
                 import uuid as _uuid_mod
                 _action = (payload_data or {}).get("action", "")
@@ -4498,6 +5025,7 @@ async def relay_sync_once() -> None:
                         ack_resp.raise_for_status()
                 continue
 
+            # Queue a template unlock for the agent.
             if cmd_type == "unlock_template":
                 try:
                     cmd = await _queue_unlock_template_command("unlock_template")
@@ -4514,6 +5042,7 @@ async def relay_sync_once() -> None:
                         ack_resp.raise_for_status()
                 continue
 
+            # Reset the reclone status to idle, unless a run is in progress.
             if cmd_type == "clear_reclone_state":
                 _status = reclone_state.get("status", "idle")
                 if _status != "running":
@@ -4533,6 +5062,7 @@ async def relay_sync_once() -> None:
                         ack_resp.raise_for_status()
                 continue
 
+            # Start a fleet reclone (optionally setting its concurrency).
             if cmd_type == "proxmox_reclone_all":
                 try:
                     concurrency = int(payload_data.get("concurrency", 0) or 0)
@@ -4594,6 +5124,7 @@ async def relay_sync_once() -> None:
             # ── regular client/proxmox commands ────────────────────────────
             if not target or not action:
                 continue
+            # Queue it for the target (or for every client if the target is "all").
             try:
                 async with state_lock:
                     if target == "all":
@@ -4616,6 +5147,7 @@ async def relay_sync_once() -> None:
                         }, headers=headers)
                         ack_resp.raise_for_status()
             except Exception as exc:
+                # Queueing failed: ack with the error.
                 logger.warning("Hub relay: failed to enqueue %s/%s %s: %s", target, action, args, exc)
                 if cmd_id:
                     async with httpx.AsyncClient(timeout=10, verify=_hub_tls_verify()) as hc_ack:
@@ -4631,6 +5163,7 @@ async def relay_sync_once() -> None:
                         }, headers=headers)
                         ack_resp.raise_for_status()
 
+        # Tell UIs about new commands and push them to connected targets.
         if commands_changed and serialized_commands is not None:
             await broadcast({"type": "commands_update", "commands": serialized_commands})
             await _push_pending_commands_for_targets(queued_targets)
@@ -4638,6 +5171,7 @@ async def relay_sync_once() -> None:
         relay_state.update({"connected": True, "error": None})  # Keep the relay marked healthy after processing commands because last_sync was already set at the successful telemetry POST.
         _debug_event("relay_sync_ok", f"proxmox_connected={proxmox_state.get('connected')} clients={len(telemetry.get('clients', []))}")
     except httpx.HTTPStatusError as exc:
+        # Auth errors (401/403/404): drop our credentials and ask the hub to re-register us.
         status_code = exc.response.status_code if exc.response else None
         if status_code in (401, 403, 404):
             state.relay_registration_refresh_needed = True
@@ -4658,48 +5192,63 @@ async def relay_sync_once() -> None:
             _save_settings()
             await _hub_check_approval(server_url, spoke_id)
         else:
+            # Other HTTP errors are just recorded.
             relay_state.update({"connected": False, "error": str(exc)})
         logger.warning("Relay sync failed: %s", exc)
         _debug_event("relay_sync_fail", str(exc)[:200])
     except Exception as exc:
+        # Any other error is recorded and logged.
         relay_state.update({"connected": False, "error": str(exc)})
         logger.warning("Relay sync failed: %s", exc)
         _debug_event("relay_sync_fail", str(exc)[:200])
 
+    # Tell UIs the relay status.
     await _broadcast_relay_state()
 
 
 async def relay_ws_loop() -> None:
+    """Background task: keep a websocket open to the hub and handle its messages.
+
+    Registers or waits for approval first, reconnects with backoff, and returns if the relay is
+    turned off.
+    """
+    # The websockets library is required.
     if not _WEBSOCKETS_AVAILABLE or websockets is None:
         raise RuntimeError("websockets not installed")
 
+    # Reconnect delay in seconds; each pass rereads the poll interval.
     backoff = 1
     while True:
         interval = int(settings.get("relay_poll_interval", RELAY_INTERVAL_DEFAULT))
         try:
+            # Relay turned off: mark disabled and stop.
             if settings.get("relay_enabled") != "on" or not settings.get("relay_server_url"):
                 relay_state["enabled"] = False
                 await _broadcast_relay_state()
                 return
 
+            # Hub URL, spoke id and credentials.
             relay_state["enabled"] = True
             server_url = settings["relay_server_url"].rstrip("/")
             spoke_id = _ensure_relay_spoke_id()
             api_key = settings.get("relay_api_key", "")
             tenant_id = settings.get("relay_tenant_id", "")
 
+            # No spoke id yet: register with the hub and try again later.
             if not spoke_id:
                 await _hub_self_register(server_url)
                 await _broadcast_relay_state()
                 await asyncio.sleep(interval)
                 continue
 
+            # After startup or a reset, ask the hub for our current registration first.
             if state.relay_registration_refresh_needed:
                 await _hub_check_approval(server_url, spoke_id)
                 spoke_id = settings.get("relay_spoke_id", spoke_id)
                 api_key = settings.get("relay_api_key", "")
                 tenant_id = settings.get("relay_tenant_id", "")
 
+            # Not approved yet: ask the hub; if still pending, wait and try again.
             if not api_key or not tenant_id:
                 relay_state["registration_status"] = relay_state.get("registration_status", "pending")
                 await _hub_check_approval(server_url, spoke_id)
@@ -4711,6 +5260,7 @@ async def relay_ws_loop() -> None:
                     await asyncio.sleep(interval)
                     continue
 
+            # Approved: build the websocket URL and a lock so sends don't interleave.
             relay_state["registration_status"] = "approved"
             ws_url = _relay_ws_url(server_url, tenant_id, spoke_id, api_key)
             send_lock = asyncio.Lock()
@@ -4723,6 +5273,7 @@ async def relay_ws_loop() -> None:
                 ws_ssl_ctx.verify_mode = ssl.CERT_NONE
                 ws_ssl = ws_ssl_ctx
 
+            # Connect; reset the backoff and count the reconnect.
             async with websockets.connect(ws_url, ping_interval=20, ping_timeout=10,
                                           ssl=ws_ssl if ws_url.startswith("wss://") else None) as websocket:
                 backoff = 1
@@ -4730,18 +5281,23 @@ async def relay_ws_loop() -> None:
                 relay_state["ws_last_reconnect_at"] = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
 
                 async def send_json(payload: dict[str, Any]) -> None:
+                    """Send one JSON message over the hub websocket, one sender at a time."""
                     async with send_lock:
                         await websocket.send(json.dumps(payload, default=str))
 
                 async def ack_fn(command_id: str, status: str, result: dict[str, Any] | None) -> None:
+                    """Ack a hub command over the websocket, with an optional result."""
+                    # Build the ack and add the result if there is one.
                     payload: dict[str, Any] = {"type": "ack", "payload": {"command_id": command_id, "status": status}}
                     if result is not None:
                         payload["payload"]["result"] = result
                     await send_json(payload)
 
                 async def telemetry_loop() -> None:
+                    """Send telemetry to the hub every poll interval until cancelled."""
                     while True:
                         try:
+                            # Build telemetry, time it and send it.
                             _t0 = time.monotonic()
                             telemetry = await _build_relay_telemetry_payload(spoke_id)
                             build_ms = round((time.monotonic() - _t0) * 1000)
@@ -4763,6 +5319,7 @@ async def relay_ws_loop() -> None:
                             logger.warning("relay telemetry_loop error (will retry in %ss): %s", interval, exc)
                         await asyncio.sleep(interval)
 
+                # Let other code send over this socket, and start the telemetry task.
                 state._relay_ws_send_json = send_json
                 state._relay_ws_spoke_id = spoke_id
                 sender = asyncio.create_task(telemetry_loop())
@@ -4773,19 +5330,23 @@ async def relay_ws_loop() -> None:
                         logger.info("Hub reconnected — clearing %d active demo override(s)", len(_demo_active))
                         _clear_all_demo_scenarios_sync()
                         await broadcast_full_state()
+                    # Ask the hub to sync, then handle each message by type.
                     await send_json({"type": "sync"})
                     async for raw_message in websocket:
                         message = json.loads(raw_message)
                         msg_type = str(message.get("type") or "").strip().lower()
+                        # Command batches and single commands use the shared batch handler.
                         if msg_type == "commands":
                             commands = message.get("commands") if isinstance(message.get("commands"), list) else []
                             await _apply_relay_command_batch(commands, ack_fn)
                         elif msg_type == "command":
                             await _apply_relay_command_batch([message], ack_fn)
                         elif msg_type == "central_feed":
+                            # Central data pushed by the hub.
                             payload = message.get("payload") if isinstance(message.get("payload"), dict) else {}
                             await _apply_central_feed(payload)
                         elif msg_type == "telemetry_ack":
+                            # The hub confirmed telemetry: we are connected; record timing stats.
                             sent_at = relay_state.pop("_last_telemetry_sent_at", None)
                             rtt_ms = round((time.time() - sent_at) * 1000) if sent_at else None
                             hub_processing_ms = message.get("processing_ms")
@@ -4799,14 +5360,17 @@ async def relay_ws_loop() -> None:
                                 relay_state["hub_loop_lag_ms"] = hub_loop_lag_ms
                             await _broadcast_relay_state()
                         elif msg_type == "pong":
+                            # Pong means the link is healthy.
                             relay_state.update({"connected": True, "error": None})
                         elif msg_type.startswith("shell_"):
+                            # Shell, VNC, token, log and trace requests go to their handlers.
                             await _handle_shell_relay_message(message)
                         elif msg_type == "vnc_proxy_request":
                             asyncio.create_task(_handle_vnc_proxy_request(message))
                         elif msg_type == "provision_proxmox_token":
                             asyncio.create_task(_handle_provision_proxmox_token(message))
                         elif msg_type == "vnc_frame_to_proxmox":
+                            # VNC frames and disconnects go to that session's queue.
                             req_id = str(message.get("request_id") or "").strip()
                             q = _vnc_sessions.get(req_id)
                             if q is not None:
@@ -4821,6 +5385,7 @@ async def relay_ws_loop() -> None:
                         elif msg_type == "command_trace_request":
                             asyncio.create_task(_handle_command_trace_request(message))
                         elif msg_type == "demo_scenario":
+                            # Demo scenarios: apply or clear them.
                             _hostname = str(message.get("hostname") or "").strip()
                             _scenario = str(message.get("scenario") or "").strip()
                             if _hostname and _scenario:
@@ -4833,7 +5398,9 @@ async def relay_ws_loop() -> None:
                                 _clear_all_demo_scenarios_sync()
                                 asyncio.create_task(broadcast_full_state())
                         elif msg_type == "purge_clients":
+                            # Purge all client history.
                             async def _do_purge_clients_relay() -> None:
+                                """Clear all clients, save the empty history and tell UIs."""
                                 async with state_lock:
                                     clients.clear()
                                 await asyncio.to_thread(_save_client_history)
@@ -4841,6 +5408,7 @@ async def relay_ws_loop() -> None:
                                 logger.info("Client history purged by hub relay request")
                             asyncio.create_task(_do_purge_clients_relay())
                 finally:
+                    # On disconnect: close shells, drop the send hook and stop telemetry.
                     await _close_all_shell_sessions(notify_exit=False)
                     if state._relay_ws_send_json is send_json:
                         state._relay_ws_send_json = None
@@ -4851,6 +5419,7 @@ async def relay_ws_loop() -> None:
         except asyncio.CancelledError:
             raise
         except WebSocketInvalidStatus as exc:
+            # Handshake rejected: 401/403 drop our credentials; 404 falls back to an HTTP sync.
             status_code = getattr(exc, "status_code", None) or getattr(getattr(exc, "response", None), "status_code", None)
             relay_state.update({"connected": False, "error": f"websocket handshake failed: {exc}", "ws_last_error": f"HTTP {status_code}: {exc}"})
             await _broadcast_relay_state()
@@ -4868,6 +5437,7 @@ async def relay_ws_loop() -> None:
                 await asyncio.sleep(min(backoff, 30))
                 backoff = min(backoff * 2, 30)
         except Exception as exc:
+            # Any other error: record it, then pick how to retry.
             relay_state.update({"connected": False, "error": str(exc), "ws_last_error": str(exc)})
             _debug_event("relay_sync_fail", str(exc)[:200])
             await _broadcast_relay_state()
@@ -4886,17 +5456,26 @@ async def relay_ws_loop() -> None:
                 await asyncio.sleep(min(backoff, 30))
                 backoff = min(backoff * 2, 30)
             elif any(token in exc_str for token in ["connection refused", "404", "not found"]):
+                # Hub unreachable or not found: try one HTTP sync, then wait.
                 await relay_sync_once()
                 await asyncio.sleep(interval)
             else:
+                # Otherwise retry with backoff (max 30 seconds).
                 await asyncio.sleep(min(backoff, 30))
                 backoff = min(backoff * 2, 30)
 
 
 async def relay_loop() -> None:
+    """Background task: run the hub relay forever.
+
+    Uses the websocket loop when available, else HTTP polling. Errors are recorded in service
+    health and retried after the poll interval plus jitter.
+    """
     while True:
+        # Poll interval plus random jitter so spokes don't hit the hub together.
         interval = int(settings.get("relay_poll_interval", RELAY_INTERVAL_DEFAULT))
         jitter = random.randint(0, 15)
+        # Run one relay pass and record service health.
         try:
             if _WEBSOCKETS_AVAILABLE and websockets is not None:
                 await relay_ws_loop()
@@ -4906,6 +5485,7 @@ async def relay_loop() -> None:
         except asyncio.CancelledError:
             raise
         except UpstreamJSONError as exc:
+            # On error: record it and wait before trying again.
             _update_service_health("relay", ok=False, error=str(exc))
             logger.warning("Relay loop upstream JSON error: %s", exc)
             await asyncio.sleep(interval + jitter)
@@ -4921,6 +5501,7 @@ async def relay_loop() -> None:
 
 
 def ensure_repo_ready() -> None:
+    """Raise HTTP 503 unless the config repo has been synced."""
     if not repo_state["synced"]:
         detail = "Repository has not been synced yet."
         if repo_state["error"]:
@@ -4929,6 +5510,7 @@ def ensure_repo_ready() -> None:
 
 
 def repo_path(*parts: str) -> Path:
+    """Return the path of a file in the repo, raising HTTP 404 if it does not exist."""
     ensure_repo_ready()
     path = REPO_DIR.joinpath(*parts)
     if not path.exists():
@@ -4937,12 +5519,17 @@ def repo_path(*parts: str) -> Path:
 
 
 def validate_platform(platform: str) -> str:
+    """Return the platform if it is supported, else raise HTTP 404."""
     if platform not in ALLOWED_PLATFORMS:
         raise HTTPException(status_code=404, detail="Unsupported platform")
     return platform
 
 
 def override_section_name(key: str, simulation_id: str | None) -> str | None:
+    """Return the config section an override key belongs in.
+
+    Simulation keys (and unknown keys) go to the simulation's own section.
+    """
     if key in SIMULATION_SECTION_KEYS:
         return simulation_id
     if key in GLOBAL_SECTION_KEYS:
@@ -4955,10 +5542,13 @@ def override_section_name(key: str, simulation_id: str | None) -> str | None:
 
 
 def apply_overrides(config_text: str, client: dict[str, Any]) -> str:
+    """Return the config text with the client's overrides applied."""
+    # No overrides: return the text unchanged.
     overrides = {key: str(value) for key, value in client.get("overrides", {}).items()}
     if not overrides:
         return config_text
 
+    # First pass: record which keys each [section] contains.
     pattern = re.compile(r"^\s*\[(?P<section>[^\]]+)\]\s*$")
     key_pattern = re.compile(r"^\s*(?P<key>[^=\s#;]+)\s*=")
     section_keys: dict[str, set[str]] = {}
@@ -4975,10 +5565,12 @@ def apply_overrides(config_text: str, client: dict[str, Any]) -> str:
             if key_match:
                 section_keys.setdefault(current_section, set()).add(key_match.group("key"))
 
+    # If the client has its own section (hostname or its prefix), use it for keys it holds.
     hostname = str(client.get("hostname", ""))
     user_candidates = [hostname, hostname.split("-")[0] if hostname else ""]
     user_section = next((candidate for candidate in user_candidates if candidate and candidate in section_keys), None)
 
+    # Pick the section for each override; skip keys with no section.
     simulation_id = client.get("simulation_id")
     replacements: dict[str, dict[str, str]] = {}
     for key, value in overrides.items():
@@ -4991,6 +5583,7 @@ def apply_overrides(config_text: str, client: dict[str, Any]) -> str:
             continue
         replacements.setdefault(section, {})[key] = value
 
+    # Second pass: rewrite the matching key lines in each section.
     current_section = None
     updated_lines: list[str] = []
     for line in config_text.splitlines():
@@ -5008,6 +5601,7 @@ def apply_overrides(config_text: str, client: dict[str, Any]) -> str:
 
         updated_lines.append(line)
 
+    # Keep the trailing newline if the original had one.
     if config_text.endswith("\n"):
         return "\n".join(updated_lines) + "\n"
     return "\n".join(updated_lines)
@@ -5021,12 +5615,14 @@ def _git(*args: str, cwd: Path | None = None, timeout: int = 120, env: dict[str,
     GIT_TERMINAL_PROMPT=0 ensures git never blocks waiting for credentials —
     public repos work without a token; private repos fail fast with a clear error.
     """
+    # Never prompt for credentials; extra env values are added on top.
     git_env = {
         **os.environ,
         "GIT_TERMINAL_PROMPT": "0",
         "GIT_ASKPASS": "/bin/echo",
         **(env or {}),
     }
+    # Run git and raise a clear error on timeout or failure.
     try:
         result = subprocess.run(
             ["git", *args],
@@ -5044,18 +5640,23 @@ def _git(*args: str, cwd: Path | None = None, timeout: int = 120, env: dict[str,
 
 
 def sync_repo_once() -> None:
+    """Clone the config repo, or fetch and reset it to the configured branch."""
+    # Use the configured branch and make sure the parent folder exists.
     branch = str(settings.get("repo_branch") or REPO_BRANCH).strip()
     REPO_DIR.parent.mkdir(parents=True, exist_ok=True)
 
+    # Empty or missing: clone the branch.
     if not REPO_DIR.exists() or not any(REPO_DIR.iterdir()):
         logger.info("Cloning %s (%s) into %s", REPO_URL, branch, REPO_DIR)
         _git("clone", "--branch", branch, "--single-branch", REPO_URL, str(REPO_DIR),
              cwd=REPO_DIR.parent, timeout=300)
         return
 
+    # Folder exists but isn't a git repo: refuse.
     if not (REPO_DIR / ".git").exists():
         raise RuntimeError(f"{REPO_DIR} exists but is not a git repository")
 
+    # Otherwise fetch and reset the local branch to the remote.
     logger.info("Pulling latest repo state from %s branch %s", REPO_URL, branch)
     _git("fetch", "--prune", "origin")
     # -B creates the local branch if missing, or resets it if it exists
@@ -5063,6 +5664,11 @@ def sync_repo_once() -> None:
 
 
 async def _sync_repo_now() -> str | None:
+    """Sync the repo now and return its version.
+
+    Updates repo status and service health, tells UIs, and raises on failure.
+    """
+    # Sync under the git lock, then record success and the version.
     try:
         async with _git_lock:
             await asyncio.to_thread(sync_repo_once)
@@ -5074,6 +5680,7 @@ async def _sync_repo_now() -> str | None:
         await broadcast({"type": "repo_status", "synced": True, "error": None, "last_sync": repo_state["last_sync"], "repo_version": repo_version})
         return repo_version
     except Exception as exc:
+        # On failure record the error, tell UIs and re-raise.
         repo_state["error"] = str(exc)
         _update_service_health("sync_repo", ok=False, error=str(exc))
         await broadcast({"type": "repo_status", "synced": repo_state["synced"], "error": str(exc), "last_sync": repo_state["last_sync"]})
@@ -5081,6 +5688,7 @@ async def _sync_repo_now() -> str | None:
 
 
 async def sync_repo() -> None:
+    """Background task: sync the repo forever at the configured interval, logging errors."""
     while True:
         try:
             await _sync_repo_now()
@@ -5095,6 +5703,7 @@ async def sync_repo() -> None:
 
 def _get_repo_version() -> str | None:
     """Read VERSION= from the synced install-lxc.sh in the repo."""
+    # Return the value of the first VERSION= line; quotes are removed.
     try:
         text = _INSTALLER_PATH.read_text()
         for line in text.splitlines():
@@ -5107,6 +5716,7 @@ def _get_repo_version() -> str | None:
 
 
 def _cs_webui_branch() -> str:
+    """Return the configured branch for cs-webui files, or the default branch."""
     branch = str(settings.get("repo_branch", REPO_BRANCH) or REPO_BRANCH).strip()
     return branch or REPO_BRANCH
 
@@ -5130,6 +5740,7 @@ async def refresh_webui_frontend() -> None:
     All network I/O is offloaded to a thread pool via asyncio.to_thread so
     the event loop is never blocked — a slow/unresponsive GitHub would
     otherwise stall all HTTP request processing on the spoke."""
+    # Raw file URL for the branch.
     branch = _cs_webui_branch()
     raw_base = f"{CS_WEBUI_REPO_RAW}/{branch}"
 
@@ -5149,6 +5760,7 @@ async def refresh_webui_frontend() -> None:
         logger.warning("webui refresh: could not fetch remote VERSION: %s", exc)
         return
 
+    # Same version: nothing to do.
     if remote_ver == local_ver:
         logger.info("webui refresh: deployed cs-webui %s is current — no update needed", local_ver)
         update_state["cswebui_current"] = local_ver or APP_VERSION
@@ -5174,6 +5786,7 @@ async def refresh_webui_frontend() -> None:
         "static/js/spoke/dashboard.js",
         "static/js/spoke/central.js",
     ]
+    # Download each file into the same path under the static folder.
     for rel_path in frontend_files:
         url = f"{raw_base}/{rel_path}"
         # Preserve subdirectory structure under STATIC_DIR
@@ -5228,6 +5841,8 @@ async def periodic_webui_refresh() -> None:
 
 
 async def acme_renewal_loop() -> None:
+    """Background task: check daily whether the TLS certificate needs renewing."""
+    # Daily: renew the certificate if needed and tell UIs when it was renewed.
     while True:
         try:
             renewed = await spoke_acme.renew_if_needed(BASE_DIR)
@@ -5239,12 +5854,15 @@ async def acme_renewal_loop() -> None:
         except asyncio.CancelledError:
             raise
         except Exception as exc:
+            # Errors are logged and recorded; try again tomorrow.
             logger.exception("ACME renewal loop error: %s", exc)
             _acme_status["last_error"] = str(exc)
         await asyncio.sleep(86400)
 
 
 async def heartbeat_check() -> None:
+    """Background task: update each client's online flag and tell UIs when any changed."""
+    # Wait one interval, then check each client's last-seen time.
     await asyncio.sleep(HEARTBEAT_INTERVAL)
     while True:
         try:
@@ -5287,6 +5905,7 @@ async def heartbeat_check() -> None:
                     })
                     await _broadcast_reclone_state()
 
+            # Record service health; errors are logged and the loop goes on.
             _update_service_health("heartbeat", ok=True)
         except asyncio.CancelledError:
             raise
@@ -5299,16 +5918,19 @@ async def heartbeat_check() -> None:
 # ── Auth endpoints ─────────────────────────────────────────────────────────────
 
 class _SpokeLoginRequest(BaseModel):
+    """Login request body for the spoke's local accounts."""
     username: str = ""
     password: str = ""
 
 
 class ChangePasswordPayload(BaseModel):
+    """Request body for changing your own password."""
     current_password: str = ""
     new_password: str = ""
 
 
 class LocalUserCreatePayload(BaseModel):
+    """Request body for creating a local user (admin by default)."""
     username: str = ""
     password: str = ""
     role: str = "admin"
@@ -5317,11 +5939,13 @@ class LocalUserCreatePayload(BaseModel):
 @app.websocket("/ws/console/{session_id}")
 async def ws_console_direct(websocket: WebSocket, session_id: str) -> None:
     """Relay raw VNC bytes between the browser (noVNC) and Proxmox vncwebsocket."""
+    # Use a one-time session; refuse it if missing or expired.
     session = _direct_console_sessions.pop(session_id, None)
     if not session or session.get("expires", 0) < time.time():
         await websocket.close(code=4404, reason="Invalid or expired console session")
         return
 
+    # Accept, then read the target and API token from the session.
     await websocket.accept()
     proxmox_host = session["proxmox_host"]
     node = session["node"]
@@ -5334,11 +5958,13 @@ async def ws_console_direct(websocket: WebSocket, session_id: str) -> None:
         await websocket.close(code=1011, reason="Proxmox API token not configured on spoke")
         return
 
+    # Build the Proxmox VNC websocket URL and auth header.
     import urllib.parse as _urlparse_console
     params = _urlparse_console.urlencode({"port": port, "vncticket": ticket})
     ws_url = f"wss://{proxmox_host}:8006/api2/json/nodes/{node}/{vmtype}/{vmid}/vncwebsocket?{params}"
     auth_header = {"Authorization": f"PVEAPIToken={api_token}"}
 
+    # Proxmox uses a self-signed cert, so skip verification.
     ssl_ctx = ssl.create_default_context()
     ssl_ctx.check_hostname = False
     ssl_ctx.verify_mode = ssl.CERT_NONE
@@ -5348,6 +5974,7 @@ async def ws_console_direct(websocket: WebSocket, session_id: str) -> None:
         return
 
     try:
+        # Pass the auth header under whichever name this websockets version uses.
         import inspect as _inspect_console
         connect_kwargs: dict[str, Any] = {"ssl": ssl_ctx, "open_timeout": 20, "max_size": None}
         hdr_key = (
@@ -5357,8 +5984,10 @@ async def ws_console_direct(websocket: WebSocket, session_id: str) -> None:
         )
         connect_kwargs[hdr_key] = auth_header
 
+        # Connect and copy data both ways until one side ends.
         async with websockets.connect(ws_url, **connect_kwargs) as px_ws:
             async def _browser_to_proxmox() -> None:
+                """Copy browser messages to Proxmox until the browser disconnects."""
                 while True:
                     msg = await websocket.receive()
                     if msg.get("type") == "websocket.disconnect":
@@ -5368,6 +5997,7 @@ async def ws_console_direct(websocket: WebSocket, session_id: str) -> None:
                         await px_ws.send(raw)
 
             async def _proxmox_to_browser() -> None:
+                """Copy Proxmox messages to the browser as bytes."""
                 async for raw in px_ws:
                     data = raw if isinstance(raw, bytes) else raw.encode()
                     await websocket.send_bytes(data)
@@ -5379,6 +6009,7 @@ async def ws_console_direct(websocket: WebSocket, session_id: str) -> None:
                 t.cancel()
             await asyncio.gather(t1, t2, return_exceptions=True)
     except (WebSocketDisconnect, asyncio.CancelledError):
+        # A disconnect is normal; other errors are logged.
         pass
     except Exception as exc:
         logger.warning("Direct VNC relay error for session %s: %s", session_id, exc)
@@ -5391,6 +6022,7 @@ _CENTRAL_CLIENT_CACHE_TTL = 60  # seconds
 
 
 async def _api_health_payload() -> dict[str, Any]:
+    """Return the health check payload: version, client count and repo status."""
     async with state_lock:
         client_count = len(clients)
     return {
@@ -5404,10 +6036,16 @@ async def _api_health_payload() -> dict[str, Any]:
 
 
 async def _run_acme_request() -> None:
+    """Request a TLS certificate via ACME and report progress to UIs.
+
+    On success, turn on spoke TLS (applied after a restart).
+    """
+    # Mark running and tell UIs.
     _acme_status["running"] = True
     _acme_status["last_result"] = None
     _acme_status["last_error"] = None
     await broadcast({"type": "acme_status", **_acme_status})
+    # Request the certificate and record the result.
     try:
         cfg = spoke_acme.load_acme_config()
         result = await spoke_acme.request_certificate(cfg, BASE_DIR)
@@ -5419,25 +6057,34 @@ async def _run_acme_request() -> None:
             logger.info("TLS certificate ready. Restart the spoke service with SPOKE_TLS=on to enable HTTPS.")
             await broadcast({"type": "cert_renewed", "expires": result.get("expires")})
     except Exception as exc:
+        # On failure record the error.
         logger.exception("ACME certificate request failed: %s", exc)
         _acme_status["last_error"] = str(exc)
         _acme_status["last_result"] = None
     finally:
+        # Always clear the running flag and tell UIs.
         _acme_status["running"] = False
         await broadcast({"type": "acme_status", **_acme_status})
 
 
 class ConfOverrideBody(BaseModel):
+    """Request body for a config override: raw INI text."""
     content: str  # Raw INI text, same format as the target .conf file
 
 
 async def _apply_client_status(status: ClientStatus) -> tuple[dict[str, Any], bool, dict[str, Any] | None]:
+    """Record a client's status report and return its serialized entry.
+
+    Returns (payload, whether the VM watchdog changed, early response). Template hostnames are
+    ignored and get an early response.
+    """
     # Ignore the Proxmox template VM — it uses the default hostname before
     # being cloned and renamed.  Registering it would pollute the dashboard.
     _IGNORED_HOSTNAMES = set(_parse_json_list(settings.get("ignored_hostnames", '["sim-rpi-0000"]')))
     if status.hostname in _IGNORED_HOSTNAMES:
         return {}, False, {"status": "ignored", "reason": "template hostname"}
 
+    # Merge into the stored client under the lock.
     now = utcnow()
     watchdog_changed = False
     async with state_lock:
@@ -5464,6 +6111,7 @@ async def _apply_client_status(status: ClientStatus) -> tuple[dict[str, Any], bo
                 "; ".join(e["msg"] for e in incoming_errors),
             )
 
+        # Save the client entry with the new report.
         clients[status.hostname] = {
             **existing,
             "hostname": status.hostname,
@@ -5481,6 +6129,7 @@ async def _apply_client_status(status: ClientStatus) -> tuple[dict[str, Any], bo
             "recent_errors": recent_errors,
             "error_count": total_errors,
         }
+        # A report after a clone finished means the VM is fine: drop its watchdog entries.
         normalized_hostname = str(status.hostname or "").strip().lower()
         for vmid_key, entry in list(vm_watchdog.items()):
             if str(entry.get("hostname") or "").strip().lower() != normalized_hostname:
@@ -5511,6 +6160,7 @@ _FAILURE_FLAGS = ("dns_fail", "dhcp_fail", "assoc_fail", "auth_fail", "ssidpw_fa
 
 
 def _build_demo_scenarios() -> dict[str, dict[str, str]]:
+    """Build the demo scenarios: normal (all off) plus one per failure flag."""
     scenarios: dict[str, dict[str, str]] = {
         "normal": {f: "off" for f in _FAILURE_FLAGS},
     }
@@ -5531,16 +6181,19 @@ async def _apply_demo_scenario(hostname: str, scenario: str, triggered_by: str) 
     Returns the serialized client payload.  Raises HTTPException if the
     scenario name is unknown or the client is not found.
     """
+    # Unknown scenario: refuse.
     flags = DEMO_SCENARIOS.get(scenario)
     if flags is None:
         raise HTTPException(status_code=422, detail=f"Unknown scenario '{scenario}'. Valid: {sorted(DEMO_SCENARIOS)}")
 
+    # Set the override flags on the client.
     async with state_lock:
         if hostname not in clients:
             raise HTTPException(status_code=404, detail=f"Client '{hostname}' not found")
         clients[hostname].setdefault("overrides", {}).update(flags)
         payload = serialize_client(hostname, clients[hostname])
 
+    # Track the active scenario and its expiry ("normal" clears it).
     if scenario == "normal":
         _demo_active.pop(hostname, None)
     else:
@@ -5551,18 +6204,21 @@ async def _apply_demo_scenario(hostname: str, scenario: str, triggered_by: str) 
             "triggered_by": triggered_by,
         }
 
+    # Tell UIs and return the client.
     await broadcast({"type": "overrides_update", "client": payload})
     return payload
 
 
 async def _clear_demo_scenario(hostname: str) -> dict[str, Any] | None:
     """Clear demo override for one client; returns serialized client or None if not found."""
+    # Drop the active scenario, then clear the client's overrides.
     _demo_active.pop(hostname, None)
     async with state_lock:
         if hostname not in clients:
             return None
         clients[hostname]["overrides"] = {}
         payload = serialize_client(hostname, clients[hostname])
+    # Tell UIs and return the client.
     await broadcast({"type": "overrides_cleared", "client": payload})
     return payload
 
@@ -5575,6 +6231,7 @@ def _clear_all_demo_scenarios_sync() -> None:
 
 
 def _demo_active_summary() -> list[dict[str, Any]]:
+    """Return the active demo scenarios with minutes left until each expires."""
     now = time.time()
     return [
         {
@@ -5593,6 +6250,7 @@ async def _demo_expiry_task() -> None:
     while True:
         try:
             await asyncio.sleep(30)
+            # Find expired scenarios and clear each one.
             now = time.time()
             expired = [h for h, v in list(_demo_active.items()) if v["expires_at"] <= now]
             for hostname in expired:
@@ -5614,6 +6272,7 @@ LOG_STREAM_POLL_SECS = 1
 
 
 def _normalize_log_source(source: str) -> str:
+    """Return the log source in lower case (default journal), or raise HTTP 400 if unknown."""
     normalized = (source or "journal").strip().lower()
     if normalized not in {"journal", "install", "agent", "watchdog"}:
         raise HTTPException(status_code=400, detail=f"Unsupported log source: {source}")
@@ -5621,6 +6280,7 @@ def _normalize_log_source(source: str) -> str:
 
 
 def _log_source_hint(source: str, detail: str | None = None) -> str:
+    """Return a hint line for when a log source has no data yet."""
     detail_text = f": {detail}" if detail else ""
     if source == "agent":
         return "[INFO] No Proxmox agent logs yet — logs arrive on the next agent telemetry poll (≤60s after activity)."
@@ -5632,15 +6292,22 @@ def _log_source_hint(source: str, detail: str | None = None) -> str:
 
 
 def _encode_sse_line(text: str) -> str:
+    """Encode text as one server-sent-events data line."""
     return f"data: {json.dumps(text)}\n\n"
 
 
 async def _stream_keepalive() -> str:
+    """Wait one keepalive interval, then return an SSE keepalive comment."""
     await asyncio.sleep(LOG_STREAM_KEEPALIVE_SECS)
     return ": keepalive\n\n"
 
 
 async def _poll_agent_inbox(hostname: str, approved_hostname: str | None = None) -> list[dict[str, Any]]:
+    """Return the pending commands for an agent and mark them delivered.
+
+    Re-sends commands left delivered for 30+ seconds without an ack, and tells UIs when anything
+    changed.
+    """
     async with state_lock:
         # Reset stale 'delivered' commands to 'pending' so they are re-sent if the agent
         # restarted without acking them (same logic as WS reconnect reset).
@@ -5663,12 +6330,14 @@ async def _poll_agent_inbox(hostname: str, approved_hostname: str | None = None)
             _save_commands()
             for cmd_id in stale_reset_ids:
                 _trace("stale_reset", hostname=hostname, approved_as=approved_hostname, cmd_id=cmd_id)
+        # Take the pending commands and mark them delivered.
         pending, expired, purged = _peek_pending_agent_commands_locked(hostname, approved_hostname)
         if pending:
             _mark_commands_delivered_locked([command["id"] for command in pending])
         serialized = _serialize_commands()
         payload = [_serialize_command_for_agent(command) for command in pending]
 
+    # Trace the poll and tell UIs if anything changed.
     _trace(
         "inbox_polled",
         hostname=hostname,
@@ -5693,11 +6362,13 @@ async def _relay_client_debug_log_to_hub(hostname: str, level: str, lines: list)
     opportunistic, not reliable transport). The LM cp's ``send_to_hub`` wraps
     this as ``{payload:{type:"CS_DEBUG_LOG", data:{hostname,level,lines}}}``,
     which the hub dispatches in ``handle_connection``."""
+    # Clean up the level and lines.
     data = {
         "hostname": hostname,
         "level": level if level in ("basic", "advanced") else "basic",
         "lines": lines if isinstance(lines, list) else [],
     }
+    # Prefer the LM control plane.
     cp = getattr(state, "_lm_control_plane", None)
     if cp is not None:
         try:
@@ -5705,6 +6376,7 @@ async def _relay_client_debug_log_to_hub(hostname: str, level: str, lines: list)
             return
         except Exception as exc:  # noqa: BLE001
             logger.debug("client debug_log relay via LM cp failed: %s", exc)
+    # Fall back to the legacy relay websocket.
     if state._relay_ws_send_json is not None:
         out = {"type": "CS_DEBUG_LOG", "data": data}
         if state._relay_ws_spoke_id and "spoke_id" not in out:
@@ -5724,6 +6396,11 @@ async def ws_client_endpoint(
     platform: str = Query("linux"),
     api_key: str = Query(""),
 ) -> None:
+    """Websocket for client agents: receive status reports and acks, push commands.
+
+    Requires a hostname and the shared client key.
+    """
+    # Need a hostname and a valid client key.
     if not hostname:
         await websocket.close(code=4400, reason="hostname is required")
         return
@@ -5731,17 +6408,21 @@ async def ws_client_endpoint(
         logger.warning("Rejected /ws/client for %s with invalid shared client API key", hostname or "unknown")
         await websocket.close(code=4403, reason="invalid client key")
         return
+    # Accept and remember this client's socket.
     await websocket.accept()
     client_ws_connections[hostname] = websocket
     try:
+        # Push pending commands, then say hello.
         await _push_pending_agent_commands(hostname, websocket)
         await websocket.send_json({"type": "hello", "hostname": hostname, "platform": platform})
         # Send current throttle directive so client immediately uses the right interval
         if _server_pressure["throttle_interval"] != 15:
             await websocket.send_json({"type": "throttle", "interval": _server_pressure["throttle_interval"]})
+        # Handle each message by type.
         while True:
             data = await websocket.receive_json()
             msg_type = str(data.get("type") or "status").strip().lower()
+            # Status report: record it, tell UIs and ack it.
             if msg_type == "status":
                 payload = data.get("payload") if isinstance(data.get("payload"), dict) else data
                 payload.setdefault("hostname", hostname)
@@ -5755,10 +6436,12 @@ async def ws_client_endpoint(
                     asyncio.create_task(_sync_sim_tags_for_client(hostname))
                     await websocket.send_json({"type": "status_ack", "hostname": hostname})
             elif msg_type == "ack":
+                # Command ack: record it and confirm.
                 payload = data.get("payload") if isinstance(data.get("payload"), dict) else data
                 await _ack_command_internal(payload)
                 await websocket.send_json({"type": "ack_ok", "id": payload.get("id")})
             elif msg_type == "ping":
+                # Ping, and sync to re-push pending commands.
                 await websocket.send_json({"type": "pong"})
             elif msg_type == "sync":
                 await _push_pending_agent_commands(hostname, websocket)
@@ -5774,6 +6457,7 @@ async def ws_client_endpoint(
     except WebSocketDisconnect:
         pass
     finally:
+        # Forget the socket if it is still ours.
         if client_ws_connections.get(hostname) is websocket:
             client_ws_connections.pop(hostname, None)
 
@@ -5784,6 +6468,11 @@ async def ws_proxmox_endpoint(
     hostname: str = Query(""),
     api_key: str = Query(""),
 ) -> None:
+    """Websocket for the Proxmox agent: receive telemetry and acks, push commands.
+
+    The agent must be approved, and its telemetry must use the approved hostname.
+    """
+    # Need a hostname and an approved agent.
     if not hostname:
         await websocket.close(code=4400, reason="hostname is required")
         return
@@ -5792,6 +6481,7 @@ async def ws_proxmox_endpoint(
         detail = response.body.decode("utf-8", errors="ignore") if isinstance(response, JSONResponse) else "agent not approved"
         await websocket.close(code=4401, reason=detail[:120])
         return
+    # Accept and make this the agent's socket; cancel any pending disconnect.
     await websocket.accept()
     state.proxmox_ws_connection = websocket
     state.proxmox_ws_hostname = approved_hostname
@@ -5806,9 +6496,11 @@ async def ws_proxmox_endpoint(
         async with state_lock:
             reset_count = _reset_delivered_commands_locked(approved_hostname, approved_hostname)
         await _push_pending_agent_commands(approved_hostname, websocket, approved_hostname)
+        # Handle each message by type.
         while True:
             data = await websocket.receive_json()
             msg_type = str(data.get("type") or "telemetry").strip().lower()
+            # Telemetry: check the hostname, apply it and ack it.
             if msg_type == "telemetry":
                 payload = data.get("payload") if isinstance(data.get("payload"), dict) else data
                 node = payload.get("node") if isinstance(payload.get("node"), dict) else {}
@@ -5819,12 +6511,15 @@ async def ws_proxmox_endpoint(
                 await _apply_proxmox_telemetry_state(payload, approved_hostname, time.time())
                 await websocket.send_json({"type": "telemetry_ack", "hostname": approved_hostname})
             elif msg_type in {"backup_progress", "reseed_progress"}:
+                # Backup and reseed progress goes up to the hub.
                 await _relay_proxmox_progress_to_hub(data)
             elif msg_type == "ack":
+                # Command ack: record it and confirm.
                 payload = data.get("payload") if isinstance(data.get("payload"), dict) else data
                 await _ack_command_internal(payload)
                 await websocket.send_json({"type": "ack_ok", "id": payload.get("id")})
             elif msg_type in {"token_provisioned", "token_provision_error"}:
+                # Token provisioning result: hand it to the waiting request.
                 req_id = str(data.get("request_id") or "").strip()
                 q = _proxmox_token_provision_queues.get(req_id)
                 if q is not None:
@@ -5841,12 +6536,14 @@ async def ws_proxmox_endpoint(
                 proxmox_state["connected"] = True
                 await websocket.send_json({"type": "pong"})
             elif msg_type == "sync":
+                # Sync: reset delivered commands and push them again.
                 async with state_lock:
                     _reset_delivered_commands_locked(approved_hostname, approved_hostname)
                 await _push_pending_agent_commands(approved_hostname, websocket, approved_hostname)
     except WebSocketDisconnect:
         pass
     finally:
+        # On disconnect clear the socket and start the grace timer before marking offline.
         if state.proxmox_ws_connection is websocket:
             state.proxmox_ws_connection = None
             state.proxmox_ws_hostname = approved_hostname
@@ -5856,12 +6553,18 @@ async def ws_proxmox_endpoint(
 
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket) -> None:
+    """Websocket for browser UIs: send a full state snapshot, then keep the socket for broadcasts.
+
+    Requires the admin websocket token.
+    """
+    # Check the admin token from the query or the Authorization header.
     token = (websocket.query_params.get("token") or _parse_bearer_token(websocket.headers.get("authorization"))).strip()
     expected_token = str(settings.get("admin_ws_token", "") or "").strip()
     if not expected_token or not token or not secrets.compare_digest(token, expected_token):
         logger.warning("Rejected browser WebSocket connection with invalid admin token")
         await websocket.close(code=4401, reason="unauthorized")
         return
+    # Accept and add to the broadcast list.
     await websocket.accept()
     ws_connections.append(websocket)
     # Send initial state snapshot — each message is individually guarded so one
@@ -5913,6 +6616,7 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
     except Exception as exc:  # noqa: BLE001
         logger.error("WS on-connect gkill_switch_update error: %s", exc)
 
+    # Ignore incoming messages; remove the socket when it closes.
     try:
         while True:
             await websocket.receive_text()
@@ -5994,9 +6698,12 @@ async def console_page(session_id: str = Query(...)) -> HTMLResponse:
 
 @app.get("/", response_class=HTMLResponse)
 async def root(request: Request):
+    """Serve the dashboard page with spoke mode, auth flags and the websocket token injected."""
+    # Load the page and set spoke mode.
     index = STATIC_DIR / "index.html"
     html = index.read_text()
     html = html.replace("{{WEBUI_MODE}}", "spoke")
+    # Inject the websocket token and auth state for the frontend.
     auth_provider = _normalize_spoke_auth_provider(settings.get("auth_provider", "local"))
     auth_required = _spoke_auth_required()
     authenticated = not auth_required or bool(_validate_spoke_session(request.cookies.get(_SPOKE_SESSION_COOKIE, "")))
@@ -6019,6 +6726,7 @@ async def root(request: Request):
     return HTMLResponse(content=html)
 
 
+# Serve the static frontend files.
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
 # === extracted service rebinds (must precede router includes below) ===
@@ -6176,6 +6884,7 @@ from services.settings import (  # noqa: E402,F401 (re-export for internal calle
 
 
 # auth routes moved to routers/auth.py
+# Register the API routers.
 from routers import auth as _auth_router  # noqa: E402
 app.include_router(_auth_router.router)
 

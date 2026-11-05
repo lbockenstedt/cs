@@ -1,9 +1,13 @@
 """Aggregate dashboard / clients / simulations / proxmox summary routes for the aggregate router package."""
+# Allow modern type-hint syntax on older Python versions.
 from __future__ import annotations
 
+# APIRouter collects this module's endpoints.
 from fastapi import APIRouter
+# Shared helpers (telemetry readers, tenant resolution), imports (Counter, Query...) and state.
 from ._common import *  # noqa: F401,F403 -- shared helpers/models/state
 
+# Sub-router merged into the aggregate router.
 router = APIRouter()
 
 
@@ -13,10 +17,16 @@ def get_aggregate_dashboard(
     tenant_id: Optional[str] = Query(default=None),
     current_user: User = Depends(auth.get_current_user),
 ):
+    """Return headline numbers for the dashboard: client count, hardware mix, checks, spokes online.
+    """
+    # Pick the tenant to report on (explicit ?tenant_id or the caller's own) and check access.
     resolved_tenant_id = _resolve_tenant_id(tenant_id, current_user)
+    # Approved spokes in the tenant and every client they report in telemetry.
     spokes = _approved_spokes(resolved_tenant_id)
     clients = [client for spoke in spokes for client in _telemetry_clients(spoke)]
+    # Count clients per hardware type, sorted by type name for stable display.
     hardware_breakdown = dict(sorted(Counter(_hardware_type(client) for client in clients).items()))
+    # Summary payload for the dashboard cards.
     return {
         "tenant_id": resolved_tenant_id,
         "client_count": len(clients),
@@ -32,6 +42,11 @@ def get_aggregate_clients(
     tenant_id: Optional[str] = Query(default=None),
     current_user: User = Depends(auth.get_current_user),
 ):
+    """Return every simulated client across the tenant's spokes, de-duplicated and enriched.
+
+    Adds spoke identity, USB/T3 flags and admin-forced simulations to each client row.
+    """
+    # Pick the tenant to report on (explicit ?tenant_id or the caller's own) and check access.
     resolved_tenant_id = _resolve_tenant_id(tenant_id, current_user)
     # Load hub-managed per-client sim overrides once (no GitHub needed).
     tenant = _get_tenant(resolved_tenant_id)
@@ -39,16 +54,23 @@ def get_aggregate_clients(
     # Collect all candidate rows keyed by MAC (or hostname fallback) so we can
     # deduplicate VMs that appear on multiple spokes due to client_history.json
     # retention.  A client with active simulations beats a stale historical one.
+    # Best row per client, keyed by MAC/hostname.
     candidates: dict[str, dict[str, Any]] = {}
+    # Walk every approved spoke in the tenant.
     for spoke in _approved_spokes(resolved_tenant_id):
+        # Display name for the spoke (falls back to its hostname).
         spoke_name = spoke.spoke_name or spoke.hostname
+        # Lookups used to decide which clients have USB Wi-Fi dongles or T3 PCI radios attached.
         usb_vmids, usb_hostnames, vmids_by_hostname = _spoke_usb_lookup(spoke)
         t3_vmids = _spoke_t3_lookup(spoke)
+        # T3 PCI radios reported by the spoke's Proxmox agent (empty if none).
         proxmox_tel = _telemetry_dict(spoke, "proxmox")
         t3_pci_devices: list[dict[str, Any]] = []
         if isinstance(proxmox_tel.get("t3_pci_devices"), list):
             t3_pci_devices = proxmox_tel["t3_pci_devices"]
+        # Number of T3 radios; prefer the reported count, else count the device list.
         t3_pci_count = int(proxmox_tel.get("t3_pci_count") or len(t3_pci_devices))
+        # Build one output row per client the spoke reports.
         for client in _telemetry_clients(spoke):
             row = dict(client)
             # Merge hub-managed permanent sim overrides into active_simulations.
@@ -58,6 +80,7 @@ def get_aggregate_clients(
             if extra_sims:
                 merged = list(set(list(row.get("active_simulations") or []) + list(extra_sims)))
                 row["active_simulations"] = merged
+            # Add spoke details and hardware flags to the row.
             row.update({
                 "tenant_id": resolved_tenant_id,
                 "spoke_id": spoke.id,
@@ -81,6 +104,7 @@ def get_aggregate_clients(
             if not dedup_key:
                 candidates[id(row)] = row  # no key available, always include
                 continue
+            # First time this client is seen: keep the row.
             existing = candidates.get(dedup_key)
             if existing is None:
                 candidates[dedup_key] = row
@@ -90,6 +114,7 @@ def get_aggregate_clients(
                 new_active = bool(row.get("active_simulations"))
                 if new_active and not existing_active:
                     candidates[dedup_key] = row
+    # Sort rows by spoke name then hostname (case-insensitive) for a stable table order.
     rows = sorted(candidates.values(),
                   key=lambda item: (str(item.get("spoke_name") or "").lower(),
                                     str(item.get("hostname") or "").lower()))
@@ -101,22 +126,35 @@ def get_aggregate_simulations(
     tenant_id: Optional[str] = Query(default=None),
     current_user: User = Depends(auth.get_current_user),
 ):
+    """Return one row per (spoke, simulation) with how many clients are running it.
+
+    Spokes with no running simulations get a single "—" row marked Idle or Spoke Offline.
+    """
+    # Pick the tenant to report on (explicit ?tenant_id or the caller's own) and check access.
     resolved_tenant_id = _resolve_tenant_id(tenant_id, current_user)
+    # Output rows.
     rows: list[dict[str, Any]] = []
+    # Count running simulations per spoke.
     for spoke in _approved_spokes(resolved_tenant_id):
+        # simulation name -> number of clients running it on this spoke.
         counts: Counter[str] = Counter()
+        # Each client may run several simulations at once.
         for client in _telemetry_clients(spoke):
             names = [str(name).strip() for name in (client.get("active_simulations") or []) if str(name).strip()]
+            # Older spokes only report a single simulation_id; use it when the list is empty.
             if not names:
                 fallback = str(client.get("simulation_id") or "").strip()
                 if fallback:
                     names = [fallback]
+            # Tally each simulation.
             for name in names:
                 counts[name] += 1
 
+        # Spoke identity and status shown on every row for this spoke.
         spoke_name = spoke.spoke_name or spoke.hostname
         online = _is_online(spoke)
         status = "Running" if online else "Spoke Offline"
+        # One row per simulation, sorted by name.
         if counts:
             for simulation_name, client_count in sorted(counts.items()):
                 rows.append({
@@ -129,6 +167,7 @@ def get_aggregate_simulations(
                     "client_count": client_count,
                     "spoke_online": online,
                 })
+        # No simulations: a placeholder row so the spoke still appears.
         else:
             rows.append({
                 "tenant_id": resolved_tenant_id,
@@ -141,6 +180,7 @@ def get_aggregate_simulations(
                 "spoke_online": online,
             })
 
+    # Sort by spoke name then simulation name for a stable table order.
     rows.sort(key=lambda item: (str(item.get("spoke_name") or "").lower(), str(item.get("simulation_name") or "").lower()))
     return {"tenant_id": resolved_tenant_id, "simulations": rows}
 
@@ -150,13 +190,20 @@ def get_aggregate_proxmox(
     tenant_id: Optional[str] = Query(default=None),
     current_user: User = Depends(auth.get_current_user),
 ):
+    """Return Proxmox host details for every approved spoke (VMs, USB devices, health, config)."""
+    # Pick the tenant to report on (explicit ?tenant_id or the caller's own) and check access.
     resolved_tenant_id = _resolve_tenant_id(tenant_id, current_user)
+    # One entry per spoke.
     hosts: list[dict[str, Any]] = []
     # Fetch effective USB list (global + tenant) once — same for all spokes.
     effective_usb_vidpids = [{k: v for k, v in d.items() if k != "source"}
                               for d in store.get_effective_usb_vidpids(resolved_tenant_id)]
+    # Build an entry for each approved spoke.
     for spoke in _approved_spokes(resolved_tenant_id):
+        # Proxmox section of telemetry.
         proxmox = _telemetry_dict(spoke, "proxmox")
+        # VM and USB lists: prefer dedicated telemetry keys, else the copies inside the proxmox
+        # section.
         vms = _telemetry_list(spoke, "proxmox_vms") or (proxmox.get("vms") if isinstance(proxmox.get("vms"), list) else [])
         usb_devices = _telemetry_list(spoke, "usb_devices") or (proxmox.get("usb_state") if isinstance(proxmox.get("usb_state"), list) else [])
         # Join prov_status from usb_state into each VM — the agent reports them separately.
@@ -166,6 +213,7 @@ def get_aggregate_proxmox(
             for u in usb_devices
             if isinstance(u, dict) and u.get("vmid") is not None and u.get("prov_status")
         }
+        # Copy each VM dict with its USB provisioning status added (non-dict VMs are left as-is).
         if _usb_prov_by_vmid:
             vms = [
                 {**vm, "prov_status": _usb_prov_by_vmid.get(int(vm["vmid"]), vm.get("prov_status"))}
@@ -173,8 +221,11 @@ def get_aggregate_proxmox(
                 else vm
                 for vm in vms
             ]
+        # USB slot capacity; only the auto-provision flag is used here.
         _used_slots, _total_slots, _dongle_count, auto_provision = _spoke_usb_capacity(spoke)
+        # Raw telemetry, for the latency/connection diagnostics below.
         tel = spoke.telemetry or {}
+        # Host entry: identity, health metrics, Proxmox data, counts, pending commands and config.
         hosts.append({
             "tenant_id": resolved_tenant_id,
             "spoke_id": spoke.id,
@@ -220,5 +271,6 @@ def get_aggregate_proxmox(
                 "reclone_concurrency": str((spoke.config or {}).get("reclone_concurrency", "1")),
             },
         })
+    # Sort hosts alphabetically by spoke name.
     hosts.sort(key=lambda item: str(item.get("spoke_name") or "").lower())
     return {"tenant_id": resolved_tenant_id, "hosts": hosts}

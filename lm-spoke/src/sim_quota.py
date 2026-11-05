@@ -24,11 +24,15 @@ Data sourcing (per the feature design):
 Mirrored in ``lm/core/src/simulations/sim_quota.py`` (vendored twin) so the hub
 and spoke agree on the schema. Keep the two in sync.
 """
+# Allow modern type-hint syntax without evaluating annotations at import time.
 from __future__ import annotations
 
+# Standard-library logging.
 import logging
+# Type hints only.
 from typing import Any, Dict, List, Tuple
 
+# Logger for this module.
 logger = logging.getLogger("CSSimQuota")
 
 # ── Schema ────────────────────────────────────────────────────────────────
@@ -50,6 +54,7 @@ SIM_QUOTA_KEYS = ("alert_id", "alert_type", "sim_id", "count", "site",
 # highest reliability), fall back to T2 (USB dongle). "t1"/"t2" = that tier ONLY
 # (underfill rather than degrade a high-reliability sim onto an unreliable dongle).
 QUOTA_TIERS = ("best", "t1", "t2")
+# Allowed alert kinds.
 ALERT_TYPES = ("alert", "insight")
 
 # Source prefix: Central and Mist are separate products. A quota row's
@@ -60,6 +65,7 @@ ALERT_TYPES = ("alert", "insight")
 # by. ``parse_alert_source`` splits it back out (defaults to central for legacy
 # / bare / unknown ids). Mirrored in lm/core/src/simulations/sim_quota.py.
 SOURCE_PREFIXES = {"central": "Central", "mist": "Mist"}
+# Lowercase prefix text mapped to its source key.
 _PREFIX_TO_SOURCE = {"central": "central", "mist": "mist"}
 
 
@@ -71,12 +77,14 @@ def parse_alert_source(alert_id: str) -> Tuple[str, str]:
     ``"DNS Fail"`` (legacy / untethered-display) → ``("central", "DNS Fail")``.
     An unknown/empty prefix falls back to ``central`` (bare). Returns the source
     as the canonical lowercase key (``"central"``/``"mist"``)."""
+    # Trim the id; split off a recognised prefix that has text after it.
     aid = str(alert_id or "").strip()
     if ":" in aid:
         prefix, _, rest = aid.partition(":")
         src = _PREFIX_TO_SOURCE.get(prefix.strip().lower())
         if src and rest.strip():
             return src, rest.strip()
+    # No known prefix: treat it as a bare Central id.
     return "central", aid
 
 
@@ -85,13 +93,16 @@ def prefixed_alert_id(source: str, bare_id: str) -> str:
     ``prefixed_alert_id("mist", "ap_offline")`` → ``"Mist:ap_offline"``.
     An unknown/empty source defaults to Central. A bare_id that is ALREADY
     prefixed is returned unchanged (idempotent)."""
+    # Normalise the source; unknown sources become Central.
     src = str(source or "central").strip().lower()
     if src not in SOURCE_PREFIXES:
         src = "central"
+    # Already prefixed ids are returned unchanged.
     bid = str(bare_id or "").strip()
     cur_src, cur_bare = parse_alert_source(bid)
     if cur_src != "central" or bid != cur_bare:
         return bid
+    # Add the product prefix (empty ids stay empty).
     return f"{SOURCE_PREFIXES[src]}:{bid}" if bid else bid
 
 # Per-sim metadata defaults. category: "failure" sims produce a network condition
@@ -165,9 +176,11 @@ SIM_KNOBS: Dict[str, List[Dict[str, int]]] = {
 
 def knobs_for_sim(sim_id: str) -> List[Dict[str, int]]:
     """The ordered tunable knob specs for a sim (empty list if it has none)."""
+    # Copy each knob spec so callers cannot change the table.
     return [dict(k) for k in SIM_KNOBS.get(str(sim_id or "").strip(), [])]
 
 
+# Minimum seconds between knob moves.
 KNOB_SETTLE_S = 1800.0  # ≥30 min — Central alert latency floor (see adaptive_step)
 
 
@@ -188,8 +201,10 @@ def knob_step(st: Dict[str, Any], knobs: List[Dict[str, int]], firing,
 
     State shape: ``{values:{key:int}, floors:{key:int|None}, active:int,
     mode:str, last_change:float}``, keyed per quota by the caller."""
+    # No knobs: nothing to change.
     if not knobs:
         return dict(st)
+    # Work on copies of the state, values and floors.
     st = dict(st)
     values = dict(st.get("values") or {})
     floors = dict(st.get("floors") or {})
@@ -202,17 +217,21 @@ def knob_step(st: Dict[str, Any], knobs: List[Dict[str, int]], firing,
             floors.setdefault(kn["key"], None)
         return {"values": values, "floors": floors, "active": 0,
                 "mode": "learning", "last_change": now}
+    # Active knob, last move time, and whether every knob already has a floor.
     active = int(st.get("active") or 0) % len(knobs)
     last = float(st.get("last_change") or 0)
     _all_floored = all(floors.get(kn["key"]) is not None for kn in knobs)
+    # No firing signal yet, or still settling: hold the current values.
     if firing is None or (now - last) < settle:  # hold
         st.update(values=values, floors=floors, active=active,
                   mode=("stable" if _all_floored else "learning"))
         return st
+    # The active knob's bounds, step and current value.
     kn = knobs[active]
     key = kn["key"]
     mn, mx, step = int(kn["min"]), int(kn["max"]), max(1, int(kn["step"]))
     cur = int(values.get(key, kn.get("start", mx)))
+    # Still firing: try a lower value.
     if firing is True:
         nv = cur - step
         if nv < mn:                     # min still fires → that's the floor
@@ -227,6 +246,7 @@ def knob_step(st: Dict[str, Any], knobs: List[Dict[str, int]], firing,
         prev = floors.get(key)
         floors[key] = rv if prev is None else min(int(prev), rv)
         active = (active + 1) % len(knobs)
+    # Save the new state and mark it stable once every knob has a floor.
     st.update(values=values, floors=floors, active=active, last_change=now,
               mode=("stable" if all(floors.get(k2["key"]) is not None
                                     for k2 in knobs) else "learning"))
@@ -235,17 +255,23 @@ def knob_step(st: Dict[str, Any], knobs: List[Dict[str, int]], firing,
 
 # ── Coercion helpers ──────────────────────────────────────────────────────
 def _as_bool(v: Any, default: bool = False) -> bool:
+    """Convert ``v`` to a bool ("1", "true", "yes", "on" are True); None gives ``default``."""
+    # Real bools pass through; None uses the default.
     if isinstance(v, bool):
         return v
     if v is None:
         return default
+    # Text values count as True only for the usual "on" words.
     return str(v).strip().lower() in ("1", "true", "yes", "on")
 
 
 def _as_int(v: Any, default: int = 1) -> int:
+    """Convert ``v`` to a positive int, or ``default`` if invalid or below 1."""
+    # Parse the number; reject values below 1.
     try:
         n = int(str(v).strip())
         return n if n >= 1 else default
+    # Unparseable values use the default.
     except Exception:
         return default
 
@@ -260,13 +286,17 @@ def normalize_quota(raw: Any) -> Dict[str, Any]:
     the site (re-homing ``wsite`` if ``rehome``). Presence quotas are ALWAYS
     multi-capable (they don't consume the client for sim purposes; other
     stackable sims may pack onto a presence-homed client)."""
+    # Non-dict input: empty quota.
     if not isinstance(raw, dict):
         return {}
+    # The sim id and its per-sim defaults.
     sim_id = str(raw.get("sim_id") or "").strip()
     meta = SIM_META.get(sim_id, {})
+    # Alert kind, defaulting to "alert" when unknown.
     alert_type = str(raw.get("alert_type") or "alert").strip().lower()
     if alert_type not in ALERT_TYPES:
         alert_type = "alert"
+    # No sim id means a presence quota.
     is_presence = not sim_id
     # Device quota (T3 IoT fleet): a catalog ``device_id`` + count + site, no
     # sim/alert. ``kind`` is explicit when the UI sends it, else derived:
@@ -276,6 +306,7 @@ def normalize_quota(raw: Any) -> Dict[str, Any]:
     kind = str(raw.get("kind") or "").strip().lower()
     if kind not in ("sim", "presence", "device"):
         kind = "device" if device_id else ("sim" if sim_id else "presence")
+    # Build the canonical quota.
     q = {
         "kind": kind,
         "device_id": device_id,
@@ -317,6 +348,7 @@ def normalize_quota(raw: Any) -> Dict[str, Any]:
     for k in ("min", "max", "step", "settle", "buffer"):
         if raw.get(k) is not None:
             q[k] = raw.get(k)
+    # Return the normalised quota.
     return q
 
 
@@ -329,11 +361,14 @@ def quota_dedup_key(q: Dict[str, Any]) -> str:
     (last-wins), independent of the sim-quota namespace so a presence row never
     collides with an alert-driven row. The engine's ``_quota_key`` mirrors this.
     """
+    # Device quota key.
     if q.get("kind") == "device" or q.get("device_id"):
         # One quota per device profile per site (last-wins).
         return f"device:{q.get('device_id', '')}:{q.get('site', '')}"
+    # Presence quota key (site only).
     if not q.get("sim_id"):
         return f"presence::{q.get('site', '')}"
+    # Sim quota key: alert type, alert id and site.
     return f"{q.get('alert_type', 'alert')}:{q.get('alert_id', '')}:{q.get('site', '')}"
 
 
@@ -351,11 +386,13 @@ def validate_sim_quotas(
     Duplicate keys (``quota_dedup_key``) collapse last-wins. The clean list is
     normalized to the canonical shape.
     """
+    # Results, errors, de-duplication map, and the allowed sims/devices.
     clean: List[Dict[str, Any]] = []
     errors: List[str] = []
     seen: Dict[str, Dict[str, Any]] = {}
     sim_set = set(available_sims or [])
     device_set = set(available_devices or [])
+    # Check each quota in turn.
     for i, raw in enumerate(quotas or []):
         q = normalize_quota(raw)
         if q["kind"] == "device":
@@ -378,6 +415,7 @@ def validate_sim_quotas(
                 errors.append(f"quota #{i}: presence quota (Clients Associated) "
                               f"requires a site — dropped")
                 continue
+        # Sim quota: needs an alert id and an allowed sim.
         else:
             if not q["alert_id"]:
                 errors.append(f"quota #{i}: missing alert_id — dropped")
@@ -387,7 +425,9 @@ def validate_sim_quotas(
                     f"quota #{i} ({q['alert_id']}): sim_id '{q['sim_id']}' "
                     f"not in available sims — dropped")
                 continue
+        # Keep the quota; a later duplicate replaces an earlier one.
         seen[quota_dedup_key(q)] = q
+    # Return the surviving quotas and the errors.
     clean = list(seen.values())
     return clean, errors
 
@@ -414,12 +454,16 @@ def guard_sim_quota_wipe(
     partial drop (some rows survive) is NOT blocked — only a full wipe is.
     Mirrored in the hub twin.
     """
+    # Count the existing quotas.
     had = len(existing_quotas or [])
+    # Full wipe requested: allow it only with the explicit force flag.
     if had and not (clean or []):
         force = body.get("force_sim_quotas_clear") if isinstance(body, dict) else None
         if str(force).strip().lower() in ("1", "true", "yes", "on"):
             return list(clean or []), False
+        # Otherwise keep the existing quotas and report the block.
         return list(existing_quotas or []), True
+    # Not a full wipe: save the new list.
     return list(clean or []), False
 
 
@@ -427,16 +471,20 @@ def resolve_effective_quotas(
     tenant_quotas: Any, available_sims: List[str] | None = None,
 ) -> List[Dict[str, Any]]:
     """The quotas the engine should run: validated + ``enabled`` only."""
+    # Validate, then keep only enabled quotas.
     clean, _ = validate_sim_quotas(tenant_quotas, available_sims)
     return [q for q in clean if q["enabled"]]
 
 
 # ── Catalog: sims + sites derived from simulation.conf ─────────────────────
 def _bucket_sections(sim_conf) -> List[str]:
+    """Return the bucket section names (s0-s9) in ``sim_conf``."""
+    # Collect sections named "s" followed by digits.
     out = []
     for sec in (sim_conf.sections() if sim_conf is not None else []):
         if sec.startswith("s") and sec[1:].isdigit():
             out.append(sec)
+    # Return the bucket names.
     return out
 
 
@@ -446,14 +494,17 @@ def available_sims(config_dir: Any) -> List[Dict[str, Any]]:
     ``SIM_META``. Sims a tenant actually uses in its buckets appear first;
     runnable sims not yet placed in any bucket follow (still offerable — the
     engine sets them via per-client override regardless of bucket default)."""
+    # Runnable sim flags (fall back to the known sims if the import fails).
     try:
         from sim_primitives import SIM_FLAGS  # lazy: avoid import cycle
     except Exception:  # noqa: BLE001
         SIM_FLAGS = tuple(SIM_META.keys())
     flags = list(SIM_FLAGS)
 
+    # Collect sims set in any bucket, in order of first appearance.
     bucket_flags: List[str] = []
     seen = set()
+    # Load the config and scan each bucket's keys.
     try:
         from sim_config import load_configs
         sim_conf, _ = load_configs(config_dir)
@@ -462,9 +513,11 @@ def available_sims(config_dir: Any) -> List[Dict[str, Any]]:
                 if key in flags and key not in seen:
                     seen.add(key)
                     bucket_flags.append(key)
+    # A config load failure is logged; only the fallback list is used.
     except Exception as exc:  # noqa: BLE001
         logger.warning("available_sims: load_configs failed: %s", exc)
 
+    # Bucket sims first, then the remaining runnable sims, with metadata.
     ordered = bucket_flags + [f for f in flags if f not in seen]
     return [
         {"sim_id": f,
@@ -481,6 +534,7 @@ def available_sites(
     """Sites the Sim-Quota UI may offer =
     ``simulation.conf`` ``wsite`` values across buckets ∪ Central
     ``site_mappings`` keys+values. Sorted, de-duplicated."""
+    # Collect every bucket's wsite value.
     sites: set[str] = set()
     try:
         from sim_config import load_configs
@@ -489,13 +543,16 @@ def available_sites(
             w = sim_conf.get(sec, "wsite", fallback="").strip()
             if w:
                 sites.add(w)
+    # A config load failure is logged.
     except Exception as exc:  # noqa: BLE001
         logger.warning("available_sites: load_configs failed: %s", exc)
+    # Add both sides of the Central site mappings.
     for k, v in (central_site_mappings or {}).items():
         if k:
             sites.add(str(k))
         if v:
             sites.add(str(v))
+    # Return them sorted.
     return sorted(sites)
 
 
@@ -506,6 +563,7 @@ def sim_quota_catalog(
     ``{sims, sites, suggested, meta}``. ``sims``/``sites`` are derived from the
     tenant's ``simulation.conf``; ``suggested`` is the global alert→sim map the
     tenant UI pre-fills; ``meta`` is the per-sim metadata."""
+    # Build the catalog: sims, sites, suggested links and per-sim metadata.
     return {
         "sims": available_sims(config_dir),
         "sites": available_sites(config_dir, central_site_mappings),

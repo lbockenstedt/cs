@@ -1,9 +1,13 @@
 """Aruba Central connectivity, webhook, browse, and monitored-item routes for the aggregate router package."""
+# Allow modern type-hint syntax on older Python versions.
 from __future__ import annotations
 
+# APIRouter collects this module's endpoints.
 from fastapi import APIRouter
+# Shared helpers, models, imports and state.
 from ._common import *  # noqa: F401,F403 -- shared helpers/models/state
 
+# Sub-router merged into the aggregate router.
 router = APIRouter()
 
 
@@ -14,18 +18,25 @@ async def test_central_connection(
     current_user: User = Depends(auth.get_current_user),
 ):
     """Test Aruba Central credentials and return token status + discovered sites."""
+    # Tenant admins only; resolves and access-checks the tenant id.
     resolved_tenant_id = _require_tenant_admin(tenant_id, current_user)
+    # Load the tenant (404 if missing).
     tenant = _get_tenant(resolved_tenant_id)
+    # Credentials must be configured.
     if not tenant.aruba_config_enc:
         return {"ok": False, "error": "No Aruba Central credentials configured for this tenant."}
+    # Decrypt them; failure is reported in the result rather than as an HTTP error.
     try:
         cfg = decrypt_dict(tenant.aruba_config_enc)
     except Exception as exc:
         return {"ok": False, "error": f"Failed to decrypt credentials: {exc}"}
+    # Build the client; a cluster URL is required.
     client = ArubaClient(cfg)
     if not client.is_configured():
         return {"ok": False, "error": "Cluster URL is not set."}
+    # Local import of httpx for the test calls and exception types.
     import httpx
+    # Try to get an access token and list sites.
     try:
         async with httpx.AsyncClient(timeout=15, verify=True) as hc:
             token = await client._ensure_token(hc)
@@ -37,7 +48,9 @@ async def test_central_connection(
                         raw_response = await client._get(dbg, "/network-monitoring/v1alpha1/sites-health")
                 except Exception as raw_exc:
                     raw_response = {"error": str(raw_exc)}
+            # List the sites the credentials can see.
             sites = await client.list_sites()
+        # Success: token obtained, plus the discovered site names.
         result: dict[str, Any] = {
             "ok": True,
             "token_obtained": True,
@@ -46,9 +59,11 @@ async def test_central_connection(
             "sites_discovered": len(sites),
             "sites": [s.get("name") for s in sites if isinstance(s, dict)],
         }
+        # Add the raw response for new_central debugging.
         if raw_response is not None:
             result["raw_sites_response"] = raw_response
         return result
+    # HTTP error from Central: report status, URL and the start of the body.
     except httpx.HTTPStatusError as exc:
         body = ""
         try:
@@ -58,14 +73,17 @@ async def test_central_connection(
         detail = f"HTTP {exc.response.status_code} from {exc.request.url}: {body or exc.response.reason_phrase}"
         logger.warning("test-central HTTP error: %s", detail)
         return {"ok": False, "token_obtained": False, "error": detail}
+    # Could not connect: usually a wrong cluster URL.
     except httpx.ConnectError as exc:
         detail = f"Connection error: {exc}" if str(exc) else f"Could not connect to {client.cluster_url} — check the cluster URL and network access"
         logger.warning("test-central connect error: %s", detail)
         return {"ok": False, "token_obtained": False, "error": detail}
+    # Timed out.
     except httpx.TimeoutException as exc:
         detail = f"Timeout connecting to {client.cluster_url}"
         logger.warning("test-central timeout: %s", exc)
         return {"ok": False, "token_obtained": False, "error": detail}
+    # Anything else: log with traceback and report.
     except Exception as exc:
         detail = str(exc) or repr(exc)
         logger.exception("test-central unexpected error")
@@ -78,26 +96,37 @@ async def register_central_webhook(
     current_user: User = Depends(auth.get_current_user),
 ):
     """Register the hub as a Central webhook receiver."""
+    # Tenant admins only; resolves and access-checks the tenant id.
     resolved_tenant_id = _require_tenant_admin(tenant_id, current_user)
+    # Load the tenant (404 if missing).
     tenant = _get_tenant(resolved_tenant_id)
+    # Decrypted config and a configured client are required.
     cfg = _load_aruba_config(tenant)
     client = ArubaClient(cfg)
     if not client.is_configured():
         raise HTTPException(status_code=400, detail="Aruba Central cluster URL is not configured.")
 
+    # Hub URL Central should call, and a new random API key it must send.
     endpoint_url = _central_webhook_endpoint_url(resolved_tenant_id)
     api_key = secrets.token_urlsafe(32)
+    # Name the webhook after the tenant.
     webhook_name = f"ClientSim Hub - {tenant.name}" if tenant.name else "ClientSim Hub"
+    # Remove any previously registered webhook first so there is only one.
     existing_webhook_id = str(cfg.get("webhook_id") or "").strip()
     if existing_webhook_id:
         await client.delete_webhook(existing_webhook_id)
+    # Register the new webhook and read its id (the field name varies by API version).
     created = await client.register_webhook(webhook_name, endpoint_url, api_key)
     webhook_id = str(created.get("id") or created.get("webhookId") or created.get("webhook_id") or "").strip()
+    # Without an id we cannot manage it later.
     if not webhook_id:
         raise HTTPException(status_code=502, detail="Central did not return a webhook ID.")
+    # Store the id and key with the tenant's Central config.
     cfg["webhook_id"] = webhook_id
     cfg["webhook_api_key"] = api_key
+    # Save the updated (encrypted) Central config.
     _persist_aruba_config(tenant, cfg)
+    # Return the id and URL.
     return {"ok": True, "webhook_id": webhook_id, "endpoint_url": endpoint_url}
 
 
@@ -107,24 +136,33 @@ async def deregister_central_webhook(
     current_user: User = Depends(auth.get_current_user),
 ):
     """Remove the hub webhook from Central."""
+    # Tenant admins only; resolves and access-checks the tenant id.
     resolved_tenant_id = _require_tenant_admin(tenant_id, current_user)
+    # Load the tenant (404 if missing).
     tenant = _get_tenant(resolved_tenant_id)
+    # URL that would be registered.
     endpoint_url = _central_webhook_endpoint_url(resolved_tenant_id)
+    # No Central config: nothing registered.
     if not tenant.aruba_config_enc:
         return {"ok": True, "registered": False, "endpoint_url": endpoint_url}
+    # Decrypt the config.
     try:
         cfg = decrypt_dict(tenant.aruba_config_enc)
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"Failed to decrypt Aruba Central credentials: {exc}") from exc
+    # If a webhook is registered and a cluster URL exists, delete it in Central.
     webhook_id = str(cfg.get("webhook_id") or "").strip()
     if webhook_id and str(cfg.get("cluster_url") or "").strip():
         cfg["cluster_url"] = _validated_cluster_url_or_400(cfg.get("cluster_url", ""))
         client = ArubaClient(cfg)
         if client.is_configured():
             await client.delete_webhook(webhook_id)
+    # Forget the id and key locally.
     cfg.pop("webhook_id", None)
     cfg.pop("webhook_api_key", None)
+    # Save the updated (encrypted) Central config.
     _persist_aruba_config(tenant, cfg)
+    # Report it as not registered.
     return {"ok": True, "registered": False, "endpoint_url": endpoint_url}
 
 
@@ -134,8 +172,11 @@ async def get_central_webhook_status(
     current_user: User = Depends(auth.get_current_user),
 ):
     """Get current webhook registration status."""
+    # Any tenant member; resolves and access-checks the tenant id.
     resolved_tenant_id = _resolve_tenant_id(tenant_id, current_user)
+    # Load the tenant (404 if missing).
     tenant = _get_tenant(resolved_tenant_id)
+    # Read the webhook id/key; unreadable config counts as not registered.
     webhook_id = ""
     webhook_api_key = ""
     if tenant.aruba_config_enc:
@@ -146,6 +187,7 @@ async def get_central_webhook_status(
         except Exception:
             webhook_id = ""
             webhook_api_key = ""
+    # Registration state, id, key and URL.
     return {
         "registered": bool(webhook_id),
         "webhook_id": webhook_id,
@@ -159,7 +201,10 @@ def get_aggregate_api_server(
     tenant_id: Optional[str] = Query(default=None),
     current_user: User = Depends(auth.get_current_user),
 ):
+    """Return each approved spoke's API server telemetry, sorted by spoke name."""
+    # Any tenant member; resolves and access-checks the tenant id.
     resolved_tenant_id = _resolve_tenant_id(tenant_id, current_user)
+    # One entry per approved spoke with its online state and API server info.
     spokes = [
         {
             "tenant_id": resolved_tenant_id,
@@ -171,6 +216,7 @@ def get_aggregate_api_server(
         }
         for spoke in _approved_spokes(resolved_tenant_id)
     ]
+    # Sort by name for a stable display.
     spokes.sort(key=lambda item: str(item.get("spoke_name") or "").lower())
     return {"tenant_id": resolved_tenant_id, "spokes": spokes}
 
@@ -180,7 +226,10 @@ def get_aggregate_central(
     tenant_id: Optional[str] = Query(default=None),
     current_user: User = Depends(auth.get_current_user),
 ):
+    """Return the Central overview (config, mode, status and per-spoke data) for a tenant."""
+    # Any tenant member; resolves and access-checks the tenant id.
     resolved_tenant_id = _resolve_tenant_id(tenant_id, current_user)
+    # Build and return it.
     return _aggregate_central_payload(resolved_tenant_id)
 
 
@@ -189,7 +238,10 @@ def get_tenant_aggregate_central_sites_config(
     tenant_id: str,
     current_user: User = Depends(auth.get_current_user),
 ):
+    """Return the tenant's Central sites config (site mappings, checks, excluded sites)."""
+    # Any tenant member; resolves and access-checks the tenant id.
     resolved_tenant_id = _resolve_tenant_id(tenant_id, current_user)
+    # Load and clean it.
     return _normalize_central_sites_config(store.get_tenant_central_sites_config(resolved_tenant_id))
 
 
@@ -199,11 +251,14 @@ def set_tenant_aggregate_central_sites_config(
     payload: CentralSitesConfigPayload,
     current_user: User = Depends(auth.get_current_user),
 ):
+    """Save the tenant's Central sites config (tenant admins)."""
+    # Tenant admins only; resolves and access-checks the tenant id.
     resolved_tenant_id = _require_tenant_admin(tenant_id, current_user)
     # Merge with existing stored config so unrelated fields (e.g. monitored_items) are preserved
     existing = store.get_tenant_central_sites_config(resolved_tenant_id) or {}
     merged = dict(existing)
     merged.update(_normalize_central_sites_config(payload.model_dump()))
+    # Save and return the cleaned result.
     store.set_tenant_central_sites_config(resolved_tenant_id, merged)
     return _normalize_central_sites_config(merged)
 
@@ -216,40 +271,55 @@ async def get_aggregate_central_status(
     """Aggregate Aruba Central status across spokes.
     Centralized mode: from hub's own polling. Distributed mode: from spoke relay telemetry.
     """
+    # Any tenant member; resolves and access-checks the tenant id.
     resolved_tenant_id = _resolve_tenant_id(tenant_id, current_user)
+    # Load the tenant (404 if missing).
     tenant = _get_tenant(resolved_tenant_id)
+    # Polling mode and approved spokes.
     mode = _central_mode(tenant)
     spokes = _approved_spokes(resolved_tenant_id)
 
+    # Centralized: use the hub's own polling cache.
     if mode == "centralized":
+        # Imported here to avoid a circular import with app.tasks.
         from ...tasks import _cache_updated_at, _hub_central_status
 
+        # Cache older than 5 minutes counts as stale and is ignored.
         is_stale = time.time() - _cache_updated_at.get(resolved_tenant_id, 0) > 300
         tenant_data = {} if is_stale else _hub_central_status.get(resolved_tenant_id, {})
+        # Token state and tenant-wide status sections from the cache (empty when stale).
         token_valid = False if is_stale else bool(tenant_data.get("token_valid", False))
         token_state = "stale" if is_stale else tenant_data.get("token_state", "not_configured")
         aggregate_status = {} if is_stale or not isinstance(tenant_data.get("status"), dict) else tenant_data.get("status", {})
         wireless_clients = {} if is_stale or not isinstance(tenant_data.get("wireless_clients"), dict) else tenant_data.get("wireless_clients", {})
         hardware_alerts = [] if is_stale or not isinstance(tenant_data.get("hardware_alerts"), list) else tenant_data.get("hardware_alerts", [])
         client_count_status = {} if is_stale or not isinstance(tenant_data.get("client_count_status"), dict) else tenant_data.get("client_count_status", {})
+        # Site config, used when a spoke has no cached mappings yet.
         central_sites_config = _normalize_central_sites_config(store.get_tenant_central_sites_config(resolved_tenant_id))
+        # Per-spoke cache data.
         tenant_spokes_data = tenant_data.get("spokes", {}) if isinstance(tenant_data.get("spokes"), dict) else {}
+        # Known spokes first, then any spoke ids only present in the cache.
         spoke_map = {spoke.id: spoke for spoke in spokes}
         ordered_spoke_ids = [spoke.id for spoke in spokes]
         ordered_spoke_ids.extend(spoke_id for spoke_id in tenant_spokes_data if spoke_id not in spoke_map)
+        # One entry per spoke.
         spokes_out = []
         for spoke_id in ordered_spoke_ids:
+            # The spoke (may be None for cache-only ids) and its cached data.
             spoke = spoke_map.get(spoke_id)
             spoke_data = tenant_spokes_data.get(spoke_id, {}) if isinstance(tenant_spokes_data.get(spoke_id), dict) else {}
+            # Site mappings from the cache.
             site_mappings = spoke_data.get("site_mappings", {}) if isinstance(spoke_data.get("site_mappings"), dict) else {}
             # Fall back to tenant-level config when spoke cache is empty (e.g. fresh start
             # before the background task has run). In centralized mode the hub monitors all
             # sites on behalf of every spoke, so the tenant config is always authoritative.
             if not site_mappings:
                 site_mappings = dict(central_sites_config.get("site_mappings") or {}) if isinstance(central_sites_config.get("site_mappings"), dict) else {}
+            # Per-site status, wireless counts and hardware alerts from the cache.
             status = spoke_data.get("status", {}) if isinstance(spoke_data.get("status"), dict) else {}
             wireless = spoke_data.get("wireless_clients", {}) if isinstance(spoke_data.get("wireless_clients"), dict) else {}
             hw_alerts = spoke_data.get("hardware_alerts", []) if isinstance(spoke_data.get("hardware_alerts"), list) else []
+            # Count OK, ERROR and other checks per site.
             sites = []
             for wsite, central_site in site_mappings.items():
                 site_status = status.get(wsite, {}) if isinstance(status.get(wsite), dict) else {}
@@ -265,6 +335,7 @@ async def get_aggregate_central_status(
                     "wireless_clients": wireless.get(wsite),
                     "status_map": site_status,
                 })
+            # Add the spoke's summary.
             spokes_out.append({
                 "spoke_id": spoke_id,
                 "spoke_name": (spoke.spoke_name or spoke.hostname) if spoke else spoke_id,
@@ -276,6 +347,7 @@ async def get_aggregate_central_status(
                 "hardware_alerts": hw_alerts,
                 "client_count_status": spoke_data.get("client_count_status", client_count_status),
             })
+        # Return the centralized result.
         return {
             "tenant_id": resolved_tenant_id,
             "mode": "centralized",
@@ -289,8 +361,10 @@ async def get_aggregate_central_status(
             "spokes": spokes_out,
         }
 
+    # Distributed: build the result from each spoke's telemetry.
     spokes_out = []
     aggregate_client_count_status: dict[str, Any] = {}
+    # Central sections reported by this spoke.
     for spoke in spokes:
         central = _central_telemetry(spoke)
         site_mappings = central.get("site_mappings", {})
@@ -298,11 +372,14 @@ async def get_aggregate_central_status(
         wireless = central.get("wireless_clients", {})
         hw_alerts = central.get("hardware_alerts", [])
         client_count_status = central.get("client_count_status", {}) if isinstance(central.get("client_count_status"), dict) else {}
+        # Add this spoke's sites to the tenant-wide client-count view (first spoke wins).
         for wsite, info in client_count_status.items():
             if wsite not in aggregate_client_count_status and isinstance(info, dict):
                 aggregate_client_count_status[wsite] = info
+        # The spoke's own Central token state.
         token_valid_spoke = bool(central.get("token_valid", False))
         token_state_spoke = central.get("token_state", {})
+        # Count OK, ERROR and other checks per mapped site.
         sites = []
         for wsite, central_site in site_mappings.items():
             site_status = status.get(wsite, {})
@@ -318,6 +395,7 @@ async def get_aggregate_central_status(
                 "wireless_clients": wireless.get(wsite),
                 "status_map": site_status,
             })
+        # Add the spoke's summary.
         spokes_out.append({
             "spoke_id": spoke.id,
             "spoke_name": spoke.spoke_name or spoke.hostname,
@@ -331,6 +409,7 @@ async def get_aggregate_central_status(
             "hardware_alerts": hw_alerts,
             "client_count_status": client_count_status,
         })
+    # Return the distributed result (token state is per spoke).
     return {
         "tenant_id": resolved_tenant_id,
         "mode": "distributed",
@@ -347,10 +426,14 @@ async def hub_central_available(
     current_user: User = Depends(auth.get_current_user),
 ):
     """Return Aruba Central alert, insight, and hardware catalogs for the hub UI."""
+    # Any tenant member; resolves and access-checks the tenant id.
     resolved_tid = _resolve_tenant_id(tenant_id, current_user)
+    # Load the tenant (404 if missing).
     tenant = _get_tenant(resolved_tid)
+    # Not configured: empty catalogs with a warning.
     if not tenant.aruba_config_enc:
         return {"alerts": [], "insights": [], "hardware": [], "warning": "Central not configured on hub."}
+    # Decrypt and validate; unreadable config returns a warning.
     try:
         cfg = decrypt_dict(tenant.aruba_config_enc)
         cfg["cluster_url"] = validate_cluster_url(cfg.get("cluster_url", ""))
@@ -358,9 +441,11 @@ async def hub_central_available(
         logger.warning("Unable to read Aruba config for tenant %s: %s", resolved_tid, exc)
         return {"alerts": [], "insights": [], "hardware": [], "warning": "Could not read Central API config."}
 
+    # Build the client; it needs a cluster URL.
     client = ArubaClient(cfg)
     if not client.is_configured():
         return {"alerts": [], "insights": [], "hardware": [], "warning": "Central not configured on hub."}
+    # Ask Central for its catalogs; errors become a warning.
     try:
         return await client.available_checks()
     except Exception as exc:
@@ -375,36 +460,47 @@ async def hub_central_devices(
     current_user: User = Depends(auth.get_current_user),
 ):
     """Fetch network devices from Central API filtered by site name. Hub-side endpoint for CNX mode."""
+    # Any tenant member; resolves and access-checks the tenant id.
     resolved_tid = _resolve_tenant_id(tenant_id, current_user)
+    # Load the tenant (404 if missing).
     tenant = _get_tenant(resolved_tid)
 
+    # Not configured.
     if not tenant.aruba_config_enc:
         return {"devices": [], "count": 0, "warning": "Central API not configured on hub."}
 
+    # Decrypt; unreadable config returns a warning.
     try:
         cfg = decrypt_dict(tenant.aruba_config_enc)
     except Exception:
         return {"devices": [], "count": 0, "warning": "Could not decrypt Central API config."}
 
+    # This endpoint only supports the New Central API.
     api_version = cfg.get("api_version", "classic")
     if api_version != "new_central":
         return {"devices": [], "count": 0, "warning": "Device list requires New Central API mode."}
 
+    # Connection details.
     cluster_url = (cfg.get("cluster_url") or "").rstrip("/")
     client_id = cfg.get("client_id", "")
     client_secret = cfg.get("client_secret", "")
 
+    # Client credentials are required to get a token.
     if not all([cluster_url, client_id, client_secret]):
         return {"devices": [], "count": 0, "warning": "Central API credentials incomplete."}
 
+    # Validate the cluster URL and build the Central client.
     cfg["cluster_url"] = _validated_cluster_url_or_400(cluster_url)
     aruba_client = ArubaClient(cfg)
 
+    # Call Central; any unexpected error becomes a warning.
     try:
         async with httpx.AsyncClient() as client:
+            # Get (or reuse) an access token and build the auth headers.
             access_token = await aruba_client._ensure_token(client)
             headers = aruba_client._headers(access_token)
 
+            # Find the site id by name via sites-health.
             site_id = None
             site_lookup_error = ""
             try:
@@ -425,6 +521,7 @@ async def hub_central_devices(
                 logger.warning("Central site lookup failed for tenant %s site %s: %s", resolved_tid, site, exc)
                 site_lookup_error = str(exc)
 
+            # Report lookup failures and unknown sites.
             if site_lookup_error:
                 return {
                     "devices": [],
@@ -435,10 +532,12 @@ async def hub_central_devices(
             if not site_id:
                 return {"devices": [], "count": 0, "warning": f"Site '{site}' not found in Central."}
 
+            # Ask for up to 500 devices in this site.
             params: dict[str, Any] = {"limit": 500}
             if site_id:
                 params["filter"] = f"siteId eq '{site_id}'"
 
+            # Fetch devices.
             dev_resp = await client.get(
                 f"{aruba_client.cluster_url}/network-monitoring/v1alpha1/devices",
                 headers=headers,
@@ -448,10 +547,12 @@ async def hub_central_devices(
             if dev_resp.status_code != 200:
                 return {"devices": [], "count": 0, "warning": f"Devices fetch failed: {dev_resp.status_code}"}
 
+            # Keep only devices actually in the site.
             raw_devices = dev_resp.json().get("items", [])
             if site_id:
                 raw_devices = [d for d in raw_devices if d.get("siteId") == site_id]
 
+            # Map Central fields to the UI's device fields ("—" when missing).
             devices = [
                 {
                     "name": d.get("deviceName") or d.get("id") or "—",
@@ -467,10 +568,13 @@ async def hub_central_devices(
                 for d in raw_devices
             ]
 
+            # Return the devices and count.
             return {"devices": devices, "count": len(devices)}
 
+    # HTTP errors propagate unchanged.
     except HTTPException:
         raise
+    # Anything else: log and return a warning.
     except Exception as exc:
         logger.warning("Error fetching Central devices for tenant %s site %s: %s", resolved_tid, site, exc)
         return {"devices": [], "count": 0, "warning": "Error fetching devices.", "error": str(exc)}
@@ -483,37 +587,49 @@ async def hub_central_site_alerts(
     current_user: User = Depends(auth.get_current_user),
 ):
     """Fetch site alerts from Central API. Hub-side endpoint."""
+    # Any tenant member; resolves and access-checks the tenant id.
     resolved_tid = _resolve_tenant_id(tenant_id, current_user)
+    # Load the tenant (404 if missing).
     tenant = _get_tenant(resolved_tid)
 
+    # Not configured.
     if not tenant.aruba_config_enc:
         return {"alerts": [], "count": 0, "warning": "Central API not configured on hub."}
 
+    # Decrypt; unreadable config returns a warning.
     try:
         cfg = decrypt_dict(tenant.aruba_config_enc)
     except Exception:
         return {"alerts": [], "count": 0, "warning": "Could not decrypt Central API config."}
 
+    # API flavour and connection details.
     api_version = cfg.get("api_version", "classic")
     cluster_url = (cfg.get("cluster_url") or "").rstrip("/")
     client_id = cfg.get("client_id", "")
     client_secret = cfg.get("client_secret", "")
 
+    # Client credentials are required to get a token.
     if not all([cluster_url, client_id, client_secret]):
         return {"alerts": [], "count": 0, "warning": "Central API credentials incomplete."}
 
+    # Validate the cluster URL and build the Central client.
     cfg["cluster_url"] = _validated_cluster_url_or_400(cluster_url)
     aruba_client = ArubaClient(cfg)
 
+    # Call Central; any unexpected error becomes a warning.
     try:
         async with httpx.AsyncClient() as client:
+            # Get (or reuse) an access token and build the auth headers.
             access_token = await aruba_client._ensure_token(client)
             headers = aruba_client._headers(access_token)
 
+            # Collected alerts and the current time.
             alerts: list[dict[str, Any]] = []
             ts_now = int(time.time())
 
+            # New Central has no alert list per site: build alerts from site health and devices.
             if api_version == "new_central":
+                # Find the site by name and read its health score.
                 site_id = None
                 health_score = None
                 site_found = False
@@ -538,6 +654,7 @@ async def hub_central_site_alerts(
                     logger.warning("Central alerts site lookup failed for tenant %s site %s: %s", resolved_tid, site, exc)
                     site_lookup_error = str(exc)
 
+                # Report lookup failures and unknown sites.
                 if site_lookup_error:
                     return {
                         "alerts": [],
@@ -548,6 +665,7 @@ async def hub_central_site_alerts(
                 if not site_found:
                     return {"alerts": [], "count": 0, "warning": f"Site '{site}' not found in Central."}
 
+                # Health below 100 becomes an alert (severity by score).
                 if health_score is not None and health_score < 100:
                     severity = "CRITICAL" if health_score < 50 else "MAJOR" if health_score < 80 else "MINOR"
                     alerts.append({
@@ -561,9 +679,11 @@ async def hub_central_site_alerts(
                         "message": f"Site health score is {health_score}/100",
                     })
 
+                # Each device in the site that is not up becomes an alert.
                 if site_id:
                     device_fetch_error = ""
                     try:
+                        # Fetch up to 500 devices in this site.
                         params: dict[str, Any] = {"limit": 500, "filter": f"siteId eq '{site_id}'"}
                         dev_resp = await client.get(
                             f"{aruba_client.cluster_url}/network-monitoring/v1alpha1/devices",
@@ -571,6 +691,7 @@ async def hub_central_site_alerts(
                             params=params,
                             timeout=20,
                         )
+                        # Alert type and name for each device type.
                         if dev_resp.status_code != 200:
                             device_fetch_error = f"Devices fetch failed: {dev_resp.status_code}"
                         else:
@@ -579,12 +700,14 @@ async def hub_central_site_alerts(
                                 "SWITCH": ("SWITCH_DOWN", "Switch Down"),
                                 "GATEWAY": ("GATEWAY_DOWN", "Gateway Down"),
                             }
+                            # Skip devices from other sites and devices that are up.
                             for dev in dev_resp.json().get("items", []):
                                 if dev.get("siteId") != site_id:
                                     continue
                                 status = (dev.get("status") or "").upper()
                                 if status in ("UP", "ONLINE"):
                                     continue
+                                # Add a "down" alert for this device.
                                 dtype = (dev.get("deviceType") or "").upper()
                                 atype, aname = _TYPE_MAP.get(dtype, ("DEVICE_DOWN", "Device Down"))
                                 alerts.append({
@@ -597,9 +720,11 @@ async def hub_central_site_alerts(
                                     "ts": ts_now,
                                     "message": f"{dev.get('model', dtype)} — status: {dev.get('status', 'Unknown')} | IP: {dev.get('ipv4') or dev.get('ip', '—')}",
                                 })
+                    # Device fetch failed.
                     except Exception as exc:
                         logger.warning("Central device alert fetch failed for tenant %s site %s: %s", resolved_tid, site, exc)
                         device_fetch_error = str(exc)
+                    # Return any alerts so far with the error.
                     if device_fetch_error:
                         return {
                             "alerts": alerts,
@@ -607,17 +732,21 @@ async def hub_central_site_alerts(
                             "warning": "Failed to fetch site devices from Central.",
                             "error": device_fetch_error,
                         }
+            # Classic Central: query the alerts API (v1, then v2).
             else:
                 thirty_days_ago = ts_now - 30 * 86400
                 alerts_fetch_error = ""
+                # Try each API path until one works.
                 for path in ["/monitoring/v1/alerts", "/monitoring/v2/alerts"]:
                     try:
+                        # Fetch the site's alerts from the last 30 days.
                         resp = await client.get(
                             f"{aruba_client.cluster_url}{path}",
                             headers=headers,
                             params={"site": site, "limit": 500, "from_timestamp": thirty_days_ago},
                             timeout=20,
                         )
+                        # Success: keep alerts for this site, mapped to the UI fields.
                         if resp.status_code == 200:
                             for alert in resp.json().get("alerts", []):
                                 alert_site = alert.get("site_name") or alert.get("site") or ""
@@ -633,17 +762,22 @@ async def hub_central_site_alerts(
                                     "ts": alert.get("timestamp") or alert.get("raised_at", ""),
                                     "message": alert.get("details") or alert.get("description", ""),
                                 })
+                            # Got a result; stop trying paths.
                             alerts_fetch_error = ""
                             break
+                        # Not found: try the next path.
                         if resp.status_code == 404:
                             continue
+                        # Other status: remember the error and try the next path.
                         alerts_fetch_error = f"{path} returned {resp.status_code}"
                         logger.warning("Central alerts fetch failed for tenant %s site %s via %s: %s", resolved_tid, site, path, resp.status_code)
+                    # Request error: remember it and try the next path.
                     except Exception as exc:
                         logger.warning("Central alerts fetch failed for tenant %s site %s via %s: %s", resolved_tid, site, path, exc)
                         alerts_fetch_error = str(exc)
                         continue
 
+                # Every path failed and nothing was found.
                 if alerts_fetch_error and not alerts:
                     return {
                         "alerts": [],
@@ -652,11 +786,14 @@ async def hub_central_site_alerts(
                         "error": alerts_fetch_error,
                     }
 
+            # Return the alerts, with a note if there were none.
             warning = None if alerts else "No alerts detected for this site."
             return {"alerts": alerts, "count": len(alerts), "warning": warning}
 
+    # HTTP errors propagate unchanged.
     except HTTPException:
         raise
+    # Anything else: log and return a warning.
     except Exception as exc:
         logger.warning("Error fetching Central alerts for tenant %s site %s: %s", resolved_tid, site, exc)
         return {"alerts": [], "count": 0, "warning": "Error fetching alerts.", "error": str(exc)}
@@ -670,6 +807,7 @@ async def hub_central_browse(
 ):
     """Return Central browse data from the in-memory cache (refreshed every 5 min by background task).
     force=true performs a synchronous refresh before returning the current payload."""
+    # Any tenant member; resolves and access-checks the tenant id.
     resolved_tid = _resolve_tenant_id(tenant_id, current_user)
 
     # Load disk cache into memory if cold (e.g. first request after restart)
@@ -679,18 +817,22 @@ async def hub_central_browse(
             _central_browse_cache[resolved_tid] = disk
             _central_browse_cache_ts[resolved_tid] = disk.get("cached_at", 0)
 
+    # Current cache entry.
     cached = _central_browse_cache.get(resolved_tid)
 
     # Also refresh when clients is empty but clients_by_site has data — stale disk cache from old format
     def _needs_client_refresh(d: dict | None) -> bool:
+        """Return True if the cache has per-site counts but no individual clients."""
         if not isinstance(d, dict):
             return False
         return not d.get("clients") and bool(d.get("clients_by_site"))
 
+    # Refresh when forced, or when the cache uses an old format.
     if force or _has_legacy_client_summary_rows(cached) or _needs_client_refresh(cached):
         await _refresh_central_browse(resolved_tid)
         cached = _central_browse_cache.get(resolved_tid)
 
+    # Have data: upgrade its format if needed (saving the result) and return it.
     if cached:
         normalized_cached = _normalize_browse_cache(cached) or {}
         if normalized_cached != cached:
@@ -699,6 +841,7 @@ async def hub_central_browse(
         return {**normalized_cached, "cached": True}
 
     # Nothing in memory or on disk yet — do a blocking fetch (first-ever load)
+    # Load it now, upgrade its format if needed, and return it.
     await _refresh_central_browse(resolved_tid)
     cached = _central_browse_cache.get(resolved_tid, {})
     normalized_cached = _normalize_browse_cache(cached) or {}
@@ -714,7 +857,9 @@ async def get_monitored_items(
     current_user: User = Depends(auth.get_current_user),
 ):
     """Return all monitored items for a tenant (viewer-accessible for button state)."""
+    # Any tenant member may read the list.
     resolved_tenant_id = _require_tenant_access(tenant_id, current_user)
+    # Items stored in the tenant's Central sites config.
     cfg = store.get_tenant_central_sites_config(resolved_tenant_id)
     items = cfg.get("monitored_items") if isinstance(cfg.get("monitored_items"), list) else []
     return {"items": items}
@@ -727,10 +872,14 @@ async def add_monitored_item(
     current_user: User = Depends(auth.get_current_user),
 ):
     """Add an item to the monitored items list (idempotent by type + identifier)."""
+    # uuid gives each item a unique id.
     import uuid as _uuid
+    # Tenant admins only.
     resolved_tenant_id = _require_tenant_admin(tenant_id, current_user)
+    # Current item list.
     cfg = store.get_tenant_central_sites_config(resolved_tenant_id)
     items: list[dict[str, Any]] = list(cfg.get("monitored_items") or [])
+    # Already present (same type and identifier): return it unchanged.
     existing = next(
         (item for item in items if isinstance(item, dict)
          and item.get("type") == body.type
@@ -739,6 +888,7 @@ async def add_monitored_item(
     )
     if existing:
         return {"item": existing, "created": False}
+    # New item with monitoring state fields.
     new_item: dict[str, Any] = {
         "id": str(_uuid.uuid4()),
         "type": str(body.type),
@@ -750,6 +900,7 @@ async def add_monitored_item(
         "last_notified": None,
         "status": "ok",
     }
+    # Add it and save.
     items.append(new_item)
     cfg["monitored_items"] = items
     store.set_tenant_central_sites_config(resolved_tenant_id, cfg)
@@ -763,7 +914,9 @@ async def delete_monitored_item(
     current_user: User = Depends(auth.get_current_user),
 ):
     """Remove a monitored item by ID."""
+    # Tenant admins only.
     resolved_tenant_id = _require_tenant_admin(tenant_id, current_user)
+    # Remove the item with this id and save.
     cfg = store.get_tenant_central_sites_config(resolved_tenant_id)
     items = [
         item for item in (cfg.get("monitored_items") or [])
@@ -780,19 +933,28 @@ async def update_aggregate_central(
     tenant_id: Optional[str] = Query(default=None),
     current_user: User = Depends(auth.get_current_user),
 ):
+    """Update a tenant's Central mode, hub credentials and browse interval (tenant admins).
+
+    Blank secret fields keep stored values. Approved spokes get a config push. In
+    centralized mode, default checks are filled in and discovered sites are mapped.
+    """
+    # Tenant from the body or query string; tenant admins only.
     requested_tenant_id = payload.tenant_id or tenant_id
     resolved_tenant_id = _require_tenant_admin(_resolve_tenant_id(requested_tenant_id, current_user), current_user)
+    # Load the tenant and validate the mode.
     tenant = _get_tenant(resolved_tenant_id)
     mode = str(payload.mode or "distributed").strip().lower()
     if mode not in MODE_VALUES:
         raise HTTPException(status_code=400, detail="mode must be centralized or distributed")
 
+    # Existing config, so blank fields can keep their stored values.
     existing_cfg: dict[str, Any] = {}
     if tenant.aruba_config_enc:
         try:
             existing_cfg = decrypt_dict(tenant.aruba_config_enc)
         except Exception:
             existing_cfg = {}
+    # Non-secret fields come from the form.
     incoming = payload.hub_central_config.model_dump()
     cfg = {
         "api_version": str(incoming.get("api_version") or existing_cfg.get("api_version") or "classic"),
@@ -801,6 +963,7 @@ async def update_aggregate_central(
         "customer_id": str(incoming.get("customer_id") or "").strip(),
         "workspace_id": str(incoming.get("workspace_id") or "").strip(),
     }
+    # Use the new client secret if given, otherwise keep the stored one.
     client_secret = str(incoming.get("client_secret") or "")
     if client_secret:
         cfg["client_secret"] = client_secret
@@ -812,12 +975,14 @@ async def update_aggregate_central(
         cfg["access_token"] = access_token
     elif existing_cfg.get("access_token"):
         cfg["access_token"] = existing_cfg["access_token"]
+    # Keep the refresh token (unless a new access token was entered) and webhook details.
     for key in ("refresh_token", "webhook_id", "webhook_api_key"):
         if key == "refresh_token" and access_token:
             continue
         if existing_cfg.get(key):
             cfg[key] = existing_cfg[key]
 
+    # Customer id and browse interval (clamped to 1-60 minutes, default 5).
     tenant.aruba_cid = cfg.get("customer_id") or tenant.aruba_cid
     tenant.central_browse_interval_minutes = max(1, min(60, payload.central_browse_interval_minutes or 5))
     # Safeguard: only update the encrypted config if the form actually contains values.
@@ -834,6 +999,7 @@ async def update_aggregate_central(
         # No existing config and nothing new — store None (first-time empty save)
         tenant.aruba_config_enc = None
     # else: keep existing aruba_config_enc unchanged to prevent accidental wipe
+    # Store the polling mode and save the tenant.
     tenant.default_processing_mode.aruba_polling = mode
     store.save_tenant(tenant)
 
@@ -844,22 +1010,27 @@ async def update_aggregate_central(
         store.save_spoke(spoke)
         store.ensure_config_update_command(resolved_tenant_id, spoke.id)
 
+    # Centralized with credentials: set up the hub's site monitoring.
     if mode == "centralized" and tenant.aruba_config_enc:
         central_sites_config = _normalize_central_sites_config(store.get_tenant_central_sites_config(resolved_tenant_id))
+        # New Central: fill in default checks if none are configured.
         if cfg.get("api_version") == "new_central":
             if not central_sites_config.get("monitored_checks"):
                 central_sites_config["monitored_checks"] = [dict(item) for item in DEFAULT_NEW_CENTRAL_MONITORED_CHECKS]
             if not central_sites_config.get("hardware_checks"):
                 central_sites_config["hardware_checks"] = [dict(item) for item in DEFAULT_NEW_CENTRAL_HARDWARE_CHECKS]
+        # Discover sites from Central; failures just mean no new sites.
         try:
             discover_client = ArubaClient(cfg)
             discovered_sites = await discover_client.list_sites() if discover_client.is_configured() else []
         except Exception as exc:
             logger.warning("Unable to auto-discover Aruba Central sites for tenant %s: %s", resolved_tenant_id, exc)
             discovered_sites = []
+        # Names already mapped (either side) or excluded, compared case-insensitively.
         existing_wsites = {str(name).strip().casefold() for name in central_sites_config.get("site_mappings", {})}
         existing_central = {str(name).strip().casefold() for name in central_sites_config.get("site_mappings", {}).values()}
         excluded = {str(s).strip().casefold() for s in central_sites_config.get("excluded_sites", []) if s}
+        # Map each newly discovered site to itself.
         for site in discovered_sites:
             site_name = str((site or {}).get("name") or "").strip()
             if not site_name:
@@ -870,8 +1041,10 @@ async def update_aggregate_central(
             central_sites_config.setdefault("site_mappings", {})[site_name] = site_name
             existing_wsites.add(normalized)
             existing_central.add(normalized)
+        # Save the updated sites config.
         store.set_tenant_central_sites_config(resolved_tenant_id, central_sites_config)
 
+    # Return the updated overview.
     return _aggregate_central_payload(resolved_tenant_id)
 
 
@@ -880,16 +1053,23 @@ async def clear_aggregate_central_secrets(
     tenant_id: str,
     current_user: User = Depends(auth.get_current_user),
 ):
+    """Remove the stored Central secret, access token and refresh token (tenant admins)."""
+    # Tenant admins only; resolves and access-checks the tenant id.
     resolved_tenant_id = _require_tenant_admin(tenant_id, current_user)
+    # Load the tenant (404 if missing).
     tenant = _get_tenant(resolved_tenant_id)
+    # Nothing stored: return the current view.
     if not tenant.aruba_config_enc:
         return _serialize_hub_central_config(tenant)
+    # Decrypt the config.
     try:
         cfg = decrypt_dict(tenant.aruba_config_enc)
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"Failed to decrypt Aruba Central credentials: {exc}") from exc
+    # Drop the secrets, save, and return the updated view.
     cfg.pop("client_secret", None)
     cfg.pop("access_token", None)
     cfg.pop("refresh_token", None)
+    # Save the updated (encrypted) Central config.
     _persist_aruba_config(tenant, cfg)
     return _serialize_hub_central_config(tenant)

@@ -1,6 +1,9 @@
 """Proxmox Agent (helpers moved verbatim from server.py; shared deps imported from server)."""
+# Postpone annotation evaluation so modern type hints are never evaluated at runtime.
 from __future__ import annotations
 
+# Shared state, constants and helpers come from server.py; this module holds the Proxmox agent
+# logic.
 from server import (
     APP_VERSION,
     Any,
@@ -124,7 +127,9 @@ from server import (
 
 async def _async_save_vm_watchdog() -> None:
     """Persist VM watchdog state without blocking the event loop."""
+    # Serialise now (on the event loop) so the thread writes a consistent snapshot.
     serialized = json.dumps(vm_watchdog, default=str)
+    # Write atomically in a worker thread; a failure is only logged.
     try:
         await asyncio.to_thread(_write_atomic_str, VM_WATCHDOG_FILE, serialized)
     except Exception as exc:
@@ -135,7 +140,9 @@ async def _async_save_vm_watchdog() -> None:
 
 async def _async_save_commands() -> None:
     """Persist command queue without blocking the event loop."""
+    # Serialise now (on the event loop) so the thread writes a consistent snapshot.
     serialized = json.dumps(commands, default=str)
+    # Write atomically in a worker thread; a failure is only logged.
     try:
         await asyncio.to_thread(_write_atomic_str, COMMAND_QUEUE_FILE, serialized)
     except Exception as exc:
@@ -146,7 +153,9 @@ async def _async_save_commands() -> None:
 
 async def _async_save_reclone_state() -> None:
     """Persist reclone state without blocking the event loop."""
+    # Serialise now (on the event loop) so the thread writes a consistent snapshot.
     serialized = json.dumps(reclone_state, default=str)
+    # Write atomically in a worker thread; a failure is only logged.
     try:
         await asyncio.to_thread(_write_atomic_str, RECLONE_STATE_FILE, serialized)
     except Exception as exc:
@@ -156,6 +165,8 @@ async def _async_save_reclone_state() -> None:
 
 
 def _save_commands() -> None:
+    """Write the command queue to disk (blocking); a failure is only logged."""
+    # Atomic write so a crash never leaves a half-written file.
     try:
         _atomic_write_json(COMMAND_QUEUE_FILE, commands)
     except Exception as exc:
@@ -165,6 +176,8 @@ def _save_commands() -> None:
 
 
 def _save_reclone_state() -> None:
+    """Write the reclone state to disk (blocking); a failure is only logged."""
+    # Atomic write so a crash never leaves a half-written file.
     try:
         _atomic_write_json(RECLONE_STATE_FILE, reclone_state)
     except Exception as exc:
@@ -174,6 +187,8 @@ def _save_reclone_state() -> None:
 
 
 def _save_update_state() -> None:
+    """Write the self-update state to disk (blocking); a failure is only logged."""
+    # Atomic write so a crash never leaves a half-written file.
     try:
         _atomic_write_json(UPDATE_STATE_FILE, update_state)
     except Exception as exc:
@@ -183,6 +198,8 @@ def _save_update_state() -> None:
 
 
 def _save_vm_watchdog() -> None:
+    """Write the VM watchdog state to disk (blocking); a failure is only logged."""
+    # Atomic write so a crash never leaves a half-written file.
     try:
         _atomic_write_json(VM_WATCHDOG_FILE, vm_watchdog)
     except Exception as exc:
@@ -192,48 +209,61 @@ def _save_vm_watchdog() -> None:
 
 
 def _load_commands() -> None:
+    """Load the saved command queue at startup, re-queueing commands cut off by a restart."""
+    # No file means an empty queue.
     try:
         if not COMMAND_QUEUE_FILE.exists():
             return
+        # The file must hold a list.
         raw = json.loads(COMMAND_QUEUE_FILE.read_text(encoding="utf-8"))
         if not isinstance(raw, list):
             raise ValueError("command queue must be a list")
+        # Rebuild the queue, noting whether anything changed and needs saving.
         now = time.time()
         changed = False
         restored: list[dict[str, Any]] = []
         for entry in raw:
+            # Skip broken entries.
             if not isinstance(entry, dict):
                 changed = True
                 continue
             cmd = dict(entry)
+            # Commands in flight when we stopped go back to pending so they are sent again.
             if cmd.get("status") in ("executing", "delivered"):
                 cmd["status"] = "pending"
                 cmd["updated_at"] = now
                 changed = True
             restored.append(cmd)
+        # Replace the queue, then drop expired/old commands.
         commands[:] = restored
         expired, purged = _cleanup_commands_locked(now)
         if expired or purged:
             changed = True
+        # Save if anything changed, then log the count.
         if changed:
             _save_commands()
         logger.info("Restored %d command(s) from disk", len(commands))
     except Exception as exc:
+        # A broken file is logged; we start with an empty queue.
         logger.warning("Could not load command queue: %s", exc)
 
 
 
 
 def _load_reclone_state() -> None:
+    """Load the saved reclone state at startup and tidy up runs cut off by a restart."""
+    # No file means the default state.
     try:
         if not RECLONE_STATE_FILE.exists():
             return
+        # The file must hold an object; copy only keys we know.
         raw = json.loads(RECLONE_STATE_FILE.read_text(encoding="utf-8"))
         if not isinstance(raw, dict):
             raise ValueError("reclone state must be an object")
         for key in reclone_state:
             if key in raw:
                 reclone_state[key] = raw[key]
+        # A run that was in progress when we stopped is marked interrupted, with a log line.
         changed = False
         if reclone_state.get("status") == "running":
             reclone_state["status"] = "interrupted"
@@ -249,6 +279,7 @@ def _load_reclone_state() -> None:
             reclone_state["log"] = list(reclone_state.get("log") or []) + [log_entry]
             reclone_state["log"] = reclone_state["log"][-200:]
             changed = True
+        # A completed run older than 8 hours is cleared back to idle.
         if reclone_state.get("status") == "completed":
             last_run = reclone_state.get("last_run") or {}
             ts = _parse_ts(last_run.get("timestamp"))
@@ -260,19 +291,24 @@ def _load_reclone_state() -> None:
                     "auto_recovery_log": [],
                 })
                 changed = True
+        # Save if anything changed.
         if changed:
             _save_reclone_state()
         logger.info("Restored reclone state from disk")
     except Exception as exc:
+        # A broken file is logged; we keep the default state.
         logger.warning("Could not load reclone state: %s", exc)
 
 
 
 
 def _load_update_state() -> None:
+    """Load the saved self-update state at startup."""
+    # No file means the default state.
     try:
         if not UPDATE_STATE_FILE.exists():
             return
+        # The file must hold an object.
         raw = json.loads(UPDATE_STATE_FILE.read_text(encoding="utf-8"))
         if not isinstance(raw, dict):
             raise ValueError("update state must be an object")
@@ -284,27 +320,34 @@ def _load_update_state() -> None:
                 continue
             if key in raw:
                 update_state[key] = raw[key]
+        # An update that was running when we stopped is marked as interrupted.
         if update_state.get("update_in_progress"):
             update_state["update_in_progress"] = False
             update_state["update_error"] = "Update interrupted by restart"
             _save_update_state()
         logger.info("Restored update state from disk")
     except Exception as exc:
+        # A broken file is logged; we keep the default state.
         logger.warning("Could not load update state: %s", exc)
 
 
 
 
 def _load_vm_watchdog() -> None:
+    """Load the saved VM watchdog state at startup, dropping or fixing bad entries."""
+    # No file means an empty watchdog.
     try:
         if not VM_WATCHDOG_FILE.exists():
             return
+        # The file must hold an object keyed by VMID.
         raw = json.loads(VM_WATCHDOG_FILE.read_text(encoding="utf-8"))
         if not isinstance(raw, dict):
             raise ValueError("vm watchdog state must be an object")
+        # Rebuild it entry by entry, noting whether anything was fixed.
         restored: dict[str, dict[str, Any]] = {}
         changed = False
         for raw_vmid, entry in raw.items():
+            # Skip entries that are not dicts or whose key is not a VMID.
             if not isinstance(entry, dict):
                 changed = True
                 continue
@@ -313,15 +356,18 @@ def _load_vm_watchdog() -> None:
             except (TypeError, ValueError):
                 changed = True
                 continue
+            # An entry without a valid clone time is useless; drop it.
             clone_completed_at = _parse_ts(entry.get("clone_completed_at"))
             if clone_completed_at is None:
                 changed = True
                 continue
+            # Reclone count must be a non-negative integer (0 if bad).
             try:
                 reclone_count = max(0, int(entry.get("reclone_count", 0) or 0))
             except (TypeError, ValueError):
                 reclone_count = 0
                 changed = True
+            # Keep only the known fields in a clean form.
             normalized = {
                 "clone_completed_at": clone_completed_at,
                 "reclone_count": reclone_count,
@@ -330,12 +376,14 @@ def _load_vm_watchdog() -> None:
             if entry != normalized or raw_vmid != vmid_key:
                 changed = True
             restored[vmid_key] = normalized
+        # Replace the in-memory state, save if anything was fixed, and log.
         vm_watchdog.clear()
         vm_watchdog.update(restored)
         if changed:
             _save_vm_watchdog()
         logger.info("Restored VM watchdog state from disk")
     except Exception as exc:
+        # A broken file is logged; the watchdog starts empty.
         logger.warning("Could not load VM watchdog state: %s", exc)
 
 
@@ -343,8 +391,10 @@ def _load_vm_watchdog() -> None:
 
 def _sanitize_proxmox_tag(name: str) -> str:
     """Normalize a simulation name to a Proxmox-safe tag with sim- prefix."""
+    # Lower-case, turn runs of other characters into "-", and add the sim- prefix if missing.
     name = re.sub(r'[^a-z0-9]+', '-', str(name).strip().lower()).strip('-')
     tag = f"{_SIM_TAG_PREFIX}{name}" if not name.startswith(_SIM_TAG_PREFIX) else name
+    # Proxmox tags are limited, so cap at 64 chars; an empty name gives no tag.
     return tag[:64] if name else ""
 
 
@@ -352,23 +402,29 @@ def _sanitize_proxmox_tag(name: str) -> str:
 
 def _get_proxmox_token_for_host(hostname: str | None) -> str:
     """Return per-host token if set, falling back to the legacy global token."""
+    # Per-host token wins when set.
     if hostname:
         per_host = str((settings.get("proxmox_tokens") or {}).get(hostname, "") or "").strip()
         if per_host:
             return per_host
+    # Otherwise use the global token.
     return str(settings.get("proxmox_api_token", "") or "").strip()
 
 
 
 
 def _get_proxmox_host_config(hostname: Any) -> dict[str, Any]:
+    """Return the saved Proxmox settings for one host (empty dict if none)."""
+    # The config must be a dict keyed by hostname.
     proxmox_config = settings.get("proxmox_config") or {}
     if not isinstance(proxmox_config, dict):
         return {}
+    # Normalise the name, then match it to a saved host entry if possible.
     normalized = _normalize_proxmox_hostname(hostname)
     if not normalized:
         return {}
     resolved = _resolve_proxmox_agent_hostname(normalized, proxmox_config) or normalized
+    # Return a copy so callers cannot change settings by accident.
     data = proxmox_config.get(resolved, {})
     return dict(data) if isinstance(data, dict) else {}
 
@@ -376,24 +432,31 @@ def _get_proxmox_host_config(hostname: Any) -> dict[str, Any]:
 
 
 def _save_proxmox_host_config(hostname: str, updates: dict[str, Any]) -> dict[str, Any]:
+    """Save Proxmox settings for one host in memory and in the persisted copy, then write to disk.
+    """
+    # The live settings and the persisted copy are both updated.
     proxmox_config = settings.setdefault("proxmox_config", {})
     persisted_config = _persisted.setdefault("proxmox_config", {})
+    # Start from the host's current entry (if valid).
     current = proxmox_config.get(hostname, {})
     if not isinstance(current, dict):
         current = {}
     entry = dict(current)
+    # A set override of 0 means "none", so the key is removed.
     if "vm_set_override" in updates:
         vm_set_override = _sanitize_vm_set_override(updates.get("vm_set_override"))
         if vm_set_override:
             entry["vm_set_override"] = vm_set_override
         else:
             entry.pop("vm_set_override", None)
+    # Store the entry, or remove the host when nothing is left.
     if entry:
         proxmox_config[hostname] = entry
         persisted_config[hostname] = dict(entry)
     else:
         proxmox_config.pop(hostname, None)
         persisted_config.pop(hostname, None)
+    # Write to disk and return a copy of the entry.
     _save_settings()
     return dict(entry)
 
@@ -401,6 +464,7 @@ def _save_proxmox_host_config(hostname: str, updates: dict[str, Any]) -> dict[st
 
 
 def _has_any_proxmox_token() -> bool:
+    """Return True if any Proxmox API token is set, global or per host."""
     if _get_proxmox_token_for_host(None):
         return True
     return any(str(tok or "").strip() for tok in (settings.get("proxmox_tokens") or {}).values())
@@ -409,6 +473,10 @@ def _has_any_proxmox_token() -> bool:
 
 
 def _save_proxmox_token_for_host(hostname: str, token: str) -> None:
+    """Save a Proxmox API token for one host in memory and in the persisted copy, then write to
+    disk.
+    """
+    # Store in both the live settings and the persisted copy.
     tokens = settings.setdefault("proxmox_tokens", {})
     persisted_tokens = _persisted.setdefault("proxmox_tokens", {})
     tokens[hostname] = token
@@ -419,16 +487,20 @@ def _save_proxmox_token_for_host(hostname: str, token: str) -> None:
 
 
 def _update_service_health(name: str, *, ok: bool, error: str | None = None) -> None:
+    """Record one run of a background task in service_health (status, counts, last error)."""
+    # Count every run and note when it happened.
     now = iso_utcnow()
     entry = service_health.setdefault(name, {"run_count": 0, "consecutive_errors": 0})
     entry["last_run"] = now
     entry["run_count"] = entry.get("run_count", 0) + 1
+    # Success clears the error state.
     if ok:
         entry["last_success"] = now
         entry["last_error_msg"] = None
         entry["consecutive_errors"] = 0
         entry["status"] = "ok"
     else:
+        # Failure: record the error; three in a row turns the status from warning to error.
         entry["last_error_msg"] = error or "unknown error"
         entry["consecutive_errors"] = entry.get("consecutive_errors", 0) + 1
         entry["status"] = "error" if entry["consecutive_errors"] >= 3 else "warning"
@@ -437,12 +509,14 @@ def _update_service_health(name: str, *, ok: bool, error: str | None = None) -> 
 
 
 def _normalize_command_action(value: Any) -> str:
+    """Normalise an action name: lower case with underscores instead of hyphens."""
     return str(value or "").strip().lower().replace("-", "_")
 
 
 
 
 def _normalize_command_type(value: Any) -> str | None:
+    """Normalise a command type (hyphens to underscores); empty becomes None."""
     normalized = str(value or "").strip().replace("-", "_")
     return normalized or None
 
@@ -450,9 +524,12 @@ def _normalize_command_type(value: Any) -> str | None:
 
 
 def _command_args_signature(args: dict[str, Any] | None) -> str:
+    """Return a stable JSON string of the args, used to spot duplicate commands."""
+    # Sorted keys make equal args give the same string.
     try:
         return json.dumps(args or {}, sort_keys=True, separators=(",", ":"), default=str)
     except TypeError:
+        # Args with odd key types: round-trip through JSON first, then sort.
         safe_args = json.loads(json.dumps(args or {}, default=str))
         return json.dumps(safe_args, sort_keys=True, separators=(",", ":"))
 
@@ -460,8 +537,13 @@ def _command_args_signature(args: dict[str, Any] | None) -> str:
 
 
 def _trim_commands_locked() -> None:
+    """Shrink the command queue to COMMAND_MAX, dropping finished commands first. Caller holds the
+    lock.
+    """
+    # Under the limit: nothing to do.
     if len(commands) <= COMMAND_MAX:
         return
+    # First drop finished commands, oldest first.
     terminal = {"completed", "failed", "expired"}
     idx = 0
     while len(commands) > COMMAND_MAX and idx < len(commands):
@@ -469,6 +551,7 @@ def _trim_commands_locked() -> None:
             del commands[idx]
             continue
         idx += 1
+    # Still too many: drop the oldest regardless of status.
     if len(commands) > COMMAND_MAX:
         del commands[:len(commands) - COMMAND_MAX]
 
@@ -476,8 +559,12 @@ def _trim_commands_locked() -> None:
 
 
 def _cleanup_commands_locked(now: float | None = None) -> tuple[int, int]:
+    """Expire stale commands and purge old finished ones; returns (expired, purged). Caller holds
+    the lock.
+    """
     now = now or time.time()
     expired = 0
+    # Commands not run within the expiry time are marked expired and traced.
     for cmd in commands:
         if cmd.get("status") in {"pending", "delivered"} and (now - cmd.get("created_at", now)) > COMMAND_EXPIRE_SECS:
             cmd["status"] = "expired"
@@ -492,12 +579,14 @@ def _cleanup_commands_locked(now: float | None = None) -> tuple[int, int]:
                 age_secs=round(now - cmd.get("created_at", now)),
             )
 
+    # Remove finished commands whose retention time has passed.
     before = len(commands)
     commands[:] = [
         cmd for cmd in commands
         if cmd.get("status") not in {"completed", "failed", "expired"}
         or now < float(cmd.get("purge_after") or cmd.get("updated_at", cmd.get("created_at", now)) + COMMAND_RESULT_RETENTION_SECS)
     ]
+    # Count purged commands, enforce the size cap and save if anything changed.
     purged = before - len(commands)
     _trim_commands_locked()
     if expired or purged:
@@ -508,6 +597,8 @@ def _cleanup_commands_locked(now: float | None = None) -> tuple[int, int]:
 
 
 def _find_active_duplicate_command_locked(target: str, action: str, args: dict[str, Any]) -> dict[str, Any] | None:
+    """Return a pending/delivered command with the same target, action and args, if any."""
+    # Compare args by their signature.
     args_sig = _command_args_signature(args)
     for cmd in commands:
         if cmd.get("target") != target or cmd.get("action") != action:
@@ -522,15 +613,22 @@ def _find_active_duplicate_command_locked(target: str, action: str, args: dict[s
 
 
 def _enqueue_command_locked(target: str, action: str, args: dict[str, Any] | None = None, command_type: str | None = None, relay: bool = False) -> tuple[dict[str, Any], bool, int, int]:
+    """Add a command to the queue unless the same one is already waiting. Caller holds the lock.
+
+    Returns (command, created, expired_count, purged_count); created is False for a duplicate.
+    """
+    # Normalise the action, type and args.
     normalized_action = _normalize_command_action(action)
     normalized_type = _normalize_command_type(command_type)
     normalized_args = dict(args or {})
+    # Validate delete arguments; relay commands use lenient checks.
     if target == "proxmox" and normalized_action == "delete_vm":
         # Hub relay commands use lenient validation — inventory may be stale or not yet loaded.
         # The proxmox agent performs the real validation before executing the delete.
         normalized_args = _prepare_delete_vm_args(normalized_args, strict=not relay)
 
     # Block all single-VM actions on protected VMIDs (start, stop, reboot, snapshot, reclone)
+    # VM actions on protected VMIDs are refused.
     _VM_ACTIONS = {"start_vm", "stop_vm", "reboot_vm", "snapshot_vm", "reclone_vm", "delete_vm"}
     if target == "proxmox" and normalized_action in _VM_ACTIONS:
         vmid = normalized_args.get("vmid")
@@ -540,12 +638,14 @@ def _enqueue_command_locked(target: str, action: str, args: dict[str, Any] | Non
                 detail=f"VM {vmid} is protected and cannot be managed from this UI",
             )
 
+    # Clean the queue, then return an existing duplicate instead of adding a new one.
     now = time.time()
     expired, purged = _cleanup_commands_locked(now)
     existing = _find_active_duplicate_command_locked(target, normalized_action, normalized_args)
     if existing is not None:
         return existing, False, expired, purged
 
+    # Create the command, append it, enforce the size cap and save.
     cmd = _make_command(target, normalized_action, normalized_args, command_type=normalized_type)
     commands.append(cmd)
     _trim_commands_locked()
@@ -556,6 +656,8 @@ def _enqueue_command_locked(target: str, action: str, args: dict[str, Any] | Non
 
 
 def _make_command(target: str, action: str, args: dict | None = None, command_type: str | None = None) -> dict[str, Any]:
+    """Build a new pending command dict with a random id and expiry time."""
+    # Created and updated now; expires after COMMAND_EXPIRE_SECS.
     now = time.time()
     return {
         "id": str(uuid.uuid4()),
@@ -576,16 +678,25 @@ def _make_command(target: str, action: str, args: dict | None = None, command_ty
 
 
 def _serialize_command_for_agent(command: dict[str, Any]) -> dict[str, Any]:
+    """Return only the command fields the agent needs."""
     return {"id": command["id"], "action": command["action"], "args": command["args"], "type": command.get("type")}
 
 
 
 
 def _command_matches_agent(command: dict[str, Any], hostname: str, approved_hostname: str | None = None) -> bool:
+    """Return True if the command is meant for this agent.
+
+    A command matches by exact hostname or, for an approved agent, by matching hostname or the
+    generic "proxmox" target.
+    """
+    # Exact hostname match.
     if command["target"] == hostname:
         return True
+    # Unapproved agents only get exact matches.
     if approved_hostname is None:
         return False
+    # Approved agents also get commands for their matched name or the generic target.
     return (
         _proxmox_hostnames_match(command["target"], approved_hostname)
         or command["target"] == "proxmox"
@@ -602,6 +713,7 @@ def _reset_delivered_commands_locked(hostname: str, approved_hostname: str | Non
     abandoned — _peek_pending_agent_commands_locked only returns 'pending' commands.
     Resetting them to 'pending' ensures they are re-delivered on the next push.
     """
+    # Turn this agent's delivered commands back to pending.
     now = time.time()
     reset = 0
     for cmd in commands:
@@ -609,6 +721,7 @@ def _reset_delivered_commands_locked(hostname: str, approved_hostname: str | Non
             cmd["status"] = "pending"
             cmd["updated_at"] = now
             reset += 1
+    # Save only if something changed.
     if reset:
         _save_commands()
     return reset
@@ -617,6 +730,11 @@ def _reset_delivered_commands_locked(hostname: str, approved_hostname: str | Non
 
 
 def _peek_pending_agent_commands_locked(hostname: str, approved_hostname: str | None = None) -> tuple[list[dict[str, Any]], int, int]:
+    """Return this agent's pending commands, cleaning the queue first. Caller holds the lock.
+
+    Returns (pending_commands, expired_count, purged_count).
+    """
+    # Clean the queue, then pick this agent's pending commands.
     expired, purged = _cleanup_commands_locked()
     pending = [
         command for command in commands
@@ -628,8 +746,12 @@ def _peek_pending_agent_commands_locked(hostname: str, approved_hostname: str | 
 
 
 def _mark_commands_delivered_locked(command_ids: list[str]) -> bool:
+    """Mark the given pending commands as delivered and save; returns True if any changed. Caller
+    holds the lock.
+    """
     if not command_ids:
         return False
+    # Use a set for fast lookups.
     ids = set(command_ids)
     now = time.time()
     changed = False
@@ -638,6 +760,7 @@ def _mark_commands_delivered_locked(command_ids: list[str]) -> bool:
             command["status"] = "delivered"
             command["updated_at"] = now
             changed = True
+    # Save only if something changed.
     if changed:
         _save_commands()
     return changed
@@ -646,24 +769,31 @@ def _mark_commands_delivered_locked(command_ids: list[str]) -> bool:
 
 
 async def _push_pending_agent_commands(hostname: str, websocket: WebSocket, approved_hostname: str | None = None) -> bool:
+    """Send an agent its pending commands over its websocket; returns False if the send failed."""
+    # Under the lock, collect pending commands and a snapshot of the queue.
     async with state_lock:
         pending, expired, purged = _peek_pending_agent_commands_locked(hostname, approved_hostname)
         payload = [_serialize_command_for_agent(command) for command in pending]
         serialized = _serialize_commands()
+    # Nothing to send; still tell UIs if the cleanup changed the queue.
     if not payload:
         if expired or purged:
             await broadcast({"type": "commands_update", "commands": serialized})
         return True
+    # Trace what is sent (just VMID and VM type from the args).
     _trace("agent_ws_push", hostname=hostname,
            commands=[{"action": c.get("action"), "args": {k: v for k, v in (c.get("args") or {}).items() if k in {"vmid", "vm_type"}}} for c in payload])
+    # Send; a failed send is traced and reported to the caller.
     try:
         await websocket.send_json({"type": "commands", "commands": payload})
     except Exception as exc:
         _trace("agent_ws_push_err", hostname=hostname, error=str(exc))
         return False
+    # Mark them delivered under the lock.
     async with state_lock:
         changed = _mark_commands_delivered_locked([command["id"] for command in pending])
         serialized = _serialize_commands()
+    # Tell UIs if the queue changed.
     if changed or expired or purged:
         await broadcast({"type": "commands_update", "commands": serialized})
     return True
@@ -672,16 +802,21 @@ async def _push_pending_agent_commands(hostname: str, websocket: WebSocket, appr
 
 
 async def _push_pending_commands_for_target(target: str) -> None:
+    """Push pending commands to whichever connected agent the target refers to."""
+    # Ignore empty targets.
     normalized = str(target or "").strip()
     if not normalized:
         return
+    # A client agent with its own websocket: push; drop the connection if the send fails.
     websocket = client_ws_connections.get(normalized)
     if websocket is not None:
         if not await _push_pending_agent_commands(normalized, websocket):
             client_ws_connections.pop(normalized, None)
+    # The Proxmox agent, if the target is "proxmox" or matches its hostname.
     if state.proxmox_ws_connection is not None and state.proxmox_ws_hostname and (
         normalized == "proxmox" or _proxmox_hostnames_match(normalized, state.proxmox_ws_hostname)
     ):
+        # Push; forget the connection if the send fails.
         if not await _push_pending_agent_commands(state.proxmox_ws_hostname, state.proxmox_ws_connection, state.proxmox_ws_hostname):
             state.proxmox_ws_connection = None
             state.proxmox_ws_hostname = None
@@ -690,6 +825,8 @@ async def _push_pending_commands_for_target(target: str) -> None:
 
 
 async def _push_pending_commands_for_targets(targets: list[str]) -> None:
+    """Push pending commands for each target, once per distinct target."""
+    # Skip empty and repeated targets.
     seen: set[str] = set()
     for target in targets:
         normalized = str(target or "").strip()
@@ -701,6 +838,7 @@ async def _push_pending_commands_for_targets(targets: list[str]) -> None:
 
 
 def _serialize_commands() -> list[dict[str, Any]]:
+    """Return the command queue with each command's age in seconds added, for the UI."""
     return [
         {**cmd, "age_secs": int(time.time() - cmd["created_at"])}
         for cmd in commands
@@ -710,6 +848,7 @@ def _serialize_commands() -> list[dict[str, Any]]:
 
 
 def _vm_watchdog_key(vmid: Any) -> str | None:
+    """Return the VMID as a string key for vm_watchdog, or None if it is not a number."""
     try:
         return str(int(vmid))
     except (TypeError, ValueError):
@@ -725,15 +864,21 @@ def _record_vm_watchdog_clone_completed(
     clone_completed_at: float | None = None,
     reclone_count: int | None = None,
 ) -> bool:
+    """Record that a VM finished cloning so the watchdog can track it; returns False for a bad
+    VMID.
+    """
+    # Ignore anything that is not a VMID.
     vmid_key = _vm_watchdog_key(vmid)
     if vmid_key is None:
         return False
+    # Keep the previous reclone count unless a new one is given.
     current = vm_watchdog.get(vmid_key) or {}
     if reclone_count is None:
         try:
             reclone_count = max(0, int(current.get("reclone_count", 0) or 0))
         except (TypeError, ValueError):
             reclone_count = 0
+    # Store clone time (now by default), count and hostname.
     vm_watchdog[vmid_key] = {
         "clone_completed_at": float(clone_completed_at if clone_completed_at is not None else time.time()),
         "reclone_count": max(0, int(reclone_count)),
@@ -745,8 +890,10 @@ def _record_vm_watchdog_clone_completed(
 
 
 def _proxmox_usb_config_payload(hostname: str | None = None) -> dict[str, Any]:
+    """Build the USB/VM provisioning settings sent to a Proxmox agent."""
     # Read sim_phy from the repo's simulation.conf so the agent knows which
     # USB device type (wired/wireless/any) to provision and assign.
+    # Default PHY type; overridden from simulation.conf when it can be read.
     sim_phy = "wireless"
     try:
         sim_conf = REPO_DIR / "configs" / "simulation.conf"
@@ -756,13 +903,17 @@ def _proxmox_usb_config_payload(hostname: str | None = None) -> dict[str, Any]:
             _merge_ini_override(parser, REPO_DIR / "configs" / "hub-sim-overrides.conf")
             sim_phy = parser.get("simulation", "sim_phy", fallback="wireless").strip().lower() or "wireless"
     except Exception:
+        # A missing or broken file keeps the default.
         pass
+    # Only the three known values are allowed.
     if sim_phy not in {"wireless", "ethernet", "any"}:
         sim_phy = "wireless"
+    # Template specs for both images and this host's VM set override.
     image1_template_spec = _resolved_template_spec(settings, 1)
     image2_template_spec = _resolved_template_spec(settings, 2)
     host_config = _get_proxmox_host_config(hostname) if hostname else {}
     vm_set_override = _sanitize_vm_set_override(host_config.get("vm_set_override", 0))
+    # Everything the agent needs, clamped to valid ranges.
     return {
         "vidpids": _parse_json_list(settings.get("usb_vidpids", "[]")),
         "missing_timeout": _setting_int("usb_missing_timeout", 60, 1),
@@ -799,15 +950,19 @@ def _proxmox_usb_config_payload(hostname: str | None = None) -> dict[str, Any]:
 
 
 def _normalize_proxmox_hostname(hostname: Any) -> str:
+    """Normalise a hostname: trimmed, lower case and without a trailing dot."""
     return str(hostname or "").strip().rstrip(".").lower()
 
 
 
 
 def _proxmox_hostname_aliases(hostname: Any) -> tuple[str, ...]:
+    """Return the full name and short name (before the first dot) of a host."""
+    # Empty names have no aliases.
     normalized = _normalize_proxmox_hostname(hostname)
     if not normalized:
         return ()
+    # Full name first, then the short name if it is different.
     aliases = [normalized]
     short = normalized.split(".", 1)[0]
     if short and short not in aliases:
@@ -818,6 +973,7 @@ def _proxmox_hostname_aliases(hostname: Any) -> tuple[str, ...]:
 
 
 def _proxmox_hostnames_match(left: Any, right: Any) -> bool:
+    """Return True when the two hostnames share a full or short name."""
     left_aliases = set(_proxmox_hostname_aliases(left))
     return bool(left_aliases and left_aliases.intersection(_proxmox_hostname_aliases(right)))
 
@@ -825,8 +981,11 @@ def _proxmox_hostnames_match(left: Any, right: Any) -> bool:
 
 
 def _resolve_proxmox_agent_hostname(hostname: Any, registry: dict[str, Any]) -> str | None:
+    """Return the key in the registry that refers to the same host, or None."""
+    # The registry must be a dict.
     if not isinstance(registry, dict):
         return None
+    # First key that matches by full or short name.
     for registered_hostname in registry:
         if _proxmox_hostnames_match(hostname, registered_hostname):
             return registered_hostname
@@ -836,11 +995,14 @@ def _resolve_proxmox_agent_hostname(hostname: Any, registry: dict[str, Any]) -> 
 
 
 def _upsert_pending_proxmox_agent(hostname: Any, client_ip: str, now: float) -> str | None:
+    """Add or update a pending agent entry and return the hostname used, or None if it is empty."""
+    # Use the existing entry's name if it matches, else the normalised name.
     resolved_hostname = _resolve_proxmox_agent_hostname(hostname, pending_proxmox_agents)
     if not resolved_hostname:
         resolved_hostname = _normalize_proxmox_hostname(hostname)
     if not resolved_hostname:
         return None
+    # New entry: record first and last seen; existing entry: update IP and last seen.
     entry = pending_proxmox_agents.get(resolved_hostname)
     if entry is None:
         pending_proxmox_agents[resolved_hostname] = {"ip": client_ip, "first_seen": now, "last_seen": now}
@@ -853,6 +1015,7 @@ def _upsert_pending_proxmox_agent(hostname: Any, client_ip: str, now: float) -> 
 
 
 def _pending_proxmox_payload() -> list[dict[str, Any]]:
+    """Return the pending agents as a list for the UI."""
     now = time.time()
     return [
         {
@@ -868,11 +1031,15 @@ def _pending_proxmox_payload() -> list[dict[str, Any]]:
 
 
 def _approved_proxmox_payload() -> list[dict[str, Any]]:
+    """Return a summary of each approved agent for the UI."""
+    # One entry per approved agent.
     result = []
     for hostname in approved_proxmox_agents:
+        # Live state for the host and its saved settings.
         state = proxmox_states.get(hostname, {})
         host_config = _get_proxmox_host_config(hostname)
         vm_set_override = _sanitize_vm_set_override(state.get("vm_set_override", host_config.get("vm_set_override", 0)))
+        # Status, versions, counts, resource use and VM set details.
         result.append({
             "hostname": hostname,
             "connected": bool(state.get("connected", False)),
@@ -895,6 +1062,8 @@ def _approved_proxmox_payload() -> list[dict[str, Any]]:
 
 
 def _proxmox_status_payload() -> dict[str, Any]:
+    """Build the full Proxmox state sent to the UI, with VM details and agent summaries added."""
+    # Node info, client last-seen times and USB entries keyed by VMID.
     node = proxmox_state.get("node") or {}
     client_seen = {hostname: client.get("last_seen") for hostname, client in clients.items()}
     usb_by_vmid = {
@@ -902,14 +1071,18 @@ def _proxmox_status_payload() -> dict[str, Any]:
         for entry in proxmox_state.get("usb_state", [])
         if entry.get("vmid") is not None
     }
+    # Add UI-only fields to each VM.
     vms = []
     current_vmids: set[int] = set()
     for vm in proxmox_state.get("vms") or []:
         enriched_vm = dict(vm)
+        # Whether the VM's client has checked in, and whether the watchdog tracks it.
         enriched_vm["pending_checkin"] = _vm_pending_checkin(enriched_vm, client_seen)
         enriched_vm["watchdog_tracked"] = bool(_vm_watchdog_key(vm.get("vmid")) and vm_watchdog.get(_vm_watchdog_key(vm.get("vmid"))))
+        # Provisioning status from its USB entry ("active" if none).
         usb_entry = usb_by_vmid.get(str(vm.get("vmid")), {})
         enriched_vm["prov_status"] = usb_entry.get("prov_status") or "active"
+        # VMs being deleted are shown as "deleting".
         try:
             vmid_int = int(vm.get("vmid"))
             current_vmids.add(vmid_int)
@@ -920,6 +1093,7 @@ def _proxmox_status_payload() -> dict[str, Any]:
         vms.append(enriched_vm)
     # Include any pending-delete VMIDs that have already been removed from agent telemetry
     # so the UI keeps showing them as "deleting…" until the next full render cycle.
+    # Keep showing deleted VMs that no longer appear in telemetry.
     for pending_vmid in _pending_delete_vmids:
         if pending_vmid not in current_vmids:
             vms.append({
@@ -931,6 +1105,7 @@ def _proxmox_status_payload() -> dict[str, Any]:
                 "pending_checkin": False,
                 "watchdog_tracked": False,
             })
+    # Everything the UI shows on the VM Server page.
     return {
         **proxmox_state,
         "vms": vms,
@@ -958,6 +1133,8 @@ def _proxmox_status_payload() -> dict[str, Any]:
 
 
 def _find_proxmox_vm(vmid: int) -> dict[str, Any] | None:
+    """Return a copy of the VM with this VMID from the current inventory, or None."""
+    # Skip entries with a bad VMID.
     for vm in proxmox_state.get("vms") or []:
         try:
             if int(vm.get("vmid")) == vmid:
@@ -970,11 +1147,17 @@ def _find_proxmox_vm(vmid: int) -> dict[str, Any] | None:
 
 
 async def _broadcast_proxmox_state() -> None:
+    """Save the state cache and send the Proxmox state to UIs, skipping the send if nothing
+    changed.
+    """
+    # Save the state to disk first.
     _save_state_cache()
+    # Hash the payload; an unchanged payload is not sent again.
     payload = _proxmox_status_payload()
     h = hashlib.md5(json.dumps(payload, sort_keys=True, default=str).encode()).hexdigest()
     if h == state._last_proxmox_hash:
         return
+    # Remember the hash and send.
     state._last_proxmox_hash = h
     await broadcast({"type": "proxmox_update", **payload})
 
@@ -982,6 +1165,7 @@ async def _broadcast_proxmox_state() -> None:
 
 
 async def _broadcast_reclone_state() -> None:
+    """Save the reclone state and send it to UIs."""
     await _async_save_reclone_state()
     await broadcast({"type": "reclone_update", **dict(reclone_state)})
 
@@ -989,20 +1173,26 @@ async def _broadcast_reclone_state() -> None:
 
 
 def _update_reclone_log(vmid: int, name: str, status: str, message: str | None = None) -> None:
+    """Update a VM's latest queued/in-progress reclone log entry, or add a new one, then save."""
+    # Search from newest for an open entry for this VM.
     timestamp = iso_utcnow()
     for entry in reversed(reclone_state["log"]):
         if entry.get("vmid") == vmid and entry.get("status") in {"queued", "in_progress"}:
             entry.update({"name": name, "status": status, "timestamp": timestamp})
+            # Set or clear the message; an old message is dropped when going back to queued/in
+            # progress.
             if message:
                 entry["message"] = message
             elif entry.get("message") and status in {"queued", "in_progress"}:
                 entry.pop("message", None)
             break
     else:
+        # No open entry: add a new one.
         entry = {"vmid": vmid, "name": name, "status": status, "timestamp": timestamp}
         if message:
             entry["message"] = message
         reclone_state["log"].append(entry)
+    # Keep the newest 200 entries and save.
     reclone_state["log"] = reclone_state["log"][-200:]
     _save_reclone_state()
 
@@ -1010,13 +1200,17 @@ def _update_reclone_log(vmid: int, name: str, status: str, message: str | None =
 
 
 def _parse_reclone_schedule(value: Any) -> tuple[str, int, int] | None:
+    """Parse a "<day> HH:MM" schedule into (day, hour, minute), or None if invalid."""
+    # Must be exactly two parts.
     raw = str(value or "").strip().lower()
     parts = raw.split()
     if len(parts) != 2:
         return None
     day, clock = parts
+    # The day must be a full weekday name.
     if day not in {"monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"}:
         return None
+    # The time must be two numbers in valid ranges.
     try:
         hour, minute = (int(piece) for piece in clock.split(":", 1))
     except ValueError:
@@ -1029,6 +1223,8 @@ def _parse_reclone_schedule(value: Any) -> tuple[str, int, int] | None:
 
 
 def _has_pending_reclone(vmid: int) -> bool:
+    """Return True if a reclone for this VM is already pending or delivered."""
+    # Look for a reclone_vm command for this VMID that has not finished.
     for cmd in commands:
         if cmd.get("action") != "reclone_vm":
             continue
@@ -1042,11 +1238,14 @@ def _has_pending_reclone(vmid: int) -> bool:
 
 
 def _proxmox_unassigned_present_usb() -> list[dict[str, Any]]:
+    """Return the USB devices that are plugged in but not assigned to any VM."""
+    # Bus paths already assigned to a VM.
     assigned_buses = {
         str(entry.get("bus_path", "")).strip()
         for entry in proxmox_state.get("usb_state", [])
         if str(entry.get("bus_path", "")).strip() and entry.get("vmid") is not None
     }
+    # Plugged-in devices whose bus path is not assigned.
     return [
         dict(entry)
         for entry in proxmox_state.get("present_usb", [])
@@ -1062,22 +1261,32 @@ def _normalize_proxmox_usb_state(
     usb_state: Any,
     present_usb: Any,
 ) -> list[dict[str, Any]]:
+    """Clean up the agent's USB state using the list of devices actually plugged in.
+
+    A device that is present again loses its missing flag, becomes active, and gets missing
+    VID:PID/name.
+    """
+    # Plugged-in devices keyed by bus path.
     present_by_bus = {
         str(entry.get("bus_path", "")).strip(): dict(entry)
         for entry in (present_usb if isinstance(present_usb, list) else [])
         if isinstance(entry, dict) and str(entry.get("bus_path", "")).strip()
     }
     normalized: list[dict[str, Any]] = []
+    # Go through each valid USB entry.
     for raw_entry in usb_state if isinstance(usb_state, list) else []:
         if not isinstance(raw_entry, dict):
             continue
         entry = dict(raw_entry)
         bus_path = str(entry.get("bus_path", "")).strip()
         present_entry = present_by_bus.get(bus_path)
+        # Device is present: clear the missing flag and mark it active if it was missing or tearing
+        # down.
         if present_entry:
             entry["missing_since"] = None
             if entry.get("prov_status") in {None, "", "missing", "tearing_down"}:
                 entry["prov_status"] = "active"
+            # Fill in VID:PID and name from the plugged-in device if missing.
             if not entry.get("vidpid") and present_entry.get("vidpid"):
                 entry["vidpid"] = present_entry.get("vidpid")
             if not entry.get("name") and present_entry.get("name"):
@@ -1089,6 +1298,8 @@ def _normalize_proxmox_usb_state(
 
 
 def _update_provision_run_state(vms: list[dict[str, Any]], usb_state: list[dict[str, Any]], now: int) -> None:
+    """Update the provisioning run progress shown in the UI from the latest VMs and USB state."""
+    # Start from a fresh state, copying fields and valid items from the current run.
     run = _default_provision_run_state()
     current = proxmox_state.get("prov_run")
     if isinstance(current, dict):
@@ -1100,6 +1311,7 @@ def _update_provision_run_state(vms: list[dict[str, Any]], usb_state: list[dict[
             if isinstance(item, dict) and item.get("vmid") is not None
         ]
 
+    # VMs and USB entries keyed by VMID.
     vm_by_vmid = {
         str(vm.get("vmid")): dict(vm)
         for vm in (vms if isinstance(vms, list) else [])
@@ -1110,6 +1322,7 @@ def _update_provision_run_state(vms: list[dict[str, Any]], usb_state: list[dict[
         for entry in (usb_state if isinstance(usb_state, list) else [])
         if isinstance(entry, dict) and entry.get("vmid") is not None
     }
+    # VMIDs currently provisioning, sorted by number.
     provisioning_vmids = [
         vmid
         for vmid, entry in usb_by_vmid.items()
@@ -1117,15 +1330,18 @@ def _update_provision_run_state(vms: list[dict[str, Any]], usb_state: list[dict[
     ]
     provisioning_vmids.sort(key=lambda value: int(value) if str(value).isdigit() else value)
 
+    # Provisioning has started with no run active: begin a new run.
     if not run.get("running") and provisioning_vmids:
         run = _default_provision_run_state()
         run["running"] = True
         run["started_at"] = now
         run["updated_at"] = now
 
+    # Items in this run, keyed by VMID.
     items = run["items"]
     item_by_vmid = {str(item.get("vmid")): item for item in items if item.get("vmid") is not None}
 
+    # During a run, add new provisioning VMs and restart items that had finished.
     if run.get("running"):
         for vmid in provisioning_vmids:
             entry = usb_by_vmid[vmid]
@@ -1153,10 +1369,12 @@ def _update_provision_run_state(vms: list[dict[str, Any]], usb_state: list[dict[
                     "completed_at": None,
                 })
 
+    # Refresh every item and work out its new status.
     for item in items:
         vmid_key = str(item.get("vmid"))
         entry = usb_by_vmid.get(vmid_key)
         vm = vm_by_vmid.get(vmid_key) or {}
+        # Copy the latest VM name and USB details onto the item.
         if vm.get("name"):
             item["vm_name"] = str(vm.get("name"))
         if entry:
@@ -1167,6 +1385,7 @@ def _update_provision_run_state(vms: list[dict[str, Any]], usb_state: list[dict[
             if entry.get("vidpid"):
                 item["vidpid"] = str(entry.get("vidpid"))
 
+        # Work out the next status from the USB provisioning state.
         previous_status = str(item.get("status") or "pending")
         next_status = previous_status
         if entry and str(entry.get("prov_status") or "").strip().lower() == "provisioning":
@@ -1183,6 +1402,7 @@ def _update_provision_run_state(vms: list[dict[str, Any]], usb_state: list[dict[
                 next_status = _derive_provision_run_item_status(entry, vm_by_vmid)
                 item["completed_at"] = None
         elif entry and str(entry.get("prov_status") or "").strip().lower() == "active":
+            # Provisioning finished (USB active).
             if previous_status != "failed":
                 # Clone finished — keep as "pending_checkin" until the VM's client
                 # actually contacts the API (pending_checkin flag on the enriched VM).
@@ -1199,33 +1419,41 @@ def _update_provision_run_state(vms: list[dict[str, Any]], usb_state: list[dict[
                     next_status = "done"
                     item["completed_at"] = item.get("completed_at") or now
         elif run.get("running") and previous_status not in {"done", "failed"}:
+            # USB state no longer shows the VM during a run.
+            # It was provisioning last time and is now gone, so provisioning failed.
             if state._prev_usb_by_vmid.get(vmid_key) == "provisioning":
                 next_status = "failed"
                 item["completed_at"] = item.get("completed_at") or now
 
+        # Touch updated_at when the status changes or provisioning is still going on.
         if next_status != previous_status or (entry and str(entry.get("prov_status") or "").strip().lower() == "provisioning"):
             item["updated_at"] = now
         item["status"] = next_status
 
+    # Count totals, done and failed items.
     run["total"] = len(items)
     run["completed"] = sum(1 for item in items if item.get("status") == "done")
     run["failed"] = sum(1 for item in items if item.get("status") == "failed")
 
     # "pending_checkin" is an active (non-terminal) status — keep run alive
     active_items = [item for item in items if item.get("status") not in {"done", "failed"}]
+    # All items finished: end the run.
     if run.get("running") and items and not active_items:
         run["running"] = False
         run["completed_at"] = now
         run["updated_at"] = now
     elif run.get("running"):
+        # Still running: just update the time.
         run["updated_at"] = now
 
+    # Store the updated run.
     proxmox_state["prov_run"] = run
 
 
 
 
 def _guest_supports_reclone(vm: dict[str, Any]) -> bool:
+    """Return True if the VM can be recloned (not a template, not protected, and supported)."""
     if vm.get("is_template"):
         return False
     if _is_protected_vmid(vm.get("vmid")):
@@ -1236,6 +1464,7 @@ def _guest_supports_reclone(vm: dict[str, Any]) -> bool:
 
 
 def _reclone_targets_for_run() -> list[dict[str, Any]]:
+    """Return the VMs a rolling reclone should process, sorted by VMID."""
     return sorted(
         [
             dict(vm)
@@ -1254,10 +1483,13 @@ def _reclone_targets_for_run() -> list[dict[str, Any]]:
 
 
 def _reclone_command_args(vm: dict[str, Any]) -> dict[str, Any]:
+    """Build the reclone_vm command args for a VM (VMID, type and optional source/bus path)."""
+    # VMID and VM type are always sent.
     args: dict[str, Any] = {
         "vmid": int(vm.get("vmid")),
         "type": str(vm.get("type") or "qemu"),
     }
+    # Optional source template VMID and USB bus path.
     if vm.get("reclone_source_vmid") is not None:
         args["source_vmid"] = int(vm["reclone_source_vmid"])
     if vm.get("reclone_bus_path"):
@@ -1268,11 +1500,15 @@ def _reclone_command_args(vm: dict[str, Any]) -> dict[str, Any]:
 
 
 async def _queue_command(target: str, action: str, args: dict[str, Any] | None = None, command_type: str | None = None) -> dict[str, Any]:
+    """Queue a command for a target, tell UIs and push it to the agent right away if connected."""
+    # Add the command (or find a duplicate) under the lock.
     async with state_lock:
         cmd, created, expired, purged = _enqueue_command_locked(target, action, args, command_type=command_type)
         serialized = _serialize_commands()
+    # Tell UIs if the queue changed.
     if created or expired or purged:
         await broadcast({"type": "commands_update", "commands": serialized})
+    # Push new commands at once if the agent is connected.
     if created:
         await _push_pending_commands_for_target(target)
     return cmd
@@ -1281,6 +1517,7 @@ async def _queue_command(target: str, action: str, args: dict[str, Any] | None =
 
 
 async def _queue_proxmox_command(action: str, args: dict[str, Any] | None = None, command_type: str | None = None, target: str = "proxmox") -> dict[str, Any]:
+    """Queue a command for a Proxmox agent and return the queued command."""
     # In multi-agent setups, resolve the generic "proxmox" target to the currently
     # WS-connected (primary) agent so the command is delivered to exactly one agent.
     # Commands remain generic "proxmox" if no agent is currently connected via WS
@@ -1295,22 +1532,27 @@ async def _queue_proxmox_command(action: str, args: dict[str, Any] | None = None
 
 def _resolve_proxmox_vm_target(vmid: int | None) -> str:
     """Return the specific agent hostname that owns this vmid, or 'proxmox' if unknown."""
+    # Use the owning agent if it is known and approved.
     if vmid is not None:
         owner = _proxmox_agent_vm_map.get(int(vmid))
         if owner and owner in approved_proxmox_agents:
             return owner
+    # Otherwise any agent can take it.
     return "proxmox"
 
 
 
 
 async def _queue_unlock_template_command(command_type: str = "unlock_template") -> dict[str, Any]:
+    """Queue a command telling the agent to unlock the VM template."""
     return await _queue_proxmox_command("unlock_template", {}, command_type=command_type)
 
 
 
 
 def _proxmox_update_branch() -> str:
+    """Return the git branch Proxmox agents should update from (the configured or default branch).
+    """
     branch = str(settings.get("repo_branch", REPO_BRANCH) or REPO_BRANCH).strip()
     return branch or REPO_BRANCH
 
@@ -1318,6 +1560,7 @@ def _proxmox_update_branch() -> str:
 
 
 def _proxmox_update_args() -> dict[str, str]:
+    """Return the update_agent args: branch and the raw GitHub URL for that branch."""
     branch = _proxmox_update_branch()
     return {
         "branch": branch,
@@ -1328,12 +1571,16 @@ def _proxmox_update_args() -> dict[str, str]:
 
 
 def _resolve_proxmox_update_target() -> str:
+    """Work out which approved agent should receive an update, or raise 409."""
+    # Prefer the agent whose node hostname we last saw.
     hostname = str((proxmox_state.get("node") or {}).get("hostname") or "").strip()
     resolved_hostname = _resolve_proxmox_agent_hostname(hostname, approved_proxmox_agents)
     if resolved_hostname:
         return resolved_hostname
+    # With exactly one approved agent, use it.
     if len(approved_proxmox_agents) == 1:
         return next(iter(approved_proxmox_agents))
+    # None, or several with no clear choice: refuse.
     if not approved_proxmox_agents:
         raise HTTPException(status_code=409, detail="No approved Proxmox agent is available")
     raise HTTPException(status_code=409, detail="Unable to determine which Proxmox host should be updated")
@@ -1342,15 +1589,20 @@ def _resolve_proxmox_update_target() -> str:
 
 
 async def _queue_proxmox_agent_update(target: str | None = None) -> dict[str, Any]:
+    """Queue an update_agent command for one approved agent; raise 409 if one is already queued."""
+    # Use the given target or pick one; it must be approved.
     resolved_target = target or _resolve_proxmox_update_target()
     if resolved_target not in approved_proxmox_agents:
         raise HTTPException(status_code=404, detail="Proxmox agent not approved")
+    # Clean the queue and add the update under the lock.
     async with state_lock:
         expired, purged = _cleanup_commands_locked()
         cmd, created, _expired, _purged = _enqueue_command_locked(resolved_target, "update_agent", _proxmox_update_args())
         serialized = _serialize_commands()
+    # A duplicate means an update is already waiting.
     if not created:
         raise HTTPException(status_code=409, detail=f"An agent update is already queued for {resolved_target}")
+    # Tell UIs and push the command right away.
     if expired or purged or created:
         await broadcast({"type": "commands_update", "commands": serialized})
     await _push_pending_commands_for_target(resolved_target)
@@ -1360,10 +1612,17 @@ async def _queue_proxmox_agent_update(target: str | None = None) -> dict[str, An
 
 
 async def _run_rolling_reclone(trigger_type: str) -> None:
+    """Reclone every eligible VM in batches, tracking progress in reclone_state.
+
+    Afterwards, unassigned dongles are provisioned; at the end the state is reset to idle with a
+    summary.
+    """
+    # Only one run at a time.
     async with reclone_run_lock:
         if reclone_state["status"] == "running":
             return
 
+        # Pick the VMs and reset progress for a new run.
         vms = _reclone_targets_for_run()
         reclone_state.update({
             "status": "running",
@@ -1375,19 +1634,24 @@ async def _run_rolling_reclone(trigger_type: str) -> None:
             "log": [],
             "started_at": iso_utcnow(),
         })
+        # Log the plan and tell UIs.
         logger.info("Rolling reclone (%s): %d eligible VMs: %s", trigger_type, len(vms), [v.get("vmid") for v in vms])
         await _broadcast_reclone_state()
         await _broadcast_proxmox_state()
 
+        # How many VMs to reclone at once.
         concurrency = max(1, int(str(settings.get("reclone_concurrency", "1")).strip() or "1"))
 
         async def _reclone_one(vm: dict) -> None:
+            """Queue a reclone for one VM and wait (up to 30 minutes) for it to finish."""
+            # Mark the VM as queued and tell UIs.
             vmid = int(vm.get("vmid"))
             name = vm.get("name") or f"VM {vmid}"
             _update_reclone_log(vmid, name, "queued")
             await _broadcast_reclone_state()
             await _broadcast_proxmox_state()
 
+            # Queue the command, then poll its status until it finishes or the deadline passes.
             cmd = await _queue_proxmox_command("reclone_vm", _reclone_command_args(vm), command_type=trigger_type)
             deadline = time.time() + 1800
             last_status = "pending"
@@ -1396,8 +1660,10 @@ async def _run_rolling_reclone(trigger_type: str) -> None:
                 # Commands remain in a small module-level list, so a linear scan keeps the
                 # lookup simple here without a broader commands storage refactor.
                 current = next((item for item in commands if item["id"] == cmd["id"]), None)
+                # The command was removed from the queue; stop waiting.
                 if current is None:
                     break
+                # When the agent picks it up, mark it in progress and poll less often.
                 status = current.get("status", "pending")
                 if status != last_status:
                     if status == "delivered":
@@ -1406,9 +1672,11 @@ async def _run_rolling_reclone(trigger_type: str) -> None:
                         await _broadcast_proxmox_state()
                         poll_interval = 5.0
                     last_status = status
+                # Finished: log the result and update the counts.
                 if status in {"completed", "failed", "expired"}:
                     final_status = "completed" if status == "completed" else "failed"
                     _update_reclone_log(vmid, name, final_status, str(current.get("message") or "").strip() or None)
+                    # Success: start watchdog tracking for the new VM.
                     if final_status == "completed":
                         _record_vm_watchdog_clone_completed(vmid, name)
                         await _async_save_vm_watchdog()
@@ -1418,9 +1686,11 @@ async def _run_rolling_reclone(trigger_type: str) -> None:
                     await _broadcast_reclone_state()
                     await _broadcast_proxmox_state()
                     return
+                # Wait, slowing down the polling while it is still pending.
                 await asyncio.sleep(poll_interval)
                 if status == "pending":
                     poll_interval = min(poll_interval * 2, 10.0)
+            # Deadline passed: count it as failed.
             logger.warning("Rolling reclone: VM %s (%s) timed out", vmid, name)
             _trace("reclone_timeout", vmid=vmid, name=name, cmd_id=cmd.get("id"), trigger=trigger_type)
             _update_reclone_log(vmid, name, "failed", "Timed out waiting for Proxmox agent ACK")
@@ -1429,6 +1699,7 @@ async def _run_rolling_reclone(trigger_type: str) -> None:
             await _broadcast_proxmox_state()
 
         try:
+            # Process the VMs in batches of the configured size.
             for i in range(0, len(vms), concurrency):
                 batch = vms[i:i + concurrency]
                 reclone_state["current_vm"] = int(batch[0].get("vmid")) if batch else None
@@ -1445,12 +1716,15 @@ async def _run_rolling_reclone(trigger_type: str) -> None:
                 )
                 await _queue_proxmox_command("provision_unassigned", {}, command_type=trigger_type)
 
+            # The run failed if any VM failed.
             reclone_state["status"] = "failed" if reclone_state["failed"] else "completed"
         except Exception as exc:
+            # An unexpected error fails the run.
             logger.exception("Rolling reclone failed: %s", exc)
             reclone_state["status"] = "failed"
             reclone_state["failed"] += 1
         finally:
+            # Always clear the current VM and record a summary of this run.
             reclone_state["current_vm"] = None
             # Capture a last_run summary before resetting so the UI can show
             # "Last run: X completed, Y failed" even after the tile goes idle.
@@ -1501,9 +1775,12 @@ async def _run_rolling_reclone(trigger_type: str) -> None:
 
 
 async def vm_watchdog_loop() -> None:
+    """Background task: reclone VMs whose client never checked in within the watchdog timeout."""
+    # Wait one interval first so agents and clients have time to report after startup.
     await asyncio.sleep(VM_WATCHDOG_INTERVAL_SECS)
     while True:
         try:
+            # Client last-seen times and VM names by VMID for this pass.
             now = time.time()
             client_seen = {hostname: client.get("last_seen") for hostname, client in clients.items()}
             vm_names = {
@@ -1513,27 +1790,33 @@ async def vm_watchdog_loop() -> None:
             }
             changed = False
             broadcast_needed = False
+            # Check every tracked VM (copy of the items, since entries may be removed).
             for vmid_key, entry in list(vm_watchdog.items()):
                 clone_completed_at = _parse_ts(entry.get("clone_completed_at"))
+                # Entries without a valid clone time are dropped.
                 if clone_completed_at is None:
                     vm_watchdog.pop(vmid_key, None)
                     changed = True
                     broadcast_needed = True
                     continue
+                # Fill in the hostname from the inventory if it was missing.
                 hostname = str(entry.get("hostname") or vm_names.get(vmid_key) or "").strip()
                 if hostname and hostname != entry.get("hostname"):
                     entry["hostname"] = hostname
                     changed = True
+                # The client has checked in since the clone: stop tracking it.
                 if _vm_has_checked_in(hostname, clone_completed_at, client_seen):
                     vm_watchdog.pop(vmid_key, None)
                     changed = True
                     broadcast_needed = True
                     continue
+                # Still inside the timeout, or a reclone is already queued: wait.
                 if (now - clone_completed_at) <= VM_WATCHDOG_TIMEOUT_SECS:
                     continue
                 vmid_int = int(vmid_key)
                 if _has_pending_reclone(vmid_int):
                     continue
+                # Timed out: queue a reclone and restart tracking with a higher reclone count.
                 vm = _find_proxmox_vm(vmid_int) or {"vmid": vmid_int}
                 await _queue_proxmox_command("reclone_vm", _reclone_command_args(vm), command_type="watchdog")
                 reclone_count = max(0, int(entry.get("reclone_count", 0) or 0)) + 1
@@ -1545,16 +1828,20 @@ async def vm_watchdog_loop() -> None:
                 )
                 changed = True
                 broadcast_needed = True
+                # Log and trace the action.
                 logger.warning("VM watchdog queued reclone for VM %s (%s) after 24h without check-in", vmid_int, hostname or vm.get("name") or f"VM {vmid_int}")
                 _trace("watchdog_reclone_queued", vmid=vmid_int, name=hostname or vm.get("name") or f"VM {vmid_int}", reclone_count=reclone_count)
+            # Save and tell UIs only if something changed, then mark the task healthy.
             if changed:
                 await _async_save_vm_watchdog()
             if broadcast_needed:
                 await _broadcast_proxmox_state()
             _update_service_health("vm_watchdog", ok=True)
         except asyncio.CancelledError:
+            # Cancellation must stop the task.
             raise
         except Exception as exc:
+            # Any other error is recorded in service health and logged; the loop keeps going.
             _update_service_health("vm_watchdog", ok=False, error=str(exc))
             logger.exception("VM watchdog error: %s", exc)
         await asyncio.sleep(VM_WATCHDOG_INTERVAL_SECS)
@@ -1566,22 +1853,28 @@ async def vm_watchdog_loop() -> None:
 
 async def expire_commands() -> None:
     """Expire stale active commands and purge terminal results after a short grace period."""
+    # Short delay after startup, then check every 15 seconds.
     await asyncio.sleep(15)
     while True:
         try:
+            # Clean the queue under the lock.
             async with state_lock:
                 expired, purged = _cleanup_commands_locked()
                 serialized = _serialize_commands()
+            # Expired commands: tell UIs and show a warning.
             if expired:
                 logger.warning("Expired %d stale command(s) from the in-memory queue", expired)
                 await broadcast({"type": "commands_update", "commands": serialized})
                 await broadcast({"type": "notification", "level": "warning", "message": "One or more commands expired without being ACKed by the agent."})
             elif purged:
+                # Purged only: just refresh the queue in UIs.
                 await broadcast({"type": "commands_update", "commands": serialized})
             _update_service_health("command_expiry", ok=True)
         except asyncio.CancelledError:
+            # Cancellation must stop the task.
             raise
         except Exception as exc:
+            # Any other error is recorded in service health and logged; the loop keeps going.
             _update_service_health("command_expiry", ok=False, error=str(exc))
             logger.exception("Command expiry error: %s", exc)
         await asyncio.sleep(15)
@@ -1590,6 +1883,7 @@ async def expire_commands() -> None:
 
 
 def _hub_isolated() -> bool:  # Compute whether hub-driven config pushes must pause so every safeguard check shares one helper.
+    """Return True when this hub-managed spoke has not heard from the hub within the timeout."""
     return bool(  # Evaluate the isolation rule in one expression so every caller uses the same last-sync timeout test.
         settings.get("hub_managed")  # Only hub-managed spokes should self-protect because self-managed spokes do not accept hub config pushes.
         and settings.get("relay_enabled") == "on"  # Only an enabled relay can be isolated because disabled hub connectivity should not trigger this safeguard.
@@ -1609,10 +1903,13 @@ def _revert_hub_managed_if_auth_failure(status_code: int | None, reason: str) ->
 
     Returns True if hub_managed was cleared so callers can log/broadcast the change.
     """
+    # Only hub-managed spokes can be reverted.
     if not settings.get("hub_managed"):
         return False
+    # Only 401/403/404 mean the hub no longer knows us.
     if status_code not in (401, 403, 404):
         return False
+    # Give control back to the local UI, save, log and record it in diagnostics.
     settings["hub_managed"] = False
     _save_settings()
     logger.warning(
@@ -1627,6 +1924,7 @@ def _revert_hub_managed_if_auth_failure(status_code: int | None, reason: str) ->
 
 
 def _hub_config_isolation_result(task_type: str) -> dict[str, Any]:  # Build a consistent skip result so every blocked hub config push is acknowledged the same way.
+    """Return the reply sent to the hub when a config push is skipped because we are isolated."""
     return {  # Return a structured ack payload so the hub can tell a deliberate isolation skip from a transport failure.
         "success": False,  # Mark the ack as non-success so the hub can distinguish a safeguard skip from an applied config change.
         "skipped": True,  # Flag the result as skipped so operators can see the spoke deliberately ignored the push.
@@ -1640,6 +1938,7 @@ def _hub_config_isolation_result(task_type: str) -> dict[str, Any]:  # Build a c
 
 
 async def hub_isolation_monitor() -> None:  # Poll isolation state so the UI updates even when no relay message arrives to trigger a broadcast.
+    """Background task: send the relay state to UIs whenever hub isolation starts or ends."""
     last_isolated = _hub_isolated()  # Capture the initial state so the monitor only broadcasts when isolation actually changes.
     while True:  # Keep watching in the background so timeout expiry and recovery both reach the UI automatically.
         await asyncio.sleep(60)  # Re-check once per minute so the safeguard flips even when no hub message arrives to trigger a relay broadcast.
@@ -1652,6 +1951,7 @@ async def hub_isolation_monitor() -> None:  # Poll isolation state so the UI upd
 
 
 async def _broadcast_update_state() -> None:
+    """Save the self-update state and send it to UIs."""
     _save_update_state()
     await broadcast({"type": "version_status", **dict(update_state)})
 
@@ -1661,9 +1961,11 @@ async def _broadcast_update_state() -> None:
 async def _hub_self_register(server_url: str) -> None:
     """POST to hub /api/spokes/register with full config payload.
     Stores the returned spoke_id. If already approved, also stores api_key and tenant_id."""
+    # Our hostname, display name and stable spoke id.
     hostname = socket.gethostname()
     spoke_name = settings.get("relay_spoke_name", "").strip() or hostname
     spoke_id = _ensure_relay_spoke_id()
+    # Registration request: identity, tenant hint, onboarding PSK, existing key and current config.
     payload = {
         "spoke_id": spoke_id,
         "hostname": hostname,
@@ -1674,12 +1976,16 @@ async def _hub_self_register(server_url: str) -> None:
         "api_key": settings.get("relay_api_key", "").strip(),
         "config": _build_registration_config(),
     }
+    # Record the attempt in the diagnostics log.
     _relay_diag_append("register_attempt", url=f"{server_url}/api/spokes/register",
                        hostname=hostname, spoke_name=spoke_name, spoke_id=spoke_id)
+    # Hub base URL for our tenant.
     hub_base = _relay_hub_base_url(server_url, settings.get("relay_tenant_id", ""))
     try:
+        # Post the registration (15 s limit).
         async with httpx.AsyncClient(timeout=15, verify=_hub_tls_verify()) as hc:
             resp = await hc.post(f"{hub_base}/api/spokes/register", json=payload)
+            # 409: the spoke name is taken; show the error and stop.
             if resp.status_code == 409:
                 data = resp.json()
                 conflict = data.get("conflict", "name_in_use")
@@ -1695,14 +2001,17 @@ async def _hub_self_register(server_url: str) -> None:
                 _relay_diag_append("register_409", conflict=conflict, message=msg)
                 logger.warning("Hub registration name conflict: %s", msg)
                 return
+            # Any other HTTP error raises and is handled below.
             resp.raise_for_status()
             data = resp.json()
+        # Keep the hub's spoke id unless it needs replacing; otherwise use our own.
         spoke_id = str(data.get("spoke_id", "")).strip()
         status = data.get("status", "pending")
         if spoke_id and not _relay_spoke_id_needs_rotation(spoke_id):
             settings["relay_spoke_id"] = spoke_id
         else:
             spoke_id = _ensure_relay_spoke_id()
+        # Approved right away: store the API key and tenant id.
         if status == "approved":
             tenant_id = data.get("tenant_id", "")
             settings["relay_api_key"] = data.get("api_key", "")
@@ -1714,6 +2023,7 @@ async def _hub_self_register(server_url: str) -> None:
                                tenant_id=data.get("tenant_id"))
             logger.info("Hub registration: approved immediately spoke_id=%s tenant_id=%s", spoke_id, data.get("tenant_id"))
         else:
+            # Pending: clear old credentials and keep any tenant hint.
             tenant_hint = str(data.get("tenant_hint", "")).strip()
             settings["relay_api_key"] = ""
             settings["relay_tenant_id"] = ""
@@ -1723,10 +2033,12 @@ async def _hub_self_register(server_url: str) -> None:
             relay_state["error"] = ""
             _relay_diag_append("register_ok", status="pending", spoke_id=spoke_id)
             logger.info("Hub registration submitted: spoke_id=%s status=pending", spoke_id)
+        # Registration is done for now; save relay state and settings.
         state.relay_registration_refresh_needed = False
         _save_relay_state()
         _save_settings()
     except Exception as exc:
+        # Failure: try registering again next cycle and show the error.
         state.relay_registration_refresh_needed = True
         _relay_diag_append("register_error", error=str(exc))
         logger.warning("Hub self-register failed: %s", exc)
@@ -1739,15 +2051,18 @@ async def _hub_self_register(server_url: str) -> None:
 async def _hub_check_approval(server_url: str, spoke_id: str) -> None:
     """Re-POST registration to check if spoke has been approved.
     Hub returns 'approved' with api_key and tenant_id once superadmin has approved."""
+    # Our identity and the credentials we already have.
     hostname = socket.gethostname()
     spoke_name = settings.get("relay_spoke_name", "").strip() or hostname
     tenant_hint = (settings.get("relay_tenant_id") or settings.get("relay_tenant_hint") or "").strip()
     existing_api_key = settings.get("relay_api_key", "").strip()
     existing_tenant_id = settings.get("relay_tenant_id", "").strip()
     had_approval = bool(existing_api_key and existing_tenant_id)
+    # Record the check, then work out the hub base URL.
     _relay_diag_append("check_approval", spoke_id=spoke_id)
     hub_base = _relay_hub_base_url(server_url, settings.get("relay_tenant_id", ""))
     try:
+        # Re-send the registration (10 s limit); the reply tells us our approval status.
         async with httpx.AsyncClient(timeout=10, verify=_hub_tls_verify()) as hc:
             resp = await hc.post(f"{hub_base}/api/spokes/register", json={
                 "spoke_id": spoke_id,
@@ -1761,6 +2076,7 @@ async def _hub_check_approval(server_url: str, spoke_id: str) -> None:
             })
             resp.raise_for_status()
             data = resp.json()
+        # Read the status and adopt a new spoke id from the hub if it is valid.
         status = data.get("status", "pending")
         updated = False
         returned_spoke_id = str(data.get("spoke_id", "")).strip()
@@ -1768,6 +2084,7 @@ async def _hub_check_approval(server_url: str, spoke_id: str) -> None:
             settings["relay_spoke_id"] = returned_spoke_id
             spoke_id = returned_spoke_id
             updated = True
+        # Approved: store the API key and tenant id.
         if status == "approved":
             tenant_id = data.get("tenant_id", "")
             settings["relay_api_key"] = data.get("api_key", "")
@@ -1780,25 +2097,31 @@ async def _hub_check_approval(server_url: str, spoke_id: str) -> None:
                                tenant_id=data.get("tenant_id"))
             logger.info("Hub approval received: spoke_id=%s tenant_id=%s", spoke_id, data.get("tenant_id"))
         else:
+            # Still pending: update the tenant hint if it changed.
             tenant_hint = str(data.get("tenant_hint", "")).strip()
             if tenant_hint and tenant_hint != settings.get("relay_tenant_hint", ""):
                 settings["relay_tenant_hint"] = tenant_hint
                 updated = True
+            # We were approved before: keep the stored approval rather than dropping it on a pending
+            # reply.
             if had_approval:
                 relay_state["registration_status"] = "approved"
                 relay_state["error"] = "Hub registration check returned pending; keeping existing approval until credentials are explicitly rejected."
                 _relay_diag_append("pending_ignored", spoke_id=spoke_id, tenant_hint=tenant_hint)
                 logger.warning("Hub registration check returned pending for approved spoke %s; keeping stored approval", spoke_id)
             else:
+                # Never approved: still pending.
                 relay_state["registration_status"] = "pending"
                 relay_state["error"] = ""
                 _relay_diag_append("still_pending", spoke_id=spoke_id)
                 logger.info("Hub registration still pending: spoke_id=%s", spoke_id)
+        # The check is done; save relay state, and settings if they changed.
         state.relay_registration_refresh_needed = False
         _save_relay_state()
         if updated:
             _save_settings()
     except Exception as exc:
+        # Failure: check again next cycle and record the error.
         state.relay_registration_refresh_needed = True
         _relay_diag_append("check_approval_error", error=str(exc))
         logger.warning("Hub approval check failed: %s", exc)
@@ -1807,6 +2130,8 @@ async def _hub_check_approval(server_url: str, spoke_id: str) -> None:
 
 
 def _relay_hub_base_url(server_url: str, tenant_id: str) -> str:
+    """Return the hub's base URL, removing a trailing /api/<tenant_id> from the relay URL."""
+    # Drop any trailing slash and the tenant path, if present.
     url = server_url.rstrip("/")
     if tenant_id:
         url = re.sub(rf"/api/{re.escape(tenant_id)}$", "", url)
@@ -1816,12 +2141,14 @@ def _relay_hub_base_url(server_url: str, tenant_id: str) -> str:
 
 
 def _hub_tls_verify() -> bool:
+    """Return True when the hub's TLS certificate should be verified."""
     return _normalize_relay_enabled(settings.get("hub_tls_verify", "off")) == "on"
 
 
 
 
 def _hub_reseed_block_result() -> dict[str, str]:
+    """Return the error sent to the hub when a command is refused during a reseed."""
     return {
         "error": "reseed_in_progress",
         "message": "Reseed in progress — provisioning paused. Try again shortly.",
@@ -1831,18 +2158,23 @@ def _hub_reseed_block_result() -> dict[str, str]:
 
 
 async def _forward_hub_passthrough_to_proxmox(cmd_type: str, payload: dict[str, Any]) -> dict[str, Any]:
+    """Send a hub command straight to the connected Proxmox agent and return a success result."""
+    # The agent must be connected.
     if state.proxmox_ws_connection is None:
         raise RuntimeError("Proxmox agent is not connected")
+    # Log what is being forwarded.
     if cmd_type == "backup":
         logger.info(f"Forwarding backup command to proxmox agent: vm_ids={payload.get('vm_ids')}")
     elif cmd_type == "reseed":
         logger.info(f"Forwarding reseed command to proxmox agent: vm_ids={payload.get('vm_ids')}")
     else:
         logger.info(f"Forwarding {cmd_type} command to proxmox agent: action={payload.get('action')}")
+    # "command" messages are sent flat; other types wrap their data in "payload".
     if cmd_type == "command":
         await state.proxmox_ws_connection.send_json({"type": cmd_type, **payload})
     else:
         await state.proxmox_ws_connection.send_json({"type": cmd_type, "payload": payload})
+    # Success result for the hub.
     return {
         "success": True,
         "task_type": cmd_type,
@@ -1854,11 +2186,15 @@ async def _forward_hub_passthrough_to_proxmox(cmd_type: str, payload: dict[str, 
 
 
 def _hub_targets_proxmox_agent(target: str) -> bool:
+    """Return True if a hub command target refers to a Proxmox agent we know."""
+    # Empty targets never match.
     normalized = _normalize_proxmox_hostname(target)
     if not normalized:
         return False
+    # Generic "proxmox" target.
     if normalized == "proxmox":
         return True
+    # The connected agent, or any approved agent.
     if state.proxmox_ws_hostname and _proxmox_hostnames_match(normalized, state.proxmox_ws_hostname):
         return True
     return _resolve_proxmox_agent_hostname(normalized, approved_proxmox_agents) is not None
@@ -1867,8 +2203,11 @@ def _hub_targets_proxmox_agent(target: str) -> bool:
 
 
 def _hub_command_blocked_by_reseed(cmd_type: str, target: str, action: str) -> bool:
+    """Return True if this hub command must wait because a reseed is running."""
+    # Nothing is blocked outside a reseed.
     if not state._proxmox_reseed_in_progress:
         return False
+    # Reclone-all, and reclone/provision commands for a Proxmox agent, are blocked.
     if cmd_type == "proxmox_reclone_all":
         return True
     return _hub_targets_proxmox_agent(target) and action in {"reclone_vm", "provision_unassigned"}
@@ -1877,8 +2216,11 @@ def _hub_command_blocked_by_reseed(cmd_type: str, target: str, action: str) -> b
 
 
 async def _relay_proxmox_progress_to_hub(message: dict[str, Any]) -> None:
+    """Forward a progress message from the Proxmox agent to the hub, tagged with our spoke id."""
+    # No relay websocket means nothing to forward to.
     if state._relay_ws_send_json is None:
         return
+    # Copy the message and add our spoke id (inside payload if there is one).
     outbound = dict(message)
     payload = outbound.get("payload") if isinstance(outbound.get("payload"), dict) else None
     if payload is not None:
@@ -1888,6 +2230,7 @@ async def _relay_proxmox_progress_to_hub(message: dict[str, Any]) -> None:
         outbound["payload"] = payload
     elif "spoke_id" not in outbound and state._relay_ws_spoke_id:
         outbound["spoke_id"] = state._relay_ws_spoke_id
+    # Send it to the hub.
     await state._relay_ws_send_json(outbound)
 
 
@@ -1897,6 +2240,7 @@ async def _relay_vnc_to_hub(message: dict[str, Any]) -> None:
     """Forward a VNC frame/control message back to the hub."""
     if state._relay_ws_send_json is None:
         return
+    # Copy the message and add our spoke id if missing.
     outbound = dict(message)
     if "spoke_id" not in outbound and state._relay_ws_spoke_id:
         outbound["spoke_id"] = state._relay_ws_spoke_id
@@ -1907,6 +2251,7 @@ async def _relay_vnc_to_hub(message: dict[str, Any]) -> None:
 
 async def _handle_vnc_proxy_request(message: dict[str, Any]) -> None:
     """Open a WebSocket to Proxmox vncwebsocket and relay frames to/from hub."""
+    # Read the request fields; request id and VMID are required.
     request_id = str(message.get("request_id") or "").strip()
     vmid = int(message.get("vmid") or 0)
     vmtype = str(message.get("vmtype") or "qemu").strip().lower()
@@ -1915,6 +2260,7 @@ async def _handle_vnc_proxy_request(message: dict[str, Any]) -> None:
         await _relay_vnc_to_hub({"type": "vnc_proxy_error", "request_id": request_id, "error": "Missing request_id or vmid"})
         return
 
+    # Find the host running the VM and its API token; both are required.
     proxmox_host = str(_proxmox_agent_vm_map.get(vmid) or state.proxmox_ws_hostname or "").strip()
     api_token = _get_proxmox_token_for_host(proxmox_host)
 
@@ -1926,14 +2272,17 @@ async def _handle_vnc_proxy_request(message: dict[str, Any]) -> None:
         return
 
     # Ask Proxmox to create a VNC ticket via REST
+    # Proxmox usually has a self-signed cert, so skip TLS verification for the websocket.
     ssl_ctx = ssl.create_default_context()
     ssl_ctx.check_hostname = False
     ssl_ctx.verify_mode = ssl.CERT_NONE
 
+    # Node name is the short host name; build the vncproxy URL and auth header.
     node = proxmox_host.split(".")[0]
     vncproxy_url = f"https://{proxmox_host}:8006/api2/json/nodes/{node}/{vmtype}/{vmid}/vncproxy"
     headers = {"Authorization": f"PVEAPIToken={api_token}"}
 
+    # Ask Proxmox for a VNC ticket and port; any failure is reported to the hub.
     try:
         if httpx is None:
             raise RuntimeError("httpx not installed")
@@ -1950,20 +2299,24 @@ async def _handle_vnc_proxy_request(message: dict[str, Any]) -> None:
         return
 
     # Register an inbound queue so browser→proxmox frames can be forwarded
+    # Queue for browser-to-Proxmox frames, registered under the request id.
     inbound_queue: asyncio.Queue = asyncio.Queue()
     _vnc_sessions[request_id] = inbound_queue
 
+    # Local alias; build the vncwebsocket URL with the ticket.
     import urllib.parse as _urlparse
     params = _urlparse.urlencode({"port": port, "vncticket": ticket})
     ws_path = f"/api2/json/nodes/{node}/{vmtype}/{vmid}/vncwebsocket?{params}"
     ws_url = f"wss://{proxmox_host}:8006{ws_path}"
 
+    # The websockets library is optional; without it we cannot relay.
     if websockets is None:
         await _relay_vnc_to_hub({"type": "vnc_proxy_error", "request_id": request_id, "error": "websockets library not installed"})
         _vnc_sessions.pop(request_id, None)
         return
 
     try:
+        # Websocket options: our TLS context, 20 s open timeout and no frame size limit.
         connect_kwargs: dict[str, Any] = {
             "ssl": ssl_ctx,
             "open_timeout": 20,
@@ -1974,11 +2327,14 @@ async def _handle_vnc_proxy_request(message: dict[str, Any]) -> None:
         hdr_key = "additional_headers" if "additional_headers" in _inspect.signature(websockets.connect).parameters else "extra_headers"
         connect_kwargs[hdr_key] = headers
 
+        # Tell the hub the proxy is ready.
         await _relay_vnc_to_hub({"type": "vnc_proxy_response", "request_id": request_id})
 
+        # Connect to Proxmox and relay in both directions.
         async with websockets.connect(ws_url, **connect_kwargs) as px_ws:
 
             async def proxmox_to_hub() -> None:
+                """Send every frame from Proxmox to the hub, base64-encoded."""
                 async for raw in px_ws:
                     data = raw if isinstance(raw, bytes) else raw.encode()
                     await _relay_vnc_to_hub({
@@ -1988,6 +2344,7 @@ async def _handle_vnc_proxy_request(message: dict[str, Any]) -> None:
                     })
 
             async def hub_to_proxmox() -> None:
+                """Send frames queued from the browser to Proxmox until a None marks the end."""
                 while True:
                     msg = await inbound_queue.get()
                     if msg is None:
@@ -1995,6 +2352,7 @@ async def _handle_vnc_proxy_request(message: dict[str, Any]) -> None:
                     raw = __import__("base64").b64decode(msg.get("data", ""))
                     await px_ws.send(raw)
 
+            # Run both directions; when either stops, cancel the other and wait for both.
             t1 = asyncio.create_task(proxmox_to_hub())
             t2 = asyncio.create_task(hub_to_proxmox())
             try:
@@ -2005,9 +2363,11 @@ async def _handle_vnc_proxy_request(message: dict[str, Any]) -> None:
             finally:
                 pass
     except Exception as exc:
+        # Errors are logged and reported to the hub.
         logger.warning("VNC relay error for request %s: %s", request_id, exc)
         await _relay_vnc_to_hub({"type": "vnc_proxy_error", "request_id": request_id, "error": str(exc)})
     finally:
+        # Always remove the session and tell the hub the console is closed.
         _vnc_sessions.pop(request_id, None)
         await _relay_vnc_to_hub({"type": "vnc_disconnect", "request_id": request_id})
 
@@ -2016,14 +2376,17 @@ async def _handle_vnc_proxy_request(message: dict[str, Any]) -> None:
 
 async def _handle_provision_proxmox_token(message: dict[str, Any]) -> None:
     """Auto-create a Proxmox API token via pvesh and report it back to the hub."""
+    # The request id ties our reply to the hub's request.
     request_id = str(message.get("request_id") or "").strip()
 
     async def _send_error(error: str) -> None:
+        """Report a token provisioning error to the hub."""
         await _relay_vnc_to_hub({"type": "proxmox_token_provision_error", "request_id": request_id, "error": error})
 
     # pvesh may not be in the systemd service PATH — check all common Proxmox locations.
     # Use os.path.isfile only (not os.access X_OK) since the service may run as a user
     # that lacks execute permission on the stat but can still exec via the kernel.
+    # Find pvesh in PATH or the usual install locations.
     pvesh_candidates = [
         shutil.which("pvesh"),
         "/usr/bin/pvesh",
@@ -2046,18 +2409,22 @@ async def _handle_provision_proxmox_token(message: dict[str, Any]) -> None:
                 pvesh_path = "pvesh"
         except Exception:
             pass
+    # No pvesh here: ask the connected Proxmox agent instead.
     if not pvesh_path:
         # pvesh not available locally — try relaying to the Proxmox agent if connected.
         if state.proxmox_ws_connection is not None:
             logger.info("provision_proxmox_token: pvesh not found locally, relaying to proxmox agent")
+            # One-slot queue the agent's reply is delivered into, keyed by request id.
             q: asyncio.Queue = asyncio.Queue(maxsize=1)
             _proxmox_token_provision_queues[request_id] = q
+            # Ask the agent to create the token and wait up to 30 s for the reply.
             try:
                 await state.proxmox_ws_connection.send_json({
                     "type": "create_proxmox_token",
                     "request_id": request_id,
                 })
                 result = await asyncio.wait_for(q.get(), timeout=30.0)
+                # Success: save the token as the global token and send it to the hub.
                 if result.get("ok"):
                     token = str(result.get("token") or "").strip()
                     settings["proxmox_api_token"] = token
@@ -2070,20 +2437,25 @@ async def _handle_provision_proxmox_token(message: dict[str, Any]) -> None:
                         "token": token,
                     })
                 else:
+                    # The agent reported a failure.
                     await _send_error(str(result.get("error") or "Agent failed to provision token"))
             except asyncio.TimeoutError:
+                # Timeout or other error: report it.
                 await _send_error("Proxmox agent did not respond to token creation request within 30 seconds")
             except Exception as exc:
                 await _send_error(f"Failed to relay token request to agent: {exc}")
             finally:
+                # Always remove the reply queue.
                 _proxmox_token_provision_queues.pop(request_id, None)
         else:
+            # No pvesh and no agent: nothing can create the token.
             await _send_error(
                 "pvesh not found locally and no Proxmox agent is connected. "
                 "Ensure the proxmox-agent.sh service is running on the Proxmox host."
             )
         return
 
+    # Fixed token name and Proxmox user.
     TOKEN_ID = "cs-hub"
     USER = "root@pam"
     logger.info("provision_proxmox_token: using pvesh at %s", pvesh_path)
@@ -2099,6 +2471,7 @@ async def _handle_provision_proxmox_token(message: dict[str, Any]) -> None:
     except Exception:
         pass  # Token may not exist yet — ignore
 
+    # Create a fresh token without privilege separation and get JSON output (15 s limit).
     try:
         proc = await asyncio.create_subprocess_exec(
             pvesh_path, "create", f"/access/users/{USER}/token/{TOKEN_ID}",
@@ -2108,25 +2481,30 @@ async def _handle_provision_proxmox_token(message: dict[str, Any]) -> None:
             stderr=asyncio.subprocess.PIPE,
         )
         stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=15.0)
+        # pvesh failed: report its error text.
         if proc.returncode != 0:
             await _send_error(f"pvesh create failed: {stderr.decode().strip()[:300]}")
             return
 
+        # Parse the JSON and extract the token secret.
         data = json.loads(stdout.decode().strip())
         secret = str(data.get("value") or "").strip()
         if not secret:
             await _send_error("pvesh returned no token value in response")
             return
 
+        # Proxmox token format is USER!TOKENID=SECRET; save it as the global token.
         full_token = f"{USER}!{TOKEN_ID}={secret}"
         settings["proxmox_api_token"] = full_token
         _persisted["proxmox_api_token"] = full_token
         _save_settings()
         logger.info("Proxmox API token auto-provisioned: %s!%s", USER, TOKEN_ID)
 
+        # Send the token to the hub.
         await _relay_vnc_to_hub({"type": "proxmox_token_provisioned", "request_id": request_id, "token": full_token})
 
     except asyncio.TimeoutError:
+        # Timeout, bad JSON or any other error is reported to the hub.
         await _send_error("pvesh timed out after 15 seconds")
     except json.JSONDecodeError as exc:
         await _send_error(f"Could not parse pvesh output: {exc}")
@@ -2138,11 +2516,14 @@ async def _handle_provision_proxmox_token(message: dict[str, Any]) -> None:
 
 async def _handle_command_trace_request(message: dict[str, Any]) -> None:
     """Send the command relay trace buffer back to the hub."""
+    # Need a request id and an open relay websocket.
     request_id = str(message.get("request_id") or "").strip()
     if not request_id or state._relay_ws_send_json is None:
         return
+    # Copy the command queue under the lock.
     async with state_lock:
         cmds_snapshot = list(_serialize_commands())
+    # Reply with agent connection info, the queue and the trace (newest first).
     out: dict[str, Any] = {
         "type": "command_trace_response",
         "request_id": request_id,
@@ -2151,6 +2532,7 @@ async def _handle_command_trace_request(message: dict[str, Any]) -> None:
         "command_queue": cmds_snapshot,
         "trace": list(reversed(_command_trace)),
     }
+    # Tag the reply with our spoke id.
     if state._relay_ws_spoke_id:
         out["spoke_id"] = state._relay_ws_spoke_id
     await state._relay_ws_send_json(out)
@@ -2159,10 +2541,16 @@ async def _handle_command_trace_request(message: dict[str, Any]) -> None:
 
 
 def _push_to_github(files_changed: list[str], commit_message: str) -> bool:
+    """Commit the given repo files and push them to GitHub; returns False if nothing changed.
+
+    Uses a temporary GIT_ASKPASS script so the token is never written into the remote URL.
+    """
+    # A GitHub token is required.
     token = settings.get("github_token", "").strip()
     if not token:
         raise ValueError("GitHub token not configured")
 
+    # The repo directory must be a git checkout.
     if not (REPO_DIR / ".git").exists():
         raise RuntimeError(f"{REPO_DIR} exists but is not a git repository")
 
@@ -2176,6 +2564,7 @@ def _push_to_github(files_changed: list[str], commit_message: str) -> bool:
     except RuntimeError:
         _git("config", "user.email", "client-sim@localhost")
 
+    # Write a temporary askpass script that answers git's prompts with the token from the env.
     askpass_script = BASE_DIR / f".git-askpass-{uuid.uuid4().hex}.sh"
     askpass_script.write_text(
         "#!/bin/sh\n"
@@ -2186,6 +2575,7 @@ def _push_to_github(files_changed: list[str], commit_message: str) -> bool:
         "esac\n",
         encoding="utf-8",
     )
+    # Only the owner may run it; pass the token to git via env vars.
     askpass_script.chmod(0o700)
     push_env = {
         "GIT_ASKPASS": str(askpass_script),
@@ -2193,20 +2583,25 @@ def _push_to_github(files_changed: list[str], commit_message: str) -> bool:
         "GITHUB_TOKEN": token,
     }
 
+    # Make sure origin is the plain repo URL.
     _git("remote", "set-url", "origin", REPO_URL)
     try:
+        # Stage the files.
         _git("add", *files_changed)
         # Check if there is anything staged
         status = subprocess.run(
             ["git", "diff", "--cached", "--quiet"],
             cwd=REPO_DIR,
         )
+        # Exit code 0 from "diff --cached --quiet" means nothing is staged.
         if status.returncode == 0:
             return False  # nothing staged
+        # Commit and push.
         _git("commit", "-m", commit_message)
         _git("push", env=push_env)
         return True
     finally:
+        # Always delete the askpass script and reset the remote URL.
         with contextlib.suppress(FileNotFoundError):
             askpass_script.unlink()
         _git("remote", "set-url", "origin", REPO_URL)
@@ -2215,22 +2610,34 @@ def _push_to_github(files_changed: list[str], commit_message: str) -> bool:
 
 
 def _update_ini_section(filepath: Path, section: str, updates: dict[str, str]) -> None:
+    """Set keys in one [section] of an INI file, keeping all other lines and the file's line
+    endings.
+
+    Missing keys are added at the end of the section; a missing section is added at the end.
+    """
+    # Read the file (empty if missing) and keep its line-ending style.
     text = filepath.read_text(encoding="utf-8") if filepath.exists() else ""
     newline = "\r\n" if "\r\n" in text else "\n"
     lines = text.splitlines()
+    # Drop blank keys from the updates.
     normalized_updates = {str(key).strip(): str(value) for key, value in updates.items() if str(key).strip()}
 
+    # Output lines and tracking for the walk below.
     updated_lines: list[str] = []
     found_keys: set[str] = set()
     section_found = False
     in_target_section = False
 
     def append_missing_keys() -> None:
+        """Add any updates not yet written to the section being output."""
         for key, value in normalized_updates.items():
             if key not in found_keys:
                 updated_lines.append(f"{key}={value}")
 
+    # Copy the file line by line, changing matching keys in the target section.
     for line in lines:
+        # A section header: finish the previous target section, then note whether this one is the
+        # target.
         match = re.match(r"^\s*\[(?P<section>[^\]]+)\]\s*$", line)
         if match:
             if in_target_section:
@@ -2241,6 +2648,7 @@ def _update_ini_section(filepath: Path, section: str, updates: dict[str, str]) -
             updated_lines.append(line)
             continue
 
+        # Inside the target section, replace values of keys that are being updated.
         if in_target_section:
             key_match = re.match(r"^(?P<indent>\s*)(?P<key>[^=\s#;][^=]*?)\s*=.*$", line)
             if key_match:
@@ -2250,17 +2658,21 @@ def _update_ini_section(filepath: Path, section: str, updates: dict[str, str]) -
                     found_keys.add(key)
                     continue
 
+        # Any other line is kept as is.
         updated_lines.append(line)
 
+    # The target section was last in the file: add missing keys now.
     if in_target_section:
         append_missing_keys()
 
+    # No such section: add it (after a blank line) with all the keys.
     if not section_found:
         if updated_lines and updated_lines[-1].strip():
             updated_lines.append("")
         updated_lines.append(f"[{section}]")
         append_missing_keys()
 
+    # Join the lines, keep a trailing newline, and write the file.
     output = newline.join(updated_lines)
     if updated_lines and (text.endswith("\n") or not text):
         output += newline
@@ -2270,10 +2682,13 @@ def _update_ini_section(filepath: Path, section: str, updates: dict[str, str]) -
 
 
 async def _run_hub_repo_sync() -> dict[str, Any]:
+    """Sync the repo now and queue a Proxmox agent update; returns a result for the hub."""
+    # Sync and start building the result.
     repo_version = await _sync_repo_now()
     output: dict[str, Any] = {"repo_version": repo_version}
     detail = f"Client-Sim repo synced{f' ({repo_version})' if repo_version else ''}"
 
+    # With an approved agent, queue an update for it.
     if approved_proxmox_agents:
         try:
             cmd = await _queue_proxmox_agent_update()
@@ -2284,14 +2699,17 @@ async def _run_hub_repo_sync() -> dict[str, Any]:
             })
             detail += f"; queued Proxmox agent update for {cmd['target']}"
         except HTTPException as exc:
+            # An update already queued is fine; any other error fails the task.
             detail_msg = str(exc.detail or exc)
             if exc.status_code == 409 and "already queued" in detail_msg.lower():
                 detail += f"; {detail_msg}"
             else:
                 raise RuntimeError(detail_msg) from exc
     else:
+        # No agent to update.
         detail += "; no approved Proxmox agent available"
 
+    # Success result for the hub.
     return {
         "success": True,
         "task_type": "repo_sync",
@@ -2307,6 +2725,7 @@ async def check_for_update() -> None:
     """Background task: check for a new installer version every 24 hours with
     a random 2-hour jitter. Auto-applies the update when a new version is
     detected and the spoke is idle (no active reclone or reseed)."""
+    # Imported here because only this task needs it.
     import random
     # Spread initial check across first 2 hours to avoid update stampedes
     initial_jitter = random.uniform(0, 7200)
@@ -2314,14 +2733,18 @@ async def check_for_update() -> None:
     await asyncio.sleep(initial_jitter)
     while True:
         try:
+            # Read the version in the synced repo (in a thread, as it touches disk).
             available = await asyncio.to_thread(_get_repo_version)
+            # Local import of datetime, kept from the original code.
             import datetime
+            # Record the result and whether it differs from the installed version.
             update_state["available_version"] = available
             update_state["last_checked"] = datetime.datetime.now().isoformat(timespec="seconds")
             update_state["update_available"] = (
                 available is not None
                 and available != update_state["current_version"]
             )
+            # Log the result, mark the task healthy and tell UIs.
             logger.info(
                 "Version check: installed=%s repo=%s update_available=%s",
                 update_state["current_version"],
@@ -2349,8 +2772,10 @@ async def check_for_update() -> None:
                     available,
                 )
         except asyncio.CancelledError:
+            # Cancellation must stop the task.
             raise
         except Exception as exc:
+            # Any other error is recorded in service health and logged; the loop keeps going.
             _update_service_health("update_checker", ok=False, error=str(exc))
             logger.exception("Update checker error: %s", exc)
         # 24 hours + up to 2-hour jitter to prevent all spokes checking simultaneously
@@ -2364,17 +2789,20 @@ async def check_for_update() -> None:
 async def _run_update_all() -> None:
     """Queue the shared Proxmox update command, wait for its ACK, then self-update the WebUI."""
 
+    # Approved agents and the ids of the update commands sent to them.
     approved = list(approved_proxmox_agents.keys())
     agent_cmd_ids: list[str] = []
 
     # ── Phase 1: Agent update ────────────────────────────────────────────────
     try:
+        # Queue an update for every approved agent under the lock.
         async with state_lock:
             update_args = _proxmox_update_args()
             for hostname in approved:
                 cmd, _created, _expired, _purged = _enqueue_command_locked(hostname, "update_agent", dict(update_args))
                 agent_cmd_ids.append(cmd["id"])
 
+        # Record progress: agent phase if any updates were queued, otherwise WebUI phase.
         state.update_all_state.update({
             "running": True,
             "phase": "agents" if agent_cmd_ids else "webui",
@@ -2385,10 +2813,12 @@ async def _run_update_all() -> None:
             "started_at": time.time(),
             "error": None,
         })
+        # Tell UIs and push the commands to connected agents.
         await broadcast({"type": "update_all_progress", **state.update_all_state})
         await broadcast({"type": "commands_update", "commands": _serialize_commands()})
         await _push_pending_commands_for_targets(approved)
 
+        # Wait up to 5 minutes for the agents to finish, checking every 5 seconds.
         if agent_cmd_ids:
             deadline = time.time() + 300
             while time.time() < deadline:
@@ -2399,18 +2829,22 @@ async def _run_update_all() -> None:
                         for c in commands
                         if c["id"] in agent_cmd_ids
                     }
+                # Count finished and failed agent commands, record progress and tell UIs.
                 done = sum(1 for status in command_statuses.values() if status in ("completed", "failed"))
                 failed = sum(1 for status in command_statuses.values() if status == "failed")
                 state.update_all_state["completed_agents"] = done
                 state.update_all_state["failed_agents"] = failed
                 await broadcast({"type": "update_all_progress", **state.update_all_state})
+                # All agents done: stop waiting.
                 if done >= len(agent_cmd_ids):
                     break
             else:
+                # Loop ended without break: timed out, but carry on to the WebUI update.
                 logger.warning(
                     "Update All: agent ACK timed out after 300s — proceeding to WebUI update anyway"
                 )
 
+        # Log how the agent phase ended.
         if len(approved) == 0:
             logger.info("Update All: no approved agents, proceeding directly to WebUI update")
         else:
@@ -2420,11 +2854,13 @@ async def _run_update_all() -> None:
                 state.update_all_state["failed_agents"],
             )
     except Exception as exc:
+        # An agent phase error is recorded but does not stop the WebUI update.
         logger.error("Update All: agent phase error (continuing to WebUI update): %s", exc)
         state.update_all_state["error"] = str(exc)
 
     # ── Phase 2: WebUI self-update ───────────────────────────────────────────
     try:
+        # Enter the WebUI phase and tell UIs.
         state.update_all_state["phase"] = "webui"
         state.update_all_state["error"] = None
         await broadcast({"type": "update_all_progress", **state.update_all_state})
@@ -2438,6 +2874,7 @@ async def _run_update_all() -> None:
         except Exception as sync_exc:
             logger.warning("Update All: repo sync failed (%s) — installer will retry git fetch", sync_exc)
 
+        # Run the installer, then record success or failure.
         await _run_self_update()
         if update_state.get("update_error"):
             state.update_all_state["phase"] = "failed"
@@ -2446,10 +2883,12 @@ async def _run_update_all() -> None:
         else:
             state.update_all_state["phase"] = "done"
     except Exception as exc:
+        # Any error marks the whole run failed.
         state.update_all_state["phase"] = "failed"
         state.update_all_state["error"] = str(exc)
         logger.error("Update All: WebUI phase error: %s", exc)
     finally:
+        # Always mark the run finished and tell UIs.
         state.update_all_state["running"] = False
         await broadcast({"type": "update_all_progress", **state.update_all_state})
 
@@ -2458,6 +2897,7 @@ async def _run_update_all() -> None:
 
 async def _run_self_update() -> None:
     """Re-run the installer from the synced repo. Systemd will restart the service."""
+    # Only one self-update at a time.
     if update_state["update_in_progress"]:
         return
     # Wait for any pending/delivered Proxmox agent commands (e.g. update_agent) to be
@@ -2476,12 +2916,14 @@ async def _run_self_update() -> None:
             _agent_update_deadline - time.time(),
         )
         await asyncio.sleep(5)
+    # The installer must exist; otherwise record the error and stop.
     if not _INSTALLER_PATH.exists():
         msg = f"Self-update: installer not found at {_INSTALLER_PATH}"
         logger.error(msg)
         update_state["update_error"] = msg
         await _broadcast_update_state()
         return
+    # Mark the update running with a fresh log and tell UIs.
     update_state["update_in_progress"] = True
     update_state["update_log"] = []
     update_state["update_error"] = None
@@ -2505,6 +2947,7 @@ async def _run_self_update() -> None:
             env={**os.environ, "PATH": full_path},
             start_new_session=True,  # detach from server's process group so SIGTERM on restart doesn't kill installer
         )
+        # Read installer output line by line, strip colour codes, log it and stream it to UIs.
         assert proc.stdout is not None
         _ansi_re = re.compile(r'\x1b(?:\[[0-9;]*[a-zA-Z]|\][^\x07\x1b]*(?:\x07|\x1b\\)|[^[\]])')
         async for raw in proc.stdout:
@@ -2512,6 +2955,7 @@ async def _run_self_update() -> None:
             update_state["update_log"].append(line)
             logger.info("self-update: %s", line)
             await _broadcast_update_state()
+        # Wait for the installer to exit.
         await proc.wait()
         # -15 (SIGTERM) is expected when the installer schedules a deferred
         # `systemctl restart` and asyncio cleans up the subprocess transport
@@ -2520,17 +2964,20 @@ async def _run_self_update() -> None:
         restart_triggered = any(
             "Restarting client-sim-dashboard" in l for l in update_state["update_log"]
         )
+        # Non-zero exit (other than the expected restart SIGTERM) is a failure.
         if proc.returncode != 0 and not (proc.returncode == -15 and restart_triggered):
             logger.error("Self-update installer exited with code %s", proc.returncode)
             update_state["update_in_progress"] = False
             update_state["update_error"] = f"Installer exited with code {proc.returncode} — check logs"
             await _broadcast_update_state()
         else:
+            # Otherwise the update succeeded.
             logger.info("Self-update installer completed successfully (rc=%s)", proc.returncode)
             update_state["update_in_progress"] = False
             update_state["update_error"] = None
             await _broadcast_update_state()
     except Exception as exc:
+        # Any error is logged and recorded in the update state.
         logger.exception("Self-update failed")
         update_state["update_in_progress"] = False
         update_state["update_error"] = str(exc)
@@ -2541,17 +2988,26 @@ async def _run_self_update() -> None:
 
 
 async def _authorize_proxmox_agent(hostname: str, api_key: str, client_ip: str, now: float) -> tuple[str | None, JSONResponse | None]:
+    """Check a Proxmox agent's hostname and API key; returns (approved hostname, None) or (None,
+    error).
+
+    Unknown agents are added to the pending list so an admin can approve them.
+    """
+    # Unknown agent: add it to the pending list and tell UIs.
     approved_hostname = _resolve_proxmox_agent_hostname(hostname, approved_proxmox_agents)
     if approved_hostname is None:
         _upsert_pending_proxmox_agent(hostname, client_ip, now)
         await broadcast({"type": "proxmox_pending_update", "pending": _pending_proxmox_payload()})
+        # 401 if it sent a key; otherwise 202 means "wait for approval".
         if api_key:
             return None, JSONResponse({"error": "agent not approved"}, status_code=401)
         return None, JSONResponse({"pending": True}, status_code=202)
 
+    # Approved agent with the wrong key.
     if api_key != approved_proxmox_agents[approved_hostname]:
         return None, JSONResponse({"error": "invalid key"}, status_code=401)
 
+    # Approved agent with a stale pending entry: remove it and tell UIs.
     pending_hostname = _resolve_proxmox_agent_hostname(hostname, pending_proxmox_agents)
     if pending_hostname is not None:
         pending_proxmox_agents.pop(pending_hostname, None)
@@ -2562,9 +3018,15 @@ async def _authorize_proxmox_agent(hostname: str, api_key: str, client_ip: str, 
 
 
 async def _apply_proxmox_telemetry_state(body: dict[str, Any], hostname: str, now: float) -> dict[str, bool]:
+    """Apply a telemetry report from a Proxmox agent to the shared and per-agent state.
+
+    Returns flags saying what changed so the caller knows what to broadcast.
+    """
+    # Snapshot each client's last-seen time under the lock.
     async with state_lock:
         client_seen = {client_hostname: client.get("last_seen") for client_hostname, client in clients.items()}
 
+    # Copy each reported VM, add the client's last-seen time and mark templates.
     enriched_vms: list[dict[str, Any]] = []
     configured_template_ids: set[str] = {
         str(settings.get("vm_image_1_template_id", "100")).strip(),
@@ -2606,15 +3068,18 @@ async def _apply_proxmox_telemetry_state(body: dict[str, Any], hostname: str, no
         and str(d.get("vidpid", "")).strip().lower() not in exclude_vidpids
     ]
 
+    # Normalize the USB state reported by the agent.
     normalized_present_usb = body.get("present_usb", [])
     normalized_usb_state = _normalize_proxmox_usb_state(body.get("usb_state", []), normalized_present_usb)
 
+    # Mark the agent connected; log a reconnect event if it was disconnected.
     was_connected = bool(proxmox_state.get("connected"))
     proxmox_state["connected"] = True
     proxmox_state["last_seen"] = now
     if not was_connected:
         gap = now - (proxmox_state.get("last_seen") or now)
         _debug_event("proxmox_reconnected", f"agent={hostname} gap={gap:.0f}s")
+    # Store the reseed flag and node info reported by the agent.
     state._proxmox_reseed_in_progress = bool(body.get("reseed_in_progress", False))
     proxmox_state["node"] = body.get("node", {}) or {}
 
@@ -2631,6 +3096,7 @@ async def _apply_proxmox_telemetry_state(body: dict[str, Any], hostname: str, no
     _prev_agent = proxmox_states.get(hostname, {})
     _agent_cpu_samples: list[tuple[float, float]] = _prev_agent.get("_cpu_samples", [])
     _agent_mem_samples: list[tuple[float, float]] = _prev_agent.get("_mem_samples", [])
+    # Add new CPU and memory samples, dropping any older than the sample window.
     _sample_cutoff = now - _RESOURCE_SAMPLE_WINDOW
     _anode = body.get("node", {}) or {}
     _cpu_pct = _anode.get("cpu_percent")
@@ -2646,8 +3112,10 @@ async def _apply_proxmox_telemetry_state(body: dict[str, Any], hostname: str, no
             _agent_mem_samples.append((now, _mem_pct))
         except (TypeError, ValueError, ZeroDivisionError):
             pass
+    # Averages over the window (None with no samples).
     _agent_cpu_avg = (sum(v for _, v in _agent_cpu_samples) / len(_agent_cpu_samples)) if _agent_cpu_samples else None
     _agent_mem_avg = (sum(v for _, v in _agent_mem_samples) / len(_agent_mem_samples)) if _agent_mem_samples else None
+    # Provisioning halt is only kept when auto-provisioning is on.
     reported_provision_halt = body.get("provision_halt") if _autoprov_enabled() else None
 
     # Update per-agent state for multi-server list UI.
@@ -2665,6 +3133,7 @@ async def _apply_proxmox_telemetry_state(body: dict[str, Any], hostname: str, no
         # Fall back to previously stored range if the agent hasn't sent it yet
         _vmid_range = (_prev_agent or {}).get("vmid_range")
 
+    # Store this agent's full state.
     proxmox_states[hostname] = {
         "connected": True,
         "last_seen": now,
@@ -2710,6 +3179,7 @@ async def _apply_proxmox_telemetry_state(body: dict[str, Any], hostname: str, no
     for vmid in reported_vmids:
         _proxmox_agent_vm_map[vmid] = hostname
 
+    # Copy the merged lists and the agent's reported settings into the shared state.
     proxmox_state["reseed_in_progress"] = state._proxmox_reseed_in_progress
     proxmox_state["usb_state"] = all_usb_state
     proxmox_state["present_usb"] = all_present_usb
@@ -2784,8 +3254,10 @@ async def _apply_proxmox_telemetry_state(body: dict[str, Any], hostname: str, no
                         and int(cmd.get("args", {}).get("vmid", -1)) in confirmed_deleted):
                     cmd["status"] = "cancelled"
                     cmd["error"] = "VM was deleted — auto-recovery cancelled"
+    # Compare USB provisioning status with the previous report, keyed by VMID.
     new_usb: list[dict] = proxmox_state["usb_state"]
     new_by_vmid = {str(e["vmid"]): e.get("prov_status", "active") for e in new_usb if e.get("vmid") is not None}
+    # VMs that went from provisioning to active, and VMs that were torn down and are gone.
     if state._prev_usb_by_vmid:
         newly_provisioned = [
             vmid for vmid, st in new_by_vmid.items()
@@ -2795,6 +3267,7 @@ async def _apply_proxmox_telemetry_state(body: dict[str, Any], hostname: str, no
             vmid for vmid, st in state._prev_usb_by_vmid.items()
             if vmid not in new_by_vmid and st in ("tearing_down", "missing")
         ]
+        # Record a summary and mark finished clones in the VM watchdog.
         if newly_provisioned:
             proxmox_state["prov_summary"] = {"action": "provisioned", "count": len(newly_provisioned), "at": now}
             for vmid in newly_provisioned:
@@ -2803,6 +3276,7 @@ async def _apply_proxmox_telemetry_state(body: dict[str, Any], hostname: str, no
             await _async_save_vm_watchdog()
         elif torn_down:
             proxmox_state["prov_summary"] = {"action": "deleted", "count": len(torn_down), "at": now}
+    # Update the provisioning run progress and remember this report for next time.
     _update_provision_run_state(proxmox_state["vms"], new_usb, now)
     state._prev_usb_by_vmid = new_by_vmid
 
@@ -2859,6 +3333,7 @@ async def _apply_proxmox_telemetry_state(body: dict[str, Any], hostname: str, no
     # Auto-trigger provision_unassigned when usb_auto_provision is enabled and
     # certified unassigned dongles are physically present.  Resource (CPU/memory)
     # thresholds gate provisioning and can also trigger deletion of the newest sim VM.
+    # Auto-provisioning is on and no reclone is running; log why checks are skipped otherwise.
     _ap_enabled = settings.get("usb_auto_provision") == "on"
     _reclone_running = reclone_state.get("status") == "running"
     if not _ap_enabled:
@@ -2867,11 +3342,13 @@ async def _apply_proxmox_telemetry_state(body: dict[str, Any], hostname: str, no
         _autoprov_gate_log("reclone_running", "reclone job is running (status=%s) — skipping provision checks", reclone_state.get("status"))
     if _ap_enabled and not _reclone_running:
         def _pct_setting(key: str, default: str) -> int:
+            """Read a percentage setting, clamped to 0-100; falls back to the default if invalid."""
             try:
                 return max(0, min(100, int(str(settings.get(key, default)).strip() or default)))
             except (TypeError, ValueError):
                 return int(default)
 
+        # Thresholds from settings and the 1-hour averages for this agent.
         cpu_prov_thr  = _pct_setting("cpu_provision_threshold", "80")
         cpu_del_thr   = _pct_setting("cpu_delete_threshold",   "90")
         cpu_prov_ceil = _pct_setting("cpu_provision_ceiling",  "90")
@@ -2896,6 +3373,7 @@ async def _apply_proxmox_telemetry_state(body: dict[str, Any], hostname: str, no
             (mem_avg is not None and mem_avg >= mem_del_thr)
         )
         if _threshold_exceeded:
+            # Collect VMIDs that have a USB dongle and their provisioning status.
             usb_vmids_int: set[int] = set()
             _usb_prov_status: dict[int, str] = {}
             for _e in normalized_usb_state:
@@ -2925,6 +3403,8 @@ async def _apply_proxmox_telemetry_state(body: dict[str, Any], hostname: str, no
             # by the USB-missing timeout handler (tearing_down) — both are transient
             # states where a second delete command causes wasted work or race conditions.
             _skip_statuses = {"provisioning", "tearing_down"}
+            # Candidates: non-template QEMU VMs with a dongle, not pending delete and not in
+            # transit.
             candidates: list[int] = []
             for _vm in enriched_vms:
                 try:
@@ -2955,6 +3435,7 @@ async def _apply_proxmox_telemetry_state(body: dict[str, Any], hostname: str, no
                             _remaining_cd, target_vmid,
                         )
                     else:
+                        # Only one delete command may be in flight at a time.
                         delete_queued = any(
                             c.get("action") == "delete_vm"
                             and c.get("status") not in {"completed", "failed", "expired"}
@@ -2982,6 +3463,7 @@ async def _apply_proxmox_telemetry_state(body: dict[str, Any], hostname: str, no
                                 cpu_avg or 0.0, mem_avg or 0.0, target_vmid, DELETE_GATE_COOLDOWN_S,
                             )
             else:
+                # No VM is safe to delete right now.
                 logger.info(
                     "Auto-provision resource gate: delete threshold exceeded "
                     "(cpu_avg=%.1f%% mem_avg=%.1f%%) — no eligible candidates "
@@ -3003,12 +3485,14 @@ async def _apply_proxmox_telemetry_state(body: dict[str, Any], hostname: str, no
                 "Auto-provision gate: delete cooldown active (%ds remaining) — suppressing provision_unassigned",
                 _remaining_prov_cd,
             )
+        # The instantaneous CPU ceiling blocks provisioning even when the average is fine.
         _ceil_hit = cpu_instant is not None and cpu_instant >= cpu_prov_ceil
         if _ceil_hit:
             logger.info(
                 "Auto-provision ceiling: instantaneous CPU %.1f%% >= ceiling %d%% — suppressing provision_unassigned",
                 cpu_instant, cpu_prov_ceil,
             )
+        # Provisioning is allowed only when no gate blocks it and both averages are below threshold.
         resource_ok = (
             not delete_queued
             and not _in_delete_cooldown
@@ -3026,6 +3510,7 @@ async def _apply_proxmox_telemetry_state(body: dict[str, Any], hostname: str, no
             cpu_instant or 0.0, cpu_prov_ceil,
             delete_queued, _in_delete_cooldown, _ceil_hit, resource_ok,
         )
+        # Log the reason provisioning was blocked (the ceiling was already logged).
         if not resource_ok and not _ceil_hit:
             if delete_queued:
                 _autoprov_gate_log("delete_queued", "delete_vm already in queue — suppressing provision_unassigned")
@@ -3037,6 +3522,7 @@ async def _apply_proxmox_telemetry_state(body: dict[str, Any], hostname: str, no
                 _autoprov_gate_log("cpu_threshold", "cpu_avg=%.1f%% >= threshold=%d%% — suppressing provision_unassigned", cpu_avg, cpu_prov_thr)
             elif mem_avg >= mem_prov_thr:
                 _autoprov_gate_log("mem_threshold", "mem_avg=%.1f%% >= threshold=%d%% — suppressing provision_unassigned", mem_avg, mem_prov_thr)
+        # A provisioning run already in progress: don't trigger another.
         prov_run = proxmox_state.get("prov_run") or {}
         if resource_ok and prov_run.get("running"):
             _autoprov_gate_log(
@@ -3046,11 +3532,13 @@ async def _apply_proxmox_telemetry_state(body: dict[str, Any], hostname: str, no
                 [i.get("vmid") for i in (prov_run.get("items") or [])],
                 [i.get("status") for i in (prov_run.get("items") or [])],
             )
+        # Resources are fine and nothing is running: look for unassigned dongles.
         if resource_ok and not prov_run.get("running"):
             unassigned = _proxmox_unassigned_present_usb()
             if not unassigned:
                 _autoprov_gate_log("no_unassigned", "no unassigned USB dongles present — nothing to provision")
             if unassigned:
+                # Keep only dongles whose VID:PID is certified.
                 certified_set = {
                     (str(v.get("vidpid", "")).strip().lower() if isinstance(v, dict) else str(v).strip().lower())
                     for v in _parse_json_list(settings.get("usb_vidpids", "[]"))
@@ -3069,6 +3557,7 @@ async def _apply_proxmox_telemetry_state(body: dict[str, Any], hostname: str, no
                         sorted(certified_set),
                     )
                 if certified_unassigned:
+                    # Queue provision_unassigned unless one is already pending.
                     has_pending = any(
                         c.get("action") == "provision_unassigned"
                         and c.get("status") not in {"completed", "failed", "expired"}
@@ -3101,6 +3590,7 @@ async def _apply_proxmox_telemetry_state(body: dict[str, Any], hostname: str, no
     # corrective bookkeeping action, not a resource-pressure shedding action.
     # It does respect its own per-host interval to avoid hammering the queue.
     if _ap_enabled and not _reclone_running and _vmid_range:
+        # Run the audit at most once per interval for each host.
         _audit_due = (now - _vmid_gap_audit_last_run.get(hostname, 0.0)) >= VMID_AUDIT_INTERVAL_S
         if _audit_due:
             _vmid_gap_audit_last_run[hostname] = now
@@ -3134,6 +3624,7 @@ async def _apply_proxmox_telemetry_state(body: dict[str, Any], hostname: str, no
                 if st not in _gap_skip and vid not in _pending_delete_vmids
             )
 
+            # Find the lowest VMID in the range missing below the highest active VMID.
             if len(_gap_active) >= 2:
                 _gap_max = _gap_active[-1]
                 _gap_active_set = set(_gap_active)
@@ -3149,6 +3640,7 @@ async def _apply_proxmox_telemetry_state(body: dict[str, Any], hostname: str, no
                     if _above_gap:
                         _gap_target = max(_above_gap)
                         _gap_del_args = _prepare_delete_vm_args({"vmid": _gap_target})
+                        # Queue the delete under the lock, unless another delete is already pending.
                         async with state_lock:
                             _gap_already_pending = any(
                                 c.get("action") == "delete_vm"
@@ -3163,6 +3655,7 @@ async def _apply_proxmox_telemetry_state(body: dict[str, Any], hostname: str, no
                                     command_type="auto-provision",
                                 )
                                 _pending_delete_vmids.add(_gap_target)
+                                # Log the action and add it to the Proxmox log buffer.
                                 _gap_msg = (
                                     f"VMID gap audit [{hostname}]: gap detected at {_lowest_gap} "
                                     f"(range {_gap_start}-{_gap_end}, active={_gap_active}) — "
@@ -3196,6 +3689,7 @@ async def _apply_proxmox_telemetry_state(body: dict[str, Any], hostname: str, no
             del proxmox_log_buffer[:len(proxmox_log_buffer) - PROXMOX_LOG_MAX]
         await broadcast({"type": "proxmox_log_update", "lines": new_lines})
 
+    # Tell UIs about the new state.
     await _broadcast_proxmox_state()
     return {"ok": True}
 
@@ -3203,6 +3697,8 @@ async def _apply_proxmox_telemetry_state(body: dict[str, Any], hostname: str, no
 
 
 async def _ack_command_internal(body: dict[str, Any]) -> dict[str, bool]:
+    """Record an agent's acknowledgement of a command (completed or failed) and tell UIs."""
+    # Read the ack fields; only completed and failed are valid statuses.
     cmd_id = str(body.get("id", "")).strip()
     status = str(body.get("status", "completed")).strip().lower()
     message = body.get("message", "")
@@ -3210,12 +3706,14 @@ async def _ack_command_internal(body: dict[str, Any]) -> dict[str, bool]:
     if status not in ("completed", "failed"):
         raise HTTPException(status_code=422, detail="status must be 'completed' or 'failed'")
 
+    # Under the lock: clean up old commands and find this one.
     async with state_lock:
         expired, purged = _cleanup_commands_locked()
         cmd = next((c for c in commands if c["id"] == cmd_id), None)
         if not cmd:
             raise HTTPException(status_code=404, detail="Command not found")
 
+        # Store the result and when it can be purged; trace the ack.
         cmd["status"] = status
         cmd["message"] = str(message) if message is not None else ""
         cmd["updated_at"] = time.time()
@@ -3223,9 +3721,11 @@ async def _ack_command_internal(body: dict[str, Any]) -> dict[str, bool]:
         _trace("agent_ack", cmd_id=cmd_id, action=cmd.get("action"), target=cmd.get("target"),
                args={k: v for k, v in (cmd.get("args") or {}).items() if k in {"vmid", "vm_type"}},
                status=status, message=str(message)[:200] if message else "")
+        # Save the queue and copy it for the broadcast.
         await _async_save_commands()
         serialized = _serialize_commands()
 
+    # Tell UIs (outside the lock).
     await broadcast({"type": "commands_update", "commands": serialized})
     return {"ok": True}
 
@@ -3233,13 +3733,20 @@ async def _ack_command_internal(body: dict[str, Any]) -> dict[str, bool]:
 
 
 async def _proxmox_disconnect_grace(expected_hostname: str | None) -> None:
+    """Mark the Proxmox agent disconnected if it has not come back within the grace period.
+
+    Skips if the agent reconnected (or reported telemetry) during the wait.
+    """
+    # Wait out the grace period first.
     await asyncio.sleep(PROXMOX_WS_GRACE_SECS)
+    # Nothing to do if any agent is connected or telemetry arrived recently.
     if state.proxmox_ws_connection is not None:
         return
     if expected_hostname and state.proxmox_ws_hostname and _proxmox_hostnames_match(expected_hostname, state.proxmox_ws_hostname):
         return
     if proxmox_state.get("last_seen") and (time.time() - float(proxmox_state.get("last_seen") or 0)) <= PROXMOX_WS_GRACE_SECS:
         return
+    # Mark disconnected, clear the VM list and tell UIs.
     proxmox_state["connected"] = False
     proxmox_state["vms"] = []
     await _broadcast_proxmox_state()
