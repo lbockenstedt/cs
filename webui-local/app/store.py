@@ -13,6 +13,7 @@ provided by ``fcntl.flock`` (exclusive file lock) on a per-spoke lock file.
 """
 from __future__ import annotations
 
+# Standard library imports.
 import contextlib
 import fcntl
 import hashlib
@@ -24,15 +25,19 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Optional
 
+# Hub settings, encryption helpers and data models.
 from .config import get_settings
 from .crypto import decrypt_dict, decrypt_str, encrypt_str, generate_api_key
 from .data_models import AuditEntry, BackupConfig, Command, HubAuthConfig, MacProfile, OuiPoolEntry, QAApiKey, Spoke, PendingSpoke, Tenant, User
 
+# Lock for read-modify-write within this process (re-entrant so helpers can nest).
 _lock = threading.RLock()
 
 
+# Module logger.
 logger = logging.getLogger(__name__)
 
+# Spoke config keys that hold relay connection settings; they are spoke-specific.
 _RELAY_CONFIG_KEYS = {
     "relay_server_url",
     "relay_api_key",
@@ -41,11 +46,13 @@ _RELAY_CONFIG_KEYS = {
     "relay_spoke_id",
     "relay_spoke_name",
 }
+# Config keys that only matter on the hub.
 _HUB_LOCAL_CONFIG_KEYS = {
     "repo_url",
     "sim_repo_url",
     "sim_repo_branch",
 }
+# Default processing mode for each feature.
 _PROCESSING_MODE_DEFAULTS = {
     "central_api": "centralized",
     "teams": "centralized",
@@ -54,17 +61,23 @@ _PROCESSING_MODE_DEFAULTS = {
 
 
 def _data_dir() -> Path:
+    """Return the data folder from settings."""
     return Path(get_settings().data_dir)
 
 
+# Data folder and the backup and login config files.
 DATA_DIR = _data_dir()
 _BACKUP_CONFIG_FILE = DATA_DIR / "backup_config.json"
 _AUTH_CONFIG_FILE = _data_dir() / "auth_config.json"
 
 
 def _read_json(path: Path) -> Any:
+    """Read a JSON file; returns None if it is missing, corrupt or unreadable (errors are logged).
+    """
+    # Missing file.
     if not path.exists():
         return None
+    # Read and parse.
     try:
         with open(path) as f:
             return json.load(f)
@@ -77,6 +90,8 @@ def _read_json(path: Path) -> Any:
 
 
 def _write_json(path: Path, data: Any) -> None:
+    """Write data to a JSON file, creating its folder. Write errors are logged and raised."""
+    # Make sure the folder exists.
     path.parent.mkdir(parents=True, exist_ok=True)
     # Serialise first so any encoding errors surface before we touch disk.
     content = json.dumps(data, indent=2, default=str)
@@ -102,6 +117,7 @@ def _file_lock(lock_path: Path):
     read-modify-write cycles are serialised.  Always acquire _lock first
     (caller's responsibility), then this context manager for flock.
     """
+    # Make sure the folder exists, then hold an exclusive lock for the block.
     lock_path.parent.mkdir(parents=True, exist_ok=True)
     with open(lock_path, "w") as lf:
         fcntl.flock(lf, fcntl.LOCK_EX)
@@ -112,18 +128,23 @@ def _file_lock(lock_path: Path):
 
 
 def _now() -> datetime:
+    """Return the current time in UTC."""
     return datetime.now(timezone.utc)
 
 
 def _users_path() -> Path:
+    """Return the path of the users file."""
     return _data_dir() / "users.json"
 
 
 def _users_lock_path() -> Path:
+    """Return the path of the users lock file."""
     return _data_dir() / "users.lock"
 
 
 def _load_users() -> list[User]:
+    """Load all users; unreadable records are logged and skipped."""
+    # Read the file and build each user.
     raw = _read_json(_users_path()) or []
     users = []
     for u in raw:
@@ -135,10 +156,12 @@ def _load_users() -> list[User]:
 
 
 def _save_users(users: list[User]) -> None:
+    """Write all users to the users file."""
     _write_json(_users_path(), [u.model_dump(mode="json") for u in users])
 
 
 def load_backup_config() -> BackupConfig:
+    """Load the backup settings (defaults if none saved)."""
     with _lock:
         raw = _read_json(_BACKUP_CONFIG_FILE)
         if not raw:
@@ -147,12 +170,14 @@ def load_backup_config() -> BackupConfig:
 
 
 def save_backup_config(config: BackupConfig) -> None:
+    """Save the backup settings."""
     with _lock:
         with _file_lock(_data_dir() / "backup_config.lock"):
             _write_json(_BACKUP_CONFIG_FILE, config.model_dump(mode="json"))
 
 
 def load_auth_config() -> HubAuthConfig:
+    """Load the hub's login provider settings (defaults if none saved)."""
     with _lock:
         raw = _read_json(_AUTH_CONFIG_FILE)
         if not raw:
@@ -161,12 +186,14 @@ def load_auth_config() -> HubAuthConfig:
 
 
 def save_auth_config(config: HubAuthConfig) -> None:
+    """Save the hub's login provider settings."""
     with _lock:
         with _file_lock(_data_dir() / "auth_config.lock"):
             _write_json(_AUTH_CONFIG_FILE, config.model_dump(mode="json"))
 
 
 def get_user(username: str) -> Optional[User]:
+    """Return the user with this username, or None."""
     with _lock:
         for u in _load_users():
             if u.username == username:
@@ -175,6 +202,7 @@ def get_user(username: str) -> Optional[User]:
 
 
 def get_user_by_id(user_id: str) -> Optional[User]:
+    """Return the user with this id, or None."""
     with _lock:
         for u in _load_users():
             if u.id == user_id:
@@ -183,11 +211,14 @@ def get_user_by_id(user_id: str) -> Optional[User]:
 
 
 def list_users() -> list[User]:
+    """Return all users."""
     with _lock:
         return _load_users()
 
 
 def save_user(user: User) -> None:
+    """Add or replace a user (matched by id)."""
+    # Lock, replace any user with the same id, and save.
     with _lock:
         with _file_lock(_users_lock_path()):
             users = _load_users()
@@ -197,6 +228,8 @@ def save_user(user: User) -> None:
 
 
 def delete_user(user_id: str) -> None:
+    """Delete a user by id."""
+    # Lock, remove the user, and save.
     with _lock:
         with _file_lock(_users_lock_path()):
             users = [u for u in _load_users() if u.id != user_id]
@@ -221,6 +254,7 @@ def ensure_admin(username: str, hashed_password: str, force_password: bool = Fal
       4. _load_users() skips individual bad records rather than throwing, so
          partial data is never mistaken for an empty store.
     """
+    # Lock both within and across processes.
     with _lock:
         with _file_lock(_users_lock_path()):
             users_path = _users_path()
@@ -255,8 +289,10 @@ def ensure_admin(username: str, hashed_password: str, force_password: bool = Fal
             except OSError:
                 prior_data_exists = True  # if we can't check, assume prior data
 
+            # Load whatever users there are.
             users = _load_users()
 
+            # No users: bootstrap only if this is clearly a fresh install.
             if not users:
                 if file_exists:
                     logger.warning(
@@ -278,6 +314,7 @@ def ensure_admin(username: str, hashed_password: str, force_password: bool = Fal
                 logger.info("ensure_admin: bootstrapped superadmin '%s' (first run).", username)
                 return
 
+            # Users exist: reset the admin's password only when asked.
             if force_password:
                 for user in users:
                     if user.username == username and user.is_superadmin:
@@ -287,14 +324,21 @@ def ensure_admin(username: str, hashed_password: str, force_password: bool = Fal
 
 
 def _tenants_path() -> Path:
+    """Return the path of the tenants file."""
     return _data_dir() / "tenants.json"
 
 
 def _tenants_lock_path() -> Path:
+    """Return the path of the tenants lock file."""
     return _data_dir() / "tenants.lock"
 
 
 def _load_tenants() -> list[Tenant]:
+    """Load all tenants, restoring tenants.json from its backup if it has gone missing.
+
+    Unreadable records are logged and skipped.
+    """
+    # Tenants file and its backup.
     tenants_path = _tenants_path()
     bak_path = _data_dir() / "tenants.json.bak"
     # Runtime auto-restore: if tenants.json disappears but a backup exists,
@@ -306,6 +350,7 @@ def _load_tenants() -> list[Tenant]:
             logger.warning("_load_tenants: tenants.json missing — auto-restored from backup")
         except OSError as exc:
             logger.error("_load_tenants: could not restore tenants.json from backup: %s", exc)
+    # Read the file and build each tenant.
     raw = _read_json(tenants_path) or []
     tenants: list[Tenant] = []
     for t in raw:
@@ -317,10 +362,12 @@ def _load_tenants() -> list[Tenant]:
 
 
 def _save_tenants(tenants: list[Tenant]) -> None:
+    """Write all tenants to the tenants file."""
     _write_json(_tenants_path(), [t.model_dump(mode="json") for t in tenants])
 
 
 def get_tenant(tenant_id: str) -> Optional[Tenant]:
+    """Return the tenant with this id, or None (deleted tenants included)."""
     with _lock:
         for t in _load_tenants():
             if t.id == tenant_id:
@@ -330,8 +377,10 @@ def get_tenant(tenant_id: str) -> Optional[Tenant]:
 
 def get_tenant_by_hint(hint: str) -> Optional[Tenant]:
     """Look up a tenant by id first, then by name (both case-insensitive)."""
+    # Empty hint matches nothing.
     if not hint:
         return None
+    # Match by id first, then by name.
     with _lock:
         tenants = _load_tenants()
         hint_lower = hint.lower()
@@ -345,11 +394,13 @@ def get_tenant_by_hint(hint: str) -> Optional[Tenant]:
 
 
 def get_tenant_central_sites_config(tenant_id: str) -> dict[str, Any]:
+    """Return a copy of the tenant's Central sites config (empty if no tenant)."""
     tenant = get_tenant(tenant_id)
     return dict(tenant.central_sites_config or {}) if tenant else {}
 
 
 def set_tenant_central_sites_config(tenant_id: str, config: dict[str, Any]) -> None:
+    """Replace the tenant's Central sites config, if the tenant exists."""
     tenant = get_tenant(tenant_id)
     if tenant:
         tenant.central_sites_config = dict(config or {})
@@ -358,6 +409,7 @@ def set_tenant_central_sites_config(tenant_id: str, config: dict[str, Any]) -> N
 
 def list_tenants(include_deleted: bool = False) -> list[Tenant]:
     """List all tenants. By default, exclude soft-deleted tenants unless include_deleted=True."""
+    # Load, dropping deleted tenants unless asked.
     with _lock:
         tenants = _load_tenants()
         if not include_deleted:
@@ -366,6 +418,8 @@ def list_tenants(include_deleted: bool = False) -> list[Tenant]:
 
 
 def save_tenant(tenant: Tenant) -> None:
+    """Add or replace a tenant (matched by id)."""
+    # Lock, replace any tenant with the same id, and save.
     with _lock:
         with _file_lock(_tenants_lock_path()):
             tenants = _load_tenants()
@@ -376,6 +430,7 @@ def save_tenant(tenant: Tenant) -> None:
 
 def delete_tenant(tenant_id: str) -> None:
     """Soft delete a tenant by setting deleted_at timestamp. Tenant data is preserved for 30 days."""
+    # Lock, set the deleted time on the tenant, and save.
     with _lock:
         with _file_lock(_tenants_lock_path()):
             from datetime import datetime, timezone
@@ -389,6 +444,7 @@ def delete_tenant(tenant_id: str) -> None:
 
 def restore_tenant(tenant_id: str) -> bool:
     """Restore a soft-deleted tenant. Returns True if restored, False if not found or not deleted."""
+    # Lock, clear the deleted time if set, and save.
     with _lock:
         with _file_lock(_tenants_lock_path()):
             tenants = _load_tenants()
@@ -402,6 +458,7 @@ def restore_tenant(tenant_id: str) -> bool:
 
 def purge_old_deleted_tenants(days: int = 30) -> list[str]:
     """Permanently delete tenants that were soft-deleted more than 'days' ago. Returns list of purged tenant IDs."""
+    # Lock and work out the cutoff.
     from datetime import datetime, timedelta, timezone
     with _lock:
         with _file_lock(_tenants_lock_path()):
@@ -410,6 +467,7 @@ def purge_old_deleted_tenants(days: int = 30) -> list[str]:
             purged_ids = []
             remaining = []
 
+            # Remove tenants deleted before the cutoff, along with their data folders.
             for tenant in tenants:
                 if tenant.deleted_at and tenant.deleted_at < cutoff:
                     purged_ids.append(tenant.id)
@@ -421,11 +479,13 @@ def purge_old_deleted_tenants(days: int = 30) -> list[str]:
                 else:
                     remaining.append(tenant)
 
+            # Save if anything was removed.
             if purged_ids:
                 _save_tenants(remaining)
 
             return purged_ids
 
+        # Never reached (after the return above): removes the tenant's user roles and folder.
         users = _load_users()
         changed = False
         for user in users:
@@ -442,20 +502,25 @@ def purge_old_deleted_tenants(days: int = 30) -> list[str]:
 
 
 def _pending_dir() -> Path:
+    """Return the folder of pending spoke registrations."""
     return _data_dir() / "pending"
 
 
 def get_pending_spoke(spoke_id: str) -> Optional[PendingSpoke]:
+    """Return a pending registration by id, or None."""
     with _lock:
         raw = _read_json(_pending_dir() / f"{spoke_id}.json")
         return PendingSpoke(**raw) if raw else None
 
 
 def list_pending_spokes() -> list[PendingSpoke]:
+    """Return all pending registrations."""
+    # No folder means none.
     with _lock:
         d = _pending_dir()
         if not d.exists():
             return []
+        # Read each file.
         results = []
         for f in d.glob("*.json"):
             raw = _read_json(f)
@@ -465,6 +530,7 @@ def list_pending_spokes() -> list[PendingSpoke]:
 
 
 def get_pending_by_hostname(hostname: str) -> Optional[PendingSpoke]:
+    """Return the pending registration with this hostname, or None."""
     with _lock:
         for p in list_pending_spokes():
             if p.hostname == hostname:
@@ -473,15 +539,22 @@ def get_pending_by_hostname(hostname: str) -> Optional[PendingSpoke]:
 
 
 def rekey_pending_spoke(old_spoke_id: str, new_spoke_id: str) -> bool:
+    """Move a pending registration to a new id.
+
+    Returns False if the old id does not exist; raises ValueError if the new id is taken.
+    """
+    # Same id: nothing to do.
     with _lock:
         if old_spoke_id == new_spoke_id:
             return True
+        # Old id must exist and the new one must be free.
         pending = get_pending_spoke(old_spoke_id)
         if not pending:
             return False
         target = _pending_dir() / f"{new_spoke_id}.json"
         if target.exists():
             raise ValueError("Pending spoke ID already exists")
+        # Re-save under the new id.
         delete_pending_spoke(old_spoke_id)
         pending.id = new_spoke_id
         save_pending_spoke(pending)
@@ -489,15 +562,18 @@ def rekey_pending_spoke(old_spoke_id: str, new_spoke_id: str) -> bool:
 
 
 def get_spoke_by_pending_hostname(hostname: str) -> Optional[PendingSpoke]:
+    """Return the pending registration with this hostname, or None."""
     return get_pending_by_hostname(hostname)
 
 
 def save_pending_spoke(spoke: PendingSpoke) -> None:
+    """Save a pending registration to its own file."""
     with _lock:
         _write_json(_pending_dir() / f"{spoke.id}.json", spoke.model_dump(mode="json"))
 
 
 def delete_pending_spoke(spoke_id: str) -> None:
+    """Delete a pending registration if it exists."""
     with _lock:
         p = _pending_dir() / f"{spoke_id}.json"
         if p.exists():
@@ -505,10 +581,12 @@ def delete_pending_spoke(spoke_id: str) -> None:
 
 
 def _spoke_path(tenant_id: str) -> Path:
+    """Return the path of a tenant's spokes file."""
     return _data_dir() / tenant_id / "spokes.json"
 
 
 def _spokes_lock_path(tenant_id: str) -> Path:
+    """Return the path of a tenant's spokes lock file."""
     return _data_dir() / tenant_id / "spokes.lock"
 
 
@@ -517,6 +595,7 @@ def _spokes_lock_path(tenant_id: str) -> Path:
 # the shared spokes.json.  Each spoke's WS connection is pinned to one worker,
 # so only one process ever writes a given spoke's state file.
 
+# Fields kept in the per-spoke state files, and all other (config) fields.
 _SPOKE_STATE_FIELDS = frozenset({"telemetry", "last_seen"})
 _SPOKE_CONFIG_FIELDS = frozenset(
     f for f in Spoke.model_fields if f not in _SPOKE_STATE_FIELDS
@@ -524,15 +603,18 @@ _SPOKE_CONFIG_FIELDS = frozenset(
 
 
 def _spoke_state_dir(tenant_id: str) -> Path:
+    """Return the folder of a tenant's per-spoke state files."""
     return _data_dir() / tenant_id / "spoke_state"
 
 
 def _spoke_state_path(tenant_id: str, spoke_id: str) -> Path:
+    """Return the path of one spoke's state file."""
     return _spoke_state_dir(tenant_id) / f"{spoke_id}.json"
 
 
 def _load_spoke_state(tenant_id: str, spoke_id: str) -> dict:
     """Return {last_seen, telemetry} for a single spoke, or empty dict."""
+    # Missing or invalid file gives an empty dict.
     raw = _read_json(_spoke_state_path(tenant_id, spoke_id))
     return raw if isinstance(raw, dict) else {}
 
@@ -540,6 +622,7 @@ def _load_spoke_state(tenant_id: str, spoke_id: str) -> dict:
 def _save_spoke_state(tenant_id: str, spoke_id: str, last_seen, telemetry: dict) -> None:
     """Write only volatile state fields to a per-spoke file (no locking needed —
     only the worker owning that spoke's WS connection ever writes this file)."""
+    # Make sure the folder exists, then write the state.
     state_dir = _spoke_state_dir(tenant_id)
     state_dir.mkdir(parents=True, exist_ok=True)
     _write_json(
@@ -553,6 +636,7 @@ def _save_spoke_state(tenant_id: str, spoke_id: str, last_seen, telemetry: dict)
 
 def _merge_spoke_state(spoke: Spoke, state: dict) -> Spoke:
     """Merge volatile state into a spoke config object (in-place)."""
+    # last_seen may be an ISO string or a Unix time; bad values are ignored.
     if "last_seen" in state and state["last_seen"]:
         try:
             from datetime import datetime, timezone
@@ -563,12 +647,15 @@ def _merge_spoke_state(spoke: Spoke, state: dict) -> Spoke:
                 spoke.last_seen = datetime.fromtimestamp(ls, tz=timezone.utc)
         except Exception:
             pass
+    # Telemetry as-is.
     if "telemetry" in state:
         spoke.telemetry = state["telemetry"]
     return spoke
 
 
 def _load_spokes(tenant_id: str) -> list[Spoke]:
+    """Load a tenant's spokes with their latest state; malformed entries are logged and skipped."""
+    # Read the config file.
     raw = _read_json(_spoke_path(tenant_id)) or []
     spokes = []
     for item in raw:
@@ -588,6 +675,7 @@ def _save_spokes(tenant_id: str, spokes: list[Spoke]) -> None:
     """Persist only config fields — no telemetry, no last_seen.
     Keeps spokes.json tiny (<5 KB for any realistic fleet) so concurrent writes
     from multiple gunicorn workers never produce multi-MB collisions."""
+    # Keep only config fields for each spoke, then write.
     rows = []
     for s in spokes:
         d = s.model_dump(mode="json")
@@ -596,6 +684,7 @@ def _save_spokes(tenant_id: str, spokes: list[Spoke]) -> None:
 
 
 def get_spoke(tenant_id: str, spoke_id: str) -> Optional[Spoke]:
+    """Return a spoke by id, or None."""
     with _lock:
         for i in _load_spokes(tenant_id):
             if i.id == spoke_id:
@@ -605,6 +694,7 @@ def get_spoke(tenant_id: str, spoke_id: str) -> Optional[Spoke]:
 
 def get_spoke_by_api_key(tenant_id: str, api_key: str) -> Optional[Spoke]:
     """Return the approved spoke whose encrypted API key matches the plaintext key."""
+    # Check each spoke's decrypted key; decryption errors are logged.
     with _lock:
         for i in _load_spokes(tenant_id):
             if i.api_key_enc:
@@ -618,12 +708,15 @@ def get_spoke_by_api_key(tenant_id: str, api_key: str) -> Optional[Spoke]:
 
 def get_approved_spoke_by_api_key(api_key: str, tenant_id: str = "") -> Optional[tuple[str, Spoke]]:
     """Return (tenant_id, spoke) for an approved spoke matching the plaintext API key."""
+    # Empty key matches nothing.
     if not api_key:
         return None
+    # Search the given tenant, or all tenants.
     with _lock:
         tenants = [t for t in _load_tenants() if not tenant_id or t.id == tenant_id]
         for tenant in tenants:
             for spoke in _load_spokes(tenant.id):
+                # Approved spokes with a key only.
                 if spoke.status != "approved" or not spoke.api_key_enc:
                     continue
                 try:
@@ -636,6 +729,7 @@ def get_approved_spoke_by_api_key(api_key: str, tenant_id: str = "") -> Optional
 
 def get_approved_spoke_by_hostname(hostname: str) -> Optional[tuple[str, Spoke]]:
     """Return (tenant_id, spoke) for the first approved spoke matching hostname across all tenants."""
+    # Search every tenant.
     with _lock:
         for tenant in _load_tenants():
             for spoke in _load_spokes(tenant.id):
@@ -646,6 +740,7 @@ def get_approved_spoke_by_hostname(hostname: str) -> Optional[tuple[str, Spoke]]
 
 def get_approved_spoke_by_id(spoke_id: str) -> Optional[tuple[str, Spoke]]:
     """Return (tenant_id, spoke) for the first approved spoke matching ID across all tenants."""
+    # Search every tenant.
     with _lock:
         for tenant in _load_tenants():
             for spoke in _load_spokes(tenant.id):
@@ -656,9 +751,11 @@ def get_approved_spoke_by_id(spoke_id: str) -> Optional[tuple[str, Spoke]]:
 
 def get_spoke_by_name(spoke_name: str) -> Optional[tuple[str, Spoke]]:
     """Return (tenant_id, spoke) for the first approved spoke matching spoke_name across all tenants."""
+    # Compare lower-case names; empty matches nothing.
     name = spoke_name.strip().lower()
     if not name:
         return None
+    # Search every tenant.
     with _lock:
         for tenant in _load_tenants():
             for spoke in _load_spokes(tenant.id):
@@ -674,10 +771,12 @@ def find_spoke_name_conflict(
     exclude_spoke_id: str = "",
 ) -> Optional[Spoke]:
     """Return the first approved spoke in tenant_id whose spoke_name conflicts."""
+    # Compare lower-case names; empty tenant or name matches nothing.
     name = spoke_name.strip().lower()
     if not tenant_id or not name:
         return None
     excluded = exclude_spoke_id.strip().lower()
+    # Approved spokes other than the excluded one.
     with _lock:
         for spoke in _load_spokes(tenant_id):
             if spoke.status != "approved":
@@ -691,6 +790,7 @@ def find_spoke_name_conflict(
 
 def get_pending_spoke_by_name(spoke_name: str) -> Optional[PendingSpoke]:
     """Return first pending spoke matching spoke_name."""
+    # Compare lower-case names; empty matches nothing.
     name = spoke_name.strip().lower()
     if not name:
         return None
@@ -708,10 +808,12 @@ def find_pending_spoke_name_conflict(
     exclude_spoke_id: str = "",
 ) -> Optional[PendingSpoke]:
     """Return the first pending spoke in tenant_hint whose spoke_name conflicts."""
+    # Compare lower-case names; empty tenant or name matches nothing.
     name = spoke_name.strip().lower()
     if not tenant_hint or not name:
         return None
     excluded = exclude_spoke_id.strip().lower()
+    # Pending spokes for this tenant other than the excluded one.
     with _lock:
         for pending in list_pending_spokes():
             if pending.tenant_hint != tenant_hint:
@@ -724,12 +826,14 @@ def find_pending_spoke_name_conflict(
 
 
 def list_spokes(tenant_id: str) -> list[Spoke]:
+    """Return all spokes in a tenant."""
     with _lock:
         return _load_spokes(tenant_id)
 
 
 def save_spoke(spoke: Spoke) -> None:
     """Persist spoke config to spokes.json and volatile state to per-spoke file."""
+    # Lock, replace any spoke with the same id, and save the config.
     with _lock:
         with _file_lock(_spokes_lock_path(spoke.tenant_id)):
             spokes = _load_spokes(spoke.tenant_id)
@@ -742,10 +846,13 @@ def save_spoke(spoke: Spoke) -> None:
 
 
 def mark_spoke_config_applied(tenant_id: str, spoke_id: str, version: int) -> None:
+    """Record that a spoke has applied a config version (only moves forward) and when."""
+    # Spoke must exist.
     with _lock:
         spoke = get_spoke(tenant_id, spoke_id)
         if not spoke:
             return
+        # Keep the highest version and note the time.
         if version > spoke.applied_config_version:
             spoke.applied_config_version = version
         spoke.last_config_applied_at = _now()
@@ -753,6 +860,7 @@ def mark_spoke_config_applied(tenant_id: str, spoke_id: str, version: int) -> No
 
 
 def get_command(tenant_id: str, spoke_id: str, command_id: str) -> Optional[Command]:
+    """Return a queued command by id, or None."""
     with _lock:
         for command in _load_queue(tenant_id, spoke_id):
             if command.id == command_id:
@@ -761,6 +869,7 @@ def get_command(tenant_id: str, spoke_id: str, command_id: str) -> Optional[Comm
 
 
 def _tenant_processing_modes(tenant: Tenant | None) -> dict[str, str]:
+    """Return the tenant's processing mode per feature; invalid or missing values use defaults."""
     modes = dict(_PROCESSING_MODE_DEFAULTS)
     if tenant:
         for key, default in _PROCESSING_MODE_DEFAULTS.items():
@@ -771,6 +880,7 @@ def _tenant_processing_modes(tenant: Tenant | None) -> dict[str, str]:
 
 
 def _global_config_path() -> Path:
+    """Return the path of the hub-wide config file."""
     return _data_dir() / "global_config.json"
 
 
@@ -782,6 +892,7 @@ def _load_global_config() -> dict[str, Any]:
 
 def get_global_usb_vidpids() -> list[dict[str, Any]]:
     """Return the platform-wide (superadmin-certified) USB device list."""
+    # Valid entries only.
     with _lock:
         devices = _load_global_config().get("usb_vidpids", [])
         return [dict(d) for d in devices if isinstance(d, dict)]
@@ -789,6 +900,7 @@ def get_global_usb_vidpids() -> list[dict[str, Any]]:
 
 def set_global_usb_vidpids(devices: list[dict[str, Any]]) -> None:
     """Persist the platform-wide USB device list."""
+    # Update the list in the hub-wide config.
     with _lock:
         config = _load_global_config()
         config["usb_vidpids"] = [dict(d) for d in (devices or []) if isinstance(d, dict)]
@@ -797,6 +909,7 @@ def set_global_usb_vidpids(devices: list[dict[str, Any]]) -> None:
 
 def get_global_usb_ignored_vidpids() -> list[dict[str, Any]]:
     """Return the platform-wide (superadmin-ignored) USB device list."""
+    # Valid entries only.
     with _lock:
         devices = _load_global_config().get("usb_ignored_vidpids", [])
         return [dict(d) for d in devices if isinstance(d, dict)]
@@ -804,6 +917,7 @@ def get_global_usb_ignored_vidpids() -> list[dict[str, Any]]:
 
 def set_global_usb_ignored_vidpids(devices: list[dict[str, Any]]) -> None:
     """Persist the platform-wide USB ignored device list."""
+    # Update the list in the hub-wide config.
     with _lock:
         config = _load_global_config()
         config["usb_ignored_vidpids"] = [dict(d) for d in (devices or []) if isinstance(d, dict)]
@@ -811,8 +925,11 @@ def set_global_usb_ignored_vidpids(devices: list[dict[str, Any]]) -> None:
 
 
 def _tenant_usb_vidpids(tenant: Tenant | None) -> list[dict[str, Any]]:
+    """Return the tenant's own USB list, falling back to the old copy in hub_config."""
+    # No tenant: none.
     if not tenant:
         return []
+    # Use the tenant's list, else the legacy hub_config copy.
     configured = tenant.usb_vidpids if isinstance(tenant.usb_vidpids, list) else []
     legacy = (tenant.hub_config or {}).get("usb_vidpids")
     if configured:
@@ -832,6 +949,7 @@ def _effective_usb_vidpids_from(
     Tenant-specific devices are appended with source='tenant'.
     If the same vidpid appears in both, the global entry wins (it already covers it).
     """
+    # Global entries first, then tenant entries not already listed.
     seen: set[str] = set()
     result: list[dict[str, Any]] = []
     for d in global_devices:
@@ -849,6 +967,7 @@ def _effective_usb_vidpids_from(
 
 def get_tenant_usb_vidpids(tenant_id: str) -> list[dict[str, Any]]:
     """Return only the tenant-specific USB devices (no global merge)."""
+    # Tenant's own list.
     with _lock:
         tenant = get_tenant(tenant_id)
         return _tenant_usb_vidpids(tenant)
@@ -856,6 +975,7 @@ def get_tenant_usb_vidpids(tenant_id: str) -> list[dict[str, Any]]:
 
 def get_effective_usb_vidpids(tenant_id: str) -> list[dict[str, Any]]:
     """Return the merged effective USB device list (global + tenant) for a tenant."""
+    # Merge the global and tenant lists.
     with _lock:
         global_devices = _load_global_config().get("usb_vidpids", [])
         tenant = get_tenant(tenant_id)
@@ -871,6 +991,7 @@ def get_discovered_usb_vidpids() -> list[dict[str, Any]]:
     spoke(s)/tenant(s) reported them and whether they are already in the global
     certified list.  Sorted by vidpid ascending.
     """
+    # Global approved and ignored id sets, lower case.
     with _lock:
         global_cfg = _load_global_config()
         global_set = {d.get("vidpid") for d in global_cfg.get("usb_vidpids", []) if d.get("vidpid")}
@@ -885,6 +1006,9 @@ def get_discovered_usb_vidpids() -> list[dict[str, Any]]:
         discovered: dict[str, dict[str, Any]] = {}
 
         def _ensure(vidpid: str, name: str = "", locally_ignored: bool = False) -> None:
+            """Add a device to the results, or fill in its name and ignored flag if already there.
+            """
+            # New device.
             if vidpid not in discovered:
                 discovered[vidpid] = {
                     "vidpid": vidpid,
@@ -893,6 +1017,7 @@ def get_discovered_usb_vidpids() -> list[dict[str, Any]]:
                     "is_global": vidpid in global_set_lower,
                     "locally_ignored": locally_ignored,
                 }
+            # Existing device: fill a missing name.
             else:
                 if not discovered[vidpid]["name"] and name:
                     discovered[vidpid]["name"] = name
@@ -900,6 +1025,7 @@ def get_discovered_usb_vidpids() -> list[dict[str, Any]]:
                 if locally_ignored:
                     discovered[vidpid]["locally_ignored"] = True
 
+        # Go through every tenant.
         for tenant in _load_tenants():
             tenant_label = tenant.name or tenant.id
 
@@ -915,6 +1041,7 @@ def get_discovered_usb_vidpids() -> list[dict[str, Any]]:
 
             # ── Include devices seen in spoke telemetry ────────────────────────
             for spoke in _load_spokes(tenant.id):
+                # Collect the spoke's USB devices from all telemetry sections that report them.
                 telemetry = spoke.telemetry or {}
                 proxmox = telemetry.get("proxmox") or {}
                 raw_devices: list[dict[str, Any]] = []
@@ -928,6 +1055,7 @@ def get_discovered_usb_vidpids() -> list[dict[str, Any]]:
                 if isinstance(present_usb, list):
                     raw_devices.extend(present_usb)
 
+                # Add each device with this spoke as a sighting.
                 spoke_label = spoke.spoke_name or spoke.hostname or spoke.id
                 for dev in raw_devices:
                     if not isinstance(dev, dict):
@@ -941,12 +1069,14 @@ def get_discovered_usb_vidpids() -> list[dict[str, Any]]:
                         discovered[vidpid]["seen_on"].append(entry)
 
                 # ── Include devices locally ignored on this spoke but not globally ignored ──
+                # The spoke's ignored list is a JSON string; bad values count as empty.
                 spoke_cfg = spoke.config or {}
                 ignored_str = spoke_cfg.get("usb_ignored_vidpids", "[]")
                 try:
                     locally_ignored_vids: list[str] = json.loads(ignored_str) if isinstance(ignored_str, str) else list(ignored_str)
                 except Exception:
                     locally_ignored_vids = []
+                # Add each ignored device not ignored globally.
                 for vidpid_raw in locally_ignored_vids:
                     vidpid = str(vidpid_raw or "").strip().lower()
                     if not vidpid or vidpid in global_ignored_lower:
@@ -956,10 +1086,13 @@ def get_discovered_usb_vidpids() -> list[dict[str, Any]]:
                     if entry not in discovered[vidpid]["seen_on"]:
                         discovered[vidpid]["seen_on"].append(entry)
 
+        # Return sorted by id.
         return sorted(discovered.values(), key=lambda d: d["vidpid"])
 
 
 def set_tenant_usb_vidpids(tenant_id: str, usb_vidpids: list[dict[str, Any]]) -> Optional[Tenant]:
+    """Save a tenant's USB list, also copying it into hub_config. Returns the tenant or None."""
+    # Lock, find the tenant, and update both copies.
     with _lock:
         tenants = _load_tenants()
         for tenant in tenants:
@@ -975,8 +1108,15 @@ def set_tenant_usb_vidpids(tenant_id: str, usb_vidpids: list[dict[str, Any]]) ->
 
 
 def _hub_core_config(tenant: Tenant | None) -> dict[str, Any]:
+    """Build the hub config to push to a tenant's spokes.
+
+    Relay and hub-only keys are removed, and the merged global + tenant USB list
+    replaces the tenant's own list.
+    """
+    # No tenant: nothing.
     if not tenant:
         return {}
+    # Copy the config without relay, hub-only or USB keys.
     hub_config = tenant.hub_config or {}
     payload = {
         key: value
@@ -984,6 +1124,7 @@ def _hub_core_config(tenant: Tenant | None) -> dict[str, Any]:
         if key not in _RELAY_CONFIG_KEYS and key not in _HUB_LOCAL_CONFIG_KEYS and key != "usb_vidpids"
     }
     # Push the effective (global + tenant) USB certified list to spokes.
+    # Merged global + tenant USB list.
     global_devices = _load_global_config().get("usb_vidpids", [])
     effective = _effective_usb_vidpids_from(global_devices, tenant)
     if effective or "usb_vidpids" in hub_config:
@@ -1003,18 +1144,26 @@ def _hub_core_config(tenant: Tenant | None) -> dict[str, Any]:
             existing = []
         merged = list(global_vids | {str(v).lower() for v in existing if v})
         payload["usb_ignored_vidpids"] = json.dumps(sorted(merged))
+    # Return the payload.
     return payload
 
 
 
 def _hub_github_config(tenant: Tenant | None) -> dict[str, Any]:
+    """Return the tenant's simulation repo URL, branch and GitHub token for spokes.
+
+    Empty if there is no config or it cannot be decrypted.
+    """
+    # No config: nothing.
     if not tenant or not tenant.github_config_enc:
         return {}
+    # Decrypt; failures are logged.
     try:
         cfg = decrypt_dict(tenant.github_config_enc)
     except Exception:
         logger.warning("Unable to decrypt GitHub config for tenant %s", tenant.id if tenant else "unknown")
         return {}
+    # Repo URL, branch (default main) and token.
     return {
         "repo_url": str(cfg.get("sim_repo_url") or "").strip(),
         "repo_branch": str(cfg.get("sim_repo_branch") or "main").strip() or "main",
@@ -1029,6 +1178,7 @@ def _hub_conf_overrides(tenant: Tenant | None) -> dict[str, Any]:
     has the current state.  None means 'no override — use GitHub file as-is'.
     An empty string means 'override is cleared'.
     """
+    # No tenant: no overrides.
     if not tenant:
         return {"sim_conf_override": None, "user_conf_override": None}
     return {
@@ -1039,19 +1189,28 @@ def _hub_conf_overrides(tenant: Tenant | None) -> dict[str, Any]:
 
 
 def tenant_has_spoke_config_payload(tenant: Tenant | None) -> bool:
+    """Return True if the tenant has any spoke config to push."""
     return any(value is not None for value in _build_spoke_config_payload(tenant).values())
 
 
 
 def _hub_central_config(tenant: Tenant | None) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+    """Build the Central settings to send to spokes from the tenant's Aruba config.
+
+    Returns (central_api, central_config) in the spoke's two formats, or (None, None) if
+    there is no config or it cannot be decrypted.
+    """
+    # No config: nothing.
     if not tenant or not tenant.aruba_config_enc:
         return None, None
+    # Decrypt; failures are logged.
     try:
         cfg = decrypt_dict(tenant.aruba_config_enc)
     except Exception:
         logger.warning("Unable to decrypt Aruba config for tenant %s", tenant.id)
         return None, None
 
+    # central_api in the spoke UI's format, for new Central or classic.
     api_version = str(cfg.get("api_version") or "classic").strip().lower()
     if api_version == "new_central":
         central_api = {
@@ -1076,6 +1235,7 @@ def _hub_central_config(tenant: Tenant | None) -> tuple[dict[str, Any] | None, d
             "central": {"url": "", "client_id": "", "customer_id": "", "workspace_id": "", "client_secret": ""},
         }
 
+    # central_config in the polling client's format.
     central_config = {
         "api_version": api_version,
         "cluster_url": cfg.get("cluster_url", ""),
@@ -1091,17 +1251,25 @@ def _hub_central_config(tenant: Tenant | None) -> tuple[dict[str, Any] | None, d
 
 
 def _hub_notification_config(tenant: Tenant | None) -> dict[str, Any]:
+    """Return the tenant's notification settings in the spoke's key names.
+
+    Empty if there is no config or it cannot be decrypted.
+    """
+    # No config: nothing.
     if not tenant or not tenant.notification_config_enc:
         return {}
+    # Decrypt; failures are logged.
     try:
         cfg = decrypt_dict(tenant.notification_config_enc)
     except Exception:
         logger.warning("Unable to decrypt notification config for tenant %s", tenant.id)
         return {}
 
+    # Split a comma-separated email string into a list.
     to_emails = cfg.get("to_emails") or []
     if isinstance(to_emails, str):
         to_emails = [item.strip() for item in to_emails.split(",") if item.strip()]
+    # Map to the spoke's key names (older key names accepted too).
     return {
         "teams_webhook_url": cfg.get("teams_webhook_url") or cfg.get("teams_webhook") or "",
         "smtp_host": cfg.get("smtp_host", ""),
@@ -1115,13 +1283,22 @@ def _hub_notification_config(tenant: Tenant | None) -> dict[str, Any]:
 
 
 def _build_spoke_config_payload(tenant: Tenant | None) -> dict[str, Any]:
+    """Build the full config payload sent to a tenant's spokes.
+
+    Core hub config, GitHub settings and conf overrides are always included. Central,
+    Teams and email settings are included only for features in distributed mode; in
+    centralized mode they are sent as None so the spoke clears them.
+    """
+    # Core config, GitHub settings and conf overrides.
     payload = _hub_core_config(tenant)
     payload.update(_hub_github_config(tenant))
     payload.update(_hub_conf_overrides(tenant))
+    # Processing modes and the Central and notification settings.
     modes = _tenant_processing_modes(tenant)
     central_api, central_config = _hub_central_config(tenant)
     notifications = _hub_notification_config(tenant)
 
+    # Central settings: blank defaults if distributed with no config, None if centralized.
     if modes["central_api"] == "distributed":
         payload["central_api"] = central_api or {
             "mode": "classic",
@@ -1142,6 +1319,7 @@ def _build_spoke_config_payload(tenant: Tenant | None) -> dict[str, Any]:
         payload["central_api"] = None
         payload["central_config"] = None
 
+    # Teams and email settings only when distributed.
     payload["teams_webhook_url"] = notifications.get("teams_webhook_url", "") if modes["teams"] == "distributed" else None
     for key in ("smtp_host", "smtp_port", "smtp_user", "smtp_password", "smtp_from", "smtp_to"):
         payload[key] = notifications.get(key) if modes["email"] == "distributed" else None
@@ -1150,16 +1328,24 @@ def _build_spoke_config_payload(tenant: Tenant | None) -> dict[str, Any]:
 
 
 def ensure_config_update_command(tenant_id: str, spoke_id: str) -> None:
+    """Queue a config_update with the full payload if the spoke is behind on config.
+
+    Does nothing if the spoke is not approved, is up to date, or already has a live
+    update for the target version queued. Records the hash of what was queued.
+    """
+    # Approved spokes that are behind only.
     with _lock:
         spoke = get_spoke(tenant_id, spoke_id)
         if not spoke or spoke.status != "approved" or spoke.config_version <= spoke.applied_config_version:
             return
+        # Skip if an update for this version is already queued or delivered.
         commands = _load_queue(tenant_id, spoke_id)
         target_version = spoke.config_version
         for command in commands:
             payload_version = int((command.payload or {}).get("config_version") or (command.payload or {}).get("__config_version", 0) or 0)
             if command.type == "config_update" and payload_version == target_version and command.status in {"queued", "delivered", "executed"}:
                 return
+        # Build the payload and queue it (expires in 24 hours).
         tenant = get_tenant(tenant_id)
         merged_payload = _build_spoke_config_payload(tenant)
         command_payload = {
@@ -1191,13 +1377,16 @@ def _authoritative_config_hash(tenant: "Tenant | None", payload: dict | None = N
     When hub_config_enabled=False, only USB cert keys are authoritative (the hub
     always owns USB certs regardless of the broader config management flag).
     """
+    # Build the payload if not given.
     if payload is None:
         payload = _build_spoke_config_payload(tenant) if tenant else {}
+    # Pick the keys the hub controls.
     usb_always = {"usb_vidpids"}
     if tenant and tenant.hub_config_enabled:
         auth = {k: v for k, v in payload.items() if v is not None}
     else:
         auth = {k: payload.get(k) for k in usb_always}
+    # Hash them.
     blob = json.dumps(auth, sort_keys=True, default=str)
     return hashlib.sha256(blob.encode()).hexdigest()[:16]
 
@@ -1217,15 +1406,18 @@ def check_and_fix_config_drift(tenant_id: str, spoke_id: str) -> bool:
     Returns True if drift was detected and the version was bumped.
     """
     with _lock:
+        # Approved spokes only.
         spoke = get_spoke(tenant_id, spoke_id)
         if not spoke or spoke.status != "approved":
             return False
         # Skip if there's already an unacked push in flight — it will self-correct.
         if spoke.config_version > spoke.applied_config_version:
             return False
+        # Tenant must exist.
         tenant = get_tenant(tenant_id)
         if not tenant:
             return False
+        # Compare with the hash of the last push.
         current_hash = _authoritative_config_hash(tenant)
         if spoke.last_pushed_config_hash == current_hash:
             return False  # In sync — nothing to do.
@@ -1249,6 +1441,7 @@ def get_spoke_config_diag(tenant_id: str, spoke_id: str) -> dict[str, Any]:
     its USB cert list or other hub-managed settings.
     """
     with _lock:
+        # Spoke must exist.
         spoke = get_spoke(tenant_id, spoke_id)
         if not spoke:
             return {"error": "Spoke not found"}
@@ -1292,9 +1485,11 @@ def get_spoke_config_diag(tenant_id: str, spoke_id: str) -> dict[str, Any]:
         ]
 
         # Hash comparison
+        # Is the spoke in sync?
         current_hash = _authoritative_config_hash(tenant, payload)
         in_sync = spoke.last_pushed_config_hash == current_hash
 
+        # Return everything.
         return {
             "spoke_id": spoke.id,
             "spoke_hostname": spoke.hostname,
@@ -1315,14 +1510,18 @@ def get_spoke_config_diag(tenant_id: str, spoke_id: str) -> dict[str, Any]:
 
 
 def ensure_config_clear_command(tenant_id: str, spoke_id: str) -> None:
+    """Queue a config_clear for an approved spoke, unless one is already live."""
+    # Approved spokes only.
     with _lock:
         spoke = get_spoke(tenant_id, spoke_id)
         if not spoke or spoke.status != "approved":
             return
+        # Skip if a clear is already queued or delivered.
         commands = _load_queue(tenant_id, spoke_id)
         for command in commands:
             if command.type == "config_clear" and command.status in {"queued", "delivered"}:
                 return
+        # Queue it (expires in 24 hours).
         commands.append(
             Command(
                 spoke_id=spoke_id,
@@ -1337,10 +1536,12 @@ def ensure_config_clear_command(tenant_id: str, spoke_id: str) -> None:
 
 def get_processing_stats(tenant_id: str) -> dict:
     """Return count of islands in centralized vs distributed mode per feature."""
+    # Approved spokes and the features to count.
     spokes = list_spokes(tenant_id)
     features = ["aruba_polling", "teams_webhook", "email", "heartbeat", "gkill", "schedules", "repo_sync"]
     stats = {feature: {"centralized": 0, "distributed": 0} for feature in features}
     approved_spokes = [spoke for spoke in spokes if spoke.status == "approved"]
+    # Count each feature's resolved mode.
     for spoke in approved_spokes:
         for feature in features:
             mode = spoke.processing_mode.resolve(feature)
@@ -1349,14 +1550,18 @@ def get_processing_stats(tenant_id: str) -> dict:
 
 
 def get_spoke_processing_stats(tenant_id: str) -> dict:
+    """Return the same counts as get_processing_stats."""
     return get_processing_stats(tenant_id)
 
 
 def delete_spoke(tenant_id: str, spoke_id: str) -> None:
+    """Delete a spoke along with its command queue and audit log."""
+    # Remove it from the spokes file.
     with _lock:
         spokes = [i for i in _load_spokes(tenant_id) if i.id != spoke_id]
         _save_spokes(tenant_id, spokes)
 
+        # Delete its queue and audit files.
         queue_path = _queue_path(tenant_id, spoke_id)
         if queue_path.exists():
             queue_path.unlink()
@@ -1367,16 +1572,24 @@ def delete_spoke(tenant_id: str, spoke_id: str) -> None:
 
 
 def rekey_spoke(tenant_id: str, old_spoke_id: str, new_spoke_id: str) -> bool:
+    """Move a spoke to a new id, along with its queue and audit files.
+
+    Returns False if the old id is not found; raises ValueError if the new id is taken.
+    """
+    # Same id: nothing to do.
     with _lock:
         if old_spoke_id == new_spoke_id:
             return True
+        # The new id must be free.
         spokes = _load_spokes(tenant_id)
         if any(spoke.id == new_spoke_id for spoke in spokes):
             raise ValueError("Spoke ID already exists")
+        # Change the id and save.
         for spoke in spokes:
             if spoke.id == old_spoke_id:
                 spoke.id = new_spoke_id
                 _save_spokes(tenant_id, spokes)
+                # Move the queue and audit files.
                 old_queue_path = _queue_path(tenant_id, old_spoke_id)
                 new_queue_path = _queue_path(tenant_id, new_spoke_id)
                 if old_queue_path.exists():
@@ -1393,6 +1606,7 @@ def rekey_spoke(tenant_id: str, old_spoke_id: str, new_spoke_id: str) -> bool:
 
 def approve_spoke(tenant_id: str, spoke_id: str) -> Optional[str]:
     """Approve a spoke, persist a newly encrypted API key, and return it once."""
+    # Find the spoke, give it a new key and approve it.
     with _lock:
         spokes = _load_spokes(tenant_id)
         for i in spokes:
@@ -1406,6 +1620,8 @@ def approve_spoke(tenant_id: str, spoke_id: str) -> Optional[str]:
 
 
 def revoke_spoke(tenant_id: str, spoke_id: str) -> None:
+    """Revoke a spoke and remove its API key."""
+    # Find the spoke, revoke it, and save.
     with _lock:
         spokes = _load_spokes(tenant_id)
         for i in spokes:
@@ -1423,23 +1639,28 @@ def update_spoke_telemetry(tenant_id: str, spoke_id: str, telemetry: dict) -> No
 
 
 def _queue_lock_path(tenant_id: str, spoke_id: str) -> Path:
+    """Return the path of a spoke's queue lock file."""
     return _data_dir() / tenant_id / "queue" / f"{spoke_id}.lock"
 
 
 def _queue_path(tenant_id: str, spoke_id: str) -> Path:
+    """Return the path of a spoke's command queue file."""
     return _data_dir() / tenant_id / "queue" / f"{spoke_id}.json"
 
 
 def _load_queue(tenant_id: str, spoke_id: str) -> list[Command]:
+    """Load a spoke's command queue."""
     raw = _read_json(_queue_path(tenant_id, spoke_id)) or []
     return [Command(**c) for c in raw]
 
 
 def _save_queue(tenant_id: str, spoke_id: str, commands: list[Command]) -> None:
+    """Write a spoke's command queue."""
     _write_json(_queue_path(tenant_id, spoke_id), [c.model_dump(mode="json") for c in commands])
 
 
 def enqueue_command(command: Command) -> None:
+    """Add a command to a spoke's queue, dropping expired ones, and wake the spoke."""
     # Use both a threading lock (intra-process) and an exclusive flock (cross-process
     # across gunicorn workers) to prevent concurrent read-modify-write races on the
     # queue JSON file.
@@ -1449,6 +1670,7 @@ def enqueue_command(command: Command) -> None:
         with open(lock_path, "w") as lf:
             fcntl.flock(lf, fcntl.LOCK_EX)
             try:
+                # Drop expired commands and add the new one.
                 cmds = _load_queue(command.tenant_id, command.spoke_id)
                 now = _now()
                 cmds = [c for c in cmds if c.expires_at > now]
@@ -1457,6 +1679,7 @@ def enqueue_command(command: Command) -> None:
             finally:
                 fcntl.flock(lf, fcntl.LOCK_UN)
 
+    # Wake the spoke's WebSocket sender, if this process has one; errors are ignored.
     with contextlib.suppress(Exception):
         from .ws import notify_spoke_command
 
@@ -1464,6 +1687,9 @@ def enqueue_command(command: Command) -> None:
 
 
 def peek_queued_commands(tenant_id: str, spoke_id: str) -> list[Command]:
+    """Return a spoke's queued commands without marking them delivered (expired ones are removed).
+    """
+    # Drop expired commands, saving only if any were removed.
     with _lock:
         now = _now()
         cmds = _load_queue(tenant_id, spoke_id)
@@ -1474,8 +1700,11 @@ def peek_queued_commands(tenant_id: str, spoke_id: str) -> list[Command]:
 
 
 def mark_commands_delivered(tenant_id: str, spoke_id: str, command_ids: list[str]) -> None:
+    """Mark the given queued commands delivered and remove expired ones."""
+    # Nothing to mark.
     if not command_ids:
         return
+    # Drop expired commands and mark the given ones delivered.
     with _lock:
         now = _now()
         ids = set(command_ids)
@@ -1491,6 +1720,7 @@ def mark_commands_delivered(tenant_id: str, spoke_id: str, command_ids: list[str
 def get_queued_commands(tenant_id: str, spoke_id: str) -> list[Command]:
     """Return queued commands, mark as delivered, purge expired."""
     with _lock:
+        # Drop expired commands, then mark and return the queued ones.
         now = _now()
         cmds = _load_queue(tenant_id, spoke_id)
         active = [c for c in cmds if c.expires_at > now]
@@ -1503,12 +1733,15 @@ def get_queued_commands(tenant_id: str, spoke_id: str) -> list[Command]:
 
 
 def list_commands(tenant_id: str, spoke_id: Optional[str] = None) -> list[Command]:
+    """Return unexpired commands, newest first, for one spoke or every spoke in the tenant."""
+    # One spoke.
     with _lock:
         now = _now()
         if spoke_id:
             commands = [c for c in _load_queue(tenant_id, spoke_id) if c.expires_at > now]
             return sorted(commands, key=lambda c: c.created_at, reverse=True)
 
+        # Every spoke in the tenant.
         commands: list[Command] = []
         for spoke in _load_spokes(tenant_id):
             commands.extend(c for c in _load_queue(tenant_id, spoke.id) if c.expires_at > now)
@@ -1516,6 +1749,8 @@ def list_commands(tenant_id: str, spoke_id: Optional[str] = None) -> list[Comman
 
 
 def ack_command(tenant_id: str, spoke_id: str, command_id: str, result: Optional[dict] = None) -> None:
+    """Mark a command executed and store its result."""
+    # Find it, update it, and save.
     with _lock:
         cmds = _load_queue(tenant_id, spoke_id)
         for c in cmds:
@@ -1530,6 +1765,7 @@ def ack_command(tenant_id: str, spoke_id: str, command_id: str, result: Optional
 
 def clear_command_queue(tenant_id: str, spoke_id: Optional[str] = None) -> int:
     """Clear all pending/queued commands for a spoke or all spokes in a tenant. Returns count cleared."""
+    # One spoke, or every spoke in the tenant; count what is removed.
     total = 0
     with _lock:
         if spoke_id:
@@ -1546,16 +1782,19 @@ def clear_command_queue(tenant_id: str, spoke_id: Optional[str] = None) -> int:
 
 def purge_expired_commands() -> int:
     """Remove command queue entries whose 24-hour TTL has elapsed and return the purge count."""
+    # No data folder: nothing to purge.
     total = 0
     now = _now()
     base = _data_dir()
     if not base.exists():
         return 0
+    # Each queue file in each tenant.
     with _lock:
         for queue_file in base.glob("*/queue/*.json"):
             raw = _read_json(queue_file) or []
             before = len(raw)
             fresh = []
+            # Keep unexpired rows; rows with a bad expiry are logged and dropped.
             for row in raw:
                 try:
                     expires_at = datetime.fromisoformat(str(row.get("expires_at") or ""))
@@ -1570,6 +1809,7 @@ def purge_expired_commands() -> int:
                     continue
                 if expires_at > now:
                     fresh.append(row)
+            # Save if anything was removed.
             if len(fresh) < before:
                 _write_json(queue_file, fresh)
                 total += before - len(fresh)
@@ -1577,16 +1817,19 @@ def purge_expired_commands() -> int:
 
 
 def _audit_path(tenant_id: str, spoke_id: str) -> Path:
+    """Return the path of a spoke's audit log file."""
     return _data_dir() / tenant_id / "audit" / f"{spoke_id}.json"
 
 
 def _load_audit(tenant_id: str, spoke_id: str) -> list[AuditEntry]:
+    """Load a spoke's audit log."""
     raw = _read_json(_audit_path(tenant_id, spoke_id)) or []
     return [AuditEntry(**e) for e in raw]
 
 
 def append_audit(entry: AuditEntry) -> None:
     """Append audit entry and trim to 7-day rolling window."""
+    # Add the entry and keep only the last 7 days.
     with _lock:
         entries = _load_audit(entry.tenant_id, entry.spoke_id)
         entries.append(entry)
@@ -1599,17 +1842,20 @@ def append_audit(entry: AuditEntry) -> None:
 
 
 def get_audit(tenant_id: str, spoke_id: str) -> list[AuditEntry]:
+    """Return a spoke's audit log."""
     with _lock:
         return _load_audit(tenant_id, spoke_id)
 
 
 def purge_old_audit() -> int:
     """Trim per-spoke audit logs to the rolling 7-day retention window."""
+    # No data folder: nothing to trim.
     total = 0
     cutoff = _now() - timedelta(days=7)
     base = _data_dir()
     if not base.exists():
         return 0
+    # Trim each audit file, saving only if something was removed.
     with _lock:
         for audit_file in base.glob("*/audit/*.json"):
             raw = _read_json(audit_file) or []
@@ -1628,6 +1874,7 @@ def init_store() -> None:
     hub starts so that even if the file is accidentally overwritten, the previous
     snapshot can be recovered by renaming users.json.bak → users.json.
     """
+    # Make sure the data and pending folders exist.
     base = _data_dir()
     for d in [base, base / "pending"]:
         d.mkdir(parents=True, exist_ok=True)
@@ -1726,14 +1973,18 @@ def init_store() -> None:
 # ── T3 MAC Profile store ──────────────────────────────────────────────────────
 
 def _mac_profiles_path(tenant_id: str) -> Path:
+    """Return the path of a tenant's MAC profiles file."""
     return _data_dir() / tenant_id / "mac_profiles.json"
 
 
 def _oui_pool_path() -> Path:
+    """Return the path of the hub-wide OUI pool file."""
     return _data_dir() / "oui_pool.json"
 
 
 def get_mac_profile(tenant_id: str, spoke_id: str) -> Optional[MacProfile]:
+    """Return a spoke's MAC profile, or None."""
+    # Profiles are stored in one file keyed by spoke id.
     with _lock:
         raw = _read_json(_mac_profiles_path(tenant_id)) or {}
         data = raw.get(spoke_id)
@@ -1743,6 +1994,8 @@ def get_mac_profile(tenant_id: str, spoke_id: str) -> Optional[MacProfile]:
 
 
 def save_mac_profile(tenant_id: str, spoke_id: str, profile: MacProfile) -> None:
+    """Save a spoke's MAC profile."""
+    # Update the spoke's entry and write the file.
     with _lock:
         path = _mac_profiles_path(tenant_id)
         raw = _read_json(path) or {}
@@ -1751,6 +2004,10 @@ def save_mac_profile(tenant_id: str, spoke_id: str, profile: MacProfile) -> None
 
 
 def list_mac_profiles(tenant_id: str) -> dict[str, MacProfile]:
+    """Return all MAC profiles in a tenant, keyed by spoke id; malformed ones are logged and
+    skipped.
+    """
+    # Build each profile.
     with _lock:
         raw = _read_json(_mac_profiles_path(tenant_id)) or {}
         result = {}
@@ -1763,6 +2020,8 @@ def list_mac_profiles(tenant_id: str) -> dict[str, MacProfile]:
 
 
 def delete_mac_profile(tenant_id: str, spoke_id: str) -> None:
+    """Delete a spoke's MAC profile if it has one."""
+    # Remove the entry and write the file.
     with _lock:
         path = _mac_profiles_path(tenant_id)
         raw = _read_json(path) or {}
@@ -1772,6 +2031,8 @@ def delete_mac_profile(tenant_id: str, spoke_id: str) -> None:
 
 
 def get_oui_pool() -> list[OuiPoolEntry]:
+    """Return the OUI pool; malformed entries are logged and skipped."""
+    # Build each entry.
     with _lock:
         raw = _read_json(_oui_pool_path()) or []
         result = []
@@ -1784,6 +2045,7 @@ def get_oui_pool() -> list[OuiPoolEntry]:
 
 
 def save_oui_pool(entries: list[OuiPoolEntry]) -> None:
+    """Save the OUI pool."""
     with _lock:
         _write_json(_oui_pool_path(), [e.model_dump(mode="json") for e in entries])
 
@@ -1795,6 +2057,7 @@ def get_oui_pool_raw() -> list[dict]:
 
 
 def save_oui_pool_raw(entries: list[dict]) -> None:
+    """Save the OUI pool from plain dicts."""
     with _lock:
         _write_json(_oui_pool_path(), entries)
 
@@ -1802,13 +2065,16 @@ def save_oui_pool_raw(entries: list[dict]) -> None:
 # ── QA API Keys ────────────────────────────────────────────────────────────────
 
 def _qa_api_keys_path() -> Path:
+    """Return the path of the QA API keys file."""
     return _data_dir() / "qa_api_keys.json"
 
 
 def list_qa_api_keys(tenant_id: str | None = None) -> list[QAApiKey]:
     """Return all QA API keys, optionally filtered to a single tenant."""
+    # Read the file.
     with _lock:
         raw: list[dict] = _read_json(_qa_api_keys_path()) or []
+    # Build each key, keeping only the tenant's if one was given.
     result = []
     for item in raw:
         try:
@@ -1821,6 +2087,8 @@ def list_qa_api_keys(tenant_id: str | None = None) -> list[QAApiKey]:
 
 
 def save_qa_api_key(key: QAApiKey) -> None:
+    """Add or replace a QA API key (matched by id)."""
+    # Replace any key with the same id and save.
     with _lock:
         raw: list[dict] = _read_json(_qa_api_keys_path()) or []
         raw = [r for r in raw if r.get("id") != key.id]
@@ -1830,6 +2098,7 @@ def save_qa_api_key(key: QAApiKey) -> None:
 
 def delete_qa_api_key(key_id: str) -> bool:
     """Remove a QA API key by ID.  Returns True if a key was removed."""
+    # Remove the key; save only if one was removed.
     with _lock:
         raw: list[dict] = _read_json(_qa_api_keys_path()) or []
         new_raw = [r for r in raw if r.get("id") != key_id]
@@ -1844,8 +2113,10 @@ def validate_qa_api_key(raw_key: str) -> QAApiKey | None:
 
     Also updates last_used_at on a successful match.
     """
+    # Keys are stored as SHA-256 hashes.
     import hashlib as _hashlib
     key_hash = _hashlib.sha256(raw_key.encode()).hexdigest()
+    # Find the matching hash, record the use, and return the key.
     with _lock:
         raw: list[dict] = _read_json(_qa_api_keys_path()) or []
         for i, item in enumerate(raw):

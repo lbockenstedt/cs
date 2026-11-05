@@ -1,7 +1,11 @@
 """Aruba Poller (helpers moved verbatim from server.py; shared deps imported from server)."""
+# Postpone annotation evaluation so modern type hints are never evaluated at runtime.
 from __future__ import annotations
 
+# check_eval turns raw Central alert data into per-check counts.
 from check_eval import count_for_check, normalize_counts
+# Shared state, constants and helpers come from server.py; this module holds the Central polling
+# logic.
 from server import (
     Any,
     CENTRAL_POLL_INTERVAL,
@@ -49,6 +53,7 @@ from server import (
 
 
 def _reset_central_runtime_tokens() -> None:
+    """Forget the in-memory Central tokens and the last auth error (e.g. after settings change)."""
     central_token["access_token"] = None
     central_token["refresh_token"] = None
     central_token["expires_at"] = 0.0
@@ -58,9 +63,12 @@ def _reset_central_runtime_tokens() -> None:
 
 
 def _public_central_api_settings() -> dict[str, Any]:
+    """Return the Central API settings for the UI, with secrets replaced by "configured" flags."""
+    # Copy the settings so the real secrets stay in place, making sure both sections exist.
     cfg = copy.deepcopy(settings.get("central_api", _default_central_api_settings()))
     cfg.setdefault("classic", {})
     cfg.setdefault("central", {})
+    # Remove the secrets and record only whether each one is set.
     cfg["classic"].pop("password", None)
     cfg["central"].pop("client_secret", None)
     cfg["classic"]["password_configured"] = bool(settings.get("central_api", {}).get("classic", {}).get("password"))
@@ -71,6 +79,7 @@ def _public_central_api_settings() -> dict[str, Any]:
 
 
 def _sync_central_runtime_config() -> None:
+    """Rebuild the runtime central_config from the central_api settings and reset tokens."""
     settings["central_config"] = _build_runtime_central_config(settings.get("central_api", _default_central_api_settings()), settings.get("central_config", {}))
     _reset_central_runtime_tokens()
 
@@ -79,12 +88,14 @@ def _sync_central_runtime_config() -> None:
 
 
 def _central_cfg() -> dict[str, str]:
+    """Return the runtime Central config (cluster URL, credentials, API version)."""
     return settings.get("central_config", {})
 
 
 
 
 def _is_new_central_api() -> bool:
+    """Return True when the config targets New Central rather than Classic Central."""
     return _central_cfg().get("api_version") == "new_central"
 
 
@@ -92,6 +103,7 @@ def _is_new_central_api() -> bool:
 
 def _central_ready() -> bool:
     """Minimum config needed to make API calls."""
+    # A cluster URL is always required.
     cfg = _central_cfg()
     if not cfg.get("cluster_url"):
         return False
@@ -109,21 +121,26 @@ def _central_token_state() -> dict[str, str]:
 
     States: not_configured | auth_failed | token_expired | connected
     """
+    # No cluster URL means nothing is configured.
     cfg = _central_cfg()
     if not cfg.get("cluster_url"):
         return {"state": "not_configured", "detail": "No cluster URL — configure in Setup tab"}
+    # New Central needs client credentials.
     if _is_new_central_api():
         if not cfg.get("client_id") or not cfg.get("client_secret"):
             return {"state": "not_configured", "detail": "Client ID / Client Secret required for Central mode"}
     else:
+        # Classic needs a pasted token (stored or in memory).
         if not cfg.get("access_token") and not central_token.get("access_token"):
             if settings.get("central_api", {}).get("mode") == "classic":
                 return {"state": "not_configured", "detail": "Classic mode is saved separately — use Test Connection in Setup to validate credentials."}
             return {"state": "not_configured", "detail": "No access token — configure in Setup tab"}
+    # Credentials exist but no token is held: auth has failed or not run yet.
     tok = central_token.get("access_token")
     if not tok:
         err = state.central_auth_error or "Authentication not yet attempted"
         return {"state": "auth_failed", "detail": err}
+    # Token has expired: report the last error, or whether it can be refreshed.
     if time.time() >= central_token.get("expires_at", 0):
         if state.central_auth_error:
             return {"state": "auth_failed", "detail": state.central_auth_error}
@@ -137,12 +154,14 @@ def _central_token_state() -> dict[str, str]:
 
 async def _apply_central_feed(feed: dict) -> None:
     """Apply hub-provided Central data feed to local in-memory state (centralized mode)."""
+    # Read each part of the hub's feed, using empty defaults.
     new_status = feed.get("status") or {}
     new_wireless = feed.get("wireless_clients") or {}
     new_total = feed.get("total_clients") or {}
     token_valid = bool(feed.get("token_valid", False))
     hardware_alerts = feed.get("hardware_alerts") or []
 
+    # Replace check status and wireless client counts with the hub's values.
     state.central_status.clear()
     for wsite, checks in new_status.items():
         if isinstance(checks, dict):
@@ -156,6 +175,7 @@ async def _apply_central_feed(feed: dict) -> None:
     # Populate _client_count_samples so the Sites health tab works the same way
     # it does in distributed mode (where _poll_central_once fills the samples).
     # Prefer total_clients; fall back to wireless_clients for older hub versions.
+    # Feed the hub's counts into the client count samples used for site health.
     counts_for_health = new_total or new_wireless
     if counts_for_health:
         now_cc = time.time()
@@ -176,8 +196,10 @@ async def _apply_central_feed(feed: dict) -> None:
                 _client_count_samples[_wsite] = [
                     s for s in _client_count_samples[_wsite] if s[0] >= cutoff_cc
                 ]
+        # Save the samples so they survive a restart.
         _save_client_count_baseline()
 
+    # Rebuild hardware alert devices per check and site from the hub's list.
     state.hardware_alert_devices = {}
     for alert in hardware_alerts:
         if not isinstance(alert, dict):
@@ -202,12 +224,15 @@ async def _apply_central_feed(feed: dict) -> None:
     state._hub_fed_hardware_alerts = [a for a in hardware_alerts if isinstance(a, dict) and a.get("id")]
 
     # Update token state so spoke Central tab shows connected status
+    # The hub says its token is valid: show Central as connected for an hour.
     if token_valid:
         central_token.setdefault("access_token", "_hub_managed_")
         central_token["expires_at"] = time.time() + 3600
     else:
+        # Not valid: show Central as not connected.
         central_token["access_token"] = None
         central_token["expires_at"] = 0.0
+    # Browse data from the hub; only replace the parts that were sent.
     browse_alerts = feed.get("central_browse_alerts")
     browse_insights = feed.get("central_browse_insights")
     browse_clients_by_site = feed.get("central_browse_clients_by_site")
@@ -229,10 +254,12 @@ async def _apply_central_feed(feed: dict) -> None:
     if isinstance(browse_devices, dict):
         state.central_browse_devices_by_site = browse_devices
         browse_changed = True
+    # New browse data invalidates the cached browse response.
     if browse_changed:
         state._central_browse_response_cache = {}
         state._central_browse_response_cached_at = 0.0
 
+    # Push the new Central state to every UI.
     await broadcast({
         "type": "central_update",
         "status": _central_status_payload(),
@@ -248,6 +275,7 @@ async def _apply_central_feed(feed: dict) -> None:
 
 async def _fetch_new_central_token(client: httpx.AsyncClient) -> tuple[bool, str]:
     """Obtain a token for New Central via HPE GreenLake client_credentials grant."""
+    # Request a token from GreenLake with the client id and secret (15 s limit).
     cfg = _central_cfg()
     try:
         resp = await client.post(
@@ -260,12 +288,15 @@ async def _fetch_new_central_token(client: httpx.AsyncClient) -> tuple[bool, str
             headers={"Content-Type": "application/x-www-form-urlencoded"},
             timeout=15,
         )
+        # Any HTTP error is reported with the start of the reply body.
         if not resp.is_success:
             return False, f"Token request failed (HTTP {resp.status_code}): {resp.text[:300]}"
+        # The reply must contain an access token.
         payload = resp.json()
         token = payload.get("access_token")
         if not token:
             return False, f"No access_token in GLP response: {resp.text[:300]}"
+        # Store it, expiring a minute early so it is refreshed before Central rejects it.
         expires_in = payload.get("expires_in", 7200)
         central_token["access_token"] = token
         central_token["refresh_token"] = None
@@ -273,6 +304,7 @@ async def _fetch_new_central_token(client: httpx.AsyncClient) -> tuple[bool, str
         logger.info("New Central token obtained via client_credentials (expires in %ss)", expires_in)
         return True, "Token obtained via client_credentials."
     except Exception as exc:
+        # Network or parsing errors are reported, not raised.
         return False, f"GLP token request error: {exc}"
 
 
@@ -285,6 +317,7 @@ async def _fetch_central_token(client: httpx.AsyncClient) -> tuple[bool, str]:
     For Classic: loads the user-pasted token from settings and probes the API.
     Returns (success, detail_message).
     """
+    # New Central: fetch a token, then probe the API with it.
     if _is_new_central_api():
         ok, msg = await _fetch_new_central_token(client)
         if not ok:
@@ -295,16 +328,19 @@ async def _fetch_central_token(client: httpx.AsyncClient) -> tuple[bool, str]:
         state.central_auth_error = None if ok else msg
         return ok, msg
 
+    # Classic: use the token pasted into settings.
     cfg = _central_cfg()
     token = cfg.get("access_token", "").strip()
     if not token:
         return False, "No access token configured."
 
+    # Load it into memory (with refresh token if set), assuming two hours of life.
     central_token["access_token"] = token
     if cfg.get("refresh_token"):
         central_token["refresh_token"] = cfg["refresh_token"]
     central_token["expires_at"] = time.time() + 7200
 
+    # Probe the API and record any error for the status display.
     ok, msg = await _probe_central_token(client)
     state.central_auth_error = None if ok else msg
     return ok, msg
@@ -314,6 +350,7 @@ async def _fetch_central_token(client: httpx.AsyncClient) -> tuple[bool, str]:
 
 async def _probe_central_token(client: httpx.AsyncClient) -> tuple[bool, str]:
     """Probe the Central API to confirm the in-memory token is accepted."""
+    # Base URL and bearer header from the current token.
     cfg = _central_cfg()
     base_url = cfg["cluster_url"].rstrip("/")
     token = central_token.get("access_token", "")
@@ -333,8 +370,10 @@ async def _probe_central_token(client: httpx.AsyncClient) -> tuple[bool, str]:
             (f"{base_url}/monitoring/v2/alerts", {"limit": 1}),
             (f"{base_url}/platform/v1/customer_id", {}),
         ]
+    # Remember the last reply so the final error message can show it.
     last_status: int = 0
     last_body: str = ""
+    # Try each probe URL in turn (15 s each), logging request and reply.
     for url, params in probe_urls:
         try:
             logger.info("Central probe → GET %s params=%s", url, params)
@@ -342,6 +381,7 @@ async def _probe_central_token(client: httpx.AsyncClient) -> tuple[bool, str]:
             last_status = resp.status_code
             last_body = resp.text[:400]
             logger.info("Central probe ← %s: %s", resp.status_code, last_body[:200])
+            # 200: the token works.
             if resp.status_code == 200:
                 logger.info("Aruba Central token validated via %s", url)
                 return True, "Token validated successfully."
@@ -360,8 +400,10 @@ async def _probe_central_token(client: httpx.AsyncClient) -> tuple[bool, str]:
             # 403/404 = wrong scope or endpoint missing — try next probe
             logger.info("Central probe %s returned %s — trying next", url, resp.status_code)
         except Exception as exc:
+            # A network error stops probing; the host itself is likely unreachable.
             return False, f"Connection error reaching {base_url}: {exc}"
 
+    # Every probe failed or was refused: give the last status and body.
     return False, (
         f"Could not confirm token with Central (last HTTP status: {last_status}). "
         f"Response: {last_body}. "
@@ -378,10 +420,13 @@ async def _refresh_central_token(client: httpx.AsyncClient) -> tuple[bool, str]:
     Classic: uses refresh_token grant against Central's OAuth endpoint.
     Returns (success, detail_message).
     """
+    # Refreshing needs client credentials.
     if not _can_refresh():
         return False, "Cannot refresh: missing client_id or client_secret."
+    # New Central has no refresh token; just request a new one.
     if _is_new_central_api():
         return await _fetch_new_central_token(client)
+    # Classic: build a refresh_token request for the OAuth endpoint.
     cfg = _central_cfg()
     token_url = cfg["cluster_url"].rstrip("/") + "/oauth2/token"
     refresh_tok = cfg.get("refresh_token") or central_token.get("refresh_token", "")
@@ -391,15 +436,19 @@ async def _refresh_central_token(client: httpx.AsyncClient) -> tuple[bool, str]:
         "client_secret": cfg["client_secret"],
         "refresh_token": refresh_tok,
     }
+    # Some Classic tenants also need the customer id.
     if cfg.get("customer_id"):
         data["customer_id"] = cfg["customer_id"]
+    # Post the refresh request (15 s limit); any HTTP error is reported.
     try:
         resp = await client.post(token_url, data=data, timeout=15)
         if not resp.is_success:
             return False, f"Refresh failed (HTTP {resp.status_code}): {resp.text[:300]}"
+        # Parse the reply; keep the old refresh token if no new one is returned.
         payload = _parse_upstream_json(resp)
         new_access = payload["access_token"]
         new_refresh = payload.get("refresh_token", refresh_tok)
+        # Store the new tokens in memory (expiring a minute early) and save them to settings.
         central_token["access_token"] = new_access
         central_token["refresh_token"] = new_refresh
         central_token["expires_at"] = time.time() + payload.get("expires_in", 7200) - 60
@@ -409,24 +458,30 @@ async def _refresh_central_token(client: httpx.AsyncClient) -> tuple[bool, str]:
         logger.info("Aruba Central token refreshed successfully")
         return True, "Token refreshed successfully."
     except UpstreamJSONError as exc:
+        # Bad JSON from Central is reported with its own message.
         return False, str(exc)
     except Exception as exc:
+        # Any other failure is reported, not raised.
         return False, f"Refresh request failed: {exc}"
 
 
 
 
 async def _test_classic_central_connection(client: httpx.AsyncClient) -> tuple[bool, str]:
+    """Test the Classic API URL with basic-auth credentials and return (ok, message)."""
+    # Read the Classic URL and credentials; all three are required.
     classic_cfg = settings.get("central_api", {}).get("classic", {})
     base_url = str(classic_cfg.get("url", "")).strip().rstrip("/")
     username = str(classic_cfg.get("username", "")).strip()
     password = str(classic_cfg.get("password", ""))
     if not base_url or not username or not password:
         return False, "Central API not configured — enter URL, Username, and Password in Setup."
+    # Try the URL with basic auth (15 s limit, following redirects).
     try:
         resp = await client.get(base_url, auth=(username, password), timeout=15, follow_redirects=True)
     except Exception as exc:
         return False, f"Connection error reaching {base_url}: {exc}"
+    # 401/403 means bad credentials; 5xx means the server failed. Anything else counts as connected.
     if resp.status_code in (401, 403):
         return False, f"Classic credentials rejected (HTTP {resp.status_code})."
     if resp.status_code >= 500:
@@ -437,6 +492,7 @@ async def _test_classic_central_connection(client: httpx.AsyncClient) -> tuple[b
 
 
 def _central_headers() -> dict[str, str]:
+    """Return the bearer auth header for Central calls, or raise 503 if there is no token."""
     token = central_token.get("access_token")
     if not token:
         raise HTTPException(status_code=503, detail="Aruba Central token not available — check connection settings")
@@ -447,12 +503,16 @@ def _central_headers() -> dict[str, str]:
 
 async def central_token_manager() -> None:
     """Background task: keep token valid. Runs every 5 minutes."""
+    # One HTTP client is reused for the life of the task.
     async with httpx.AsyncClient() as client:
         while True:
             try:
+                # Only act once Central is configured.
                 if _central_ready():
+                    # Note whether a token is missing or expires within five minutes.
                     no_token = not central_token.get("access_token")
                     expiring = time.time() >= central_token.get("expires_at", 0) - 300
+                    # No token: fetch one.
                     if no_token:
                         ok, msg = await _fetch_central_token(client)
                         if not ok:
@@ -460,6 +520,8 @@ async def central_token_manager() -> None:
                         # Broadcast updated token state regardless of success
                         await broadcast({"type": "central_update", "status": _central_status_payload(), "wireless_clients": dict(state.central_wireless_clients), "hardware_alerts": _hw_alerts_payload(), "client_count_status": _client_count_payload(), "ts": time.time(), "token_state": _central_token_state()})
                     elif expiring and _can_refresh():
+                        # Expiring soon: refresh it; on failure clear it so the next cycle fetches a
+                        # new one.
                         ok, msg = await _refresh_central_token(client)
                         if not ok:
                             logger.warning("Central token refresh failed: %s", msg)
@@ -467,13 +529,18 @@ async def central_token_manager() -> None:
                             central_token["access_token"] = None  # force re-fetch next cycle
                         else:
                             state.central_auth_error = None
+                        # Tell UIs the new token state.
                         await broadcast({"type": "central_update", "status": _central_status_payload(), "wireless_clients": dict(state.central_wireless_clients), "hardware_alerts": _hw_alerts_payload(), "client_count_status": _client_count_payload(), "ts": time.time(), "token_state": _central_token_state()})
+                # This cycle ran fine.
                 _update_service_health("central_token", ok=True)
             except asyncio.CancelledError:
+                # Cancellation must stop the task.
                 raise
             except Exception as exc:
+                # Any other error is recorded in service health and logged; the loop keeps going.
                 _update_service_health("central_token", ok=False, error=str(exc))
                 logger.exception("Central token manager error: %s", exc)
+            # Check again in five minutes.
             await asyncio.sleep(300)
 
 
@@ -481,17 +548,21 @@ async def central_token_manager() -> None:
 
 async def _poll_central_once(client: httpx.AsyncClient) -> None:
     """Single poll cycle: fetch alerts + insights per mapped site, evaluate checks."""
+    # Nothing to do without config and a token.
     if not _central_ready() or not central_token.get("access_token"):
         return
 
+    # Read the site mappings and the checks to evaluate; stop if there is nothing to check.
     site_mappings: dict[str, str] = settings.get("site_mappings", {})
     monitored: list[dict[str, Any]] = settings.get("monitored_checks", [])
     hw_checks: list[dict[str, Any]] = settings.get("hardware_checks", [])
     if not site_mappings or (not monitored and not hw_checks):
         return
 
+    # IDs of hardware checks, to spot hardware alerts quickly.
     hw_check_ids: set[str] = {c["id"] for c in hw_checks}
 
+    # Shared request data for this cycle.
     cfg = _central_cfg()
     base_url = cfg["cluster_url"].rstrip("/")
     headers = _central_headers()
@@ -501,6 +572,7 @@ async def _poll_central_once(client: httpx.AsyncClient) -> None:
     # Accumulate hardware alert devices across all sites this cycle
     new_hw_devices: dict[str, dict[str, list[str]]] = {c["id"]: {} for c in hw_checks}
 
+    # Poll each mapped site.
     for wsite, central_site in site_mappings.items():
         site_check_status: dict[str, Any] = {}
 
@@ -508,12 +580,14 @@ async def _poll_central_once(client: httpx.AsyncClient) -> None:
         alert_type_counts: dict[str, int] = {}
         site_health: dict[str, Any] = {}
 
+        # New Central has no alert counts, so build them from health, device and client data.
         if _is_new_central_api():
             # New Central v1alpha1: derive synthetic alert_type_counts from available endpoints.
             # Fetch sites-health, devices, and clients in parallel for the mapped site.
 
             # ── sites-health ──────────────────────────────────────────────
             site_id: str | None = None
+            # Find this site's health entry; on 401 refresh the token and retry once.
             try:
                 resp = await client.get(
                     f"{base_url}/network-monitoring/v1alpha1/sites-health",
@@ -529,6 +603,7 @@ async def _poll_central_once(client: httpx.AsyncClient) -> None:
                         headers=headers,
                         timeout=20,
                     )
+                # Record the site's health score and AP count, and remember its site id.
                 if resp.status_code == 200:
                     for item in resp.json().get("items", []):
                         sname = item.get("siteName") or item.get("site_name") or ""
@@ -541,9 +616,11 @@ async def _poll_central_once(client: httpx.AsyncClient) -> None:
                             alert_type_counts["AP_COUNT"] = int(ap_count)
                             break
             except Exception as exc:
+                # A failure here is logged; the other data is still fetched.
                 logger.warning("New Central sites-health fetch failed for site %s: %s", central_site, exc)
 
             # ── devices (AP_DOWN, SWITCH_DOWN, GATEWAY_DOWN) ──────────────
+            # Count APs, switches and gateways that are not up (filtered by site when known).
             try:
                 params: dict[str, Any] = {"limit": 500}
                 if site_id:
@@ -568,9 +645,11 @@ async def _poll_central_once(client: httpx.AsyncClient) -> None:
                     alert_type_counts["SWITCH_DOWN"] = switch_down
                     alert_type_counts["GATEWAY_DOWN"] = gw_down
             except Exception as exc:
+                # A failure here is logged; the other data is still fetched.
                 logger.warning("New Central devices fetch failed for site %s: %s", central_site, exc)
 
             # ── clients (CLIENT_COUNT) ─────────────────────────────────────
+            # Total client count for the site.
             try:
                 cparams: dict[str, Any] = {}
                 if site_id:
@@ -582,12 +661,15 @@ async def _poll_central_once(client: httpx.AsyncClient) -> None:
                 if resp.status_code == 200:
                     alert_type_counts["CLIENT_COUNT"] = int(resp.json().get("count", 0))
             except Exception as exc:
+                # A failure here is logged.
                 logger.warning("New Central clients fetch failed for site %s: %s", central_site, exc)
 
             # New Central: no insights endpoint — skip
             insight_cat_counts: dict[str, int] = {}
         else:
+            # Classic Central: count alerts by type, trying the v1 API then v2.
             for alerts_path in ["/monitoring/v1/alerts", "/monitoring/v2/alerts"]:
+                # Fetch alerts for the site; on 401 refresh the token and retry once.
                 try:
                     resp = await client.get(
                         f"{base_url}{alerts_path}",
@@ -605,6 +687,7 @@ async def _poll_central_once(client: httpx.AsyncClient) -> None:
                             params={"site": central_site, "limit": 1000},
                             timeout=20,
                         )
+                    # Count each alert type; stop after the first API version that answers.
                     if resp.status_code == 200:
                         data = resp.json()
                         for alert in data.get("alerts", []):
@@ -620,14 +703,17 @@ async def _poll_central_once(client: httpx.AsyncClient) -> None:
                                         if dev not in new_hw_devices[atype][wsite]:
                                             new_hw_devices[atype][wsite].append(dev)
                         break
+                    # 404: this API version is missing, so try the next one.
                     if resp.status_code == 404:
                         continue
                 except Exception as exc:
+                    # Any other failure is logged and we stop trying.
                     logger.warning("Central alerts fetch failed for site %s: %s", central_site, exc)
                     break
 
             # ── Fetch insights for this site ──────────────────────────
             insight_cat_counts: dict[str, int] = {}
+            # Count AIOps insights by category.
             try:
                 resp = await client.get(
                     f"{base_url}/aiops/v1/insights",
@@ -642,6 +728,7 @@ async def _poll_central_once(client: httpx.AsyncClient) -> None:
                         if cat:
                             insight_cat_counts[cat] = insight_cat_counts.get(cat, 0) + 1
             except Exception as exc:
+                # A failure here is logged.
                 logger.warning("Central insights fetch failed for site %s: %s", central_site, exc)
 
         # ── Evaluate each monitored check ─────────────────────────
@@ -653,12 +740,14 @@ async def _poll_central_once(client: httpx.AsyncClient) -> None:
         # exhausted the client pool.
         # Shared with the other three deployments via check_eval (single source
         # of truth for this matching).
+        # Case-insensitive counts for alerts and insights, logged to help diagnose missed checks.
         _alert_ci = normalize_counts(alert_type_counts)
         _insight_ci = normalize_counts(insight_cat_counts)
         logger.info("central-check diag [%s]: monitored=%s alert_keys=%s insight_keys=%s",
                     central_site,
                     [str(c.get("id")) for c in monitored if isinstance(c, dict) and c.get("id")],
                     sorted(_alert_ci), sorted(_insight_ci))
+        # Evaluate each alert/insight check that has an id.
         for check in monitored:
             check_type = check.get("type", "")
             check_id = check.get("id", "")
@@ -667,8 +756,10 @@ async def _poll_central_once(client: httpx.AsyncClient) -> None:
                 continue
             if check_type not in ("alert", "insight"):
                 continue
+            # Count how often the check's condition was seen at this site.
             count = count_for_check(check, _alert_ci, _insight_ci)
 
+            # A check is OK (green) when its condition is present at least once.
             status = "OK" if count > 0 else "ERROR"
             site_check_status[check_id] = {
                 "status": status,
@@ -677,6 +768,7 @@ async def _poll_central_once(client: httpx.AsyncClient) -> None:
                 "check_type": check_type,
                 "ts": now,
             }
+            # Add a history record for this check.
             new_records.append({
                 "ts": now,
                 "wsite": wsite,
@@ -688,9 +780,11 @@ async def _poll_central_once(client: httpx.AsyncClient) -> None:
                 "count": count,
             })
 
+        # Save this site's results.
         state.central_status[wsite] = site_check_status
 
         # ── Fetch wireless client count for this site from Central ─
+        # Wireless client count for the site (0 if it cannot be fetched).
         wl_count = 0
         try:
             if _is_new_central_api():
@@ -728,17 +822,21 @@ async def _poll_central_once(client: httpx.AsyncClient) -> None:
                             clients_path, site_param, central_site,
                             resp.status_code, resp.text[:200],
                         )
+                        # 200: read the total and stop trying.
                         if resp.status_code == 200:
                             body = resp.json()
                             wl_count = int(body.get("total") or body.get("count") or 0)
                             fetched = True
                             break
+                        # 404: try the next parameter or path.
                         if resp.status_code == 404:
                             continue
                     if fetched:
                         break
         except Exception as exc:
+            # A failure is logged and the count stays 0.
             logger.warning("Central wireless client count fetch failed for site %s: %s", central_site, exc)
+        # Save the count, then add it to the samples and drop samples older than the window.
         state.central_wireless_clients[wsite] = wl_count
 
         _client_count_samples.setdefault(wsite, []).append((now, wl_count))
@@ -746,6 +844,7 @@ async def _poll_central_once(client: httpx.AsyncClient) -> None:
         _client_count_samples[wsite] = [
             s for s in _client_count_samples[wsite] if s[0] >= cutoff_cc
         ]
+    # Save hardware alert devices for all sites and send notifications for checks that turned red.
     state.hardware_alert_devices = new_hw_devices
     await _check_transitions_and_notify(now)
 
@@ -754,18 +853,21 @@ async def _poll_central_once(client: httpx.AsyncClient) -> None:
 
     # ── Persist history ───────────────────────────────────────────
     if new_records:
+        # Drop old in-memory records, add the new ones, and append them to the history file.
         cutoff = _history_cutoff()
         async with history_lock:
             state.central_history[:] = [r for r in state.central_history if r["ts"] >= cutoff]
             state.central_history.extend(new_records)
         await asyncio.to_thread(_append_and_trim_history, new_records)
 
+    # Push the new Central state to UIs and save it to the state cache.
     await broadcast({"type": "central_update", "status": _central_status_payload(), "wireless_clients": dict(state.central_wireless_clients), "hardware_alerts": _hw_alerts_payload(), "client_count_status": _client_count_payload(), "ts": now, "token_state": _central_token_state()})
     _save_state_cache()
     # In distributed mode with new_central, also fetch browse data (alerts, insights,
     # devices, clients) filtered to this spoke's assigned sites so the hub can assemble
     # a complete multi-site view.
     if _is_new_central_api():
+        # Errors here are logged; the poll itself already succeeded.
         try:
             await _fetch_nc_browse_for_spoke(client)
         except Exception as exc:
@@ -776,6 +878,7 @@ async def _poll_central_once(client: httpx.AsyncClient) -> None:
 
 def _central_status_payload() -> dict[str, Any]:
     """Serialize current central_status for WS / API responses."""
+    # Copy only the fields the UI needs.
     return {
         wsite: {
             check_id: {
@@ -805,10 +908,12 @@ def _hw_alerts_payload() -> list[dict[str, Any]]:
     stored in _hub_fed_hardware_alerts.  Fall back to that list so the simulation
     view can display gateway/AP/switch status correctly.
     """
+    # With local hardware checks configured, build the list here.
     hw_checks: list[dict[str, Any]] = settings.get("hardware_checks", [])
     if not hw_checks:
         # Hub-connected mode: return the pre-built list pushed by the hub
         return list(state._hub_fed_hardware_alerts)
+    # For each check, list devices per site and the total count.
     site_mappings: dict[str, str] = settings.get("site_mappings", {})
     result = []
     for check in hw_checks:
@@ -817,10 +922,12 @@ def _hw_alerts_payload() -> list[dict[str, Any]]:
         total = sum(len(devs) for devs in devices_by_wsite.values())
         sites_out = {}
         for wsite, devs in devices_by_wsite.items():
+            # Use the Central site name for display.
             sites_out[wsite] = {
                 "site_name": site_mappings.get(wsite, wsite),
                 "devices": devs,
             }
+        # Fill in name and device type when the check does not set them.
         result.append({
             "id": cid,
             "name": check.get("name") or _HW_FRIENDLY.get(cid, cid),
@@ -845,6 +952,7 @@ def _sim_clients_per_wsite(active_snap: dict[str, Any]) -> dict[str, int]:
     # Build sim_id → wsite from simulation.conf (s0..s9 buckets)
     sim_to_wsite: dict[str, str] = {}
     sim_conf_path = REPO_DIR / "configs" / "simulation.conf"
+    # Map each bucket to its wsite from simulation.conf.
     try:
         parser = configparser.ConfigParser()
         parser.read_string(sim_conf_path.read_text(encoding="utf-8"))
@@ -860,10 +968,12 @@ def _sim_clients_per_wsite(active_snap: dict[str, Any]) -> dict[str, int]:
             if wsite_val:
                 sim_to_wsite[sim_id] = wsite_val
 
+    # No buckets means nothing to count.
     if not sim_to_wsite:
         return {}
 
     # Count online clients per wsite
+    # Count online clients per wsite, matched through their simulation id.
     counts: dict[str, int] = {w: 0 for w in set(sim_to_wsite.values())}
     for client_data in active_snap.values():
         sim_id = client_data.get("simulation_id", "")
@@ -879,22 +989,28 @@ def _sim_clients_per_wsite(active_snap: dict[str, Any]) -> dict[str, int]:
 
 async def central_poller() -> None:
     """Background task: poll Central every CENTRAL_POLL_INTERVAL seconds."""
+    # One HTTP client is reused for the life of the task.
     async with httpx.AsyncClient() as client:
         while True:
             try:
+                # Check the polling mode on every pass so a change takes effect without a restart.
                 if settings.get("hub_aruba_polling_mode") == "centralized":
                     # Polling is delegated to the hub — mark health ok so the
                     # UI doesn't show a stale warning, then sleep until next check.
                     _update_service_health("central_poller", ok=True)
                     await asyncio.sleep(300)
                     continue
+                # Run one poll and mark the poller healthy.
                 await _poll_central_once(client)
                 _update_service_health("central_poller", ok=True)
             except asyncio.CancelledError:
+                # Cancellation must stop the task.
                 raise
             except Exception as exc:
+                # Any other error is recorded in service health and logged; the loop keeps going.
                 _update_service_health("central_poller", ok=False, error=str(exc))
                 logger.exception("Central poll error: %s", exc)
+            # Wait for the next poll.
             await asyncio.sleep(CENTRAL_POLL_INTERVAL)
 
 
@@ -906,11 +1022,14 @@ def _telemetry_filtered_browse_list(items: list[dict[str, Any]], site_field: str
     Prevents unassigned-site data (fetched for the local browse tab) from being
     sent to the hub and polluting its distributed-mode aggregation.
     """
+    # Lower-case Central site names this spoke is assigned to.
     assigned: set[str] = {
         str(v).strip().lower() for v in settings.get("site_mappings", {}).values() if v
     }
+    # No assignments: keep everything.
     if not assigned:
         return list(items)
+    # Keep only items whose site is assigned.
     return [i for i in items if str(i.get(site_field) or "").strip().lower() in assigned]
 
 
@@ -918,11 +1037,14 @@ def _telemetry_filtered_browse_list(items: list[dict[str, Any]], site_field: str
 
 def _telemetry_filtered_browse_dict(by_site: dict[str, Any]) -> dict[str, Any]:
     """Return a by-site browse dict filtered to only this spoke's assigned Central sites."""
+    # Lower-case Central site names this spoke is assigned to.
     assigned: set[str] = {
         str(v).strip().lower() for v in settings.get("site_mappings", {}).values() if v
     }
+    # No assignments: keep everything.
     if not assigned:
         return dict(by_site)
+    # Keep only sites that are assigned.
     return {k: v for k, v in by_site.items() if str(k).strip().lower() in assigned}
 
 
@@ -930,6 +1052,7 @@ def _telemetry_filtered_browse_dict(by_site: dict[str, Any]) -> dict[str, Any]:
 
 async def _fetch_central_client_names(wsite: str, central_site: str) -> list[str]:
     """Fetch wireless client hostnames from Central for a given site (cached 60 s)."""
+    # Use the cached list if it is still fresh.
     cache_key = f"{wsite}:{central_site}"
     now = time.time()
     if cache_key in _central_client_cache:
@@ -937,18 +1060,23 @@ async def _fetch_central_client_names(wsite: str, central_site: str) -> list[str
         if now - ts < _CENTRAL_CLIENT_CACHE_TTL:
             return names
 
+    # Without a token or client id we cannot call Central.
     cfg = _central_cfg()
     if not cfg.get("access_token") and not cfg.get("client_id"):
         return []
 
+    # Base URL, auth header and the list to fill.
     base_url = cfg["cluster_url"].rstrip("/")
     headers = _central_headers()
     names: list[str] = []
 
+    # Try the v2 then v1 API, and both site parameter names.
     async with httpx.AsyncClient() as client:
         for path in ["/monitoring/v2/clients/wireless", "/monitoring/v1/clients/wireless"]:
             for site_param in ["site", "site_name"]:
                 try:
+                    # Fetch up to 1000 clients (12 s limit overall); on 401 refresh the token and
+                    # retry once.
                     resp = await asyncio.wait_for(
                         client.get(
                             f"{base_url}{path}",
@@ -968,6 +1096,7 @@ async def _fetch_central_client_names(wsite: str, central_site: str) -> list[str
                             params={site_param: central_site, "limit": 1000},
                             timeout=10,
                         )
+                    # 200: collect lower-case client names, cache them and return.
                     if resp.status_code == 200:
                         body = resp.json()
                         for c in body.get("clients", []):
@@ -977,9 +1106,12 @@ async def _fetch_central_client_names(wsite: str, central_site: str) -> list[str
                                 names.append(n)
                         _central_client_cache[cache_key] = (now, names)
                         return names
+                    # 404: try the next combination.
                     if resp.status_code == 404:
                         continue
                 except Exception:
+                    # Errors are ignored; try the next combination.
                     pass
 
+    # Nothing worked: return an empty list.
     return names

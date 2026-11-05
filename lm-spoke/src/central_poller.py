@@ -19,18 +19,28 @@ integration didn't exist in lm-spoke at all) — real polling now runs, sourced
 from THIS spoke's own local Central credentials instead of an LM hub tenant
 config.
 """
+# Allow modern type-hint syntax without evaluating annotations at import time.
 from __future__ import annotations
 
+# The poll loop runs as an asyncio task.
 import asyncio
+# Baselines and history are saved as JSON.
 import json
+# Standard-library logging.
 import logging
+# File paths and atomic file replace.
 import os
+# Timestamps and wall-clock alignment.
 import time
+# Type hints only.
 from typing import Any, Dict, Optional
 
+# Aruba Central API client.
 from aruba import ArubaClient
+# Shared matching of monitored checks against alert/insight counts.
 from check_eval import count_for_check, normalize_counts
 
+# Logger for this module.
 logger = logging.getLogger("CentralPoller")
 
 _POLL_INTERVAL_S = 300  # 5 min — matches aruba.py's own cache TTLs
@@ -49,11 +59,13 @@ def _boundary_guard_delay(now: float) -> float:
     5-minute wall-clock boundary. ``now`` is epoch seconds (UTC-aligned, so
     ``now % 300`` = seconds since the last 5-minute mark). 0 = already in the safe
     zone (60s..240s past the boundary)."""
+    # Position within the current 5-minute cycle.
     phase = now % _CENTRAL_UPDATE_PERIOD_S
     if phase < _BOUNDARY_GUARD_S:                                  # just AFTER a boundary
         return _BOUNDARY_GUARD_S - phase
     if phase > _CENTRAL_UPDATE_PERIOD_S - _BOUNDARY_GUARD_S:       # just BEFORE the next boundary
         return (_CENTRAL_UPDATE_PERIOD_S - phase) + _BOUNDARY_GUARD_S
+    # Already in the safe zone.
     return 0.0
 
 # Client-count baseline constants — ported verbatim from the source webui-spoke
@@ -61,13 +73,16 @@ def _boundary_guard_delay(now: float) -> float:
 # (NOT the 1h average), so a prolonged client drop stays flagged instead of the
 # baseline sagging to match it. KEEP IN SYNC with lm's central_hub_poller.py
 # ClientCountTracker (centralized mode uses that copy).
+# Within-hour window and the samples needed before judging.
 _CC_WINDOW = 3600
 _CC_MIN_SAMPLES = 3
 _CC_WARN_PCT = 20.0        # >20% below the hour average -> WARNING
 _CC_ERROR_PCT = 50.0       # >50% below -> ERROR
+# History windows.
 _CC_1DAY_WINDOW = 86400
 _CC_7DAY_WINDOW = 7 * 86400
 _CC_30DAY_WINDOW = 30 * 86400   # long-run history retention (the 7-day is a subset)
+# How often an hourly snapshot is taken.
 _CC_SNAPSHOT_INTERVAL = 3600
 # Severe sustained die-off: current hour < 20% of the rolling PEAK (max hourly-avg)
 # over the window → ERROR. Gated on a meaningful peak so a quiet site can't error on noise.
@@ -101,6 +116,7 @@ _CC_RATE_DROP_PCT = 5.0        # short-window drop -> WARNING
 # jitter (5-sample window, modelled on a healthy steady site):
 #     jitter 2% -> 0.0% | 3% -> 2.9% | 5% -> 10.3% | 8% -> 22.1%
 # Raise _CC_RATE_DROP_PCT to 10 if a fleet turns out noisier than ~5%.
+# Separator used inside tracker keys.
 _CC_KEYSEP = "\x1f"
 _CC_SCOPE = "_"  # single-tenant spoke → one fixed scope key
 
@@ -115,19 +131,25 @@ def _cc_thresholds(central_config):
     peak floor that arms the die-off rule. Returns resolved values with the
     die-off as a 0-1 fraction; ``error_pct`` is coerced up to ``warn_pct`` so red
     can never trip before amber. Mirror of the lm central_hub_poller copy."""
+    # Per-tenant overrides from the Central config.
     t = (central_config or {}).get("cc_thresholds") or {}
 
     def _num(val, dflt, lo, hi):
+        """Parse ``val`` as a float clamped to [lo, hi], or ``dflt`` if invalid."""
+        # Fall back to the default on bad input.
         try:
             x = float(val)
         except (TypeError, ValueError):
             return dflt
+        # Clamp to the range.
         return max(lo, min(hi, x))
 
+    # Warning/error drop percentages (error never below warning).
     warn = _num(t.get("warn_pct"), _CC_WARN_PCT, 0.0, 100.0)
     err = _num(t.get("error_pct"), _CC_ERROR_PCT, 0.0, 100.0)
     if err < warn:
         err = warn
+    # Die-off fraction and the peak needed to arm it.
     die = _num(t.get("die_off_pct"), _CC_MAX_FRACTION * 100.0, 0.0, 100.0) / 100.0
     peak = int(_num(t.get("min_peak"), _CC_MAX_MIN_PEAK, 1, 1_000_000))
     # Steady-state fractions, defaulting to the existing die_off_pct so an
@@ -140,6 +162,7 @@ def _cc_thresholds(central_config):
     daily = _num(t.get("daily_pct"), die * 100.0, 0.0, 100.0) / 100.0
     weekly = _num(t.get("weekly_pct"), die * 100.0, 0.0, 100.0) / 100.0
     monthly = _num(t.get("monthly_pct"), die * 100.0, 0.0, 100.0) / 100.0
+    # Return the resolved thresholds.
     return {"warn_pct": warn, "error_pct": err, "die_off_frac": die,
             "min_peak": peak, "daily_frac": daily,
             "weekly_frac": weekly, "monthly_frac": monthly,
@@ -147,6 +170,7 @@ def _cc_thresholds(central_config):
             "rate_samples": rate_n}
 
 
+# Severity ranking used to pick the worst status.
 _CC_SEVERITY = {"error": 3, "warning": 2, "ok": 1}  # else (no_data/pending/…) -> 0
 
 
@@ -156,24 +180,32 @@ def _cc_period_drop(hist, now, window_s):
     Returns None when either period lacks data, so a fresh site cannot alarm on
     an empty comparison. Drop only -- growth is not a fault.
     """
+    # Values from this period and the one before.
     cur = [v for ts, v in hist if ts >= now - window_s]
     prev = [v for ts, v in hist if now - 2 * window_s <= ts < now - window_s]
+    # Need data in both.
     if not cur or not prev:
         return None
+    # Previous average must be positive.
     a = sum(prev) / len(prev)
     if a <= 0:
         return None
+    # Drop percentage (never negative).
     return max(0.0, (a - (sum(cur) / len(cur))) / a * 100.0)
 
 
 def _cc_rate_drop(samples, n):
     """Drop % of the last *n* samples' average vs the *n* before them."""
+    # Need two full windows.
     if len(samples) < 2 * n:
         return None
+    # Average of the earlier window.
     vals = [s[1] for s in samples]
     prev = sum(vals[-2 * n:-n]) / n
+    # Previous average must be positive.
     if prev <= 0:
         return None
+    # Drop percentage (never negative).
     return max(0.0, (prev - sum(vals[-n:]) / n) / prev * 100.0)
 
 
@@ -190,10 +222,12 @@ def _cc_site_floor(sites_cfg, *site_names):
     Returns None when unset, zero or unparseable, which disables the floor rule
     for that site ONLY. Never inferred from history -- that is the peak problem.
     """
+    # Read the per-site minimum map.
     try:
         floors = (sites_cfg or {}).get("site_min_clients") or {}
     except AttributeError:
         return None
+    # Return the first valid positive floor among the names.
     for name in site_names:
         if name in (None, ""):
             continue
@@ -203,6 +237,7 @@ def _cc_site_floor(sites_cfg, *site_names):
                 return float(raw)
         except (TypeError, ValueError):
             continue
+    # No floor configured.
     return None
 
 def _cc_worst(*statuses):
@@ -211,11 +246,13 @@ def _cc_worst(*statuses):
     ok > no_data). So a wired-only or wireless-only die-off reddens the site even
     if the other half is healthy. All-empty → the first status (usually
     no_data). Mirror of the lm central_hub_poller copy."""
+    # Keep the highest-ranked status.
     worst, rank = None, -1
     for s in statuses:
         r = _CC_SEVERITY.get(s, 0)
         if r > rank:
             rank, worst = r, s
+    # Default to ok.
     return worst or "ok"
 
 
@@ -233,6 +270,8 @@ class ClientCountTracker:
     the reference. See the identical copy in lm central_hub_poller.py."""
 
     def __init__(self, baseline_path: str, sevenday_path: str) -> None:
+        """Set up the tracker with its two persistence files and load saved state."""
+        # File paths, in-memory samples, history and baselines.
         self._baseline_path = baseline_path
         self._sevenday_path = sevenday_path
         self._samples: Dict[str, list] = {}
@@ -243,10 +282,14 @@ class ClientCountTracker:
 
     @staticmethod
     def _key(scope: str, wsite: str, kind: str = "") -> str:
+        """Build the tracker key from scope, site and optional series kind."""
+        # Join with the separator; add the kind when given.
         base = f"{scope}{_CC_KEYSEP}{wsite}"
         return f"{base}{_CC_KEYSEP}{kind}" if kind else base
 
     def _load(self) -> None:
+        """Load the saved baseline and history (empty on any error)."""
+        # Seed recent samples from the saved hourly averages.
         now = time.time()
         try:
             with open(self._baseline_path, encoding="utf-8") as f:
@@ -256,8 +299,10 @@ class ClientCountTracker:
                 self._samples[key] = [
                     (now - (_CC_MIN_SAMPLES - i) * 60, avg) for i in range(_CC_MIN_SAMPLES)
                 ]
+        # Missing or corrupt baseline: start empty.
         except Exception:  # noqa: BLE001
             self._baseline = {}
+        # Load hourly history, dropping anything older than 30 days.
         try:
             with open(self._sevenday_path, encoding="utf-8") as f:
                 raw = json.load(f) or {}
@@ -266,14 +311,18 @@ class ClientCountTracker:
                 k: [(float(ts), float(v)) for ts, v in entries if float(ts) >= cutoff]
                 for k, entries in raw.items()
             }
+        # Missing or corrupt history: start empty.
         except Exception:  # noqa: BLE001
             self._hourly = {}
 
     def record(self, scope: str, wsite: str, current: int, kind: str = "") -> None:
+        """Add a client-count sample for this site/series and keep only the last hour."""
+        # Append the sample.
         now = time.time()
         key = self._key(scope, wsite, kind)
         samples = self._samples.setdefault(key, [])
         samples.append((now, int(current)))
+        # Drop samples older than the window.
         cutoff = now - _CC_WINDOW
         self._samples[key] = [s for s in samples if s[0] >= cutoff]
 
@@ -288,6 +337,7 @@ class ClientCountTracker:
             disables it.
         ``thresholds`` (from _cc_thresholds → central_config) overrides the module
         defaults per tenant. The 7d/30d peaks are recorded regardless of status."""
+        # Resolve thresholds, falling back to the defaults.
         _t = thresholds or {}
         warn_pct = _t.get("warn_pct", _CC_WARN_PCT)
         error_pct = _t.get("error_pct", _CC_ERROR_PCT)
@@ -300,6 +350,7 @@ class ClientCountTracker:
         rate_samples = int(_t.get("rate_samples", _CC_RATE_SAMPLES))
         floor = _t.get("floor")
         monthly_frac = _t.get("monthly_frac", die_off_frac)
+        # Gather this series' samples and history windows.
         now = time.time()
         key = self._key(scope, wsite, kind)
         samples = self._samples.get(key, [])
@@ -307,6 +358,7 @@ class ClientCountTracker:
         vals_1d = [v for ts, v in hist if ts >= now - _CC_1DAY_WINDOW]
         vals_7d = [v for ts, v in hist if ts >= now - _CC_7DAY_WINDOW]
         vals_30d = [v for ts, v in hist if ts >= now - _CC_30DAY_WINDOW]
+        # No samples: return a no_data entry.
         if not samples:
             return {"site_name": central_site, "current": 0, "hourly_avg": 0,
                     "drop_pct": 0.0, "max_7day": round(max(vals_7d or [0]), 1),
@@ -315,6 +367,7 @@ class ClientCountTracker:
                     "avg_7day": round(sum(vals_7d) / len(vals_7d), 1) if vals_7d else 0.0,
                     "avg_30day": round(sum(vals_30d) / len(vals_30d), 1) if vals_30d else 0.0,
                     "status": "no_data", "ts": now}
+        # Current count, hourly average and peaks.
         current = samples[-1][1]
         hourly_avg = sum(s[1] for s in samples) / len(samples)
         max_7day = round(max(vals_7d + [hourly_avg]), 1)
@@ -336,13 +389,16 @@ class ClientCountTracker:
         day_drop_pct = _cc_period_drop(hist, now, _CC_1DAY_WINDOW)
         week_drop_pct = _cc_period_drop(hist, now, _CC_7DAY_WINDOW)
         rate_drop_pct = _cc_rate_drop(samples, rate_samples)
+        # Too few samples: no judgement yet.
         if len(samples) < _CC_MIN_SAMPLES:
             drop_pct, status = 0.0, "no_data"
+        # Within-hour drop percentage.
         else:
             if hourly_avg >= 1:
                 drop_pct = max(0.0, (hourly_avg - current) / hourly_avg * 100.0)
             else:
                 drop_pct = 0.0
+            # Map the drop to a status.
             if drop_pct > error_pct:
                 status = "error"
             elif drop_pct > warn_pct:
@@ -406,6 +462,7 @@ class ClientCountTracker:
                         die_off_peak = avg_30day
                     triggered.append("die_off_monthly(%s<%s*%s=%s)" %
                                      (hourly_avg, avg_30day, monthly_frac, round(avg_30day * monthly_frac, 1)))
+        # Return the full status entry.
         return {"site_name": central_site, "current": current,
                 "hourly_avg": round(hourly_avg, 1), "drop_pct": round(drop_pct, 1),
                 "max_7day": max_7day, "max_30day": max_30day,
@@ -424,9 +481,12 @@ class ClientCountTracker:
                 "status": status, "ts": samples[-1][0]}
 
     def maybe_snapshot(self) -> None:
+        """Once an hour, save each series' hourly average to the baseline and history."""
+        # Skip until an hour has passed.
         now = time.time()
         if now - self._last_snapshot < _CC_SNAPSHOT_INTERVAL:
             return
+        # Snapshot every series with enough samples.
         self._last_snapshot = now
         cutoff = now - _CC_30DAY_WINDOW
         snapshot: Dict[str, dict] = {}
@@ -438,6 +498,7 @@ class ClientCountTracker:
             hist = self._hourly.setdefault(key, [])
             hist.append((now, avg))
             self._hourly[key] = [(ts, v) for ts, v in hist if ts >= cutoff]
+        # Persist the baseline and history.
         if snapshot:
             self._baseline.update(snapshot)
             self._persist(self._baseline_path, self._baseline)
@@ -446,11 +507,14 @@ class ClientCountTracker:
 
     @staticmethod
     def _persist(path: str, data: dict) -> None:
+        """Write ``data`` to ``path`` as JSON atomically; failures only log a warning."""
+        # Write a temp file, then swap it in.
         try:
             tmp = path + ".tmp"
             with open(tmp, "w", encoding="utf-8") as f:
                 json.dump(data, f, indent=2)
             os.replace(tmp, path)
+        # Log and continue on failure.
         except Exception as exc:  # noqa: BLE001
             logger.warning("ClientCountTracker: persist failed (%s): %s", path, exc)
 
@@ -458,12 +522,14 @@ class ClientCountTracker:
 def _build_config(central_config: Dict[str, Any]) -> Dict[str, Any]:
     """Map the Setup UI's central_config shape (mode: classic|central) onto
     ArubaClient's expected config shape (api_version: classic|new_central)."""
+    # Copy the config and translate mode to api_version.
     cfg = dict(central_config)
     mode = cfg.pop("mode", None)
     cfg["api_version"] = "new_central" if mode == "central" else "classic"
     return cfg
 
 
+# Index of each status in a history bucket.
 _HEALTH_IDX = {"ok": 0, "warning": 1, "error": 2}  # else (no_data/pending/unknown) -> 3
 
 
@@ -473,15 +539,21 @@ class CheckHealthHistory:
     in sync. summary() rolls hourly up to 30 DAILY buckets; hourly() returns raw."""
 
     def __init__(self, path: str) -> None:
+        """Set up the history with its file and load saved data."""
+        # File path and in-memory buckets.
         self._path = path
         self._h: Dict[str, Dict[int, list]] = {}
         self._load()
 
     @staticmethod
     def _key(tenant: str, site: str, check_id: str) -> str:
+        """Build the history key from tenant, site and check id."""
+        # Join with the separator.
         return f"{tenant}{_CC_KEYSEP}{site}{_CC_KEYSEP}{check_id}"
 
     def _load(self) -> None:
+        """Load saved history, dropping buckets older than 30 days."""
+        # Read and filter the file.
         try:
             with open(self._path, encoding="utf-8") as f:
                 raw = json.load(f) or {}
@@ -494,6 +566,8 @@ class CheckHealthHistory:
             self._h = {}
 
     def record(self, tenant: str, site: str, check_id: str, status: str) -> None:
+        """Count one status for this check in the current hour, and drop old buckets."""
+        # Find or create the current hour's bucket.
         now = time.time()
         buckets = self._h.setdefault(self._key(tenant, site, check_id), {})
         bucket = int(now // 3600 * 3600)
@@ -501,26 +575,34 @@ class CheckHealthHistory:
         if cell is None:
             cell = [0, 0, 0, 0]
             buckets[bucket] = cell
+        # Count the status (unknown values count as "other").
         cell[_HEALTH_IDX.get(str(status).strip().lower(), 3)] += 1
+        # Drop buckets older than 30 days.
         cutoff = now - _CC_30DAY_WINDOW
         for b in [b for b in buckets if b < cutoff]:
             del buckets[b]
 
     def save(self) -> None:
+        """Save the history to disk atomically; failures are ignored."""
+        # Write a temp file, then swap it in.
         try:
             tmp = self._path + ".tmp"
             with open(tmp, "w", encoding="utf-8") as f:
                 json.dump({k: {str(b): v for b, v in bk.items()}
                            for k, bk in self._h.items()}, f, default=str)
             os.replace(tmp, self._path)
+        # Ignore write failures.
         except Exception:  # noqa: BLE001
             pass
 
     def summary(self, tenant: str) -> Dict[str, Any]:
+        """Return a per-site, per-check list of daily status counts for the last 30 days."""
+        # Start of the 30-day window and this tenant's key prefix.
         now = time.time()
         floor = int(now // 86400 * 86400) - 29 * 86400
         prefix = f"{tenant}{_CC_KEYSEP}"
         out: Dict[str, Any] = {}
+        # Walk this tenant's checks.
         for key, buckets in self._h.items():
             if not key.startswith(prefix):
                 continue
@@ -528,6 +610,7 @@ class CheckHealthHistory:
             if len(parts) != 3:
                 continue
             _, site, check_id = parts
+            # Roll the hourly buckets up into days.
             days: Dict[int, list] = {}
             for b, cell in buckets.items():
                 d = int(b // 86400 * 86400)
@@ -536,13 +619,17 @@ class CheckHealthHistory:
                 acc = days.setdefault(d, [0, 0, 0, 0])
                 for i in range(4):
                     acc[i] += cell[i]
+            # Store the days in order.
             out.setdefault(site, {})[check_id] = [
                 {"d": d, "o": v[0], "w": v[1], "e": v[2], "n": v[3]}
                 for d, v in sorted(days.items())
             ]
+        # Return the summary.
         return out
 
     def hourly(self, tenant: str, site: str, check_id: str) -> list:
+        """Return the hourly status buckets for one check."""
+        # Buckets in time order.
         buckets = self._h.get(self._key(tenant, site, check_id), {})
         return [{"h": b, "o": v[0], "w": v[1], "e": v[2], "n": v[3]}
                 for b, v in sorted(buckets.items())]
@@ -558,6 +645,7 @@ def client_os_counts(clients) -> Dict[str, int]:
     numbers. Unreported values collapse into "Unknown" instead of "—" so the
     label reads sensibly in a count ("12 Unknown").
     """
+    # Count each client's OS, with blanks labelled "Unknown".
     counts: Dict[str, int] = {}
     for c in (clients or []):
         try:
@@ -609,8 +697,11 @@ class CentralPoller:
     }
 
     def __init__(self, spoke, instance: str = "central") -> None:
+        """Set up the poller for ``instance`` with its tracker and health history."""
+        # Reject unknown instances.
         if instance not in self._INSTANCES:
             raise ValueError(f"unknown CentralPoller instance: {instance!r}")
+        # Store the spoke and this instance's settings.
         self.spoke = spoke
         self._inst_name = instance
         self._inst = self._INSTANCES[instance]
@@ -627,6 +718,7 @@ class CentralPoller:
         # 30-day per-check status history (green/yellow/red) for the health graphs;
         # per-instance filename so on-prem history doesn't merge with cloud's.
         self._health = CheckHealthHistory(os.path.join(ddir, self._inst["health_file"]))
+        # Build the API client from the current config.
         self.reload()
 
     # ── per-instance local_store / status accessors ─────────────────────────
@@ -635,16 +727,24 @@ class CentralPoller:
     # on-prem reads central_on_prem_config/central_on_prem_status. The default
     # instance reproduces the original hardcoded behavior exactly.
     def _cfg(self) -> Dict[str, Any]:
+        """Return this instance's Central config."""
+        # Call the matching local_store getter.
         return getattr(self.spoke.local_store, self._inst["config_getter"])()
 
     def _sites_cfg(self) -> Dict[str, Any]:
+        """Return this instance's sites config."""
+        # Call the matching local_store getter.
         return getattr(self.spoke.local_store, self._inst["sites_getter"])()
 
     def _set_status(self, val: Dict[str, Any]) -> None:
+        """Write this instance's status onto the spoke."""
+        # Set the matching spoke attribute.
         setattr(self.spoke, self._inst["status_attr"], val)
 
     # ── (re)build the ArubaClient from the current stored config ───────────
     def reload(self) -> None:
+        """Rebuild the Aruba client from the stored config (None if unconfigured)."""
+        # Need a cluster URL to build a client.
         cfg = _build_config(self._cfg())
         self._client = ArubaClient(cfg) if cfg.get("cluster_url") else None
 
@@ -652,16 +752,21 @@ class CentralPoller:
         """Spawn the 5-min poll loop on the running event loop. Cancels any
         prior task first (idempotent). No-op with a warning when no loop is
         running yet (callers without a loop use the FastAPI ``startup`` hook)."""
+        # Cancel any existing task.
         if self._task and not self._task.done():
             self._task.cancel()
+        # Need a running loop.
         try:
             loop = asyncio.get_running_loop()
         except RuntimeError:
             logger.warning("Event loop not running; Central poll loop deferred.")
             return
+        # Start the loop task.
         self._task = loop.create_task(self._poll_loop())
 
     async def _poll_loop(self) -> None:
+        """Poll forever, avoiding the 5-minute refresh boundary."""
+        # Wait out the boundary guard if needed.
         while True:
             _guard = _boundary_guard_delay(time.time())
             if _guard > 0:
@@ -669,19 +774,24 @@ class CentralPoller:
                             "delaying %.0fs to avoid a mid-refresh false positive.",
                             _BOUNDARY_GUARD_S, _guard)
                 await asyncio.sleep(_guard)
+            # Poll once; errors are logged but never stop the loop.
             try:
                 await self._poll_once()
             except asyncio.CancelledError:
                 raise
             except Exception as exc:  # noqa: BLE001 — never let a bad poll kill the loop
                 logger.warning("Central poll failed: %s", exc)
+            # Wait for the next cycle.
             await asyncio.sleep(_POLL_INTERVAL_S)
 
     def _hub_polls(self) -> bool:
+        """Return True if the hub polls this API (centralized mode)."""
+        # Ask the local store, if it supports it.
         hub_polls = getattr(self.spoke.local_store, "hub_polls", None)
         return bool(callable(hub_polls) and hub_polls(self._inst["mode_feature"]))
 
     async def _poll_once(self) -> None:
+        """Poll every mapped site once and publish the combined status."""
         if self._hub_polls():
             # Hub (centralized) mode: the hub's CentralHubPoller owns this API;
             # a spoke poll would duplicate every site row on the hub dashboard.
@@ -690,10 +800,12 @@ class CentralPoller:
                 self._hub_mode_logged = True
             self._set_status({})
             return
+        # Distributed mode: reset the log flag and check the client is configured.
         self._hub_mode_logged = False
         if not self._client or not self._client.is_configured():
             self._set_status({})
             return
+        # Load thresholds and the sites config.
         cc_thresh = _cc_thresholds(self._cfg())
         sites_cfg = self._sites_cfg()
         site_mappings: Dict[str, str] = sites_cfg.get("site_mappings") or {}
@@ -701,17 +813,21 @@ class CentralPoller:
         hw_checks: list = sites_cfg.get("hardware_checks") or []
         hw_check_ids = {str(h.get("id")) for h in hw_checks if h.get("id")}
 
+        # Result accumulators.
         status: Dict[str, Dict[str, Any]] = {}
         client_count_status: Dict[str, Any] = {}
         hw_totals: Dict[str, int] = {}
         hw_names = {str(h.get("id")): h for h in hw_checks if h.get("id")}
 
+        # Poll each mapped site.
         for wireless_site, central_site in site_mappings.items():
             try:
                 data = await self._client.poll_site_data(central_site, hw_check_ids)
+            # A failed site gets a single error row.
             except Exception as exc:  # noqa: BLE001
                 status[wireless_site] = {"poll_error": {"status": "error", "message": str(exc)}}
                 continue
+            # Alert and insight counts for this site.
             alert_counts = data.get("alert_type_counts") or {}
             insight_counts = data.get("insight_cat_counts") or {}
             # Match case-insensitively AND across BOTH the alert and insight
@@ -732,6 +848,7 @@ class CentralPoller:
                         wireless_site, central_site,
                         [str(c.get("id")) for c in monitored if isinstance(c, dict) and c.get("id")],
                         sorted(alert_ci), sorted(insight_ci))
+            # Evaluate each monitored check.
             checks: Dict[str, Any] = {}
             for chk in monitored:
                 cid = str(chk.get("id") or "")
@@ -743,6 +860,7 @@ class CentralPoller:
                 chk_site = str(chk.get("site") or "").strip().lower()
                 if chk_site and chk_site not in (str(central_site).lower(), str(wireless_site).lower(), "all sites"):
                     continue
+                # How many matching conditions are present.
                 n = count_for_check(chk, alert_ci, insight_ci)
                 # INVERTED semantics: this is a demo/simulation platform that is
                 # SUPPOSED to be generating these alerts/insights. A monitored check
@@ -766,6 +884,7 @@ class CentralPoller:
                                 f"(0 seen; {_seen} other condition(s) at site, "
                                 f"{_cc} clients)")
                     checks[cid] = {"status": "error", "message": _msg}
+            # Save this site's checks and read its client counts.
             status[wireless_site] = checks
             current = int(data.get("client_count", 0) or 0)
             wired = int(data.get("wired_clients", 0) or 0)
@@ -798,6 +917,7 @@ class CentralPoller:
             _sub_thresh["floor"] = None
             w_entry = self._cc.entry(_CC_SCOPE, wireless_site, central_site, _sub_thresh, kind="wired")
             wl_entry = self._cc.entry(_CC_SCOPE, wireless_site, central_site, _sub_thresh, kind="wireless")
+            # Add wired/wireless details to the total entry.
             cc_entry["wired"] = wired
             cc_entry["wireless"] = wireless
             cc_entry["wired_status"] = w_entry["status"]
@@ -806,6 +926,7 @@ class CentralPoller:
             cc_entry["wireless_drop_pct"] = wl_entry["drop_pct"]
             # Overall = worst of total/wired/wireless.
             cc_entry["status"] = _cc_worst(cc_entry["status"], w_entry["status"], wl_entry["status"])
+            # Save the client-count entry.
             client_count_status[wireless_site] = cc_entry
             # Surface the site's client-count monitor as a CHECK so "everything
             # monitored" shows on the dashboard Checks view. Direct (NOT inverted)
@@ -820,6 +941,7 @@ class CentralPoller:
             # "0% drop, still red" with no visible cause. Mirror of the fix in
             # lm's central_hub_poller.py.
             _trend_bits = []
+            # Note any significant trend drops.
             if cc_entry.get("day_drop_pct") is not None and cc_entry["day_drop_pct"] >= 5:
                 _trend_bits.append(f"day {cc_entry['day_drop_pct']}%")
             if cc_entry.get("week_drop_pct") is not None and cc_entry["week_drop_pct"] >= 5:
@@ -842,6 +964,7 @@ class CentralPoller:
             # with no explanation for the color.
             _do = [(lbl, e) for lbl, e in (("total", cc_entry), ("wired", w_entry),
                                            ("wireless", wl_entry)) if e.get("die_off")]
+            # Explain a sustained die-off, if one fired.
             if _do:
                 _frac = int((_do[0][1].get("die_off_frac") or 0) * 100)
                 _do_txt = ", ".join(f"{lbl} {e['hourly_avg']} < {_frac}% of avg {e['die_off']}"
@@ -855,6 +978,7 @@ class CentralPoller:
                                 "sample_count", "min_samples", "warn_pct", "error_pct",
                                 "weekly_frac", "monthly_frac", "min_peak", "period_drop_pct",
                                 "rate_drop_thresh", "rate_samples", "triggered", "status")
+            # Add the client-count check with its debug details.
             checks["Steady Client Count 1hr Average"] = {
                 "status": cc_entry["status"],
                 "message": _cc_msg,
@@ -864,6 +988,7 @@ class CentralPoller:
                     "wireless": {k: wl_entry.get(k) for k in _cc_debug_fields},
                 },
             }
+            # Add up hardware-down devices across the site.
             for alert_id, devices in (data.get("hw_devices") or {}).items():
                 hw_totals[alert_id] = hw_totals.get(alert_id, 0) + sum(devices.values())
 
@@ -871,15 +996,18 @@ class CentralPoller:
         # the live device list and add a check on its pinned site — DOWN = error
         # (a monitored switch/AP/gateway is offline). new_central only; best-effort.
         if hw_checks:
+            # Fetch the live device list (empty on failure).
             try:
                 all_devices = await self._client._nc_devices()
             except Exception:  # noqa: BLE001
                 all_devices = []
+            # Index devices by serial and name.
             dev_by_key: Dict[str, dict] = {}
             for d in all_devices:
                 for k in (d.get("serialNumber"), d.get("serial"), d.get("deviceName"), d.get("name")):
                     if k:
                         dev_by_key[str(k)] = d
+            # Add an up/down check for each monitored device on its sites.
             for hc in hw_checks:
                 hid = str(hc.get("id") or "")
                 if not hid:
@@ -896,6 +1024,7 @@ class CentralPoller:
                         "message": "up" if up else "DOWN",
                     }
 
+        # Build the hardware alert totals.
         hardware_alerts = [
             {"id": aid, "name": (hw_names.get(aid) or {}).get("name", aid),
              "device_type": (hw_names.get(aid) or {}).get("device_type", ""),
@@ -911,6 +1040,7 @@ class CentralPoller:
             for cid, info in checks_map.items():
                 st = (info.get("status") if isinstance(info, dict) else info) or "no_data"
                 self._health.record(_CC_SCOPE, wsite, cid, st)
+        # Publish the status.
         self._set_status({
             "status": status,
             "hardware_alerts": hardware_alerts,
@@ -926,9 +1056,12 @@ class CentralPoller:
     # ── on-demand actions (Setup → Central API tab) ─────────────────────────
 
     async def available_checks(self) -> Dict[str, Any]:
+        """Return the Central check catalogue for the Setup picker."""
+        # Not configured: empty catalogue.
         if not self._client:
             return {"status": "SUCCESS", "alerts": [], "insights": [], "hardware": [],
                     "warning": "Central not configured."}
+        # Ask the client.
         result = await self._client.available_checks()
         return {"status": "SUCCESS", **result}
 
@@ -939,16 +1072,19 @@ class CentralPoller:
         original webui-hub browse (ArubaClient.browse_all). Cached inside the
         client (5–15 min per endpoint), so repeated tab opens don't hammer Central.
         """
+        # Not configured: empty result.
         if not self._client or not self._client.is_configured():
             return {"status": "SUCCESS", "sites": [], "alerts": [], "insights": [],
                     "clients": [], "devices_by_site": {}, "clients_by_site": {},
                     "os_counts": {}, "warning": "Central not configured.",
                     "fetched_at": time.time()}
+        # Fetch everything and add OS counts.
         try:
             data = await self._client.browse_all()
             return {"status": "SUCCESS", **data,
                     "os_counts": client_os_counts(data.get("clients")),
                     "fetched_at": time.time()}
+        # Report errors.
         except Exception as exc:  # noqa: BLE001
             logger.warning("Central browse failed [%s]: %s",
                            self.spoke.spoke_id, exc)
@@ -975,8 +1111,10 @@ class CentralPoller:
                 "token_state": None, "token_valid": False,
                 "status": "Central not configured.",
             }]}
+        # Note the config hash and mode for logging.
         chash = getattr(self._client, "_config_hash", "?")
         mode = getattr(self._client, "api_version", "?")
+        # Try to get a token.
         try:
             import httpx
             async with httpx.AsyncClient(timeout=15) as client:
@@ -985,6 +1123,7 @@ class CentralPoller:
             msg = "Connected."
             logger.info("test_connection [%s] mode=%s cfg=%s: connected to Central",
                         self.spoke.spoke_id, mode, chash)
+        # Record the failure.
         except Exception as exc:  # noqa: BLE001 — surface any token/transport error
             token_valid = False
             msg = f"Connection failed: {exc}"
@@ -992,6 +1131,7 @@ class CentralPoller:
             # response body) lands in the log; the UI only gets the one-line str(exc).
             logger.warning("test_connection [%s] mode=%s cfg=%s FAILED: %r",
                            self.spoke.spoke_id, mode, chash, exc)
+        # Report the result.
         return {"status": "SUCCESS", "spokes": [{
             "spoke_id": self.spoke.spoke_id, "spoke_name": self.spoke.spoke_id,
             "token_state": self._client._token_state() if self._client else None,

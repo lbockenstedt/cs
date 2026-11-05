@@ -1,16 +1,21 @@
 """Shared mutable module-level state for the webui-spoke, consolidated out of server.py."""
+# Postpone annotation evaluation so modern type hints are never evaluated at runtime.
 from __future__ import annotations
 
+# asyncio and typing are used only in the type hints below.
 import asyncio
 from typing import Any, Awaitable, Callable
 
+# WebSocket is the type of the stored Proxmox agent connection.
 from fastapi import WebSocket
 
 # ── Settings cache ────────────────────────────────────────────────────────────
+# Cached public settings and when they were built (see services/settings.py).
 _settings_cache: dict[str, Any] = {}
 _settings_cache_time: float = 0.0
 
 # ── State snapshot cache (JSON file, no DB) ──────────────────────────────────
+# When the state cache file was last written (see services/state_cache.py).
 _state_cache_last_save: float = 0.0
 
 # WS delta: skip proxmox broadcast when payload hasn't changed
@@ -42,6 +47,7 @@ hardware_alert_devices: dict[str, dict[str, list[str]]] = {}
 _hub_fed_hardware_alerts: list[dict] = []
 
 # ── Proxmox WebSocket relay ───────────────────────────────────────────────────
+# The open Proxmox agent websocket, its hostname and a pending disconnect-cleanup task.
 proxmox_ws_connection: WebSocket | None = None
 proxmox_ws_hostname: str | None = None
 proxmox_ws_disconnect_task: asyncio.Task[Any] | None = None
@@ -49,9 +55,12 @@ proxmox_ws_disconnect_task: asyncio.Task[Any] | None = None
 # ── Relay registration / WS ───────────────────────────────────────────────────
 # Recomputed at server load from bool(relay_state["enabled"]).
 relay_registration_refresh_needed: bool = False
+# Function used to send JSON over the relay websocket, and the spoke id the hub gave us.
 _relay_ws_send_json: Callable[[dict[str, Any]], Awaitable[None]] | None = None
 _relay_ws_spoke_id: str | None = None
+# Version found in the synced repo.
 _repo_ver: str | None = None
+# True while Proxmox state is being re-sent to the hub.
 _proxmox_reseed_in_progress = False
 
 # Hub-synced monitored items — fetched each relay cycle, cached here
@@ -73,8 +82,10 @@ _resource_samples_started: float = 0.0  # epoch when first sample was recorded
 # redundant API calls.  Keyed this way because VMIDs can collide across nodes.
 _vm_applied_sim_tags: dict[tuple[str, int], frozenset[str]] = {}
 
+# When the resource cache was last saved.
 _resource_cache_last_saved: float = 0.0
 
+# Progress of the "Update All" run (agents first, then the WebUI).
 update_all_state: dict[str, Any] = {
     "running": False,
     "phase": "idle",
@@ -85,5 +96,6 @@ update_all_state: dict[str, Any] = {
     "started_at": None,
     "error": None,
 }
+# Last time slot the reclone schedule fired, so it fires only once per slot.
 last_schedule_trigger: str | None = None
 _hub_repo_sync_task: asyncio.Task[Any] | None = None  # dedup guard for fire-and-forget repo_sync

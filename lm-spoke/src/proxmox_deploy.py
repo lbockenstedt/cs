@@ -22,17 +22,23 @@ Source of truth: ``cs/webui-spoke/server.py``
   - relay payload build:   ``_build_relay_telemetry_payload`` (lines 6011-6161)
 """
 
+# Allow modern type-hint syntax without evaluating annotations at import time.
 from __future__ import annotations
 
+# Standard-library logging.
 import logging
+# Timestamps for last-seen and resource samples.
 import time
+# Type hints only.
 from typing import Any, Dict, List, Optional, Tuple
 
+# DHCP status probe (imported as a top-level module or within the package).
 try:
     from dhcp_status import collect_dhcp_status
 except ImportError:  # package-context import (core.src.base_spoke-style dual path)
     from .dhcp_status import collect_dhcp_status
 
+# Logger for this module.
 logger = logging.getLogger("ProxmoxDeploy")
 
 # Rolling resource-sample window for the per-host cpu_1h_avg / mem_1h_avg the
@@ -46,31 +52,40 @@ _RESOURCE_SAMPLE_WINDOW = 3600.0
 
 def _s(v: Any) -> Optional[str]:
     """Coerce to a stripped str-or-None (mirrors the legacy ``str(...).strip() or None``)."""
+    # None stays None.
     if v is None:
         return None
+    # Convert to trimmed text; failures give None.
     try:
         out = str(v).strip()
     except Exception:
         return None
+    # Empty text becomes None.
     return out or None
 
 
 def _is_template(vm: Dict[str, Any]) -> bool:
+    """Return True if a VM looks like a template (flag, tag or name prefix)."""
+    # An explicit template flag wins.
     if bool(vm.get("is_template")):
         return True
+    # Template tags also count.
     tags = [str(t).lower() for t in (vm.get("tags") or [])]
     if any(t in ("template", "tmpl", "is-template") for t in tags):
         return True
+    # Otherwise check the name prefix.
     name = str(vm.get("name", "") or "").lower()
     return name.startswith(("template-", "tmpl-"))
 
 
 def _tag_usb(item: Any, hostname: str) -> Any:
     """Stamp a USB entry with its source host (mirrors the legacy tagged_usb_state)."""
+    # Copy dicts and add the host name if missing.
     if isinstance(item, dict):
         item = dict(item)
         item.setdefault("_agent_hostname", hostname)
         return item
+    # Non-dict entries pass through unchanged.
     return item
 
 
@@ -117,6 +132,7 @@ class ProxmoxDeploy:
     )
 
     def __init__(self) -> None:
+        """Start with empty per-host state, event buffers and resource-sample rings."""
         # hostname → per-host state entry (see ingest_telemetry for the shape).
         self.proxmox_states: Dict[str, Dict[str, Any]] = {}
         # Rolling event buffers per host (Phase E fills these; D1 keeps empty).
@@ -134,12 +150,15 @@ class ProxmoxDeploy:
         buffer) so a shut-down host stops being relayed to the hub. Returns True if
         the host was present. Used by the CS_PURGE_HOST command (operator deletes a
         VM Server row for an intentionally-off host)."""
+        # Trimmed hostname and whether it is known.
         hn = (hostname or "").strip()
         present = hn in self.proxmox_states
+        # Remove the host from every per-host store.
         self.proxmox_states.pop(hn, None)
         self.cpu_samples.pop(hn, None)
         self.mem_samples.pop(hn, None)
         self.events.pop(hn, None)
+        # Report whether it was there.
         return present
 
     # ── ingest ───────────────────────────────────────────────────────────────
@@ -152,12 +171,15 @@ class ProxmoxDeploy:
         flag, normalize USB state, compute counts, and store the host summary.
         Returns the stored entry.
         """
+        # No hostname: drop the frame.
         if not hostname:
             logger.warning("CS_INGEST_TELEMETRY: missing hostname — dropping")
             return {}
+        # Treat a missing body as empty; note the time.
         body = body or {}
         now = time.time()
 
+        # VM list, node info and the three USB lists from the frame.
         raw_vms = body.get("vms", []) or []
         node = body.get("node", {}) or {}
         usb_state = body.get("usb_state", []) or []
@@ -183,6 +205,7 @@ class ProxmoxDeploy:
             int(x) for x in (body.get("reclone_vmids") or []) if x is not None
         }
 
+        # Copy each VM, tag its host, and add template and default fields.
         enriched_vms: List[Dict[str, Any]] = []
         for v in raw_vms:
             v = dict(v or {})
@@ -196,27 +219,34 @@ class ProxmoxDeploy:
             v.setdefault("pci_passthrough_addrs", [])
             v.setdefault("prov_status", "")
             # Stamp the live transient state (deleting wins over provisioning).
+            # The VM's id as an int (None if invalid).
             try:
                 _vmid = int(v.get("vmid")) if v.get("vmid") is not None else None
+            # Invalid id.
             except (TypeError, ValueError):
                 _vmid = None
+            # Mark the VM's current action: tearing down, recloning or provisioning.
             if _vmid is not None and _vmid in deleting_vmids:
                 v["prov_status"] = "tearing_down"
             elif _vmid is not None and _vmid in reclone_vmids:
                 v["prov_status"] = "recloning"
             elif _vmid is not None and _vmid in provisioning_vmids:
                 v["prov_status"] = "provisioning"
+            # Keep the enriched VM.
             enriched_vms.append(v)
 
+        # Non-template VMs and the running ones among them.
         non_template = [v for v in enriched_vms if not v.get("is_template")]
         running = [v for v in non_template if str(v.get("status", "")).lower() == "running"]
 
+        # VMID range as ints (None if missing or invalid).
         vr = body.get("vmid_range")
         vmid_range = None
         if isinstance(vr, dict):
             try:
                 vmid_range = {"start": int(vr.get("start", 0) or 0),
                               "end":   int(vr.get("end", 0) or 0)}
+            # Invalid numbers: no range.
             except (TypeError, ValueError):
                 vmid_range = None
 
@@ -227,13 +257,16 @@ class ProxmoxDeploy:
         # delay's location is visible.
         agent_telemetry = dict(body.get("telemetry") or {})
         agent_telemetry["ingested_at"] = now
+        # Work out the agent-to-spoke delay when the agent sent its timestamp.
         try:
             _gen = agent_telemetry.get("gen_ts")
             if isinstance(_gen, (int, float)):
                 agent_telemetry["agent_to_spoke_lag_s"] = round(max(0.0, now - _gen), 1)
+        # Lag is diagnostic only; ignore errors.
         except Exception:  # noqa: BLE001
             pass
 
+        # Build the host's state entry.
         entry: Dict[str, Any] = {
             "connected":        True,
             "last_seen":        now,
@@ -300,10 +333,12 @@ class ProxmoxDeploy:
         self._record_resource_samples(hostname, node, now)
         entry["cpu_1h_avg"] = self._resource_1h_average(self.cpu_samples.get(hostname, []))
         entry["mem_1h_avg"] = self._resource_1h_average(self.mem_samples.get(hostname, []))
+        # Store the entry and log a summary.
         self.proxmox_states[hostname] = entry
         logger.debug("CS_INGEST_TELEMETRY: %s — %d VMs (%d running, %d templates), %d USB",
                      hostname, len(enriched_vms), len(running),
                      len(enriched_vms) - len(non_template), len(usb_state))
+        # Return the stored entry.
         return entry
 
     # ── resource samples (cpu_1h_avg / mem_1h_avg) ───────────────────────────
@@ -319,17 +354,22 @@ class ProxmoxDeploy:
         the mean always reflects the last hour. Best-effort: a missing/zero
         field just skips that sample rather than raising.
         """
+        # Need a hostname and a node dict.
         if not hostname or not isinstance(node, dict):
             return
+        # Samples older than this are dropped.
         cutoff = now - _RESOURCE_SAMPLE_WINDOW
+        # Record a CPU sample and trim the ring.
         cpu_pct = node.get("cpu_percent")
         if cpu_pct is not None:
             try:
                 ring = self.cpu_samples.setdefault(hostname, [])
                 ring.append((now, float(cpu_pct)))
                 ring[:] = [(ts, v) for ts, v in ring if ts >= cutoff]
+            # Bad values are skipped.
             except (TypeError, ValueError):
                 pass
+        # Record a memory % sample when used and total are valid.
         mem_used = node.get("mem_used_kb")
         mem_total = node.get("mem_total_kb")
         try:
@@ -340,8 +380,10 @@ class ProxmoxDeploy:
                     ring = self.mem_samples.setdefault(hostname, [])
                     ring.append((now, mem_pct))
                     ring[:] = [(ts, v) for ts, v in ring if ts >= cutoff]
+            # No memory data: just make sure the ring exists.
             else:
                 self.mem_samples.setdefault(hostname, [])
+        # Bad values are skipped.
         except (TypeError, ValueError, ZeroDivisionError):
             pass
 
@@ -356,12 +398,16 @@ class ProxmoxDeploy:
         Details header (CPU 1h / Mem 1h) shows e.g. ``42.17`` not
         ``42.173333333333334``.
         """
+        # No samples: no average.
         if not samples:
             return None
+        # Keep samples from the last hour.
         cutoff = time.time() - _RESOURCE_SAMPLE_WINDOW
         recent = [v for ts, v in samples if ts >= cutoff]
+        # None in the last hour: no average.
         if not recent:
             return None
+        # Mean rounded to 2 decimals.
         return round(sum(recent) / len(recent), 2)
 
     # ── tier join (client → VM → USB dongle) ─────────────────────────────────
@@ -373,18 +419,22 @@ class ProxmoxDeploy:
         hostname) maps a hostname to its ``vmid``. Membership of that vmid in
         ``usb_vmids`` is what makes a client T2. Built once per request so the
         per-client resolve is O(1)."""
+        # Collect VM ids holding a dongle and map each VM name to its id.
         usb_vmids: set = set()
         name_to_vmid: Dict[str, str] = {}
         for st in self.proxmox_states.values():
+            # Every VM id that has a USB dongle assigned.
             for u in (st.get("usb_state") or []):
                 v = u.get("vmid")
                 if v not in (None, ""):
                     usb_vmids.add(str(v))
+            # Map each lowercase VM name to its id (first one wins).
             for vm in (st.get("vms") or []):
                 nm = str(vm.get("name") or "").strip().lower()
                 v = vm.get("vmid")
                 if nm and v not in (None, ""):
                     name_to_vmid.setdefault(nm, str(v))
+        # Return both maps.
         return usb_vmids, name_to_vmid
 
     def name_to_host(self) -> Dict[str, str]:
@@ -395,12 +445,14 @@ class ProxmoxDeploy:
         via its hosting server's pxmx_site_map entry. ``setdefault`` keeps the
         first host seen for a name (a client hostname maps to one VM on one
         host in practice)."""
+        # Map each lowercase VM name to the host it runs on (first one wins).
         name_to_host: Dict[str, str] = {}
         for host, st in self.proxmox_states.items():
             for vm in (st.get("vms") or []):
                 nm = str(vm.get("name") or "").strip().lower()
                 if nm:
                     name_to_host.setdefault(nm, str(host))
+        # Return the map.
         return name_to_host
 
     def vm_tier_index(self) -> Dict[str, str]:
@@ -411,6 +463,7 @@ class ProxmoxDeploy:
         row so csClassifyClient renders the correct badge (T3 especially, which has
         no USB dongle). VMs the agent couldn't classify are absent → the row keeps
         the has_usb-derived default (T2 for a dongle, else T1)."""
+        # Collect each VM's tier when the agent supplied a valid one.
         tiers: Dict[str, str] = {}
         for st in self.proxmox_states.values():
             for vm in (st.get("vms") or []):
@@ -418,6 +471,7 @@ class ProxmoxDeploy:
                 t = vm.get("tier")
                 if v not in (None, "") and t in ("t1", "t2", "t3"):
                     tiers[str(v)] = t
+        # Return the map.
         return tiers
 
     def vm_health_index(self) -> Dict[str, str]:
@@ -428,6 +482,7 @@ class ProxmoxDeploy:
         builders map hostname → vmid → this state and stamp it on the row so the
         Hub UI can flag e.g. "USB present but no driver loaded". VMs with no probe
         data are absent (None on the row)."""
+        # Collect each VM's health state when the agent supplied one.
         health: Dict[str, str] = {}
         for st in self.proxmox_states.values():
             for vm in (st.get("vms") or []):
@@ -435,6 +490,7 @@ class ProxmoxDeploy:
                 h = vm.get("health")
                 if v not in (None, "") and h:
                     health[str(v)] = h
+        # Return the map.
         return health
 
     @staticmethod
@@ -453,9 +509,11 @@ class ProxmoxDeploy:
         NOTE: this is the USB-passthrough → T2 signal only. The full T1/T2/T3
         split (T1 = physical or PCI passthrough 1912:0015; T3 = a specific USB
         VID:PID) is a separate change — see memory todo-delete-gate-tier-t2-only."""
+        # The client's VM id, whether that VM holds a dongle, and the client's own report.
         vmid = name_to_vmid.get(str(hostname).strip().lower())
         joined = bool(vmid and vmid in usb_vmids)   # hypervisor truth
         reported = bool(client.get("has_usb"))       # fallback for non-VM clients
+        # Either source makes it T2.
         return vmid, (joined or reported)
 
     # ── relay payload ────────────────────────────────────────────────────────
@@ -464,6 +522,7 @@ class ProxmoxDeploy:
         """The per-host ``proxmox`` block the VM Server view reads (vm_count/
         usb_count come from here). Falls back to per-entry keys for any field
         a host hasn't reported yet."""
+        # Copy just the summary keys.
         return {k: st.get(k) for k in self._SUMMARY_KEYS}
 
     def relay_payload(self, spoke_id: str, spoke_name: str = "",
@@ -478,17 +537,22 @@ class ProxmoxDeploy:
         ``STALE_SECS``) are marked disconnected but retained so a briefly-offline
         agent keeps its row until it reconnects or ages out.
         """
+        # Hosts silent for longer than this are marked disconnected.
         STALE_SECS = 180
+        # Output lists and the most recently seen host.
         now = time.time()
         hosts: List[Dict[str, Any]] = []
         all_vms: List[Dict[str, Any]] = []
         all_usb: List[Any] = []
         freshest: Optional[Dict[str, Any]] = None
 
+        # Build one entry per host.
         for hn, st in self.proxmox_states.items():
+            # Treat the host as connected only if it reported recently.
             st = st or {}
             age = now - float(st.get("last_seen", 0) or 0)
             connected = bool(st.get("connected")) and age <= STALE_SECS
+            # Summary with the live connected flag, plus the host's VMs and USB devices.
             summary = self._host_summary(st)
             summary["connected"] = connected
             vms = st.get("vms", []) or []
@@ -511,6 +575,7 @@ class ProxmoxDeploy:
                 "relayed_at":    now,
                 "relay_age_s":   round(age, 1),
             })
+            # Track the most recently seen host.
             if freshest is None or float(st.get("last_seen", 0) or 0) > \
                     float((freshest or {}).get("last_seen", 0) or 0):
                 freshest = {**st, "last_seen": st.get("last_seen", 0)}
@@ -524,6 +589,7 @@ class ProxmoxDeploy:
             primary_hostname = (freshest.get("node", {}) or {}).get("hostname") or \
                 next(iter(self.proxmox_states), "")
 
+        # Assemble the frame.
         payload: Dict[str, Any] = {
             "spoke_id":    spoke_id,
             "spoke_name":  spoke_name or spoke_id,
@@ -556,6 +622,7 @@ class ProxmoxDeploy:
             # that needs live status must offload it itself.
             "dhcp":        dhcp if dhcp is not None else {},
         }
+        # Return the frame.
         return payload
 
     # ── event ingest stubs (Phase E fills these) ─────────────────────────────
@@ -567,8 +634,10 @@ class ProxmoxDeploy:
         Recorded best-effort; ``command_result`` is ALSO used by the cs spoke to
         close the deferred long-op ack loop (``CS_ACK_COMMAND``), and Phase E
         wires the buffered events into the broadcaster for live UI updates."""
+        # No hostname: nothing to store.
         if not hostname:
             return
+        # Add the event to the host's buffer.
         buf = self.events.setdefault(hostname, [])
         buf.append({"ts": time.time(), "kind": kind, "data": data or {}})
         # keep the last 200 per host

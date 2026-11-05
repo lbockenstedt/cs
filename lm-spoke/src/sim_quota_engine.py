@@ -35,19 +35,25 @@ takes a client not already running an exclusive sim; a multi-capable quota may
 stack onto an engine-owned client (and onto a client running an exclusive sim).
 A human manual pin on a sim flag the engine didn't set is never touched.
 """
+# Allow modern type-hint syntax without evaluating annotations at import time.
 from __future__ import annotations
 
+# Async loop, JSON persistence, logging, random picks, timing and ids.
 import asyncio
 import json
 import logging
 import random
 import time
 import uuid
+# Filesystem paths for the persisted state files.
 from pathlib import Path
+# Type hints only.
 from typing import Any, Dict, List, Optional, Tuple
 
+# Parses a quota's alert source.
 from sim_quota import parse_alert_source
 
+# Logger for this module.
 logger = logging.getLogger("SimQuotaEngine")
 
 HARVEST_WINDOW_S = 1800.0        # a client seen within the last 30 min is
@@ -133,6 +139,7 @@ def _default_qt_exclude_sims() -> set:
     bad dongle we DO want to shed. Falls back to the literal
     ``QT_EXCLUDE_SIMS_DEFAULT`` if ``SIM_META`` can't be imported.
     """
+    # Exclusive sims from SIM_META, minus the DNS sims.
     try:
         from sim_quota import SIM_META
         excl = {s for s, m in SIM_META.items()
@@ -140,6 +147,7 @@ def _default_qt_exclude_sims() -> set:
         excl -= set(QT_EXCLUDE_NONISOLATING_SIMS)
         if excl:
             return excl
+    # Fall back to the literal list.
     except Exception:  # noqa: BLE001
         pass
     return set(QT_EXCLUDE_SIMS_DEFAULT)
@@ -147,6 +155,7 @@ def _default_qt_exclude_sims() -> set:
 
 
 def _quota_key(q: Dict[str, Any]) -> str:
+    """Return the ledger key for a quota (presence, untethered sim, or alert-driven)."""
     # Mirrors sim_quota.quota_dedup_key: a presence quota (sim_id empty —
     # "Clients Associated", N clients homed to a site, no sim) is keyed by site
     # alone, so it never collides with an alert-driven sim quota's ledger entry.
@@ -177,6 +186,8 @@ class SimQuotaEngine:
     """Owns the engine ledger + reconcile loop for one cs spoke."""
 
     def __init__(self, spoke) -> None:
+        """Set up the ledger, per-sweep caches and persisted state, then load it from disk."""
+        # The spoke this engine works for.
         self.spoke = spoke
         # Ledger: quota_key -> { "sim_id", "site", "clients": { hostname: from_site } }
         # from_site is the client's pre-assignment site (for Chunk 3 revert);
@@ -236,6 +247,7 @@ class SimQuotaEngine:
         self._dot1x: Dict[str, Dict[str, Any]] = {}
         self._dot1x_last_sync: float = 0.0
         self._dot1x_path: Optional[Path] = None
+        # Work out where each persisted state file lives.
         try:
             data_dir = Path(getattr(spoke, "data_dir", None) or ".")
             data_dir.mkdir(parents=True, exist_ok=True)
@@ -244,8 +256,10 @@ class SimQuotaEngine:
             self._stacked_path = data_dir / "sim_quota_stacked.json"
             self._harvest_path = data_dir / "sim_quota_harvest.json"
             self._dot1x_path = data_dir / "sim_quota_dot1x.json"
+        # No data folder: run without a persisted ledger.
         except Exception:  # noqa: BLE001
             self._ledger_path = None
+        # Load the persisted state.
         self._load_ledger()
         self._load_displaced()
         self._load_stacked()
@@ -254,8 +268,11 @@ class SimQuotaEngine:
 
     # ── ledger persistence ───────────────────────────────────────────────────
     def _load_ledger(self) -> None:
+        """Load the ledger from disk, starting empty if it is missing or bad."""
+        # Nothing to load.
         if not self._ledger_path or not self._ledger_path.exists():
             return
+        # Read the file; a bad file means an empty ledger.
         try:
             self._ledger = json.loads(self._ledger_path.read_text(encoding="utf-8")) or {}
             if not isinstance(self._ledger, dict):
@@ -265,20 +282,27 @@ class SimQuotaEngine:
             self._ledger = {}
 
     def _save_ledger(self) -> None:
+        """Save the ledger and the other persisted state to disk."""
+        # Nothing to save to.
         if not self._ledger_path:
             return
+        # Write the ledger; failures are logged.
         try:
             self._ledger_path.write_text(
                 json.dumps(self._ledger, indent=2, default=str), encoding="utf-8")
         except Exception as exc:  # noqa: BLE001
             logger.warning("SimQuotaEngine: ledger save failed: %s", exc)
+        # Save the other state files too.
         self._save_displaced()
         self._save_stacked()
         self._save_harvest()
 
     def _load_stacked(self) -> None:
+        """Load the stacked-sim state and rotation clock from disk."""
+        # Nothing to load.
         if not self._stacked_path or not self._stacked_path.exists():
             return
+        # Read the file; a bad file means no stacked sims.
         try:
             raw = json.loads(self._stacked_path.read_text(encoding="utf-8")) or {}
             self._stacked = {str(h): set(v or [])
@@ -289,8 +313,11 @@ class SimQuotaEngine:
             self._stacked = {}
 
     def _save_stacked(self) -> None:
+        """Save the stacked-sim state and rotation clock to disk."""
+        # Nothing to save to.
         if not self._stacked_path:
             return
+        # Write the file; failures are logged.
         try:
             self._stacked_path.write_text(json.dumps(
                 {"stacked": {h: sorted(v) for h, v in self._stacked.items() if v},
@@ -299,8 +326,11 @@ class SimQuotaEngine:
             logger.warning("SimQuotaEngine: stacked save failed: %s", exc)
 
     def _load_harvest(self) -> None:
+        """Load the last-harvest times from disk."""
+        # Nothing to load.
         if not self._harvest_path or not self._harvest_path.exists():
             return
+        # Read the file; a bad file means no cooldowns.
         try:
             raw = json.loads(self._harvest_path.read_text(encoding="utf-8")) or {}
             self._last_harvest = {str(h): float(t) for h, t in raw.items()}
@@ -309,8 +339,11 @@ class SimQuotaEngine:
             self._last_harvest = {}
 
     def _save_harvest(self) -> None:
+        """Save the last-harvest times to disk."""
+        # Nothing to save to.
         if not self._harvest_path:
             return
+        # Write the file; failures are logged.
         try:
             self._harvest_path.write_text(
                 json.dumps(self._last_harvest, indent=2), encoding="utf-8")
@@ -318,8 +351,11 @@ class SimQuotaEngine:
             logger.warning("SimQuotaEngine: harvest-cooldown save failed: %s", exc)
 
     def _load_dot1x(self) -> None:
+        """Load the 802.1X account state from disk."""
+        # Nothing to load.
         if not self._dot1x_path or not self._dot1x_path.exists():
             return
+        # Read the file; a bad file means no accounts.
         try:
             raw = json.loads(self._dot1x_path.read_text(encoding="utf-8")) or {}
             self._dot1x = {str(h): dict(v) for h, v in raw.items() if isinstance(v, dict)}
@@ -328,16 +364,22 @@ class SimQuotaEngine:
             self._dot1x = {}
 
     def _save_dot1x(self) -> None:
+        """Save the 802.1X account state to disk."""
+        # Nothing to save to.
         if not self._dot1x_path:
             return
+        # Write the file; failures are logged.
         try:
             self._dot1x_path.write_text(json.dumps(self._dot1x, indent=2), encoding="utf-8")
         except Exception as exc:  # noqa: BLE001
             logger.warning("SimQuotaEngine: dot1x state save failed: %s", exc)
 
     def _load_displaced(self) -> None:
+        """Load the displaced (engine-turned-off) sims from disk."""
+        # Nothing to load.
         if not self._displaced_path or not self._displaced_path.exists():
             return
+        # Read the file; a bad file means nothing displaced.
         try:
             raw = json.loads(self._displaced_path.read_text(encoding="utf-8")) or {}
             if isinstance(raw, dict):
@@ -347,8 +389,11 @@ class SimQuotaEngine:
             self._displaced = {}
 
     def _save_displaced(self) -> None:
+        """Save the displaced sims to disk."""
+        # Nothing to save to.
         if not self._displaced_path:
             return
+        # Write the file; failures are logged.
         try:
             self._displaced_path.write_text(
                 json.dumps({h: sorted(v) for h, v in self._displaced.items() if v}, indent=2),
@@ -358,26 +403,32 @@ class SimQuotaEngine:
 
     # ── client state helpers ─────────────────────────────────────────────────
     def _registry(self):
+        """Return the spoke's client registry, or None."""
         return getattr(self.spoke, "registry", None)
 
     def _ignored_hostnames(self) -> set:
         """Hostnames the operator flagged to ignore (hub_config.ignored_hostnames)
         — e.g. a client being spun up or decommissioned. Excluded from the pool,
         harvest, counts, and ledger so it's never assigned or shown."""
+        # Combine the pushed list and the hub-config copy, lower-cased.
         out: set = set()
         try:
             ls = self.spoke.local_store
             names = list(ls.get_ignored_hostnames() or [])          # pushed via _pool_config
             names += list((ls.get_hub_config() or {}).get("ignored_hostnames") or [])  # hub-SoT copy
             out = {str(h).strip().lower() for h in names if str(h).strip()}
+        # Errors mean nothing is ignored.
         except Exception:  # noqa: BLE001
             return set()
         return out
 
     def _all_clients(self) -> Dict[str, Dict[str, Any]]:
+        """Return every registered client except ignored hostnames."""
+        # Read all clients.
         reg = self._registry()
         allc = reg.get_all() if reg is not None else {}
         ignored = self._ignored_hostnames()
+        # Drop ignored hostnames.
         if not ignored:
             return allc
         return {h: c for h, c in allc.items() if str(h).strip().lower() not in ignored}
@@ -391,20 +442,24 @@ class SimQuotaEngine:
         gateway_state latch) — only a drop confirmed continuously for a full
         OFFLINE_TTL_S (60 min) marks a client as genuinely not working, and it
         stays excluded until it proves an equally continuous 60 min back up."""
+        # Must have been seen recently.
         ls = c.get("last_seen")
         if not (ls and (now - float(ls)) < HARVEST_WINDOW_S):
             return False
+        # And not have a confirmed gateway drop.
         return not self._is_gateway_down_confirmed(c)
 
     def _gateway_exempt(self, c: Dict[str, Any]) -> bool:
         """True while the client runs a connectivity-breaking sim (see
         GATEWAY_EXEMPT_SIMS) — no gateway is that sim's intended effect, so a
         gateway drop while running one is never held against the client."""
+        # Get the names of the running sims.
         sims = c.get("active_simulations")
         try:
             keys = set(sims.keys()) if isinstance(sims, dict) else set(sims or [])
         except (TypeError, ValueError):
             return False
+        # Exempt if any is connectivity-breaking.
         return bool(keys & GATEWAY_EXEMPT_SIMS)
 
     def _is_gateway_down_confirmed(self, c: Dict[str, Any]) -> bool:
@@ -415,8 +470,10 @@ class SimQuotaEngine:
         so this needs no ``now`` — the 60-min confirmation already happened
         (or hasn't) by the time it's set. Exempt while running a
         connectivity-breaking sim."""
+        # No confirmed drop.
         if not c.get("gateway_confirmed_down"):
             return False
+        # Ignore the drop while a connectivity-breaking sim runs.
         return not self._gateway_exempt(c)
 
     def _refresh_host_index(self) -> None:
@@ -424,12 +481,14 @@ class SimQuotaEngine:
         are guarded: a spoke with no deploy (tests / pre-agent mode) or no
         pxmx_site_map yields empty maps and _effective_site falls through to the
         bucket-default wsite path."""
+        # Client-to-host index from the deploy module.
         deploy = getattr(self.spoke, "deploy", None)
         try:
             self._name_to_host = deploy.name_to_host() if deploy is not None else {}
         except Exception as exc:  # noqa: BLE001
             logger.debug("SimQuotaEngine: name_to_host failed: %s", exc)
             self._name_to_host = {}
+        # Server-to-site map.
         try:
             self._pxmx_site_map = self.spoke.local_store.get_pxmx_site_map() or {}
         except Exception as exc:  # noqa: BLE001
@@ -460,6 +519,7 @@ class SimQuotaEngine:
         """``{host: {vmid_str: bus_path}}`` from the deploy's per-host
         ``usb_state`` snapshot. The host key matches ``_name_to_host``'s value
         (= the agent_id for ``send_to_agent``)."""
+        # Build the VMID-to-bus map for each host.
         out: Dict[str, Dict[str, str]] = {}
         for host, st in getattr(deploy, "proxmox_states", {}).items():
             m: Dict[str, str] = {}
@@ -471,10 +531,13 @@ class SimQuotaEngine:
         return out
 
     def _qt_exclude_sims(self) -> set:
+        """Return the sims that exempt a dongle from quarantine (operator list or the default)."""
+        # Read the operator's list.
         try:
             csc = self.spoke.local_store.get_central_sites_config() or {}
         except Exception:  # noqa: BLE001
             return _default_qt_exclude_sims()
+        # Use the default when none is set.
         vals = csc.get("qt_exclude_sims")
         if not vals:
             return _default_qt_exclude_sims()
@@ -495,16 +558,19 @@ class SimQuotaEngine:
         alarm engine.
         """
         try:
+            # Need the deploy module.
             deploy = getattr(self.spoke, "deploy", None)
             if deploy is None:
                 self._qt_telemetry = {}
                 return
+            # Exclusion sims and grace period.
             exclude = self._qt_exclude_sims()
             try:
                 grace = float((self.spoke.local_store.get_central_sites_config()
                                or {}).get("qt_grace_s") or QT_GRACE_S_DEFAULT)
             except Exception:  # noqa: BLE001
                 grace = QT_GRACE_S_DEFAULT
+            # VM indexes.
             _, name_to_vmid = deploy.usb_vmid_index()
             host_vm_bus = self._host_vm_bus_index(deploy)
             # Per-VM in-guest health from the pxmx agent's QGA probe (already
@@ -518,14 +584,17 @@ class SimQuotaEngine:
                 health_by_vmid = _hidx() if callable(_hidx) else {}
             except Exception:  # noqa: BLE001
                 health_by_vmid = {}
+            # Per-host and per-bus counters, plus the shed candidates.
             per_host_total: Dict[str, int] = {}
             per_host_failed: Dict[str, int] = {}
             per_bus_fail: Dict[str, int] = {}
             candidates: List[Tuple[str, Any, str, Optional[str]]] = []
             seen_t2: set = set()
+            # Check each T2 (USB dongle) client.
             for hostname, c in self._all_clients().items():
                 if str(c.get("tier") or "").lower() != "t2":
                     continue
+                # Restart the grace clock when the client's target SSID changes.
                 hkey = str(hostname).strip().lower()
                 seen_t2.add(hkey)
                 target = self._qt_target(c)
@@ -535,6 +604,7 @@ class SimQuotaEngine:
                     prev = self._qt_ssid_since.get(hkey)
                     if prev is None or prev[0] != target:
                         self._qt_ssid_since[hkey] = (target, now)
+                # Count the client against its host.
                 host = self._name_to_host.get(hkey)
                 if host:
                     per_host_total[host] = per_host_total.get(host, 0) + 1
@@ -545,6 +615,7 @@ class SimQuotaEngine:
                     continue
                 if c.get("ip") or c.get("connected_ssid"):
                     continue
+                # Skip clients that are offline.
                 ls = c.get("last_seen")
                 if not ls or (now - float(ls)) > QT_ONLINE_S:
                     continue  # offline (no heartbeat over the backend net)
@@ -552,11 +623,13 @@ class SimQuotaEngine:
                 # or the config carries none) — a config gap, never a dongle fault.
                 if target is None:
                     continue
+                # Grace runs from the latest of first seen, engine start and target change.
                 fs = c.get("first_seen") or ls
                 anchor = max(float(fs), self._qt_started_at,
                              self._qt_ssid_since[hkey][1])
                 if (now - anchor) < grace:
                     continue  # within the grace window — give it time to connect
+                # Sims the client is running.
                 active = set(c.get("active_simulations") or [])
                 # A configured-on exclusion sim explains the no-IP even before
                 # (or without) the client echoing it back in active_simulations —
@@ -569,6 +642,7 @@ class SimQuotaEngine:
                 cfg_excl_on = {s for s in exclude
                                if str(cfg.get(s) or "").strip().lower() == "on"}
                 intended = active | cfg_excl_on
+                # Need the VM id.
                 vmid = name_to_vmid.get(hkey)
                 if not vmid:
                     continue
@@ -588,12 +662,14 @@ class SimQuotaEngine:
                 # newly shed a client.
                 if not radio_dead and intended and intended.issubset(exclude):
                     continue
+                # Count the failure and add it as a candidate.
                 bus = (host_vm_bus.get(host) or {}).get(str(vmid))
                 if host:
                     per_host_failed[host] = per_host_failed.get(host, 0) + 1
                 if bus:
                     per_bus_fail[bus] = per_bus_fail.get(bus, 0) + 1
                 candidates.append((hostname, vmid, host, bus))
+            # Forget SSID clocks for clients that are gone.
             for k in [k for k in self._qt_ssid_since if k not in seen_t2]:
                 del self._qt_ssid_since[k]
             # Storm guard: >20% per host failed → bulk alarm; suppress shed there.
@@ -603,6 +679,7 @@ class SimQuotaEngine:
                 if total >= QT_BULK_MIN_HOST and (failed / total) > QT_BULK_THRESHOLD:
                     bulk_hosts.append(host)
             bulk_set = set(bulk_hosts)
+            # Telemetry for the hub's alarm engine.
             self._qt_telemetry = {
                 "ts": now,
                 "per_host": {h: {"failed": per_host_failed.get(h, 0),
@@ -611,6 +688,7 @@ class SimQuotaEngine:
                 "per_bus_fails": dict(per_bus_fail),
                 "bulk_hosts": bulk_hosts,
             }
+            # Shed each candidate unless its host has a bulk failure.
             for hostname, vmid, host, bus in candidates:
                 if host in bulk_set:
                     logger.warning("dongle-quarantine: bulk failure on host %s "
@@ -626,15 +704,18 @@ class SimQuotaEngine:
                 if host:
                     self._qt_shed_recent.setdefault(host, {})[hostname] = now
                 asyncio.create_task(self._qt_shed(hostname, vmid, host, bus, now))
+        # Log sweep errors without stopping the loop.
         except Exception as exc:  # noqa: BLE001 — a sweep must not kill the loop
             logger.warning("dongle-quarantine sweep failed: %s", exc)
 
     async def _qt_shed(self, hostname: str, vmid: Any, host: Optional[str],
                        bus: Optional[str], now: float) -> None:
         """Dispatch quarantine_dongle_and_destroy to the client's pxmx agent."""
+        # Need a control plane and host.
         cp = getattr(self.spoke, "control_plane", None)
         if cp is None or not host:
             return
+        # Ask the agent to quarantine the bus and destroy the VM.
         try:
             vid = int(vmid) if str(vmid).isdigit() else vmid
             await cp.send_to_agent(
@@ -645,6 +726,7 @@ class SimQuotaEngine:
                  "cs_cmd_id": uuid.uuid4().hex},
                 agent_id=host,
                 timeout=getattr(self.spoke, "_relay_timeout_long", 60.0))
+            # Record the shed and log it.
             self._qt_shed_recent.setdefault(host, {})[hostname] = now
             logger.warning("dongle-quarantine: shed %s (vmid %s, bus %s, host %s)",
                            hostname, vmid, bus, host)
@@ -659,9 +741,11 @@ class SimQuotaEngine:
         """The (wsite, ssid) this client is supposed to join — override first,
         then its reported config — or None when it has no usable SSID (blank or
         the "-" a blank site+ssid renders to under site_based_ssid)."""
+        # Override first, then reported config.
         ov = c.get("overrides") or {}
         cfg = c.get("config") or {}
         ssid = str(ov.get("ssid") or cfg.get("ssid") or "").strip()
+        # No usable SSID.
         if not ssid or ssid == "-":
             return None
         wsite = str(ov.get("wsite") or cfg.get("wsite") or "").strip()
@@ -671,15 +755,18 @@ class SimQuotaEngine:
         """True when a human explicitly set this sim flag in the client's
         user-overrides.conf ``[username]`` section (on OR off). The engine leaves
         those clients alone for that sim."""
+        # Need user overrides and a sim id.
         uc = getattr(self, "_user_conf", None)
         if uc is None or not sim_id:
             return False
+        # Look up the client's user section for this sim flag.
         try:
             from sim_config import username_for
             un = username_for(hostname)
             if uc.has_section(un):
                 v = str(uc.get(un, sim_id, fallback="")).strip().lower()
                 return v in ("on", "off")
+        # Errors mean not pinned.
         except Exception:  # noqa: BLE001
             return False
         return False
@@ -701,6 +788,7 @@ class SimQuotaEngine:
         scale + RF isolation); without it, clients fall back to bucket wsite
         and you get one entire-tenant pool. The pxmx-server step is what lets a
         quota's pool match the chamber boundary instead of the bucket hash."""
+        # An override wsite wins.
         ov = c.get("overrides") or {}
         w = ov.get("wsite")
         if w:
@@ -716,11 +804,13 @@ class SimQuotaEngine:
         # host index is refreshed once per reconcile sweep. A TENANT_POOL server
         # is NOT a physical site — its clients fall through to the wsite that
         # placement assigns (or the bucket default) so they can be placed anywhere.
+        # The hosting server's real site, if mapped.
         host = self._name_to_host.get(str(hostname).strip().lower())
         if host:
             s = self._pxmx_site_map.get(host)
             if s and s != TENANT_POOL:
                 return str(s)
+        # Else the client's bucket wsite.
         cfg = c.get("config") or {}
         w = cfg.get("wsite")
         if w:
@@ -743,6 +833,7 @@ class SimQuotaEngine:
     def _physical_site_of(self, hostname: str) -> str:
         """The hosting pxmx server's REAL assigned site (RF chamber), or "" when
         the server is in the tenant pool or unmapped. Uses the per-sweep index."""
+        # The hosting server's mapped site, unless it is the tenant pool.
         host = self._name_to_host.get(str(hostname).strip().lower())
         if host:
             s = self._pxmx_site_map.get(host)
@@ -754,6 +845,7 @@ class SimQuotaEngine:
         """True when the client's hosting server is in the tenant-wide pool (or
         unmapped) — i.e. it is assignable to any site/SSID by placement rather
         than physically pinned to one chamber."""
+        # Unmapped or tenant-pool servers are assignable.
         host = self._name_to_host.get(str(hostname).strip().lower())
         if not host:
             return True  # unmapped server → assignable (tenant pool)
@@ -788,9 +880,11 @@ class SimQuotaEngine:
         client records the client's natural site, so it's recognized as a fellow
         re-homer and releasing one quota won't revert ``wsite`` out from under
         the other. A manual operator ``wsite`` override is preserved on revert."""
+        # Check any wsite override.
         ov = c.get("overrides") or {}
         ov_wsite = str(ov.get("wsite") or "")
         if ov_wsite:
+            # Sites of ledger entries that own this client.
             owning_sites = {str(e.get("site") or "")
                             for e in self._ledger.values()
                             if hostname in (e.get("clients") or {})}
@@ -800,6 +894,8 @@ class SimQuotaEngine:
         return self._site_without_override(hostname, c)
 
     def _has_sim_on(self, c: Dict[str, Any], sim_id: str) -> bool:
+        """True when ``sim_id`` is on for the client, by override or bucket default."""
+        # An explicit override decides.
         ov = c.get("overrides") or {}
         v = str(ov.get(sim_id, "")).strip().lower()
         if v == "on":
@@ -811,6 +907,8 @@ class SimQuotaEngine:
         return str(prof.get(sim_id, "")).strip().lower() == "on"
 
     def _engine_owned_clients(self) -> set:
+        """Return every hostname held by any ledger entry."""
+        # Collect clients from every ledger entry.
         out = set()
         for entry in self._ledger.values():
             for h in (entry.get("clients") or {}).keys():
@@ -821,6 +919,7 @@ class SimQuotaEngine:
         """The sim_ids the engine has set ON on this client (across every ledger
         entry it appears in — a multi-capable client can be packed under several
         quotas). Used to tell engine-set overrides from human manual pins."""
+        # Collect the sim id of each ledger entry holding this client.
         out = set()
         for entry in self._ledger.values():
             if hostname in (entry.get("clients") or {}):
@@ -830,11 +929,13 @@ class SimQuotaEngine:
         return out
 
     def _sim_multi(self, sim_id: str) -> bool:
+        """True when ``sim_id`` may share a client with other sims (stackable)."""
         # Authoritative per-sim shareable override (hub-pushed via sim_shareable)
         # WINS over the hardcoded SIM_META default — a sim set non-shareable can
         # never be stacked (Config → Sim Quotas → Simulation Sharing tile).
         # Uses the per-sweep caches set in reconcile; falls back to a live read
         # when called outside a sweep (behavior identical to the original).
+        # Use the hub's shareable setting if there is one.
         sh = getattr(self, "_sim_shareable", None)
         if sh is None:
             try:
@@ -843,6 +944,7 @@ class SimQuotaEngine:
                 sh = {}
         if sim_id in sh:
             return bool(sh[sim_id])
+        # Else the SIM_META default.
         meta = getattr(self, "_sim_meta", "unset")
         if meta == "unset":
             try:
@@ -857,6 +959,7 @@ class SimQuotaEngine:
     def _client_active_sims(self, c: Dict[str, Any]) -> set:
         """Sims currently ON for this client — override wins, else bucket default.
         ``off`` overrides suppress a bucket-default-on sim."""
+        # Known sim flags.
         flags = getattr(self, "_sim_meta_keys", None)
         if flags is None:
             try:
@@ -864,6 +967,7 @@ class SimQuotaEngine:
                 flags = list(SIM_META.keys())
             except Exception:  # noqa: BLE001
                 flags = []
+        # A sim is on when its override, or else its bucket default, is "on".
         ov = c.get("overrides") or {}
         cfg = c.get("config") or {}
         active = set()
@@ -910,10 +1014,12 @@ class SimQuotaEngine:
         turned off to preempt the client (harvest wins over drones) — also the
         engine's, NOT a human pin. Only an ``off`` that is engine-owned yet NOT in
         ``_displaced`` is a human who flipped an engine key off."""
+        # Engine-set sims, engine-owned keys and displaced sims.
         eng = self._engine_sims_for(hostname)
         engine_keys = set(c.get("engine_keys") or ())
         displaced = self._displaced.get(hostname) or set()
         ov = c.get("overrides") or {}
+        # Look for an on/off sim override the engine did not set.
         for k, v in ov.items():
             if k == "wsite" or k in eng:
                 continue
@@ -928,6 +1034,7 @@ class SimQuotaEngine:
     # ── per-quota client-tier policy (t1 = dedicated PCI, t2 = USB dongle) ────
     @staticmethod
     def _tier_of(c: Dict[str, Any]) -> str:
+        """Return the client's tier (t1, t2, t3 or empty)."""
         # Authoritative tier from the agent's passthrough classification, persisted
         # onto the registry client (record_tiers_batch) — t1/t2/t3 or "".
         return str((c or {}).get("tier") or "").lower()
@@ -942,10 +1049,12 @@ class SimQuotaEngine:
         """Tenant tier priority for quotas that did not pin a tier. Default
         't1_first' — use every available T1, fall back to T2 — which is the
         historical 'best' behaviour, so an unconfigured tenant is unchanged."""
+        # Read the tenant setting.
         try:
             csc = self.spoke.local_store.get_central_sites_config() or {}
         except Exception:  # noqa: BLE001
             return "t1_first"
+        # Unknown values fall back to t1_first.
         v = str(csc.get("tier_priority") or "").strip().lower()
         return v if v in self._TIER_PRIORITY_VALUES else "t1_first"
 
@@ -955,9 +1064,11 @@ class SimQuotaEngine:
         A quota that PINS t1/t2 always wins — the per-quota setting is an
         explicit operator decision and the tenant default must not override it.
         Only 'best' (unset) consults the default."""
+        # A pinned quota tier wins.
         rt = (req_tier or "best").strip().lower()
         if rt in ("t1", "t2"):
             return rt
+        # Otherwise apply the tenant default.
         pri = self._tier_priority()
         if pri == "t1_only":
             return "t1"
@@ -969,6 +1080,7 @@ class SimQuotaEngine:
         """Hard tier gate: a 't1'/'t2' quota admits ONLY that tier (underfill
         rather than degrade); 'best' admits all — ordering decides preference.
         t1_only/t2_only from the tenant default gate the same way."""
+        # Pinned tiers admit only that tier.
         eff = self._effective_tier(req_tier)
         if eff in ("t1", "t2"):
             return self._tier_of(c) == eff
@@ -978,6 +1090,7 @@ class SimQuotaEngine:
         """Ordering rank. 'best' → T1 first then T2; 'best_t2' (tenant
         t2_first) → T2 first then T1 — for a fleet that wants its T1 radios kept
         free for pinned quotas. Hard t1/t2 already filtered → uniform rank."""
+        # Only the "best" modes rank tiers.
         eff = self._effective_tier(req_tier)
         if eff not in ("best", "best_t2"):
             return 0
@@ -991,6 +1104,7 @@ class SimQuotaEngine:
         reported adapter inventory (``c["adapters"]``, from the heartbeat —
         see client_registry.apply_status). Empty set = no inventory reported
         yet (fresh client, or a client-sim build that predates this field)."""
+        # Collect wired/wireless from each adapter.
         media = set()
         for a in (c.get("adapters") or []):
             m = (a or {}).get("media_type")
@@ -1012,14 +1126,17 @@ class SimQuotaEngine:
         ineligible for wired/wireless sims (not "any" ones) until it does, so
         the reporting gap can't reproduce a wireless-only sim landing on a
         wired-only client."""
+        # No sim means no media requirement.
         if not sim_id:
             return True
+        # Look up the sim's required media.
         meta = getattr(self, "_sim_meta", None)
         if meta is None:
             try:
                 from sim_quota import SIM_META as meta
             except Exception:  # noqa: BLE001
                 return True
+        # "any" always qualifies.
         required = (meta.get(sim_id) or {}).get("media", "any")
         if required not in ("wired", "wireless"):
             return True
@@ -1028,8 +1145,10 @@ class SimQuotaEngine:
     def _client_supports_sim(self, c: Dict[str, Any], sim_id: str) -> bool:
         """Fail closed for platform/sim combinations clients explicitly report
         as unsupported."""
+        # Only auth_fail has platform limits.
         if (sim_id or "") != "auth_fail":
             return True
+        # Windows with EAP-TLS cannot run it.
         platform = str(c.get("platform") or "").lower()
         cfg = c.get("config") or {}
         dot1x_eap = str((cfg or {}).get("dot1x_eap") or "").lower()
@@ -1053,9 +1172,11 @@ class SimQuotaEngine:
 
         ``c`` is the client entry; omitted → no exemption (fail closed to the
         historical behaviour rather than silently exempting an unknown tier)."""
+        # Zero disables the cooldown.
         cd = float(getattr(self, "_harvest_cooldown_s", 0) or 0)
         if cd <= 0:
             return False
+        # T1 clients are exempt.
         if c is not None and self._tier_of(c) == "t1":
             return False
         return (now - float(self._last_harvest.get(hostname, 0.0))) < cd
@@ -1080,6 +1201,7 @@ class SimQuotaEngine:
           quotas in HUB mode — the whole pool looked "busy" and WPA/Max-Assoc/DNS
           quotas sat underfilled with no eligible client.
         """
+        # Basic checks: not already assigned, harvestable and not human-pinned.
         if hostname in assigned:
             return False
         if not self._is_harvestable(c, now):
@@ -1095,6 +1217,7 @@ class SimQuotaEngine:
         # matches — see _media_ok.
         if not self._media_ok(c, sim_id):
             return False
+        # Platform support.
         if not self._client_supports_sim(c, sim_id):
             return False
         # Harvest cooldown: a client that recently finished a harvest rests before
@@ -1124,10 +1247,12 @@ class SimQuotaEngine:
         None if it IS usable (in-site or re-homable). Read-only mirror of
         _pool_eligible + the tier/in_site/cross tests, for the Engine State
         diagnostic. Caller pre-filters to harvestable + not already assigned."""
+        # Human pins.
         if self._has_manual_sim_pin(hostname, c):
             return "human_pin"
         if sim_id and self._human_pinned_sim(hostname, sim_id):
             return "human_pin"
+        # Media, platform, cooldown and tier checks.
         if not self._media_ok(c, sim_id):
             return "media_mismatch"           # sim needs wired/wireless this client lacks
         if not self._client_supports_sim(c, sim_id):
@@ -1137,6 +1262,7 @@ class SimQuotaEngine:
             return "harvest_cooldown"
         if not self._tier_ok(c, req_tier):
             return "tier_mismatch"                # quota wants a tier this client isn't
+        # Exclusivity rules.
         if multi:
             if self._engine_exclusive_running(hostname):
                 return "exclusive_monopolized"   # ANOTHER quota's exclusive sim owns it
@@ -1161,6 +1287,11 @@ class SimQuotaEngine:
     # ── assign / release ─────────────────────────────────────────────────────
     async def _assign(self, hostname: str, sim_id: str, site: str,
                       cell: Optional[Dict[str, Any]] = None) -> None:
+        """Assign ``hostname`` to a quota by turning its sim on and re-homing it if needed.
+        Also turns off conflicting bucket-default exclusive sims and stacked sims,
+        and pins the cell's SSID when the quota targets a cell.
+        """
+        # Need a registry.
         reg = self._registry()
         if reg is None:
             return
@@ -1192,6 +1323,7 @@ class SimQuotaEngine:
             # tells it from a human "off". Human pins are excluded upstream
             # (_pool_eligible); engine-owned sims belong to other quotas (also
             # excluded), so this only suppresses a true bucket-default drone sim.
+            # Bucket-default exclusive sims to turn off.
             engine_owned = self._engine_sims_for(hostname)
             disp = [s for s in self._client_active_sims(c)
                     if s != sim_id and s not in engine_owned and not self._sim_multi(s)]
@@ -1219,6 +1351,7 @@ class SimQuotaEngine:
                 val = str(cell.get(src) or "").strip()
                 if val:
                     overrides[key] = val
+        # Write the overrides and log.
         if overrides:
             await self._engine_set(hostname, overrides)
         logger.info("SimQuotaEngine: assigned %s → sim=%s site=%s (from %s)",
@@ -1226,6 +1359,8 @@ class SimQuotaEngine:
 
     async def _release(self, hostname: str, sim_id: str, from_site: str,
                        quota_key: Optional[str] = None) -> None:
+        """Release ``hostname`` from a quota: remove its sim flag and restore its site."""
+        # Need a registry.
         reg = self._registry()
         if reg is None:
             return
@@ -1248,6 +1383,7 @@ class SimQuotaEngine:
         cur_site = self._effective_site(hostname, c)
         target = (self._remaining_rehome_target(hostname, quota_key)
                   if quota_key else None)
+        # Keep another quota's re-home, else restore the original site.
         if target:
             if cur_site != target:
                 await self._engine_set(hostname, {"wsite": target})
@@ -1262,6 +1398,7 @@ class SimQuotaEngine:
         """The account location of a 1X cell ('' = manual / not a 1X cell).
         Same 1X test as the matrix editor's csCellAuth: explicit auth, else an
         SSID literally named 1X."""
+        # A 1X cell with a known account backend.
         auth = str(cd.get("auth") or "").strip().lower()
         is_1x = auth == "1x" or (not auth and str(cd.get("ssid") or "").strip().upper() == "1X")
         backend = str(cd.get("dot1x_account") or "").strip().lower()
@@ -1272,22 +1409,27 @@ class SimQuotaEngine:
         engine currently has on a JIT 1X cell. Re-reads the registry: the
         reconcile snapshot predates this sweep's placement. A client unseen
         for DOT1X_STALE_S is treated as torn down."""
+        # Username helper and the JIT 1X cells.
         from sim_config import username_for
         cells = getattr(self, "_cells_by_name", {}) or {}
         jit = {n: cd for n, cd in cells.items() if self._dot1x_cell_backend(cd)}
         out: Dict[str, Dict[str, str]] = {}
         if not jit:
             return out
+        # Find live clients placed on a JIT cell.
         for h, c in self._all_clients().items():
             try:
                 ls = float(c.get("last_seen") or 0)
             except (TypeError, ValueError):
                 continue
+            # Skip stale clients.
             if not ls or (now - ls) >= DOT1X_STALE_S:
                 continue
+            # Find the client's cell.
             cell = self._cell_of(h, c, self._effective_site(h, c), jit)
             if not cell:
                 continue
+            # Record the client's username, backend and cell.
             user = str(username_for(h) or "").strip().lower()
             if user:
                 out[h] = {"username": user, "backend": self._dot1x_cell_backend(jit[cell]),
@@ -1295,9 +1437,12 @@ class SimQuotaEngine:
         return out
 
     async def _dot1x_send(self, msg_type: str, data: Dict[str, Any]) -> bool:
+        """Send a JIT 802.1X message to the hub; return True on success."""
+        # Need a control plane.
         cp = getattr(self.spoke, "control_plane", None)
         if cp is None:
             return False
+        # Send it; failures are retried next sweep.
         try:
             return bool(await cp.send_to_hub(msg_type, data))
         except Exception as exc:  # noqa: BLE001 — retried next sweep
@@ -1305,6 +1450,8 @@ class SimQuotaEngine:
             return False
 
     async def _dot1x_notify(self, hostname: str) -> None:
+        """Push the client's changed overrides to it, ignoring errors."""
+        # Call the spoke's override-changed hook if it has one.
         cb = getattr(self.spoke, "_on_client_override_changed", None)
         if cb is not None:
             try:
@@ -1318,19 +1465,23 @@ class SimQuotaEngine:
         for clients the engine no longer has on a JIT cell, re-request any
         provision the hub hasn't answered, and SYNC the full set periodically
         so the hub can catch anything a lost frame missed."""
+        # Work out which accounts are wanted.
         try:
             wanted = self._dot1x_wanted(now)
         except Exception as exc:  # noqa: BLE001
             logger.warning("dot1x: wanted-set build failed: %s", exc)
             return
+        # Release accounts that are no longer wanted.
         changed = False
         for h, st in list(self._dot1x.items()):
             w = wanted.get(h)
+            # Same account: just update the cell if it moved.
             if w and w["username"] == st.get("username") and w["backend"] == st.get("backend"):
                 if w["cell"] != st.get("cell"):
                     st["cell"] = w["cell"]
                     changed = True
                 continue
+            # Release it and remove the password.
             await self._dot1x_send("CS_DOT1X_RELEASE", {
                 "hostname": h, "username": st.get("username"), "backend": st.get("backend")})
             self._dot1x.pop(h, None)
@@ -1338,6 +1489,7 @@ class SimQuotaEngine:
             await self._dot1x_notify(h)
             changed = True
             logger.info("dot1x: released %s (%s/%s)", h, st.get("backend"), st.get("username"))
+        # Provision new accounts, or re-request unanswered ones.
         for h, w in wanted.items():
             st = self._dot1x.get(h)
             if st and (st.get("delivered") or now - float(st.get("requested_at") or 0) < DOT1X_RESEND_S):
@@ -1346,18 +1498,21 @@ class SimQuotaEngine:
             # race the send's return and is only accepted for known clients.
             self._dot1x[h] = {**w, "requested_at": now, "delivered": False,
                               "version": (st or {}).get("version", 0)}
+            # Keep the record if sent; otherwise roll it back.
             if await self._dot1x_send("CS_DOT1X_PROVISION", {"hostname": h, **w}):
                 changed = True
             elif st is None:
                 self._dot1x.pop(h, None)
             else:
                 self._dot1x[h] = st
+        # Periodically sync the full set with the hub.
         if now - self._dot1x_last_sync >= DOT1X_SYNC_S and (self._dot1x or wanted):
             active = [{"hostname": h, "username": st.get("username"), "backend": st.get("backend"),
                        "cell": st.get("cell"), "version": st.get("version", 0)}
                       for h, st in self._dot1x.items()]
             if await self._dot1x_send("CS_DOT1X_SYNC", {"active": active}):
                 self._dot1x_last_sync = now
+        # Save the state if anything changed.
         if changed:
             await asyncio.to_thread(self._save_dot1x)
 
@@ -1365,16 +1520,20 @@ class SimQuotaEngine:
         """Hub → CS_DOT1X_CREDENTIAL: apply (or revoke) a JIT account password
         on the named clients as an engine-owned ``dot1x_password`` override.
         Never echoes the password."""
+        # Read the request.
         username = str(d.get("username") or "").strip().lower()
         backend = str(d.get("backend") or "").strip().lower()
         revoke = bool(d.get("revoke"))
         password = d.get("password")
+        # A password is required unless revoking.
         if not revoke and not (isinstance(password, str) and password):
             return {"status": "ERROR", "message": "missing password"}
+        # Credential version.
         try:
             version = float(d.get("version") or 0)
         except (TypeError, ValueError):
             version = 0.0
+        # Apply to each named client.
         applied, skipped = [], []
         for h in d.get("hostnames") or []:
             h = str(h or "").strip()
@@ -1384,6 +1543,7 @@ class SimQuotaEngine:
             if not h or not st or st.get("username") != username or st.get("backend") != backend:
                 skipped.append(h)
                 continue
+            # Revoke or set the password.
             if revoke:
                 await self._engine_remove(h, ["dot1x_password"])
                 # Forget it so the next sweep re-provisions if the client is
@@ -1392,8 +1552,10 @@ class SimQuotaEngine:
             else:
                 await self._engine_set(h, {"dot1x_password": password})
                 st.update({"delivered": True, "version": version})
+            # Notify the client.
             await self._dot1x_notify(h)
             applied.append(h)
+        # Save the state and reply.
         if applied:
             await asyncio.to_thread(self._save_dot1x)
         return {"status": "SUCCESS", "applied": applied, "skipped": skipped, "revoked": revoke}
@@ -1401,12 +1563,14 @@ class SimQuotaEngine:
     def dot1x_mark_undelivered(self, hostname: str) -> None:
         """The client's overrides were wiped (Control Panel Clear) — re-request
         on the next sweep so the hub re-delivers the (unchanged) password."""
+        # Reset the record so it is requested again.
         st = self._dot1x.get(str(hostname or "").strip())
         if st:
             st.update({"version": 0, "delivered": False, "requested_at": 0})
             self._save_dot1x()
 
     def dot1x_managed(self, hostname: str) -> bool:
+        """True when the engine manages a JIT 802.1X account for ``hostname``."""
         return str(hostname or "").strip() in self._dot1x
 
     async def _engine_set(self, hostname: str, overrides: Dict[str, Any]) -> None:
@@ -1415,9 +1579,11 @@ class SimQuotaEngine:
         a human manual pin). Falls back to plain ``set_overrides`` for
         fake/test registries that don't track provenance (behavior identical
         minus the engine_keys bookkeeping)."""
+        # Need a registry.
         reg = self._registry()
         if reg is None:
             return
+        # Use provenance tracking when the registry supports it.
         if hasattr(reg, "set_engine_overrides"):
             await reg.set_engine_overrides(hostname, overrides)
         else:
@@ -1429,9 +1595,11 @@ class SimQuotaEngine:
         ``remove_engine_keys`` — matches the pre-provenance release behavior
         (and the fake's set_overrides doesn't prune, so the "off" lingers in
         the fake exactly as it did before)."""
+        # Need a registry.
         reg = self._registry()
         if reg is None:
             return
+        # Remove keys when supported, else set them off.
         if hasattr(reg, "remove_engine_keys"):
             await reg.remove_engine_keys(hostname, keys)
         else:
@@ -1448,6 +1616,7 @@ class SimQuotaEngine:
         quota's re-home — the multi_capable packing × re-home edge case). Returns
         ``None`` when no other quota re-homes the client.
         """
+        # Look for another entry whose site differs from the client's original site.
         for key, entry in self._ledger.items():
             if key == excluding_key:
                 continue
@@ -1466,14 +1635,17 @@ class SimQuotaEngine:
         (wsite/ssid/ssidpw). Delivered via the served [username] layer, so it
         wins over the client's bucket. Non-toggle overrides survive the registry
         prune (unlike on/off sim flags)."""
+        # Need a registry.
         reg = self._registry()
         if reg is None:
             return
+        # Build the connectivity overrides from the cell.
         overrides: Dict[str, Any] = {}
         for src, key in (("site", "wsite"), ("ssid", "ssid"), ("ssidpw", "ssidpw")):
             val = str(cell.get(src) or "").strip()
             if val:
                 overrides[key] = val
+        # Apply them.
         if overrides:
             await reg.set_overrides(hostname, overrides)
 
@@ -1481,8 +1653,10 @@ class SimQuotaEngine:
                  cells: Dict[str, Dict[str, Any]]) -> str:
         """Which cell (by name) this client currently sits on at ``site`` — matched
         by its effective ssid (override → bucket default)."""
+        # The client's effective SSID.
         ov = c.get("overrides") or {}
         ssid = str(ov.get("ssid") or (c.get("config") or {}).get("ssid") or "").strip()
+        # Find the cell at this site with that SSID.
         for name, cd in cells.items():
             if str(cd.get("site") or "").strip() == site and str(cd.get("ssid") or "").strip() == ssid:
                 return name
@@ -1503,11 +1677,13 @@ class SimQuotaEngine:
         takes none; a cell flagged ``all`` soaks the balance after the split.
         Runs AFTER the harvest loop so it only touches clients not pinned to a
         quota. Stateless: it just sets each spare client's ssid/wsite each sweep."""
+        # Reset warnings and read the weighted rules.
         self._placement_warnings = []
         try:
             rules = self.spoke.local_store.get_ssid_weights() or []
         except Exception:  # noqa: BLE001
             return
+        # Known cells.
         cells = getattr(self, "_cells_by_name", {})
         if not rules:
             # No weighted rules configured → even spread across every enabled
@@ -1533,6 +1709,7 @@ class SimQuotaEngine:
         # upgrade pass, which will displace a T2 to make room for it.
         # Group rules by the cell's physical site.
         by_site: Dict[str, List[Dict[str, Any]]] = {}
+        # Skip rules for unknown cells or cells without a site.
         for r in rules:
             cname = str(r.get("ssid") or r.get("cell") or "").strip()
             cell = cells.get(cname)
@@ -1541,6 +1718,7 @@ class SimQuotaEngine:
             site = str(cell.get("site") or r.get("site") or "").strip()
             if not site:
                 continue
+            # Record the rule under its site.
             by_site.setdefault(site, []).append({
                 "cell": cell, "name": cname,
                 "weight": max(0.0, float(r.get("weight") or 0)),
@@ -1572,13 +1750,16 @@ class SimQuotaEngine:
         # `all` / weight-0 (sum 0) floors its base at 1 so it still receives an
         # even share for its `all` cell to soak.
         weights: Dict[str, float] = {}
+        # Weight each site by its cell weights times its site weight.
         for s in sites:
             cell_sum = float(sum(r["weight"] for r in by_site.get(s, [])))
             base = max(1.0, cell_sum)              # all/weight-0-only site → floor 1
             sw = float(site_w.get(s, 1) or 0) if s in site_w else 1.0
             weights[s] = max(0.0, sw * base)
+        # All zero means an even split.
         if sum(weights.values()) <= 0:
             weights = {s: 1.0 for s in sites}          # unset / all-zero → even split
+        # Assign tenant-pool clients to sites.
         spread_site: Dict[str, str] = {}
         _counts = {s: 0 for s in sites}
         for h in (h for h in online
@@ -1598,11 +1779,13 @@ class SimQuotaEngine:
                      and (self._physical_site_of(h) == site or spread_site.get(h) == site)]
             if not spare:
                 continue
+            # Split the spare clients across weighted cells.
             weighted = [r for r in srules if r["weight"] > 0]
             all_rule = next((r for r in srules if r["all"]), None)
             total_w = sum(r["weight"] for r in weighted)
             n = len(spare)
             alloc: Dict[str, int] = {r["name"]: 0 for r in srules}
+            # Proportional split with whole numbers.
             if total_w > 0:
                 raw = [(r, n * r["weight"] / total_w) for r in weighted]
                 for r, x in raw:
@@ -1661,8 +1844,10 @@ class SimQuotaEngine:
         ledger, so a stacked client stays fully harvestable; ``_assign`` clears a
         client's stack when a quota harvests it (harvest wins over the ambient
         many)."""
+        # Read the cap and the stackable sims.
         cap = int(getattr(self, "_stack_cap", 3) or 0)
         candidates = self._stackable_sims()
+        # Disabled: clear any stacking and stop.
         if cap <= 0 or not candidates:
             if self._stacked:                          # disabled → tear the layer down
                 await self._clear_all_stacked(clients)
@@ -1674,6 +1859,7 @@ class SimQuotaEngine:
         rotation_s = float(getattr(self, "_stack_rotation_s", 600.0) or 600.0)
         if self._stack_rotation_ts and (now - self._stack_rotation_ts) < rotation_s:
             return
+        # Start a new rotation.
         self._stack_rotation_ts = now
         await self._clear_all_stacked(clients)         # release the old shuffle first
         # Eligible spare pool: harvestable, NOT harvested this sweep (no ledger
@@ -1684,16 +1870,21 @@ class SimQuotaEngine:
                 and not self._engine_sims_for(h)
                 and not self._exclusive_running(h, c)
                 and not self._has_manual_sim_pin(h, c)]
+        # Nothing to stack.
         if not pool:
             return
+        # Per-sim weights.
         weights = getattr(self, "_sim_weights", {}) or {}
 
         def _w(s: str) -> float:
+            """Return the weight for sim ``s`` (default 1, never negative)."""
+            # Bad values count as 1.
             try:
                 return max(0.0, float(weights.get(s, 1.0)))
             except (TypeError, ValueError):
                 return 1.0
 
+        # Shuffle the pool and start empty sets.
         total_w = sum(_w(s) for s in candidates) or 1.0
         N = len(pool)
         random.shuffle(pool)
@@ -1703,6 +1894,7 @@ class SimQuotaEngine:
         # clients still UNDER cap are eligible, so no client exceeds stack_cap;
         # heavier sims reach more clients (breadth ∝ weight), lighter sims may
         # leave a client with a single sim.
+        # Give each sim its share of random clients under the cap.
         for s in candidates:
             target = min(N, int(round(_w(s) / total_w * N * cap)))
             if target <= 0:
@@ -1712,6 +1904,7 @@ class SimQuotaEngine:
             for h in under[:target]:
                 assign[h].add(s)
             await asyncio.sleep(0)                      # yield per sim (scales to 1000s)
+        # Apply the stacked sims.
         placed = 0
         for h, sims in assign.items():
             if not sims:
@@ -1727,12 +1920,14 @@ class SimQuotaEngine:
     async def reconcile(self) -> Dict[str, Any]:
         """One sweep: align the ledger + overrides with effective_sim_quotas."""
         async with self._reconcile_lock:
+            # Hold the lock so only one sweep runs at a time; read the target quotas.
             quotas = self.spoke.local_store.get_effective_sim_quotas() or []
             # Device-kind quotas (T3 IoT fleet) are realized by a SEPARATE pass —
             # they target T3 hosts with a device composition, not harvested
             # clients — so split them off before the sim/presence loop below.
             device_quotas = [q for q in quotas if q.get("kind") == "device"]
             quotas = [q for q in quotas if q.get("kind") != "device"]
+            # Sweep time, client snapshot, quota keys and per-sweep host indexes.
             now = time.time()
             self._sweep_now = now          # for _assign / _diag_reason (no `now` arg)
             clients = self._all_clients()
@@ -1787,6 +1982,7 @@ class SimQuotaEngine:
             except Exception:  # noqa: BLE001
                 self._cells_by_name = {}
 
+            # Action counters.
             actions = {"assigned": 0, "released": 0, "kept": 0}
             # Exclusivity: a tenant-pool client belongs to exactly ONE physical
             # SITE per sweep (no MIA+DFW), and to exactly ONE SSID CELL (no
@@ -1797,6 +1993,7 @@ class SimQuotaEngine:
             # Clients Associated), different cells don't.
             self._claimed_site: Dict[str, str] = {}
             self._claimed_cell: Dict[str, str] = {}
+            # Seed the claims from the current ledger.
             for _e in self._ledger.values():
                 _s = str(_e.get("site") or "")
                 _ck = str(_e.get("claim") or _s)
@@ -1837,6 +2034,7 @@ class SimQuotaEngine:
                 # and starve the WS keepalive (a >5s block drops the hub link with
                 # 1011 keepalive ping timeout → flap).
                 await asyncio.sleep(0)
+                # Ledger key and sim for this quota.
                 key = _quota_key(q)
                 sim_id = q.get("sim_id") or ""
                 # Sharing is GLOBAL, not per-quota: a quota stacks only if the SIM
@@ -1865,12 +2063,14 @@ class SimQuotaEngine:
                 _src, _ = parse_alert_source(str(q.get("alert_id") or ""))
                 _base_claim = str(cell.get("name") or scope_site) if cell else scope_site
                 claim_key = f"{_src}:{_base_claim}"
+                # How many clients this quota wants.
                 target = int(q.get("count") or 1)
                 # A PRESENCE quota (sim_id empty — "Clients Associated") homes N
                 # clients to the site and runs no sim; it's still a real ledger
                 # entry the engine keeps filled (substitute on offline/dead).
                 entry = self._ledger.setdefault(
                     key, {"sim_id": sim_id, "site": scope_site, "clients": {}})
+                # Keep the entry's details current.
                 entry["sim_id"] = sim_id
                 entry["site"] = scope_site
                 entry["claim"] = claim_key
@@ -1894,6 +2094,7 @@ class SimQuotaEngine:
                 # and released so it can rejoin the pool. ``producing`` is the
                 # online+in-site+sim-on subset that counts toward N.
                 producing: List[str] = []
+                # Check each client this quota holds.
                 for h, from_site in list(assigned.items()):
                     c = clients.get(h)
                     if c is None:
@@ -1913,6 +2114,7 @@ class SimQuotaEngine:
                         assigned.pop(h, None)
                         actions["released"] += 1
                         continue
+                    # Not currently harvestable: dead clients are released.
                     if not self._is_harvestable(c, now):
                         last_seen = float(c.get("last_seen") or 0)
                         gw_down = self._is_gateway_down_confirmed(c)
@@ -1948,6 +2150,7 @@ class SimQuotaEngine:
                         assigned.pop(h, None)
                         actions["released"] += 1
                         continue
+                    # Still good: keep it.
                     producing.append(h)
                     actions["kept"] += 1
 
@@ -1984,6 +2187,7 @@ class SimQuotaEngine:
                 # tier-upgrade pass runs on a FULL quota, where the top-up that
                 # used to define this is skipped.
                 req_tier = str(q.get("tier") or "best").strip().lower()
+                # Under target: top up.
                 if len(producing) < target:
                     need = target - len(producing)
                     # A tenant-pool client (server not site-pinned) is assignable
@@ -2004,6 +2208,7 @@ class SimQuotaEngine:
                     # eligibles keeps the current set instead of swapping (anti-osc).
                     in_site.sort(key=lambda h: (self._tier_rank(clients[h], req_tier),
                                                 h not in _prev_holders))
+                    # Take what is needed.
                     picks = in_site[:need]
                     if q.get("rehome") and len(picks) < need:
                         # Cross-site fallback: any other-site eligible runner.
@@ -2024,6 +2229,7 @@ class SimQuotaEngine:
                         cross.sort(key=lambda h: (self._tier_rank(clients[h], req_tier),
                                                   h not in _prev_holders))  # tier + sticky
                         picks += cross[:need - len(picks)]
+                    # Assign each pick and record its natural site and claims.
                     for h in picks:
                         await self._assign(h, sim_id, scope_site, cell=cell)
                         c = clients.get(h) or {}
@@ -2045,6 +2251,7 @@ class SimQuotaEngine:
                 # not a returning original earlier in the ledger).
                 over = len(assigned) - target
                 if over > 0:
+                    # Release offline extras first, then the newest producers.
                     offline_extras = [h for h in assigned if h not in producing]
                     to_release = offline_extras[:over]
                     if len(to_release) < over:
@@ -2070,7 +2277,9 @@ class SimQuotaEngine:
                 # tier is not worth the disruption.
                 if (self._effective_tier(req_tier) in ("best", "best_t2")
                         and target > 0 and len(assigned) >= target):
+                    # Swap up to a few holders per sweep.
                     for _ in range(TIER_UPGRADE_PER_SWEEP):
+                        # Find the worst-ranked holder.
                         held = [h for h in producing if h in assigned]
                         if not held:
                             break
@@ -2092,6 +2301,7 @@ class SimQuotaEngine:
                                       or h in homed_here
                                       or (self._is_tenant_pool_client(h)
                                           and self._site_ok_for(h, scope_site)))]
+                        # No better candidate.
                         if not cands:
                             break
                         best_h = min(cands, key=lambda h: self._tier_rank(
@@ -2122,6 +2332,7 @@ class SimQuotaEngine:
                 # over the harvestable pool attributing each not-assigned client's
                 # blocking reason (see _diag_reason). Surfaced on Config → Engine
                 # State so "underfilled 0/N" is self-explaining instead of opaque.
+                # Count free-eligible, not-harvestable and blocked clients.
                 blocked: Dict[str, int] = {}
                 eligible_free = not_harvestable = 0
                 _seen = 0
@@ -2129,11 +2340,13 @@ class SimQuotaEngine:
                     _seen += 1
                     if _seen % 250 == 0:
                         await asyncio.sleep(0)  # this pass is O(clients) PER quota — yield at 1000s scale
+                    # Skip clients already assigned.
                     if h in assigned:
                         continue
                     if not self._is_harvestable(c, now):
                         not_harvestable += 1
                         continue
+                    # Record why the client is blocked, if it is.
                     r = self._diag_reason(h, c, sim_id, multi, scope_site,
                                           claim_key, assigned,
                                           str(q.get("tier") or "best").strip().lower())
@@ -2141,6 +2354,7 @@ class SimQuotaEngine:
                         eligible_free += 1
                     else:
                         blocked[r] = blocked.get(r, 0) + 1
+                # Save the diagnostics for this quota.
                 self._quota_diag[key] = {
                     "sim_id": sim_id, "site": scope_site, "claim": claim_key,
                     "multi": multi, "target": target, "producing": len(producing),
@@ -2194,6 +2408,7 @@ class SimQuotaEngine:
             # account location (after every placement pass above settled).
             await self._reconcile_dot1x(now)
 
+            # Save the ledger and log any actions.
             await asyncio.to_thread(self._save_ledger)
             if any(actions.values()):
                 logger.info("SimQuotaEngine reconcile: %s", actions)
@@ -2237,6 +2452,7 @@ class SimQuotaEngine:
         stale assignments after a config/model change — e.g. a client stuck in
         two quotas from an older engine build."""
         async with self._reconcile_lock:
+            # Clear the ledger.
             clients = self._all_clients()
             self._ledger = {}
             # Also drop the stacking layer + rotation clock so the tail reverts
@@ -2261,13 +2477,16 @@ class SimQuotaEngine:
                                caps: Dict[str, int]) -> Dict[str, int]:
         """Largest-remainder split of ``total`` across ``hosts`` proportional to
         each host's capacity (even split when total capacity is 0). {host: share}."""
+        # Nothing to split.
         total = max(0, int(total))
         if not hosts or total == 0:
             return {h: 0 for h in hosts}
+        # Zero capacity: split evenly.
         cap_sum = sum(max(0, caps.get(h, 0)) for h in hosts)
         if cap_sum <= 0:
             base, rem = divmod(total, len(hosts))
             return {h: base + (1 if i < rem else 0) for i, h in enumerate(hosts)}
+        # Proportional split, then hand out the remainder.
         raw = {h: total * max(0, caps.get(h, 0)) / cap_sum for h in hosts}
         floor = {h: int(raw[h]) for h in hosts}
         leftover = total - sum(floor.values())
@@ -2293,6 +2512,7 @@ class SimQuotaEngine:
         # site → {device_id: total count}
         by_site: Dict[str, Dict[str, int]] = {}
         for q in device_quotas:
+            # Skip disabled or incomplete quotas.
             if not q.get("enabled"):
                 continue
             site = str(q.get("site") or "").strip()
@@ -2303,6 +2523,7 @@ class SimQuotaEngine:
             by_site.setdefault(site, {})[did] = by_site[site].get(did, 0) + cnt
         # T3 hosts grouped by effective site.
         t3_by_site: Dict[str, List[str]] = {}
+        # Only IoT-capable hosts.
         for h, c in clients.items():
             if not c.get("iot_capable"):
                 continue
@@ -2315,12 +2536,14 @@ class SimQuotaEngine:
                 logger.info("SimQuotaEngine: device quota for site %s has no T3 host "
                             "serving it — %d device profile(s) unplaced", site, len(comp))
                 continue
+            # Split each device count across the site's hosts by capacity.
             caps = {h: int((clients.get(h) or {}).get("iot_capacity") or 25) for h in hosts}
             per_host: Dict[str, Dict[str, int]] = {h: {} for h in hosts}
             for did, cnt in comp.items():
                 for h, share in self._apportion_by_capacity(cnt, hosts, caps).items():
                     if share > 0:
                         per_host[h][did] = share
+            # Build each host's "id:count" list.
             for h in hosts:
                 if per_host[h]:
                     desired[h] = ",".join(f"{d}:{n}" for d, n in sorted(per_host[h].items()))
@@ -2328,8 +2551,10 @@ class SimQuotaEngine:
         prev = set(getattr(self, "_iot_hosts", set()))
         for h, comp_str in desired.items():
             await self._engine_set(h, {"iot_devices": comp_str})
+        # Clear hosts no longer targeted.
         for h in prev - set(desired):
             await self._engine_remove(h, ["iot_devices"])
+        # Remember the targeted hosts and log.
         self._iot_hosts = set(desired)
         if desired or prev:
             logger.info("SimQuotaEngine: device quotas → %d T3 host(s) staged (%s)",
@@ -2349,9 +2574,11 @@ class SimQuotaEngine:
         pass's job, and only when it matches the bucket. ``wsite`` is
         reconciled by ``_release``'s from_site revert, not here (a stale
         ``engine_keys`` wsite entry with no override is a no-op)."""
+        # Need a registry that tracks provenance.
         reg = self._registry()
         if reg is None or not hasattr(reg, "remove_engine_keys"):
             return
+        # Check each client's engine-set keys.
         for hostname, c in clients.items():
             eng = list((c.get("engine_keys") or []))
             if not eng:
@@ -2361,9 +2588,11 @@ class SimQuotaEngine:
             # every sweep and stacking could never persist between rotations.
             claimed = self._engine_sims_for(hostname) | self._stacked.get(hostname, set())
             ov = c.get("overrides") or {}
+            # Engine keys still "on" that nothing claims.
             orphans = [k for k in eng
                        if k != "wsite" and k not in claimed
                        and str(ov.get(k, "")).strip().lower() == "on"]
+            # Remove them.
             if orphans:
                 await reg.remove_engine_keys(hostname, orphans)
                 logger.debug("SimQuotaEngine: removed orphan engine keys %s for %s",
@@ -2379,16 +2608,20 @@ class SimQuotaEngine:
         pass (which only drops overrides that MATCH the bucket, whereas an
         off-over-a-bucket-on never matches) — and forget the record. A record for
         a client no longer in the registry is dropped without a revert."""
+        # Nothing displaced.
         if not self._displaced:
             return
+        # Check each displaced client.
         reg = self._registry()
         for hostname in list(self._displaced.keys()):
             sims = self._displaced.get(hostname) or set()
+            # Drop records with no sims or a gone client.
             if not sims or hostname not in clients:
                 self._displaced.pop(hostname, None)
                 continue
             if self._engine_sims_for(hostname):
                 continue                      # still harvested → keep the suppression
+            # Restore the bucket defaults and forget the record.
             if reg is not None and hasattr(reg, "remove_engine_keys"):
                 await self._engine_remove(hostname, sorted(sims))
             self._displaced.pop(hostname, None)
@@ -2401,15 +2634,18 @@ class SimQuotaEngine:
         flips off, so the prune drops it and the override object stays a true
         diff over the bucket). Only removes overrides matching the bucket —
         served config is unchanged. Skips clients with no on/off flags."""
+        # Need a registry that can prune.
         reg = self._registry()
         if reg is None or not hasattr(reg, "prune_against_bucket"):
             return
+        # Re-prune clients that have on/off overrides.
         for hostname, c in clients.items():
             ov = c.get("overrides") or {}
             if not ov:
                 continue
             if not any(str(v).strip().lower() in ("on", "off") for v in ov.values()):
                 continue
+            # Errors are logged and skipped.
             try:
                 await reg.prune_against_bucket(hostname)
             except Exception as exc:  # noqa: BLE001 — hygiene pass must not kill the sweep
@@ -2418,16 +2654,22 @@ class SimQuotaEngine:
 
     # ── loop ─────────────────────────────────────────────────────────────────
     def start(self) -> None:
+        """Start the periodic reconcile loop if it is not already running."""
+        # Already running.
         if self._loop_task is not None and not self._loop_task.done():
             return
         self._loop_task = asyncio.create_task(self._loop(), name="sim-quota-engine")
 
     def stop(self) -> None:
+        """Stop the periodic reconcile loop."""
+        # Cancel the task if there is one.
         if self._loop_task is not None:
             self._loop_task.cancel()
             self._loop_task = None
 
     async def _loop(self) -> None:
+        """Reconcile forever, every RECONCILE_INTERVAL_S seconds."""
+        # Run a sweep; cancellation stops the loop, other errors are logged.
         while True:
             try:
                 await self.reconcile()
@@ -2435,6 +2677,7 @@ class SimQuotaEngine:
                 raise
             except Exception as exc:  # noqa: BLE001 — a sweep must not kill the loop
                 logger.warning("SimQuotaEngine sweep failed: %s", exc)
+            # Wait for the next sweep.
             await asyncio.sleep(RECONCILE_INTERVAL_S)
 
     def trigger(self) -> None:
@@ -2444,10 +2687,12 @@ class SimQuotaEngine:
         trigger — so a burst of client WS churn coalesces into ONE reconcile instead
         of a storm of full sweeps (which pegged the loop + thrashed assign/release).
         The 60s periodic loop is the backstop if a burst never quiets."""
+        # Need a running event loop.
         try:
             loop = asyncio.get_running_loop()
         except RuntimeError:
             return  # no running loop yet — the periodic loop will catch it
+        # Cancel any pending sweep and schedule a new one.
         t = getattr(self, "_debounce_task", None)
         if t is not None and not t.done():
             t.cancel()   # reset the timer — coalesce this burst into the pending sweep
@@ -2455,10 +2700,13 @@ class SimQuotaEngine:
             self._debounced_reconcile(), name="sim-quota-reconcile-debounced")
 
     async def _debounced_reconcile(self) -> None:
+        """Wait out the debounce window, then reconcile once."""
+        # A newer trigger cancels this one.
         try:
             await asyncio.sleep(RECONCILE_DEBOUNCE_S)
         except asyncio.CancelledError:
             return  # superseded by a newer trigger within the debounce window
+        # Run the sweep; errors are logged.
         try:
             await self.reconcile()
         except asyncio.CancelledError:
@@ -2468,18 +2716,21 @@ class SimQuotaEngine:
 
     # ── introspection (for the Chunk 4 quota-state view) ─────────────────────
     def snapshot(self) -> Dict[str, Any]:
+        """Return the ledger view (quota key to sim, site and clients), hiding ignored hosts."""
         # Serve the immutable end-of-sweep snapshot (see reconcile's publish
         # block) so the ledger view is always consistent with the diagnostics /
         # pool the same call returns. Pre-first-sweep, fall back to the live
         # persisted ledger. Hide ignored hostnames at read time (the next
         # reconcile also drops them from the ledger proper).
         ignored = self._ignored_hostnames()
+        # Use the published ledger if there is one.
         pub = getattr(self, "_published", None)
         led = pub.get("ledger") if pub else None
         if led is None:
             led = {k: {"sim_id": e.get("sim_id"), "site": e.get("site"),
                        "clients": list((e.get("clients") or {}).keys())}
                    for k, e in self._ledger.items()}
+        # Hide ignored hostnames.
         return {
             key: {"sim_id": e.get("sim_id"), "site": e.get("site"),
                   "clients": [h for h in (e.get("clients") or [])
@@ -2494,15 +2745,18 @@ class SimQuotaEngine:
         opaque '0/N underfilled' names WHICH clients are blocked and by what.
         Served from the published end-of-sweep snapshot so it stays consistent
         with snapshot()/pool_counts(). Empty until the first sweep runs."""
+        # Use the published snapshot if there is one.
         pub = getattr(self, "_published", None)
         if pub is not None:
             return list(pub.get("diagnostics") or [])
+        # Else the live diagnostics.
         diag = getattr(self, "_quota_diag", None) or {}
         return [{"key": k, **v} for k, v in diag.items()]
 
     def placement_warnings(self) -> List[Dict[str, Any]]:
         """SSID cells that couldn't reach their hold-N floor last sweep (pool too
         small). Consumed by the Quota State view (published snapshot)."""
+        # Use the published snapshot if there is one.
         pub = getattr(self, "_published", None)
         if pub is not None:
             return list(pub.get("placement_warnings") or [])
@@ -2512,11 +2766,13 @@ class SimQuotaEngine:
         """One O(n) pass over the registry using the CURRENT host-index caches
         (no refresh — the caller owns cache vintage). Total online, per-physical-
         site counts, and the tenant-pool (assignable-anywhere) count."""
+        # Count each harvestable client.
         out = {"online": 0, "by_site": {}, "tenant_pool": 0}
         for h, c in self._all_clients().items():
             if not self._is_harvestable(c, now):
                 continue
             out["online"] += 1
+            # Tenant-pool clients, else by physical site.
             if self._is_tenant_pool_client(h):
                 out["tenant_pool"] += 1
             else:
@@ -2532,9 +2788,11 @@ class SimQuotaEngine:
         the reconcile lock, since that would clobber the caches the running sweep
         depends on and desync its fill vs diagnostic passes (the root cause of the
         impossible '4/7 with 14 free' pairs)."""
+        # Use the published snapshot if there is one.
         pub = getattr(self, "_published", None)
         if pub and pub.get("pool") is not None:
             return dict(pub["pool"])
+        # Else compute live, refreshing the index only when no sweep is running.
         if not self._reconcile_lock.locked():
             self._refresh_host_index()
         return self._compute_pool_counts(time.time())

@@ -1,7 +1,10 @@
 """Misc API routes (moved verbatim from server.py; logic imported from server)."""
+# Postpone annotation evaluation so modern type hints are never evaluated at runtime.
 from __future__ import annotations
 
+# APIRouter groups these endpoints so server.py can mount them with include_router().
 from fastapi import APIRouter
+# Constants, helpers and shared state live in server.py; this file only defines the routes.
 from server import (
     APP_VERSION,
     Any,
@@ -64,6 +67,7 @@ from server import (
     validate_platform,
 )
 
+# The router object every endpoint below is registered on.
 router = APIRouter()
 
 
@@ -80,21 +84,26 @@ async def api_bootstrap(request: Request, body: dict[str, Any] = Body(...)) -> d
         crosses the network; an external caller cannot reach it.
     """
 
+    # Reject any caller that is not on this machine.
     client_host = (request.client.host if request.client else "") or ""
     if client_host not in ("127.0.0.1", "::1", "localhost"):
         logger.warning("Bootstrap attempt rejected from non-localhost %s", client_host)
         raise HTTPException(status_code=403, detail="bootstrap only accepted from localhost")
 
+    # Refuse to run twice: once a hub URL is set, bootstrap is locked.
     if settings.get("relay_server_url", "").strip():
         raise HTTPException(status_code=409, detail="hub already configured — bootstrap is one-time only")
 
+    # Read the hub URL, tenant id and onboarding PSK from the request.
     hub_url = str(body.get("relay_server_url", "") or "").strip()
     tenant_id = str(body.get("relay_tenant_id", "") or "").strip()
     onboarding_psk = str(body.get("relay_onboarding_psk", "") or "").strip()
 
+    # The hub URL is mandatory.
     if not hub_url:
         raise HTTPException(status_code=422, detail="relay_server_url is required")
 
+    # Save the hub settings (tenant id and PSK only when given) and enable the relay.
     settings["relay_server_url"] = hub_url
     if tenant_id:
         settings["relay_tenant_id"] = tenant_id
@@ -104,19 +113,23 @@ async def api_bootstrap(request: Request, body: dict[str, Any] = Body(...)) -> d
     settings["relay_enabled"] = "on"
     _save_settings()
 
+    # Reset the relay status so the UI shows it as enabled but not yet connected.
     relay_state.update({
         "enabled": True,
         "connected": False,
         "error": None,
         "registration_status": _relay_registration_status_from_settings(),
     })
+    # Ask the relay to re-register with the hub, and save the relay state.
     state.relay_registration_refresh_needed = True
     _save_relay_state()
+    # Restart the relay background task so it connects to the new hub right away.
     task = background_tasks.get("relay")
     if task and not task.done():
         task.cancel()
     background_tasks["relay"] = asyncio.get_event_loop().create_task(relay_loop())
 
+    # Log the change and return the applied values (without revealing the PSK itself).
     logger.info("Bootstrap: hub configured to %s (tenant: %s)", hub_url, tenant_id or "none")
     return {"status": "ok", "relay_server_url": hub_url, "relay_tenant_id": tenant_id, "has_psk": bool(onboarding_psk)}
 
@@ -127,8 +140,11 @@ async def api_bootstrap(request: Request, body: dict[str, Any] = Body(...)) -> d
 
 @router.get("/api/acme")
 async def api_acme_get() -> dict[str, Any]:
+    """Return the ACME settings (secrets masked), current cert details and the spoke TLS toggle."""
+    # Load the saved settings and mask any secrets.
     cfg = spoke_acme.load_acme_config()
     data = _public_acme_settings(cfg)
+    # Add the current certificate details and whether the spoke serves HTTPS.
     data["cert_info"] = spoke_acme.get_cert_info()
     data["spoke_tls"] = settings.get("spoke_tls", "off")
     return data
@@ -138,13 +154,17 @@ async def api_acme_get() -> dict[str, Any]:
 
 @router.post("/api/acme")
 async def api_acme_update(payload: dict[str, Any]) -> dict[str, Any]:
+    """Save ACME settings from the UI, keeping existing secrets the UI sent back masked."""
+    # Start from the saved settings.
     existing = spoke_acme.load_acme_config()
+    # Merge credentials: a "***" or null value means "unchanged", so keep the stored secret.
     incoming_credentials = payload.get("dns_credentials") or {}
     merged_credentials = dict(existing.dns_credentials or {})
     for key, value in incoming_credentials.items():
         if value in (None, "***"):
             continue
         merged_credentials[key] = value
+    # Build the new config, keeping saved values for fields the request did not include.
     cfg = spoke_acme.AcmeConfig(
         enabled=bool(payload.get("enabled", existing.enabled)),
         domain=str(payload.get("domain", existing.domain) or "").strip(),
@@ -157,10 +177,13 @@ async def api_acme_update(payload: dict[str, Any]) -> dict[str, Any]:
         last_error=existing.last_error,
         cert_expiry=existing.cert_expiry,
     )
+    # Persist the ACME settings.
     spoke_acme.save_acme_config(cfg)
+    # The HTTPS toggle lives in the main settings file, not acme.json.
     if "spoke_tls" in payload:
         settings["spoke_tls"] = _normalize_toggle(payload.get("spoke_tls"))
         _save_settings()
+    # Return the same shape as GET /api/acme.
     data = _public_acme_settings(cfg)
     data["cert_info"] = spoke_acme.get_cert_info()
     data["spoke_tls"] = settings.get("spoke_tls", "off")
@@ -171,8 +194,11 @@ async def api_acme_update(payload: dict[str, Any]) -> dict[str, Any]:
 
 @router.post("/api/acme/request")
 async def api_acme_request() -> dict[str, Any]:
+    """Start a certificate request in the background unless one is already running."""
+    # Only one request at a time.
     if _acme_status.get("running"):
         return {"status": "running"}
+    # Run the request in the background; the UI polls /api/acme/status for progress.
     asyncio.create_task(_run_acme_request())
     return {"status": "started"}
 
@@ -181,6 +207,7 @@ async def api_acme_request() -> dict[str, Any]:
 
 @router.get("/api/acme/status")
 async def api_acme_status() -> dict[str, Any]:
+    """Return a copy of the background ACME request's progress/result."""
     return dict(_acme_status)
 
 
@@ -188,10 +215,13 @@ async def api_acme_status() -> dict[str, Any]:
 
 @router.get("/api/scripts/list")
 async def api_scripts_list(platform: str = Query(...)) -> list[str]:
+    """List the script file names available for a platform folder in the repo."""
+    # Reject unknown platform names (also prevents path tricks).
     platform = validate_platform(platform)
     scripts_dir = repo_path(platform)
     if not scripts_dir.is_dir():
         raise HTTPException(status_code=404, detail=f"Script directory not found for {platform}")
+    # Return the sorted names of the regular files in the folder.
     return sorted(path.name for path in scripts_dir.iterdir() if path.is_file())
 
 
@@ -199,10 +229,13 @@ async def api_scripts_list(platform: str = Query(...)) -> list[str]:
 
 @router.get("/api/scripts/{platform}/{filename}")
 async def api_scripts_get(platform: str, filename: str) -> FileResponse:
+    """Serve one script file from a platform folder in the repo."""
+    # Validate the platform and resolve both paths to absolute real paths.
     platform = validate_platform(platform)
     scripts_dir = repo_path(platform).resolve()
     candidate = (scripts_dir / filename).resolve()
 
+    # The file must sit directly in the platform folder (blocks ../ escapes) and exist.
     if candidate.parent != scripts_dir or not candidate.is_file():
         raise HTTPException(status_code=404, detail="Script file not found")
 
@@ -215,12 +248,15 @@ async def api_scripts_get(platform: str, filename: str) -> FileResponse:
 async def api_init() -> dict[str, Any]:
     """Single endpoint that returns all state needed for initial page render.
     Replaces 5+ separate REST calls made on page load."""
+    # Copy the Central config without its secrets so they never reach the browser.
     cfg = dict(settings["central_config"])
     for secret_key in ("client_secret", "access_token", "refresh_token"):
         cfg.pop(secret_key, None)
+    # Instead, tell the UI which secrets are configured.
     cfg["access_token_configured"] = bool(settings["central_config"].get("access_token") or central_token.get("access_token"))
     cfg["refresh_token_configured"] = bool(settings["central_config"].get("refresh_token") or central_token.get("refresh_token"))
     cfg["client_secret_configured"] = bool(settings["central_config"].get("client_secret"))
+    # Everything the dashboard needs on first load, in one response.
     return {
         "mode": "spoke",
         "proxmox": _proxmox_status_payload(),
@@ -263,6 +299,7 @@ async def api_qa_summary() -> dict[str, Any]:
     reporting clients so Copilot (or any automated check) can assert the full
     auto-provisioning pipeline is healthy on this spoke.
     """
+    # Snapshot the proxmox and client state under the shared lock.
     async with state_lock:
         proxmox_connected = bool(proxmox_state.get("connected", False))
         present_usb: list[Any] = list(proxmox_state.get("present_usb") or [])
@@ -270,25 +307,32 @@ async def api_qa_summary() -> dict[str, Any]:
         vms: list[Any] = list(proxmox_state.get("vms") or [])
         reporting_clients = len(clients)
 
+    # Prefer the live USB list; fall back to the assigned-USB state.
     dongle_count = len(present_usb) if present_usb else len(usb_state)
     # Only count sim-client VMs — those with a USB dongle assigned (in usb_state).
     # Templates, IoT VMs, and other non-sim VMs must not be included in this total.
+    # vmids that have a dongle assigned, and how many known VMs are among them.
     usb_vmids = {str(e.get("vmid")) for e in usb_state if e.get("vmid") is not None}
     sim_vm_count = sum(1 for vm in vms if str(vm.get("vmid", "")) in usb_vmids)
+    # Whether VMs are automatically created for new dongles.
     auto_provision = _normalize_toggle(settings.get("usb_auto_provision", "off")) == "on"
 
+    # Collect problems; an empty list means the spoke passes.
     issues: list[str] = []
     if not proxmox_connected:
         issues.append("Proxmox agent is not connected")
+    # With auto-provisioning on, every dongle should have its own VM.
     if auto_provision and dongle_count > 0 and sim_vm_count != dongle_count:
         issues.append(
             f"VM count ({sim_vm_count}) does not match dongle count ({dongle_count})"
         )
+    # Every dongle should have a client reporting in.
     if dongle_count > 0 and reporting_clients != dongle_count:
         issues.append(
             f"reporting clients ({reporting_clients}) does not match dongle count ({dongle_count})"
         )
 
+    # Return the counts plus the pass/fail verdict and the reasons.
     return {
         "proxmox_agent_connected": proxmox_connected,
         "dongle_count": dongle_count,
@@ -307,6 +351,7 @@ async def api_qa_summary() -> dict[str, Any]:
 async def api_setup_clear_cache() -> dict[str, Any]:
     """Wipe all cached files, re-clone the repo, clear in-memory client/central state,
     then restart the WebUI service so it starts completely fresh."""
+    # shutil removes the repo directory tree.
     import shutil
 
     # 1. Delete cached data files
@@ -321,12 +366,14 @@ async def api_setup_clear_cache() -> dict[str, Any]:
         HISTORY_FILE,
         CLIENT_COUNT_BASELINE_FILE,
     ]:
+        # Missing files are fine; any other error is ignored so the rest of the cleanup still runs.
         try:
             path.unlink(missing_ok=True)
         except Exception:
             pass
 
     # 2. Clear in-memory state
+    # Each piece of state is cleared under its own lock.
     async with state_lock:
         clients.clear()
     async with history_lock:
@@ -334,29 +381,37 @@ async def api_setup_clear_cache() -> dict[str, Any]:
     state.central_wireless_clients.clear()
 
     # 3. Remove any stale git lock and wipe + re-clone the repo
+    # Hold the git lock so no other git operation runs while the repo is replaced.
     async with _git_lock:
+        # Remove a leftover index.lock that would block git.
         lock_file = REPO_DIR / ".git" / "index.lock"
         lock_file.unlink(missing_ok=True)
+        # Delete the whole clone.
         try:
             shutil.rmtree(REPO_DIR, ignore_errors=True)
         except Exception as exc:
             logger.warning("clear-cache: could not remove REPO_DIR: %s", exc)
+        # Clone it again and record the result for the UI.
         try:
             await asyncio.to_thread(sync_repo_once)
             repo_state["synced"] = True
             repo_state["error"] = None
             repo_state["last_sync"] = time.time()
         except Exception as exc:
+            # Re-clone failure is recorded so the UI can show it.
             logger.warning("clear-cache: re-clone failed: %s", exc)
             repo_state["error"] = str(exc)
 
+    # Log and tell connected UIs that a restart is coming.
     logger.info("Setup cache cleared by user request — restarting service")
     await broadcast({"type": "notification", "level": "info",
                      "message": "Cache cleared — service restarting in 2 seconds…"})
 
     # 4. Restart the service after a short delay so the response can be sent
     async def _delayed_restart() -> None:
+        """Wait 2 s, then restart the dashboard service through passwordless sudo."""
         await asyncio.sleep(2)
+        # Restart failures are logged; the user can restart manually.
         try:
             await asyncio.create_subprocess_shell(
                 "sudo -n systemctl restart client-sim-dashboard",
@@ -366,6 +421,7 @@ async def api_setup_clear_cache() -> dict[str, Any]:
         except Exception as exc:
             logger.error("clear-cache: restart failed: %s", exc)
 
+    # Schedule the restart and reply immediately.
     asyncio.create_task(_delayed_restart())
     return {"status": "ok", "message": "Cache cleared — service restarting"}
 
@@ -374,6 +430,8 @@ async def api_setup_clear_cache() -> dict[str, Any]:
 
 @router.get("/.well-known/acme-challenge/{token}", include_in_schema=False)
 async def acme_challenge(token: str):
+    """Answer an ACME http-01 challenge when port 80 is served by this app."""
+    # Return the key authorization for a known token, otherwise 404.
     key_authorization = _acme_challenges.get(token)
     if not key_authorization:
         raise HTTPException(404)
