@@ -917,7 +917,8 @@ class ConfigCommandsMixin:
         merged = dict(current)
         # Merge non-empty values, and new keys even when empty.
         for k, v in (cfg or {}).items():
-            if v not in (None, ""):
+            # token_url is not a secret: blank means "override removed".
+            if v not in (None, "") or k == "token_url":
                 merged[k] = v
             elif k not in current:
                 merged[k] = v
