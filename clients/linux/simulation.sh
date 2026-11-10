@@ -333,7 +333,7 @@ if [[ "$web_server" == "on" ]]; then
   # Start every sim OFF. The engine turns failure sims on via the [username]
   # override applied further down; the roll below is what turns AMBIENT traffic on.
   for sim in dhcp_fail dns_fail dns_latency assoc_fail port_flap ssidpw_fail auth_fail \
-             mac_auth_fail ping_test download iperf www_traffic collab client_offline; do declare -g "$sim=off"; done
+             mac_auth_fail ping_test download iperf www_traffic www_discover collab client_offline; do declare -g "$sim=off"; done
   #
   # Ambient distribution — two-step model (level, then weighted split)
   # ------------------------------------------------------------------
@@ -399,6 +399,8 @@ else
   download=$(get_value $simulation_id 'download')
   iperf=$(get_value $simulation_id 'iperf')
   www_traffic=$(get_value $simulation_id 'www_traffic')
+  www_discover=$(get_value $simulation_id 'www_discover')
+  www_discover="${www_discover:-off}"
   collab=$(get_value $simulation_id 'collab')
   # Ambient random pool: pick a random bucket, take only its randomizable flags;
   # every failure sim is forced off (harvest-only). A [username] harvest override
@@ -408,7 +410,7 @@ else
     random_bucket="s$(( RANDOM % 10 ))"
     echo "Ambient random pool: rolling behaviour from bucket ${random_bucket}" | tee -a ${LOG_FILE}
     for sim in dhcp_fail dns_fail assoc_fail port_flap ssidpw_fail auth_fail \
-               mac_auth_fail ping_test download iperf www_traffic collab; do
+               mac_auth_fail ping_test download iperf www_traffic www_discover collab; do
       if [[ " $randomizable_sims " == *" $sim "* ]]; then
         declare -g "$sim=$(get_value $random_bucket "$sim")"
       else
@@ -464,6 +466,7 @@ echo DHCP Fail: $dhcp_fail | tee -a ${LOG_FILE}
 echo DNS Fail: $dns_fail | tee -a ${LOG_FILE}
 echo DNS Latency: $dns_latency | tee -a ${LOG_FILE}
 echo WWW Traffic: $www_traffic | tee -a ${LOG_FILE}
+echo WWW Discover: $www_discover | tee -a ${LOG_FILE}
 echo iPerf: $iperf | tee -a ${LOG_FILE}
 echo "Collab: $collab app=${collab_app:-teams} server=${collab_server:-unset}" | tee -a ${LOG_FILE}
 echo Download: $download | tee -a ${LOG_FILE}
@@ -535,7 +538,7 @@ report_status() {
   # (its heartbeat rides a separate backend network, so absence here ≠ offline).
   sim_ip=$(ip -4 -o route get 1.1.1.1 2>/dev/null | grep -oP 'src \K\S+' | head -n1)
   [[ "${gateway_reachable:-}" == "true" ]] && gateway_json=true
-  for sim in dns_fail dns_latency assoc_fail port_flap iperf download www_traffic ping_test ssidpw_fail auth_fail mac_auth_fail dhcp_fail collab client_offline; do
+  for sim in dns_fail dns_latency assoc_fail port_flap iperf download www_traffic www_discover ping_test ssidpw_fail auth_fail mac_auth_fail dhcp_fail collab client_offline; do
     if [[ "${!sim}" == "on" ]]; then
       [[ $first == true ]] && first=false || active_simulations+=","
       active_simulations+="\"$sim\""
@@ -557,11 +560,11 @@ report_status() {
   detect_adapter_inventory
   local payload
   printf -v payload \
-    '{"hostname":"%s","simulation_id":"%s","platform":"%s","iteration":%s,"connected_ssid":"%s","ip":"%s","gateway_reachable":%s,"dns_ceiling":%s,"active_simulations":[%s],"errors":%s,"adapters":%s,"config":{"kill_switch":"%s","dns_fail":"%s","dns_latency":"%s","iperf":"%s","www_traffic":"%s","download":"%s","ping_test":"%s","ssidpw_fail":"%s","auth_fail":"%s","mac_auth_fail":"%s","dhcp_fail":"%s","collab":"%s","client_offline":"%s"}}' \
+    '{"hostname":"%s","simulation_id":"%s","platform":"%s","iteration":%s,"connected_ssid":"%s","ip":"%s","gateway_reachable":%s,"dns_ceiling":%s,"active_simulations":[%s],"errors":%s,"adapters":%s,"config":{"kill_switch":"%s","dns_fail":"%s","dns_latency":"%s","iperf":"%s","www_traffic":"%s","www_discover":"%s","download":"%s","ping_test":"%s","ssidpw_fail":"%s","auth_fail":"%s","mac_auth_fail":"%s","dhcp_fail":"%s","collab":"%s","client_offline":"%s"}}' \
     "$(json_escape "$hostname")" "$(json_escape "${simulation_id:-}")" "$(json_escape "$platform")" \
     "$iteration" "$(json_escape "${connected_ssid:-}")" "$(json_escape "${sim_ip:-}")" "$gateway_json" "$dns_ceiling" "$active_simulations" "$errors_json" "$adapters_json" \
     "$(json_escape "${kill_switch:-off}")" "$(json_escape "${dns_fail:-off}")" "$(json_escape "${dns_latency:-off}")" "$(json_escape "${iperf:-off}")" \
-    "$(json_escape "${www_traffic:-off}")" "$(json_escape "${download:-off}")" "$(json_escape "${ping_test:-off}")" \
+    "$(json_escape "${www_traffic:-off}")" "$(json_escape "${www_discover:-off}")" "$(json_escape "${download:-off}")" "$(json_escape "${ping_test:-off}")" \
     "$(json_escape "${ssidpw_fail:-off}")" "$(json_escape "${auth_fail:-off}")" "$(json_escape "${mac_auth_fail:-off}")" "$(json_escape "${dhcp_fail:-off}")" \
     "$(json_escape "${collab:-off}")" "$(json_escape "${client_offline:-off}")"
   local status_file="/usr/local/scripts/client-status.json"
@@ -1037,6 +1040,12 @@ if [ "$kill_switch" != "on" ]; then
     fi
    #------------------------------------------------------------
    #End WWW Traffic Simulation
+   #------------------------------------------------------------
+   #Running WWW Discover simulation
+   #------------------------------------------------------------
+   if [[ "$www_discover" == "on" ]]; then
+    run_simulation "www_discover.sh" 30
+   fi
    #------------------------------------------------------------
    #Running ping simulation
    #------------------------------------------------------------
