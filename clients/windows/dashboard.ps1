@@ -153,9 +153,10 @@ while ($true) {
         download         = get_value $simulationId 'download'
         iperf            = get_value $simulationId 'iperf'
         www_traffic      = get_value $simulationId 'www_traffic'
+        www_discover     = get_value $simulationId 'www_discover'
     }
 
-    foreach ($key in @('kill_switch','sim_load','public_repo','repo_location','vh_server','site_based_ssid','iperf_bw','wsite','sim_phy','ssid','ssidpw','dhcp_fail','dns_fail','assoc_fail','port_flap','ping_test','download','iperf','www_traffic','ssidpw_fail','auth_fail','mac_auth_fail')) {
+    foreach ($key in @('kill_switch','sim_load','public_repo','repo_location','vh_server','site_based_ssid','iperf_bw','wsite','sim_phy','ssid','ssidpw','dhcp_fail','dns_fail','assoc_fail','port_flap','ping_test','download','iperf','www_traffic','www_discover','ssidpw_fail','auth_fail','mac_auth_fail')) {
         Apply-Override -Section $username -Name $key -Config $config
     }
 
@@ -182,6 +183,7 @@ while ($true) {
         @{ Name = 'DHCP Fail'; Value = $config.dhcp_fail },
         @{ Name = 'DNS Fail'; Value = $config.dns_fail },
         @{ Name = 'WWW Traffic'; Value = $config.www_traffic },
+        @{ Name = 'WWW Discover'; Value = $config.www_discover },
         @{ Name = 'iPerf'; Value = $config.iperf },
         @{ Name = 'Download'; Value = $config.download },
         @{ Name = 'Port Flap'; Value = $config.port_flap },
