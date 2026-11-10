@@ -56,7 +56,7 @@ New CS_* commands (all local-store/aruba-backed, none require a hub): `CS_GET/SE
 - Config: `CS_GET_CONFIG`, `CS_UPDATE_CONFIG`/`UPDATE_CONFIG`, `CS_UPDATE_USER_OVERRIDES`.
 - Kill switch: `CS_KILL_SWITCH`, `CS_GET_KILL_SWITCH`.
 - Demo scenarios (TTL + auto-expiry): `CS_DEMO_SCENARIO`, `CS_DEMO_CLEAR`, `CS_GET_DEMO_ACTIVE`, `CS_GET_DEMO_SCENARIOS`.
-- Per-client override panel (11 toggles): `CS_GET/SET/CLEAR/SET_ALL_CLIENT_OVERRIDES`. Toggles: `kill_switch`, `dns_fail`, `iperf`, `download`, `www_traffic`, `ping_test`, `ssidpw_fail`, `auth_fail`, `dhcp_fail`, `port_flap`, `assoc_fail`.
+- Per-client override panel: `CS_GET/SET/CLEAR/SET_ALL_CLIENT_OVERRIDES`. Toggles include `kill_switch`, `dns_fail`, `iperf`, `download`, `www_traffic`, `www_discover`, `ping_test`, `ssidpw_fail`, `auth_fail`, `dhcp_fail`, `port_flap`, `assoc_fail`.
 - Client registry bulk: `CS_PURGE_CLIENTS` (drops every registered client + deletes `data/clients.json`).
 - Per-host USB VMID overrides: `CS_GET/SET/CLEAR_HOST_USB_OVERRIDE`.
 - CS ingest (unified pxmx agent → hub → here): `CS_INGEST_TELEMETRY/LOG/PROGRESS/WATCHDOG_EVENT/HW_RESET/COMMAND_RESULT`, `CS_STORE_PROXMOX_TOKEN`.
@@ -113,9 +113,42 @@ Implementation: `local_ui_routes.py` answers the same `/sim/api/*` REST contract
 
 **Run a demo scenario (auto-expiring fault).** Simulations → **Clients** tab → the target client's **Demo** column → pick a scenario (`normal` = clear, or one of `dns_fail` / `dhcp_fail` / `assoc_fail` / `auth_fail` / `ssidpw_fail` / `port_flap`) → trigger. It shows in the **"Active Demo Scenarios"** card with minutes remaining; it auto-clears after **120 minutes** (or on client reboot), reverting to the client's persisted state. Clear early from the same card / column.
 
-**Toggle a per-client fault (persisted override).** Simulations → **Clients** → the client row's **⚙ Control** button opens **"Live Overrides — {hostname}"** with the 11 toggles: `kill_switch`, `dns_fail`, `iperf`, `download`, `www_traffic`, `ping_test`, `ssidpw_fail`, `auth_fail`, `dhcp_fail`, `port_flap`, `assoc_fail`. Set what you want → **Apply** (persists to that client), **Clear Overrides** (removes them), or **Apply to ALL** (pushes the same set to every registered client). Unlike a demo, these persist until you clear them. The client picks them up on its next `/api/config` fetch.
+**Toggle a per-client fault (persisted override).** Simulations → **Clients** → the client row's **⚙ Control** button opens **"Live Overrides — {hostname}"** with toggles including `kill_switch`, `dns_fail`, `iperf`, `download`, `www_traffic`, `www_discover`, `ping_test`, `ssidpw_fail`, `auth_fail`, `dhcp_fail`, `port_flap`, `assoc_fail`. Set what you want → **Apply** (persists to that client), **Clear Overrides** (removes them), or **Apply to ALL** (pushes the same set to every registered client). Unlike a demo, these persist until you clear them. The client picks them up on its next `/api/config` fetch.
 
 **Use the kill switch (emergency stop).** Simulations → **Clients** → the banner at the top: **"⛔ Emergency Stop"** halts all sims (clients poll `/api/kill-switch` and stand down); **"▶ Resume Sims"** re-enables. This is global; the per-client `kill_switch` override above stops just one client.
+
+## WWW Discover — Network Diagnostics
+
+`www_discover` is an independent Linux/Windows browsing simulation, default
+`off` in every `[s0]`–`[s9]` bucket. Enable its bucket flag or per-client override;
+the orchestrators skip dispatch while its script is already running. It appears
+in client status, both dashboards, Live Overrides and the bucket editor.
+
+Each launch picks exactly one nonblank line uniformly from its own
+`www_discover_websites.txt` and opens headless Firefox. The owner-approved list is:
+
+- `https://worldaz.tr.teams.microsoft.com`
+- `https://zoom.us`
+- `https://www.okta.com`
+- `https://www.google.com`
+- `https://www.linkedin.com`
+
+The identical source lists live in `configs/`, `clients/linux/` and
+`clients/windows/`. Runtime paths are `/usr/local/scripts/www_discover_websites.txt`
+and `C:\Scripts\www_discover_websites.txt`. The existing `www_traffic` simulation
+and shared `websites.txt` are unchanged.
+
+Linux dispatches `run_simulation "www_discover.sh" 30`, with `timeout` limiting
+Firefox to 60 seconds (a 5-second forced-cleanup grace if TERM is ignored).
+It uses foreground `cpulimit -l 10` when available, otherwise plain
+`firefox-esr --headless`. Windows launches Firefox hidden, waits at most 60
+seconds, then stops only the process returned by that launch. Empty/missing
+lists or missing Firefox are logged and exit successfully. Logs are `sim.log`
+and `debug-www-discover.log` in the platform's scripts directory.
+
+This produces ordinary browsing traffic, not an alert: no quota, DNS-flood
+logic, or process-name killing is involved. No T3 or spoke-side emulation port
+is included.
 
 ## Simulation Build Assistant & Chat Capabilities
 
