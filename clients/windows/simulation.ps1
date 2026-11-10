@@ -115,7 +115,7 @@ function Send-Status {
         }
 
         $activeSimulations = @()
-        foreach ($name in @('dns_fail','dns_latency','collab','iperf','download','www_traffic','ping_test','ssidpw_fail','auth_fail','mac_auth_fail','dhcp_fail','client_offline')) {
+        foreach ($name in @('dns_fail','dns_latency','collab','iperf','download','www_traffic','www_discover','ping_test','ssidpw_fail','auth_fail','mac_auth_fail','dhcp_fail','client_offline')) {
             if ((Get-Variable -Name $name -Scope Script -ValueOnly -ErrorAction SilentlyContinue) -eq 'on') {
                 $activeSimulations += $name
             }
@@ -145,6 +145,7 @@ function Send-Status {
                 client_offline = [string]$script:client_offline
                 iperf = [string]$script:iperf
                 www_traffic = [string]$script:www_traffic
+                www_discover = [string]$script:www_discover
                 download = [string]$script:download
                 ping_test = [string]$script:ping_test
                 ssidpw_fail = [string]$script:ssidpw_fail
@@ -484,6 +485,8 @@ while ($true) {
     $script:download = get_value $script:simulation_id 'download'
     $script:iperf = get_value $script:simulation_id 'iperf'
     $script:www_traffic = get_value $script:simulation_id 'www_traffic'
+    $script:www_discover = get_value $script:simulation_id 'www_discover'
+    if (-not $script:www_discover) { $script:www_discover = 'off' }
     $script:dns_latency = get_value $script:simulation_id 'dns_latency'
     $script:collab = get_value $script:simulation_id 'collab'
     $script:client_offline = get_value $script:simulation_id 'client_offline'
@@ -509,7 +512,7 @@ while ($true) {
         $randomBucket = 's' + (Get-Random -Minimum 0 -Maximum 10)
         Write-SimLog "Ambient random pool: rolling behaviour from bucket $randomBucket"
         $randomizableList = $randomizableSims -split '\s+' | Where-Object { $_ }
-        foreach ($sim in @('dhcp_fail','dns_fail','dns_latency','collab','assoc_fail','port_flap','ssidpw_fail','auth_fail','mac_auth_fail','ping_test','download','iperf','www_traffic')) {
+        foreach ($sim in @('dhcp_fail','dns_fail','dns_latency','collab','assoc_fail','port_flap','ssidpw_fail','auth_fail','mac_auth_fail','ping_test','download','iperf','www_traffic','www_discover')) {
             if ($randomizableList -contains $sim) {
                 Set-Variable -Name $sim -Scope Script -Value (get_value $randomBucket $sim)
             } else {
@@ -536,7 +539,7 @@ while ($true) {
     Apply-UserOverrides -Section $script:username -Names @(
         'kill_switch','sim_load','public_repo','repo_location','site_based_ssid','iperf_bw',
         'wsite','sim_phy','ssid','ssidpw','ssid_auth','dhcp_fail','dns_fail','dns_latency','collab','assoc_fail','port_flap','ping_test',
-        'download','iperf','www_traffic','ssidpw_fail','auth_fail','mac_auth_fail','mac_auth_fail_mac','smb_address','ping_address',
+        'download','iperf','www_traffic','www_discover','ssidpw_fail','auth_fail','mac_auth_fail','mac_auth_fail_mac','smb_address','ping_address',
         'dns_bad_ip_1','dns_bad_ip_2','dns_bad_ip_3',
         'dns_bad_record_1','dns_bad_record_2','dns_bad_record_3','iperf_server',
         'collab_app','collab_bw','collab_time','collab_server','dot1x_password','dot1x_eap','web_server','client_offline'
@@ -706,6 +709,10 @@ while ($true) {
                     Run-Simulation -ScriptName 'www_traffic.ps1'
                     Write-SimDebug 'Running WWW Traffic Simulation'
                     $script:www_traffic = 'off'
+                }
+                if ($script:www_discover -eq 'on' -and -not (Test-ScriptRunning -ScriptName 'www_discover.ps1')) {
+                    Run-Simulation -ScriptName 'www_discover.ps1'
+                    Write-SimDebug 'Running WWW Discover Simulation'
                 }
                 if ($script:ping_test -eq 'on' -and -not (Test-ScriptRunning -ScriptName 'ping_test.ps1')) {
                     Run-Simulation -ScriptName 'ping_test.ps1'
