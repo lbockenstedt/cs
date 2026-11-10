@@ -79,6 +79,18 @@ function Get-SimTargetSsid {
     return $script:ssid
 }
 
+# Get-SimSsidAuth — how this client's SSID authenticates: psk, mpsk, 1x or open.
+# The engine delivers it as ssid_auth (the Auth of the SSID matrix cell the client
+# is placed on). Without ssid_auth (older configs, standalone buckets) an SSID
+# literally named "1X" means 802.1X and anything else means PSK — the original
+# rule. Reads $script:ssid_auth / $script:ssid. Mirrors bash _ssid_auth.
+function Get-SimSsidAuth {
+    $auth = "$($script:ssid_auth)".Trim().ToLower()
+    if (@('psk', 'mpsk', '1x', 'open') -contains $auth) { return $auth }
+    if ($script:ssid -eq '1X') { return '1x' }
+    return 'psk'
+}
+
 # Get-SimConnectedSsid — the SSID the wlan adapter is currently associated to
 # (empty when disconnected). Parses `netsh wlan show interfaces`, ignoring the
 # BSSID row. Mirrors nmcli's "connected" read.

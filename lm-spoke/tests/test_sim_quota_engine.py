@@ -879,6 +879,48 @@ def test_reconcile_weighted_spreads_tenant_pool_across_sites(tmp_path):
     assert wsites.count("B") == 2, wsites
 
 
+def test_place_delivers_ssid_auth_for_open_and_psk_cells(tmp_path):
+    # The client routes its connect on ssid_auth, so every placement must send
+    # it — an open cell (no ssidpw) included, or the client would try a WPA
+    # connect with whatever password an earlier PSK cell left behind.
+    clients = {f"c{i}": _client(f"c{i}", "") for i in range(2)}
+    spoke = _FakeSpoke(clients, [], tmp_path)
+    spoke.local_store._matrix = [
+        {"name": "A-open", "site": "A", "auth": "open", "ssid": "Guest", "enabled": True},
+        {"name": "B-psk", "site": "B", "ssid": "Corp", "ssidpw": "pw", "enabled": True},
+    ]
+    spoke.local_store._weights = [
+        {"ssid": "A-open", "site": "A", "weight": 1},
+        {"ssid": "B-psk", "site": "B", "weight": 1},
+    ]
+    _run(SimQuotaEngine(spoke).reconcile())
+    ov = {(o := spoke.registry.clients[h].get("overrides", {}))["ssid"]: o for h in clients}
+    assert ov["Guest"]["ssid_auth"] == "open"
+    assert "ssidpw" not in ov["Guest"]
+    assert ov["Corp"]["ssid_auth"] == "psk"     # no auth set → psk
+
+
+def test_cell_quota_pins_ssid_auth(tmp_path):
+    # A quota scoped to a cell pins ssid/ssidpw AND ssid_auth to the client.
+    clients = {"c0": _client("c0", "MIA")}
+    spoke = _FakeSpoke(clients, [_q("Central:dns_fail", "dns_fail", 1, site="MIA-OPEN")], tmp_path)
+    spoke.local_store._matrix = [
+        {"name": "MIA-OPEN", "site": "MIA", "auth": "open", "ssid": "Guest", "enabled": True},
+    ]
+    _run(SimQuotaEngine(spoke).reconcile())
+    ov = spoke.registry.clients["c0"].get("overrides", {})
+    assert ov.get("ssid") == "Guest" and ov.get("ssid_auth") == "open", ov
+
+
+def test_cell_auth_rule():
+    a = SimQuotaEngine._cell_auth
+    assert a({"auth": "Open", "ssid": "Guest"}) == "open"
+    assert a({"auth": "mpsk", "ssid": "X"}) == "mpsk"
+    assert a({"ssid": "1X"}) == "1x"               # legacy: SSID literally 1X
+    assert a({"ssid": "Corp"}) == "psk"
+    assert a({"auth": "bogus", "ssid": "Corp"}) == "psk"
+
+
 def test_reconcile_weighted_site_weights_bias_the_spread(tmp_path):
     # ambient_site_weights {A:3, B:1} → 6 spare split 4-to-A / 2-to-B (weighted).
     clients = {f"c{i}": _client(f"c{i}", "") for i in range(6)}

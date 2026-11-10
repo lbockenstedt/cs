@@ -122,6 +122,9 @@ QT_ONLINE_S = 300.0                  # client seen within 5min counts as online
 # places on a 1X cell whose ``dot1x_account`` names a backend gets an account
 # there; the hub delivers the password back as CS_DOT1X_CREDENTIAL.
 DOT1X_BACKENDS = ("entra", "ldap", "clearpass")
+# SSID matrix cell auth types (the editor's CS_SSID_AUTH_TYPES). Delivered to
+# clients as the ssid_auth override; they connect PSK, 802.1X or open by it.
+SSID_AUTH_TYPES = ("psk", "mpsk", "1x", "open")
 DOT1X_RESEND_S = 300.0     # re-request a provision the hub hasn't answered
 DOT1X_SYNC_S = 900.0       # full keep-alive / reconciliation with the hub
 DOT1X_STALE_S = 86400.0    # unseen this long = torn down → release the account
@@ -1344,13 +1347,15 @@ class SimQuotaEngine:
                     self._displaced.setdefault(hostname, set()).add(s)
         if site and site != from_site:
             overrides["wsite"] = site
-        # Cell quota: also pin the client's SSID (+ password) to the cell, so a
-        # "MIA-PSK" quota lands the client on the PSK SSID — not just the site.
+        # Cell quota: also pin the client's SSID (+ password + auth type) to the
+        # cell, so a "MIA-PSK" quota lands the client on the PSK SSID — not just
+        # the site. ssid_auth tells the client how to connect (psk/mpsk/1x/open).
         if cell:
             for src, key in (("ssid", "ssid"), ("ssidpw", "ssidpw")):
                 val = str(cell.get(src) or "").strip()
                 if val:
                     overrides[key] = val
+            overrides["ssid_auth"] = self._cell_auth(cell)
         # Write the overrides and log.
         if overrides:
             await self._engine_set(hostname, overrides)
@@ -1392,15 +1397,23 @@ class SimQuotaEngine:
         logger.info("SimQuotaEngine: released %s ← sim=%s (site %s)",
                     hostname, sim_id or "(presence)", target or from_site or "*")
 
+    @staticmethod
+    def _cell_auth(cd: Dict[str, Any]) -> str:
+        """How an SSID cell authenticates: 'psk', 'mpsk', '1x' or 'open'.
+        Same rule as the matrix editor's csCellAuth: the explicit auth when it is
+        a known type, else '1x' for an SSID literally named 1X, else 'psk'."""
+        auth = str(cd.get("auth") or "").strip().lower()
+        if auth in SSID_AUTH_TYPES:
+            return auth
+        return "1x" if str(cd.get("ssid") or "").strip().upper() == "1X" else "psk"
+
     # ── JIT 802.1X accounts ─────────────────────────────────────────────────
     @staticmethod
     def _dot1x_cell_backend(cd: Dict[str, Any]) -> str:
         """The account location of a 1X cell ('' = manual / not a 1X cell).
-        Same 1X test as the matrix editor's csCellAuth: explicit auth, else an
-        SSID literally named 1X."""
+        Uses _cell_auth (the matrix editor's csCellAuth rule)."""
         # A 1X cell with a known account backend.
-        auth = str(cd.get("auth") or "").strip().lower()
-        is_1x = auth == "1x" or (not auth and str(cd.get("ssid") or "").strip().upper() == "1X")
+        is_1x = SimQuotaEngine._cell_auth(cd) == "1x"
         backend = str(cd.get("dot1x_account") or "").strip().lower()
         return backend if is_1x and backend in DOT1X_BACKENDS else ""
 
@@ -1632,7 +1645,7 @@ class SimQuotaEngine:
     # ── SSID placement (design doc §5) ───────────────────────────────────────
     async def _place(self, hostname: str, cell: Dict[str, Any]) -> None:
         """Move a client onto an SSID cell by setting its connectivity overrides
-        (wsite/ssid/ssidpw). Delivered via the served [username] layer, so it
+        (wsite/ssid/ssidpw/ssid_auth). Delivered via the served [username] layer, so it
         wins over the client's bucket. Non-toggle overrides survive the registry
         prune (unlike on/off sim flags)."""
         # Need a registry.
@@ -1645,6 +1658,9 @@ class SimQuotaEngine:
             val = str(cell.get(src) or "").strip()
             if val:
                 overrides[key] = val
+        # Always send the auth type: an open cell has no ssidpw, so the client
+        # must be told not to use any password left over from an earlier cell.
+        overrides["ssid_auth"] = self._cell_auth(cell)
         # Apply them.
         if overrides:
             await reg.set_overrides(hostname, overrides)

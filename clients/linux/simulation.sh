@@ -13,13 +13,14 @@ source '/usr/local/scripts/ini-parser.sh'
 # apply_overrides/json_escape) — canonical source clients/lib/common.sh.
 source '/usr/local/scripts/common.sh'
 # Network connect / adapter / reset helpers — split into sourced files so each
-# concern (PSK connect, 1X connect, recovery, shared waits/state) can be edited
+# concern (PSK connect, 1X connect, open connect, recovery, shared waits/state) can be edited
 # in isolation WITHOUT touching the others or this orchestrator. Order matters:
 # network_common.sh defines the shared helpers + the _reconnect_fails state that
 # the other three call, so it MUST be sourced first.
 source '/usr/local/scripts/network_common.sh'
 source '/usr/local/scripts/connect_psk.sh'
 source '/usr/local/scripts/connect_1x.sh'
+source '/usr/local/scripts/connect_open.sh'
 # Wired 802.1X / MAC-Auth-Bypass counterparts to connect_1x.sh — auth_fail and
 # mac_auth_fail are media="any" (both have a real wired path); see the file
 # header for why this is split out from the (wireless-only) connect_1x.sh.
@@ -92,7 +93,7 @@ init_simulation_context() {
 # sim user lacked passwordless sudo, leaving the box on stale code with the new
 # code already on disk (update.sh then reports "no files updated" forever).
 _self_path="/usr/local/scripts/simulation.sh"
-# The four network files sourced at the top of this file. We watch their mtimes
+# The network files sourced at the top of this file. We watch their mtimes
 # alongside simulation.sh's own so an edit to ANY of them re-execs the loop into
 # fresh code (same mechanism as the old single-file check below, just covering
 # every file we source). Listed once here, used by the in-loop change check.
@@ -100,6 +101,7 @@ _NET_SOURCE_FILES=(
   /usr/local/scripts/network_common.sh
   /usr/local/scripts/connect_psk.sh
   /usr/local/scripts/connect_1x.sh
+  /usr/local/scripts/connect_open.sh
   /usr/local/scripts/connect_wired_1x.sh
   /usr/local/scripts/recovery.sh
 )
@@ -322,11 +324,11 @@ server_url="${server_url:-http://169.253.1.1:8080}"
 randomizable_sims=$(get_value 'simulation' 'randomizable_sims')
 if [[ "$web_server" == "on" ]]; then
   # --- HUB / engine-driven ambient placement -----------------------------------
-  # Connectivity (wsite/ssid/ssidpw) is intentionally left blank here: the engine
+  # Connectivity (wsite/ssid/ssidpw/ssid_auth) is intentionally left blank here: the engine
   # delivers it as a [username] override that apply_override() layers on top LAST,
   # so it always wins. sim_phy is a global default for now (wireless); the T1
   # wired+wireless (Raspberry Pi) case is handled separately, see docs.
-  wsite=""; ssid=""; ssidpw=""
+  wsite=""; ssid=""; ssidpw=""; ssid_auth=""
   sim_phy=$(get_value 'simulation' 'sim_phy'); sim_phy="${sim_phy:-wireless}"
   # Start every sim OFF. The engine turns failure sims on via the [username]
   # override applied further down; the roll below is what turns AMBIENT traffic on.
@@ -386,6 +388,8 @@ else
   sim_phy=$(get_value $simulation_id 'sim_phy')
   ssid=$(get_value $simulation_id 'ssid')
   ssidpw=$(get_value $simulation_id 'ssidpw')
+  # psk/mpsk/1x/open — empty falls back to the SSID-name rule (_ssid_auth).
+  ssid_auth=$(get_value $simulation_id 'ssid_auth')
   dhcp_fail=$(get_value $simulation_id 'dhcp_fail')
   dns_fail=$(get_value $simulation_id 'dns_fail')
   dns_latency=$(get_value $simulation_id 'dns_latency')
@@ -451,6 +455,7 @@ echo Simulation Details: | tee -a ${LOG_FILE}
 echo Hostname: $HOSTNAME | tee -a ${LOG_FILE}
 echo Site: $wsite | tee -a ${LOG_FILE}
 echo Site Based SSID: $site_based_ssid | tee -a ${LOG_FILE}
+echo "SSID: ${ssid:-unassigned} (auth=$(_ssid_auth))" | tee -a ${LOG_FILE}
 echo Phy: $sim_phy | tee -a ${LOG_FILE}
 if [[ "$sim_phy" == "wireless" ]] && [[ -n ${wladapter} ]]; then echo Adapter: $wladapter | tee -a ${LOG_FILE}; fi
 echo Simulation Load: $sim_load | tee -a ${LOG_FILE}
@@ -655,7 +660,13 @@ run_simulation() {
 #------------------------------------------------------------
 if type -t detect_t3_pci >/dev/null 2>&1 && detect_t3_pci; then
   echo "T3 adapter detected — running IoT-fleet (vwlan) simulation" | tee -a ${LOG_FILE}
-  run_iot_simulation "$ssid" "$ssidpw"
+  # An open SSID has no passphrase: an empty psk makes iot_write_wpa_conf write
+  # key_mgmt=NONE, and ignores any stale ssidpw left over from a PSK cell.
+  if [[ "$(_ssid_auth)" == "open" ]]; then
+    run_iot_simulation "$ssid" ""
+  else
+    run_iot_simulation "$ssid" "$ssidpw"
+  fi
   z=$(( ${z:-0} + 1 ))
   report_status "$z"
   iot_cycle=$(get_value 'simulation' 'iot_cycle_sleep'); [[ "$iot_cycle" =~ ^[0-9]+$ ]] || iot_cycle=300
@@ -826,6 +837,8 @@ if [ "$kill_switch" != "on" ]; then
       echo "SSID Incorrect Password has no wired equivalent — skipping (sim_phy=ethernet)" | tee -a ${LOG_FILE}
      elif [[ -z ${wladapter} ]]; then
       echo "SSID Incorrect Password requires a wireless adapter — none detected, skipping" | tee -a ${LOG_FILE}
+     elif [[ "$(_ssid_auth)" == "open" ]]; then
+      echo "SSID Incorrect Password does not apply to an open SSID (no password) — skipping" | tee -a ${LOG_FILE}
      else
      # Base the wrong password on the client's EFFECTIVE password: the
      # [username]/cell override (get_value $username) wins over the [s0-s9]
@@ -843,10 +856,10 @@ if [ "$kill_switch" != "on" ]; then
       [[ -n "$real_dot1x" ]] && dot1x_password="${real_dot1x}_fail"
       echo Iteration $i of 100 | tee -a ${LOG_FILE}
       # Fast wrong-password attempt (>=10 failures/min): the PSK and 1X fail
-      # functions are separate — pick by SSID type. Each drops the 15s settle and
+      # functions are separate — pick by SSID auth type. Each drops the 15s settle and
       # caps nmcli at 5s; the AP/RADIUS records the failed handshake/auth within
       # ~1-2s, so a short cap still registers every attempt as a distinct event.
-      if [[ "$ssid" == "1X" ]]; then
+      if [[ "$(_ssid_auth)" == "1x" ]]; then
         connect_1x_fail 5
       else
         connect_wifi_fail 5
@@ -894,7 +907,8 @@ if [ "$kill_switch" != "on" ]; then
      mac_fail_ssid=$(_target_ssid) || mac_fail_ssid=""
      # Bootstrap the profile ONCE, unspoofed, if it doesn't exist yet — `device
      # wifi connect` negotiates WPA2/WPA3/security automatically (a manual
-     # `connection add` can't easily replicate that). This is the ONLY
+     # `connection add` can't easily replicate that). An open SSID has no
+     # security to negotiate, so it uses the plain open profile instead. This is the ONLY
      # `device wifi connect` call in this block: every iteration after this
      # uses `connection up` (via manage_connection), which HONORS
      # cloned-mac-address. `device wifi connect` does NOT — it silently resets
@@ -902,7 +916,11 @@ if [ "$kill_switch" != "on" ]; then
      # spoofed connection or the spoof is undone the instant it's applied.
      if [[ -n "$mac_fail_ssid" ]] && ! nmcli -t -f NAME connection show 2>/dev/null | grep -Fxq "$mac_fail_ssid"; then
        echo "  [mac_auth_fail] bootstrapping connection profile '${mac_fail_ssid}' (one-time, unspoofed)" | tee -a ${LOG_FILE}
-       nmcli -w 30 device wifi connect "$mac_fail_ssid" password "$ssidpw" >/dev/null 2>&1
+       if [[ "$(_ssid_auth)" == "open" ]]; then
+         _connect_open_build_profile "$mac_fail_ssid" >/dev/null 2>&1
+       else
+         nmcli -w 30 device wifi connect "$mac_fail_ssid" password "$ssidpw" >/dev/null 2>&1
+       fi
      fi
      for i in {1..100}; do
       echo "Enable/Disable WLAN interface (spoofed MAC deny-list test)" | tee -a ${LOG_FILE}
