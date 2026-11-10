@@ -163,7 +163,11 @@ name=DNS Fail — MIA
 central_check=
 wsite=MIA               # site label — must match a site_mappings entry in the webUI
 ssid=PSK                # SSID to connect to
-ssidpw=PassW0rd!        # WPA passphrase
+ssidpw=PassW0rd!        # WPA passphrase (ignored when ssid_auth=open)
+ssid_auth=psk           # psk | mpsk | 1x | open — how to connect. Unset = the
+                        # old rule (ssid "1X" = 802.1X, anything else PSK). The
+                        # engine sets it from the SSID matrix cell's Auth. open =
+                        # no password; ssidpw_fail is skipped on open SSIDs.
 dhcp_fail=off           # simulate DHCP failure
 dns_fail=on             # simulate DNS failure (generates DNS alert in Central)
 assoc_fail=off          # count toward an SSID pre-configured on the AP/controller
