@@ -54,6 +54,19 @@ _target_ssid() {
   fi
 }
 
+# _ssid_auth — print how this client's SSID authenticates: psk, mpsk, 1x or open.
+# The engine delivers it as ssid_auth (the Auth of the SSID matrix cell the client
+# is placed on). Without ssid_auth (older configs, standalone buckets) an SSID
+# literally named "1X" means 802.1X and anything else means PSK — the original rule.
+_ssid_auth() {
+  local auth
+  auth=$(printf '%s' "${ssid_auth:-}" | tr '[:upper:]' '[:lower:]')
+  case "$auth" in
+    psk|mpsk|1x|open) printf '%s\n' "$auth" ;;
+    *) if [[ "${ssid:-}" == "1X" ]]; then echo 1x; else echo psk; fi ;;
+  esac
+}
+
 # delete_matching_connections — remove every saved NetworkManager wifi profile
 # whose name contains "PSK". Forces a fresh association on the next connect
 # (each attempt is then a distinct AP event, not a cached profile reuse). Used

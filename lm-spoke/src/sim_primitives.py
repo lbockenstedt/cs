@@ -416,6 +416,21 @@ def _effective_ssid(profile: Dict[str, str]) -> str:
     return ssid
 
 
+def _is_open_ssid(profile: Dict[str, str]) -> bool:
+    """True when the profile's SSID is open (ssid_auth=open — no password)."""
+    return (profile.get("ssid_auth", "") or "").strip().lower() == "open"
+
+
+def _wifi_connect_args(profile: Dict[str, str], ssid: str) -> list:
+    """nmcli args for a first-time ``device wifi connect`` to ``ssid``. An open
+    SSID gets no ``password`` (any ssidpw left from an earlier PSK cell is
+    ignored); every other SSID passes the profile's ssidpw."""
+    args = ["device", "wifi", "connect", ssid]
+    if not _is_open_ssid(profile):
+        args += ["password", profile.get("ssidpw", "")]
+    return args
+
+
 async def sim_assoc_fail(profile: Dict[str, str], ctx: SimCtx) -> PrimResult:
     """Client-count sim, NOT a client-side failure: the AP/controller side is
     pre-configured out of band so this SSID fires CLIENT_ASSOCIATION_FAILURE /
@@ -434,8 +449,7 @@ async def sim_assoc_fail(profile: Dict[str, str], ctx: SimCtx) -> PrimResult:
     # Bring up the saved connection, else connect with the password.
     ssid = _effective_ssid(profile)
     if not await _nmcli("connection", "up", ssid, timeout=10.0):
-        await _nmcli("device", "wifi", "connect", ssid,
-                     "password", profile.get("ssidpw", ""), timeout=15.0)
+        await _nmcli(*_wifi_connect_args(profile, ssid), timeout=15.0)
     # Report the attempt.
     return _ok("assoc_fail", f"connect attempt to {ssid}", "nmcli")
 
@@ -447,6 +461,9 @@ async def sim_ssidpw_fail(profile: Dict[str, str], ctx: SimCtx) -> PrimResult:
         return _degraded("ssidpw_fail", "nmcli", "install NetworkManager (nmcli)")
     if not await _find_wireless_adapter():
         return _degraded("ssidpw_fail", "wlan-iface", "no wireless interface found")
+    # An open SSID has no password to get wrong.
+    if _is_open_ssid(profile):
+        return _ok("ssidpw_fail", "skipped: an open SSID has no password", "")
     # SSID and a deliberately wrong password.
     ssid = _effective_ssid(profile)
     badpw = f"{profile.get('ssidpw', '')}_fail"
@@ -495,8 +512,7 @@ async def sim_mac_auth_fail(profile: Dict[str, str], ctx: SimCtx) -> PrimResult:
     # Create the connection once if it does not exist.
     exists = await _nmcli("connection", "show", ssid, timeout=5.0)
     if not exists:
-        await _nmcli("device", "wifi", "connect", ssid, "password",
-                     profile.get("ssidpw", ""), timeout=15.0)
+        await _nmcli(*_wifi_connect_args(profile, ssid), timeout=15.0)
     # Set the spoofed MAC on the connection.
     await _nmcli("connection", "modify", ssid,
                  "802-11-wireless.cloned-mac-address", target_mac, timeout=5.0)
