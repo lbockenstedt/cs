@@ -122,7 +122,7 @@ random/default** (§10). A human `[username]` pin is always honored.
 ## 5. SSID cells — definitions, cell quotas, and weighted rules
 
 The **SSID matrix** (Pool & SSID card) is **definitions only**: each cell is
-`{ name = "<site>-<ssid>", site, ssid (auth: PSK/1X/…), password, enabled }`.
+`{ name = "<site>-<ssid>", site, ssid (auth: PSK/MPSK/1X/Open), password, enabled }`.
 It carries **no** counts — no Hold N, no per-cell weight. A cell name like
 `MIA-PSK` encodes its physical site (`MIA`) and its auth (`PSK`).
 
@@ -199,8 +199,11 @@ Clients land on a cell in exactly **two ways**, configured in one place
    the connect is skipped (never `"-"`), and a blank `wsite` with
    `site_based_ssid=on` falls back to the bare SSID.
 
-Both write `wsite` / `ssid` / `ssidpw` into the served `[username]` (frozen
-connectivity — see §12), so bucket randomization can never move a box's SSID.
+Both write `wsite` / `ssid` / `ssidpw` / `ssid_auth` into the served `[username]`
+(frozen connectivity — see §12), so bucket randomization can never move a box's
+SSID. `ssid_auth` is the cell's Auth (`psk`/`mpsk`/`1x`/`open`; a cell with no
+Auth is `1x` when its SSID is literally `1X`, else `psk`) and is always sent, so
+an Open cell's client ignores any `ssidpw` left over from an earlier PSK cell.
 
 > **Deprecated:** the old per-cell **Hold N** + **remainder** placement model
 > (`_reconcile_placement`, `ssid_placement`) is gone. Hold N → a cell harvest
@@ -489,7 +492,7 @@ Client `username = $HOSTNAME | cut -d- -f1` matches server `username_for`.
 
 ## 13. Config surfaces (all fleet-size-independent)
 
-- **SSID matrix** — the cells that exist: `{ site, ssid/auth (PSK/1X/…),
+- **SSID matrix** — the cells that exist: `{ site, ssid/auth (PSK/MPSK/1X/Open),
   password, enabled }`. **Definitions only** — no counts.
 - **Site source / mode** — PXMX topology vs weighted-assignment + site-based SSID.
 - **Weighted random rules** (`ssid_weights`) — `{ site, ssid(cell), weight, all }`
@@ -580,6 +583,11 @@ alert feature when it ships** (planned, not built).
 - **802.1X** — `connect_1x()` (PEAP/MSCHAPv2, identity = short username, no cert
   validation); `connect_wifi()` dispatches to it when the cell auth is `1X`;
   `ssidpw_fail` flows through it automatically.
+- **Open** — `connect_open()` (`connect_open.sh` / `connect_open.ps1`, T3 via
+  `iot_sim.sh` with an empty psk → `key_mgmt=NONE`); `connect_wifi()` dispatches
+  to it when `ssid_auth=open`. The profile is rebuilt with no security on every
+  connect. `ssidpw_fail` is skipped on open SSIDs (no password to get wrong);
+  `auth_fail` / `mac_auth_fail` still run.
 - Dead `mac_id` (unused crc32 MAC) removed.
 
 **Remaining / future:**

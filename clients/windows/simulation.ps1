@@ -2,6 +2,7 @@
 . 'C:\Scripts\common.ps1'
 . 'C:\Scripts\network_common.ps1'
 . 'C:\Scripts\connect_1x.ps1'
+. 'C:\Scripts\connect_open.ps1'
 . 'C:\Scripts\connect_psk.ps1'
 
 $version = '0.01'
@@ -265,8 +266,9 @@ function Remove-WifiProfile {
 function Connect-Wifi {
     # Delegate to the shared connect library. Connect-WifiPsk (connect_psk.ps1)
     # does the WPA2-PSK associate + reconnect-fail ramp AND dispatches to 802.1X
-    # (connect_1x.ps1) when the bucket SSID is "1X". Mirrors the Linux
-    # simulation.sh sourcing network_common.sh + connect_psk.sh + connect_1x.sh.
+    # (connect_1x.ps1) or open (connect_open.ps1) per Get-SimSsidAuth. Mirrors the
+    # Linux simulation.sh sourcing network_common.sh + connect_psk.sh +
+    # connect_1x.sh + connect_open.sh.
     return [bool](Connect-WifiPsk)
 }
 
@@ -472,6 +474,8 @@ while ($true) {
     $script:sim_phy = get_value $script:simulation_id 'sim_phy'
     $script:ssid = get_value $script:simulation_id 'ssid'
     $script:ssidpw = get_value $script:simulation_id 'ssidpw'
+    # psk/mpsk/1x/open — empty falls back to the SSID-name rule (Get-SimSsidAuth).
+    $script:ssid_auth = get_value $script:simulation_id 'ssid_auth'
     $script:dhcp_fail = get_value $script:simulation_id 'dhcp_fail'
     $script:dns_fail = get_value $script:simulation_id 'dns_fail'
     $script:assoc_fail = get_value $script:simulation_id 'assoc_fail'
@@ -531,7 +535,7 @@ while ($true) {
 
     Apply-UserOverrides -Section $script:username -Names @(
         'kill_switch','sim_load','public_repo','repo_location','site_based_ssid','iperf_bw',
-        'wsite','sim_phy','ssid','ssidpw','dhcp_fail','dns_fail','dns_latency','collab','assoc_fail','port_flap','ping_test',
+        'wsite','sim_phy','ssid','ssidpw','ssid_auth','dhcp_fail','dns_fail','dns_latency','collab','assoc_fail','port_flap','ping_test',
         'download','iperf','www_traffic','ssidpw_fail','auth_fail','mac_auth_fail','mac_auth_fail_mac','smb_address','ping_address',
         'dns_bad_ip_1','dns_bad_ip_2','dns_bad_ip_3',
         'dns_bad_record_1','dns_bad_record_2','dns_bad_record_3','iperf_server',
@@ -625,11 +629,16 @@ while ($true) {
                     # Fast wrong-password loop (<=~6s/attempt) so the "WPA Passphrase
                     # Incorrect" insight fires >=10x/min — the full-connect loop
                     # (radio cycle + scan-wait each) was far too slow to trip it.
-                    # PSK vs 1X per the bucket SSID. Mirrors Linux connect_wifi_fail.
-                    $script:ssidpw = "${correctSsidpw}_fail"
-                    for ($i = 1; $i -le 100; $i++) {
-                        Write-SimDebug "Running SSID Incorrect Password — iteration $i of 100"
-                        if ($script:ssid -eq '1X') { [void](Connect-Wifi1xFail) } else { [void](Connect-WifiPskFail) }
+                    # PSK vs 1X per Get-SimSsidAuth. Mirrors Linux connect_wifi_fail.
+                    # An open SSID has no password to get wrong, so it is skipped.
+                    if ((Get-SimSsidAuth) -eq 'open') {
+                        Write-SimLog 'SSID Incorrect Password does not apply to an open SSID (no password) — skipping'
+                    } else {
+                        $script:ssidpw = "${correctSsidpw}_fail"
+                        for ($i = 1; $i -le 100; $i++) {
+                            Write-SimDebug "Running SSID Incorrect Password — iteration $i of 100"
+                            if ((Get-SimSsidAuth) -eq '1x') { [void](Connect-Wifi1xFail) } else { [void](Connect-WifiPskFail) }
+                        }
                     }
                 }
                 if ($script:auth_fail -eq 'on') {
