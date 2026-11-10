@@ -6,29 +6,6 @@ The `cs` spoke module drives synthetic network client simulation, automated test
 
 ---
 
-## Repository layout
-
-| Path | What it holds |
-| :--- | :--- |
-| `.claude/` | Fleet-owned skills, synced from lm; edit them in lm. |
-| `.github/` | CI (`workflows/ci.yml`), the thin `promote`/`backmerge` callers, promotion scripts and fleet-owned agents. |
-| `clients/` | The client simulation scripts that run on the simulated clients: `linux/`, `windows/`, `t3/` and their tests. |
-| `configs/` | Default simulation config and the URL/DNS lists the clients use. |
-| `docs/` | This module's docs (copies of the canonical pages in `lm/docs`). |
-| `installers/` | Installers for the client-sim host (Linux, Windows, Proxmox LXC). |
-| `lm-spoke/` | The LM spoke itself: `src/`, `tests/`, its installer and Dockerfile. |
-| `proxmox/` | Proxmox agent and helpers that clone and watch the client VMs. |
-| `svr-mgmt/` | Ansible playbooks for managing the simulation servers. |
-| `webui-local/` | Stand-alone local web UI for the simulator (also deployable to Azure). |
-| `webui-spoke/` | The web UI served through the LM spoke (relay to LM, ACME). |
-| `AGENTS.md` | Orientation for people and AI agents; the fleet rules block is synced from lm. |
-| `install_cs.sh` | Installer (idempotent; safe to re-run). |
-| `README.md` | This file. |
-| `src` | Symlink to `lm-spoke/src`. |
-| `tests` | Symlink to `lm-spoke/tests`. |
-| `uninstall_cs.sh` | Uninstaller. |
-| `VERSION` | Bot-owned version; promotion bumps it. Never edit by hand. |
-
 ## Architecture
 
 `cs` operates as the control, orchestration, and telemetry aggregation layer for client simulations:
