@@ -3,7 +3,7 @@
 #                                                                                #
 # PowerShell 5.1 (Desktop) port of clients/linux/connect_psk.sh. Owns the two    #
 # PSK connect paths:                                                             #
-#   Connect-WifiPsk      — the normal, genuine associate (also the 1X dispatcher)#
+#   Connect-WifiPsk      — the normal associate (also the 1X / open dispatcher) #
 #   Connect-WifiPskFail  — the fast wrong-password loop for the ssidpw_fail sim. #
 #                                                                                #
 # Dot-source AFTER network_common.ps1 (it provides the state/helpers below and   #
@@ -11,6 +11,7 @@
 #                                                                                #
 # Depends on simulation.ps1 having set (each loop, before these are CALLED):     #
 #   $script:ssid, $script:ssidpw, $script:wsite, $script:site_based_ssid         #
+#   $script:ssid_auth — psk/mpsk/1x/open (see Get-SimSsidAuth)                   #
 # Plus the shared state/helpers in network_common.ps1: ReconnectFails,           #
 # RadioCycleAfter, Test-WifiBusy, Wait-RadioReady, Wait-SsidSeen,                #
 # Invoke-RadioCycleIfNeeded, Test-ConnectOutcome, Register-Connect*,             #
@@ -66,11 +67,18 @@ function Connect-WifiPsk {
         [bool]$Track = $true
     )
 
-    # An 802.1X (enterprise) SSID is flagged by ssid == "1X" in the SSID matrix —
-    # route it to the 1X path in connect_1x.ps1. Every other SSID is PSK below.
-    if ($script:ssid -eq '1X') {
-        Connect-Wifi1x -WaitTime $WaitTime -Reset:$Reset
-        return
+    # Route by the SSID's auth type (Get-SimSsidAuth, network_common.ps1):
+    # 802.1X goes to connect_1x.ps1, open goes to connect_open.ps1. PSK and MPSK
+    # are handled below.
+    switch (Get-SimSsidAuth) {
+        '1x' {
+            Connect-Wifi1x -WaitTime $WaitTime -Reset:$Reset
+            return
+        }
+        'open' {
+            Connect-WifiOpen -WaitTime $WaitTime -Reset:$Reset -ScanCap $ScanCap -Track $Track
+            return
+        }
     }
 
     $targetSsid = Get-SimTargetSsid

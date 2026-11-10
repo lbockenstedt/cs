@@ -63,7 +63,7 @@ SIM_FLAG_KEYS = (
     "site_based_ssid", "iperf_bw", "ssidpw_fail", "auth_fail", "mac_auth_fail",
     "allow_offline",
     "web_server", "server_url",
-    "wsite", "ssid", "ssidpw", "dhcp_fail", "dns_fail", "dns_latency", "assoc_fail",
+    "wsite", "ssid", "ssidpw", "ssid_auth", "dhcp_fail", "dns_fail", "dns_latency", "assoc_fail",
     "port_flap", "ping_test", "download", "iperf", "www_traffic", "sim_phy",
     "l1", "smb_address", "ping_address", "iperf_server", "mac_auth_fail_mac",
     "dns_bad_ip_1", "dns_bad_ip_2", "dns_bad_ip_3",

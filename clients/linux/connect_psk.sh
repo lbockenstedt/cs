@@ -2,7 +2,7 @@
 # connect_psk.sh — PSK (personal) wifi connect functions for simulation.sh
 # ----------------------------------------------------------------------------
 # Sourced after network_common.sh. Owns the two PSK connect paths:
-#   connect_wifi       — the normal, genuine associate (also the 1X dispatcher).
+#   connect_wifi       — the normal, genuine associate (also the 1X/open dispatcher).
 #   connect_wifi_fail  — the fast wrong-password loop for the ssidpw_fail sim.
 #
 # Readable over clever. The one tricky bit (background nmcli + wait on its PID
@@ -12,6 +12,7 @@
 #
 # Depends on (set by simulation.sh before these are CALLED, not when sourced):
 #   $ssid, $ssidpw, $wsite, $site_based_ssid — the SSID + creds to connect with
+#   $ssid_auth                              — psk/mpsk/1x/open (see _ssid_auth)
 #   $wladapter                              — from detect_wlan_adapter (common.sh)
 # Plus the shared state/helpers in network_common.sh: _reconnect_fails,
 # _RADIO_CYCLE_AFTER, _wifi_busy, _wait_radio_ready, _wait_ssid_seen,
@@ -31,13 +32,19 @@ version=0.01
 connect_wifi() {
   local wait_time="${1:-180}" reset="${2:-}" scan_cap="${3:-}" track="${4:-1}"
 
-  # An 802.1X (enterprise) SSID is flagged by ssid == "1X" in the SSID matrix —
-  # route it to the 1X path in connect_1x.sh. Every other SSID is PSK, handled
+  # Route by the SSID's auth type (_ssid_auth, network_common.sh): 802.1X goes
+  # to connect_1x.sh, open goes to connect_open.sh. PSK and MPSK are handled
   # below.
-  if [[ "$ssid" == "1X" ]]; then
-    connect_1x "$wait_time" "$reset"
-    return
-  fi
+  case "$(_ssid_auth)" in
+    1x)
+      connect_1x "$wait_time" "$reset"
+      return
+      ;;
+    open)
+      connect_open "$wait_time" "$reset" "$scan_cap" "$track"
+      return
+      ;;
+  esac
 
   # Build the SSID we actually connect to. With site_based_ssid=on the SSID is
   # prefixed with the site name so the same bucket can map to different SSIDs
