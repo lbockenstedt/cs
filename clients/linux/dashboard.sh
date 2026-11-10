@@ -102,6 +102,7 @@ refresh_config() {
   download=$(get_value "$simulation_id" 'download')
   iperf=$(get_value "$simulation_id" 'iperf')
   www_traffic=$(get_value "$simulation_id" 'www_traffic')
+  www_discover=$(get_value "$simulation_id" 'www_discover')
   apply_overrides
 }
 refresh_config
@@ -237,6 +238,7 @@ sys.stdout.write(json.dumps(d))' 2>/dev/null)
         [[ "$download"    == "on" ]] && active_sims+=("download")
         [[ "$iperf"       == "on" ]] && active_sims+=("iperf")
         [[ "$www_traffic" == "on" ]] && active_sims+=("www_traffic")
+        [[ "$www_discover" == "on" ]] && active_sims+=("www_discover")
         [[ "$ssidpw_fail" == "on" ]] && active_sims+=("ssidpw_fail")
         [[ "$auth_fail"   == "on" ]] && active_sims+=("auth_fail")
         [[ "$mac_auth_fail" == "on" ]] && active_sims+=("mac_auth_fail")
@@ -344,6 +346,7 @@ get_script_flag() {
     iperf.sh)       echo "$iperf"       ;;
     ping_test.sh)   echo "$ping_test"   ;;
     www_traffic.sh) echo "$www_traffic" ;;
+    www_discover.sh) echo "$www_discover" ;;
     *)              echo "off"          ;;
   esac
 }
@@ -507,8 +510,8 @@ while true; do
   # WHY: Bash associative arrays have no guaranteed iteration order so the
   # flags would appear in a different sequence every refresh. Parallel arrays
   # give consistent ordering so the operator can scan quickly.
-  flag_labels=("Kill Switch" "DHCP Fail" "DNS Fail" "DNS Latency" "WWW Traffic" "iPerf" "Download" "Port Flap" "Bad SSID PW" "Auth Fail" "MAC Auth Fail")
-  flag_values=("$kill_switch" "$dhcp_fail" "$dns_fail" "$dns_latency" "$www_traffic" "$iperf" "$download" "$port_flap" "$ssidpw_fail" "$auth_fail" "$mac_auth_fail")
+  flag_labels=("Kill Switch" "DHCP Fail" "DNS Fail" "DNS Latency" "WWW Traffic" "WWW Discover" "iPerf" "Download" "Port Flap" "Bad SSID PW" "Auth Fail" "MAC Auth Fail")
+  flag_values=("$kill_switch" "$dhcp_fail" "$dns_fail" "$dns_latency" "$www_traffic" "$www_discover" "$iperf" "$download" "$port_flap" "$ssidpw_fail" "$auth_fail" "$mac_auth_fail")
   printf "  %sSimulations:%s\n" "$BOLD" "$RST"
   col=0
   for i in "${!flag_labels[@]}"; do

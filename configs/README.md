@@ -177,6 +177,7 @@ port_flap=off           # simulate wired port link flap
 ping_test=on            # run continuous ICMP ping test
 download=on             # run HTTP download traffic
 www_traffic=on          # run web browsing simulation traffic
+www_discover=off        # browse dedicated Network Diagnostics URLs (no alert)
 iperf=off               # run iPerf throughput test
 collab=off              # run collaboration-style UDP media traffic
 client_offline=off      # end-of-cycle offline window on the simulation adapter only
@@ -197,6 +198,7 @@ sim_phy=wireless        # wireless or ethernet
 | `ping_test`   | Sends ICMP to `ping_address` (traffic generation)  | —                            |
 | `download`    | Downloads a file repeatedly (traffic generation)   | —                            |
 | `www_traffic` | Fetches web pages (traffic generation)             | —                            |
+| `www_discover` | Opens one uniformly random URL from `www_discover_websites.txt` in headless Firefox, capped at 60s; default off in all buckets | — |
 | `iperf`       | Runs iPerf to `iperf_server` (bandwidth test)      | —                            |
 | `collab`      | Replays a Teams/Zoom/WebEx capture (or synthetic UDP) to `collab_server`; hub sink replays the server side back | — |
 
