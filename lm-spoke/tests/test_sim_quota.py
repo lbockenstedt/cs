@@ -119,7 +119,7 @@ def test_available_sims_from_conf_buckets(tmp_path):
     # Every returned sim is enriched with category + multi_capable.
     for s in sims:
         assert "category" in s and "multi_capable" in s
-    # dhcp_fail isn't in any bucket but is a runnable PRIMITIVE → still offered.
+    # dhcp_fail isn't in any bucket but is a known SIM_META sim → still offered.
     assert "dhcp_fail" in ids
 
 
@@ -208,3 +208,20 @@ def test_quota_dedup_key_presence_vs_sim():
     assert sim_quota.quota_dedup_key(
         {"alert_type": "alert", "alert_id": "X", "sim_id": "dns_fail", "site": "MIA"}
     ) == "alert:X:MIA"
+
+
+def test_available_sims_offers_every_sim_meta_sim(tmp_path):
+    # Client-script-only sims (no Python primitive, e.g. www_discover) must
+    # still be offered in the quota dropdown: SIM_META is the one sim catalog.
+    sims = {s["sim_id"] for s in sim_quota.available_sims(_write_conf(tmp_path))}
+    assert "www_discover" in sims
+    assert sims == set(sim_quota.SIM_META)
+
+
+def test_sim_lists_cover_every_sim_meta_sim():
+    import sim_config
+    import simulation_engine
+    for sim in sim_quota.SIM_META:
+        assert sim in sim_config._SIM_TOGGLE_KEYS
+        assert sim in sim_config.SIM_FLAG_KEYS
+        assert sim in simulation_engine._BEACON_CONFIG_KEYS

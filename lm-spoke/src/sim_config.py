@@ -43,6 +43,8 @@ from pathlib import Path
 # Type hints only.
 from typing import Any, Dict, Optional, Tuple
 
+from sim_quota import SIM_META
+
 # Logger for config-loading messages.
 logger = logging.getLogger("CSConfig")
 
@@ -51,20 +53,14 @@ logger = logging.getLogger("CSConfig")
 # The per-client sim ON/OFF toggles (the flags the ambient random pool rotates).
 # Used by effective_client_fields to let a rotating client's REPORTED flags win
 # over its home-bucket profile for the Clients view.
-_SIM_TOGGLE_KEYS = (
-    "dhcp_fail", "dns_fail", "dns_latency", "assoc_fail", "port_flap", "ping_test",
-    "download", "iperf", "www_traffic", "ssidpw_fail", "auth_fail", "mac_auth_fail",
-    "kill_switch",
-)
+_SIM_TOGGLE_KEYS = tuple(SIM_META) + ("kill_switch",)
 
 # Every setting name a simulation profile may contain.
-SIM_FLAG_KEYS = (
+SIM_FLAG_KEYS = tuple(SIM_META) + (
     "kill_switch", "rapid_update", "sim_load", "github_repo", "repo_location",
-    "site_based_ssid", "iperf_bw", "ssidpw_fail", "auth_fail", "mac_auth_fail",
-    "allow_offline",
+    "site_based_ssid", "iperf_bw", "allow_offline",
     "web_server", "server_url",
-    "wsite", "ssid", "ssidpw", "ssid_auth", "dhcp_fail", "dns_fail", "dns_latency", "assoc_fail",
-    "port_flap", "ping_test", "download", "iperf", "www_traffic", "sim_phy",
+    "wsite", "ssid", "ssidpw", "ssid_auth", "sim_phy",
     "l1", "smb_address", "ping_address", "iperf_server", "mac_auth_fail_mac",
     "dns_bad_ip_1", "dns_bad_ip_2", "dns_bad_ip_3",
     "dns_bad_record_1", "dns_bad_record_2", "dns_bad_record_3",
