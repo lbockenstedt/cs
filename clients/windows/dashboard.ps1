@@ -5,6 +5,30 @@ $version = '0.01'
 $logPath = 'C:\Scripts\sim.log'
 $refreshRate = 5
 $scriptRoot = 'C:\Scripts'
+# The dashboard starts once at logon and runs forever, so it kept showing its
+# launch-time code after an update replaced it. Watch this file and the files it
+# dot-sources; when one changes, start the new code in this console and end this
+# process (the window was opened with -NoExit, so a plain exit would leave a prompt).
+$watchedFiles = @($PSCommandPath, 'C:\Scripts\common.ps1', 'C:\Scripts\ini-parser.ps1')
+function Get-WatchedStamp {
+    # One write time per watched file, joined in a fixed order.
+    ($watchedFiles | ForEach-Object { (Get-Item -LiteralPath $_ -ErrorAction SilentlyContinue).LastWriteTimeUtc.Ticks }) -join ','
+}
+$startStamp = Get-WatchedStamp
+
+function Restart-IfChanged {
+    # Relaunch into the new code once every watched file parses cleanly.
+    if ((Get-WatchedStamp) -eq $startStamp) { return }
+    foreach ($file in $watchedFiles) {
+        $errors = $null
+        [System.Management.Automation.Language.Parser]::ParseFile($file, [ref]$null, [ref]$errors) | Out-Null
+        if ($errors) { return }
+    }
+    Start-Process -FilePath 'powershell.exe' -NoNewWindow `
+        -ArgumentList "-NoProfile -ExecutionPolicy Bypass -File `"$PSCommandPath`""
+    [Environment]::Exit(0)
+}
+
 $excludeScripts = @('dashboard.ps1','startup.ps1','simulation.ps1','ini-parser.ps1','sys_mon.ps1','common.ps1','network_common.ps1')
 
 function Get-SimulationId {
@@ -124,6 +148,7 @@ function Get-RunningScriptRows {
 }
 
 while ($true) {
+    Restart-IfChanged
     $global:iniConfig = Parse-IniFile 'C:\Scripts\simulation.conf'
     $username = ($env:COMPUTERNAME -split '-')[0]
     $simulationId = Get-SimulationId
