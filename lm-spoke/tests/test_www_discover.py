@@ -51,6 +51,8 @@ def prepare_launch(tmp_path, contents, *, firefox=True, cpulimit=False):
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
     for name in ("sed", "shuf", "tee"):
+        if not shutil.which(name):
+            pytest.skip(f"{name} is not installed (macOS has no shuf)")
         (bin_dir / name).symlink_to(shutil.which(name))
     stubs = {
         "timeout": 'printf "timeout %s\\n" "$*" >> "$CALLS"\nshift 3\nexec "$@"\n',
