@@ -18,6 +18,23 @@ source '/usr/local/scripts/common.sh'
 # RAISE this under load, never lower it.
 refresh_rate=5
 CACHE_DIR="/tmp/client-sim-dash"
+# The dashboard starts once at login and runs forever, so it kept showing its
+# launch-time code after update.sh replaced it (a new sim such as www_discover
+# never appeared in its tables). Watch this file and the files it sources, and
+# re-exec into the new code when one changes, as simulation.sh does.
+_dash_files=(/usr/local/scripts/dashboard.sh /usr/local/scripts/common.sh /usr/local/scripts/ini-parser.sh)
+# _dash_mtimes — one mtime per watched file, in a fixed order.
+_dash_mtimes() { stat -c '%Y' "${_dash_files[@]}" 2>/dev/null; }
+_dash_snapshot=$(_dash_mtimes)
+# reload_if_changed — re-exec when a watched file changed and all of them parse
+# (a half-written copy keeps the current code until the next refresh).
+reload_if_changed() {
+  [[ "$(_dash_mtimes)" == "$_dash_snapshot" ]] && return
+  local f
+  for f in "${_dash_files[@]}"; do bash -n "$f" 2>/dev/null || return; done
+  kill "$_cache_pid" 2>/dev/null
+  exec bash /usr/local/scripts/dashboard.sh
+}
 
 # Terminal colors — degrade gracefully if tput is unavailable (e.g. SSH without TERM)
 GRN=$(tput setaf 2 2>/dev/null || true)
@@ -467,6 +484,7 @@ run_cache_worker &
 _cache_pid=$!
 
 while true; do
+  reload_if_changed
   clear
   # Re-read config each refresh so the flag table reflects the current
   # simulation.conf (engine-pushed [username] overrides land immediately,
