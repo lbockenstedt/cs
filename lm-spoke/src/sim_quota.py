@@ -11,8 +11,9 @@ This module is intentionally engine-free: declaring a quota here only stores
 config under ``central_sites_config["sim_quotas"]``; nothing auto-runs yet.
 
 Data sourcing (per the feature design):
-  * Sims come from ``SIM_META``, the one sim catalog (every other sim list in
-    the spoke derives from it), ordered by the ``simulation.conf`` buckets.
+  * Sims come from ``SIM_META``, the one sim list (lm
+    ``core/src/simulations/sims.json``; every other sim list in the spoke
+    derives from it), ordered by the ``simulation.conf`` buckets.
   * Sites are pulled from ``simulation.conf`` ``wsite`` values ∪ Central
     ``site_mappings``.
   * The alert→sim linkage is a TENANT user action (Config → Sim Quotas). The
@@ -31,6 +32,26 @@ from __future__ import annotations
 import logging
 # Type hints only.
 from typing import Any, Dict, List, Tuple
+
+# Per-sim metadata defaults. category: "failure" sims produce a network condition
+# Aruba reports as an alert/insight; "traffic" sims are baseline load generators
+# (the default bucket state — the abundant generic pool the quota draws from).
+# multi_capable: True = may pack onto a client already running other sims;
+# False (exclusive) = the engine assigns it only to a client not already running
+# another exclusive quota sim. media: "wired" | "wireless" | "any" — the
+# physical adapter a sim needs. assoc_fail/ssidpw_fail are wireless-only (SSID
+# association / a WPA passphrase have no wired equivalent). auth_fail and
+# mac_auth_fail are "any": both have a genuine wired equivalent (wired 802.1X
+# bad-credential reject / wired MAC-Auth-Bypass deny on the switch port — see
+# clients/linux/connect_wired_1x.sh) as well as the wireless one, so either a
+# wired-only or wireless-only client qualifies. port_flap needs a wired NIC to
+# flap. Consulted by sim_quota_engine._media_ok against the client's
+# self-reported adapter inventory so a wireless-only sim never lands on a
+# wired-only client (and vice versa). Defaults are overrideable per-quota in
+# the tenant Config → Sim Quotas subtab.
+# The one sim list lives in lm core (sims.json); the spoke runs lm core from
+# /opt/lm, so it imports it rather than keeping a copy.
+from core.src.simulations.sim_catalog import SIM_META
 
 # Logger for this module.
 logger = logging.getLogger("CSSimQuota")
@@ -105,38 +126,6 @@ def prefixed_alert_id(source: str, bare_id: str) -> str:
     # Add the product prefix (empty ids stay empty).
     return f"{SOURCE_PREFIXES[src]}:{bid}" if bid else bid
 
-# Per-sim metadata defaults. category: "failure" sims produce a network condition
-# Aruba reports as an alert/insight; "traffic" sims are baseline load generators
-# (the default bucket state — the abundant generic pool the quota draws from).
-# multi_capable: True = may pack onto a client already running other sims;
-# False (exclusive) = the engine assigns it only to a client not already running
-# another exclusive quota sim. media: "wired" | "wireless" | "any" — the
-# physical adapter a sim needs. assoc_fail/ssidpw_fail are wireless-only (SSID
-# association / a WPA passphrase have no wired equivalent). auth_fail and
-# mac_auth_fail are "any": both have a genuine wired equivalent (wired 802.1X
-# bad-credential reject / wired MAC-Auth-Bypass deny on the switch port — see
-# clients/linux/connect_wired_1x.sh) as well as the wireless one, so either a
-# wired-only or wireless-only client qualifies. port_flap needs a wired NIC to
-# flap. Consulted by sim_quota_engine._media_ok against the client's
-# self-reported adapter inventory so a wireless-only sim never lands on a
-# wired-only client (and vice versa). Defaults are overrideable per-quota in
-# the tenant Config → Sim Quotas subtab.
-SIM_META: Dict[str, Dict[str, object]] = {
-    "dns_fail":    {"category": "failure", "multi_capable": False, "media": "any"},
-    "dns_latency": {"category": "failure", "multi_capable": False, "media": "any"},
-    "dhcp_fail":   {"category": "failure", "multi_capable": False, "media": "any"},
-    "assoc_fail":  {"category": "failure", "multi_capable": False, "media": "wireless"},
-    "auth_fail":   {"category": "failure", "multi_capable": False, "media": "any"},
-    "ssidpw_fail": {"category": "failure", "multi_capable": False, "media": "wireless"},
-    "mac_auth_fail": {"category": "failure", "multi_capable": False, "media": "any"},
-    "port_flap":   {"category": "failure", "multi_capable": False, "media": "wired"},
-    "ping_test":   {"category": "traffic", "multi_capable": True, "media": "any"},
-    "download":    {"category": "traffic", "multi_capable": True, "media": "any"},
-    "www_traffic": {"category": "traffic", "multi_capable": True, "media": "any"},
-    "iperf":       {"category": "traffic", "multi_capable": True, "media": "any"},
-    "collab":      {"category": "traffic", "multi_capable": True, "media": "any"},
-    "www_discover": {"category": "traffic", "multi_capable": True, "media": "any"},
-}
 
 # Suggested alert/insight → sim linkage (global defaults the tenant UI
 # pre-fills; the tenant can change the sim per-quota). Hardware alerts

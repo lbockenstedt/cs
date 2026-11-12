@@ -172,6 +172,7 @@ while ($true) {
         ssidpw           = get_value $simulationId 'ssidpw'
         dhcp_fail        = get_value $simulationId 'dhcp_fail'
         dns_fail         = get_value $simulationId 'dns_fail'
+        dns_latency      = get_value $simulationId 'dns_latency'
         assoc_fail       = get_value $simulationId 'assoc_fail'
         port_flap        = get_value $simulationId 'port_flap'
         ping_test        = get_value $simulationId 'ping_test'
@@ -179,9 +180,12 @@ while ($true) {
         iperf            = get_value $simulationId 'iperf'
         www_traffic      = get_value $simulationId 'www_traffic'
         www_discover     = get_value $simulationId 'www_discover'
+        collab           = get_value $simulationId 'collab'
+        auth_fail        = get_value $simulationId 'auth_fail'
+        mac_auth_fail    = get_value $simulationId 'mac_auth_fail'
     }
 
-    foreach ($key in @('kill_switch','sim_load','public_repo','repo_location','vh_server','site_based_ssid','iperf_bw','wsite','sim_phy','ssid','ssidpw','dhcp_fail','dns_fail','assoc_fail','port_flap','ping_test','download','iperf','www_traffic','www_discover','ssidpw_fail','auth_fail','mac_auth_fail')) {
+    foreach ($key in @('kill_switch','sim_load','public_repo','repo_location','vh_server','site_based_ssid','iperf_bw','wsite','sim_phy','ssid','ssidpw','dhcp_fail','dns_fail','dns_latency','assoc_fail','port_flap','ping_test','download','iperf','www_traffic','www_discover','collab','ssidpw_fail','auth_fail','mac_auth_fail')) {
         Apply-Override -Section $username -Name $key -Config $config
     }
 
@@ -207,12 +211,18 @@ while ($true) {
         @{ Name = 'Kill Switch'; Value = $config.kill_switch },
         @{ Name = 'DHCP Fail'; Value = $config.dhcp_fail },
         @{ Name = 'DNS Fail'; Value = $config.dns_fail },
+        @{ Name = 'DNS Latency'; Value = $config.dns_latency },
         @{ Name = 'WWW Traffic'; Value = $config.www_traffic },
         @{ Name = 'WWW Discover'; Value = $config.www_discover },
+        @{ Name = 'Collab'; Value = $config.collab },
+        @{ Name = 'Ping Test'; Value = $config.ping_test },
         @{ Name = 'iPerf'; Value = $config.iperf },
         @{ Name = 'Download'; Value = $config.download },
         @{ Name = 'Port Flap'; Value = $config.port_flap },
-        @{ Name = 'Incorrect SSID PW'; Value = $config.ssidpw_fail }
+        @{ Name = 'Assoc Fail'; Value = $config.assoc_fail },
+        @{ Name = 'Incorrect SSID PW'; Value = $config.ssidpw_fail },
+        @{ Name = 'Auth Fail'; Value = $config.auth_fail },
+        @{ Name = 'MAC Auth Fail'; Value = $config.mac_auth_fail }
     )) {
         if ($label.Value -eq 'on') {
             Write-Host "$($label.Name): on"
