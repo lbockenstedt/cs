@@ -11,8 +11,8 @@ This module is intentionally engine-free: declaring a quota here only stores
 config under ``central_sites_config["sim_quotas"]``; nothing auto-runs yet.
 
 Data sourcing (per the feature design):
-  * Sims are pulled from ``simulation.conf`` (the bucket flags that are runnable
-    PRIMITIVES), enriched with per-sim metadata (``SIM_META``).
+  * Sims come from ``SIM_META``, the one sim catalog (every other sim list in
+    the spoke derives from it), ordered by the ``simulation.conf`` buckets.
   * Sites are pulled from ``simulation.conf`` ``wsite`` values ∪ Central
     ``site_mappings``.
   * The alert→sim linkage is a TENANT user action (Config → Sim Quotas). The
@@ -135,6 +135,7 @@ SIM_META: Dict[str, Dict[str, object]] = {
     "www_traffic": {"category": "traffic", "multi_capable": True, "media": "any"},
     "iperf":       {"category": "traffic", "multi_capable": True, "media": "any"},
     "collab":      {"category": "traffic", "multi_capable": True, "media": "any"},
+    "www_discover": {"category": "traffic", "multi_capable": True, "media": "any"},
 }
 
 # Suggested alert/insight → sim linkage (global defaults the tenant UI
@@ -489,17 +490,11 @@ def _bucket_sections(sim_conf) -> List[str]:
 
 
 def available_sims(config_dir: Any) -> List[Dict[str, Any]]:
-    """Sims the Sim-Quota UI may offer, derived from ``simulation.conf`` bucket
-    sections (only flags that are runnable PRIMITIVES), enriched with
-    ``SIM_META``. Sims a tenant actually uses in its buckets appear first;
-    runnable sims not yet placed in any bucket follow (still offerable — the
-    engine sets them via per-client override regardless of bucket default)."""
-    # Runnable sim flags (fall back to the known sims if the import fails).
-    try:
-        from sim_primitives import SIM_FLAGS  # lazy: avoid import cycle
-    except Exception:  # noqa: BLE001
-        SIM_FLAGS = tuple(SIM_META.keys())
-    flags = list(SIM_FLAGS)
+    """Sims the Sim-Quota UI may offer: every ``SIM_META`` sim (the one sim
+    catalog), with the sims a tenant already uses in its ``simulation.conf``
+    buckets first. Unplaced sims are still offerable: the engine turns them on
+    with a per-client override whatever the bucket default is."""
+    flags = list(SIM_META.keys())
 
     # Collect sims set in any bucket, in order of first appearance.
     bucket_flags: List[str] = []
