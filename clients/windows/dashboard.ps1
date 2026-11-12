@@ -181,8 +181,6 @@ while ($true) {
         www_traffic      = get_value $simulationId 'www_traffic'
         www_discover     = get_value $simulationId 'www_discover'
         collab           = get_value $simulationId 'collab'
-        auth_fail        = get_value $simulationId 'auth_fail'
-        mac_auth_fail    = get_value $simulationId 'mac_auth_fail'
     }
 
     foreach ($key in @('kill_switch','sim_load','public_repo','repo_location','vh_server','site_based_ssid','iperf_bw','wsite','sim_phy','ssid','ssidpw','dhcp_fail','dns_fail','dns_latency','assoc_fail','port_flap','ping_test','download','iperf','www_traffic','www_discover','collab','ssidpw_fail','auth_fail','mac_auth_fail')) {
