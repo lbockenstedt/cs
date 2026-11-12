@@ -36,3 +36,13 @@ def test_client_scripts_and_ui_cover_sim(sim):
     js = _text("lm-spoke/static/sim-views.js")
     assert sim in _js_list(js, "CS_CONTROL_FLAGS"), "%s is missing from CS_CONTROL_FLAGS" % sim
     assert sim in _js_list(js, "CS_ONOFF_KEYS"), "%s is missing from CS_ONOFF_KEYS" % sim
+
+
+def test_dashboard_ps1_config_has_no_duplicate_keys():
+    """dashboard.ps1's $config hash literal must not repeat a key (case-insensitive)."""
+    # PowerShell refuses to parse a hash literal with a duplicate key, which
+    # kills the whole Windows dashboard.
+    body = re.search(r"\$config = @\{\n(.*?)\n\s*\}", _text("clients/windows/dashboard.ps1"), re.S).group(1)
+    keys = [k.lower() for k in re.findall(r"^\s*(\w+)\s*=", body, re.M)]
+    dupes = sorted({k for k in keys if keys.count(k) > 1})
+    assert not dupes, "duplicate keys in dashboard.ps1 $config: %s" % dupes
