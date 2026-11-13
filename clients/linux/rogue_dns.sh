@@ -42,7 +42,7 @@ restore_dhcp() {
   if nmcli connection up uuid "$connection" ifname "$wl" >> "$log" 2>&1; then
     write_state dhcp
   else
-    echo 'rogue_dns: DHCP restore failed; retaining static state for retry' | tee -a "$log"
+    echo 'rogue_dns: DHCP restore failed; retaining state for retry' | tee -a "$log"
     return 1
   fi
 }
@@ -66,7 +66,9 @@ PY
     # profile, so it only ever drops runtime (device modify) changes.
     wl=$(nmcli -t -f DEVICE,TYPE device status | awk -F: '$2=="wifi" {print $1; exit}')
     [[ -n $wl ]] || { echo 'rogue_dns: unreadable state and no wireless device' | tee -a "$log"; exit 1; }
-    if [[ -n $rogue_dns_server && "$(nmcli -g IP4.DNS device show "$wl")" == "$rogue_dns_server" ]]; then
+    # A failed query proves nothing, so keep the corrupt state and retry.
+    wl_dns=$(nmcli -g IP4.DNS device show "$wl") || { echo "rogue_dns: unreadable state; DNS query on $wl failed, retrying" | tee -a "$log"; exit 1; }
+    if [[ -n $rogue_dns_server && $wl_dns == "$rogue_dns_server" ]]; then
       echo "rogue_dns: unreadable state; $wl uses rogue_dns_server, restoring DHCP" | tee -a "$log"
       connection=$(nmcli -g GENERAL.CON-UUID device show "$wl")
       restore_dhcp

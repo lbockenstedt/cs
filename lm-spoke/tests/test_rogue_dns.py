@@ -43,6 +43,8 @@ if args[:2] == ['device', 'reapply']:
     sys.exit(0)
 if args[0] == '-t':
     print('wlan0:wifi:connected')
+elif mode == 'dns_query_fail' and args[1] == 'IP4.DNS':
+    sys.exit(10)
 else:
     # rogue_applied: the device still resolves through rogue_dns_server.
     values = {'GENERAL.CON-UUID': 'test-uuid', 'IP4.ADDRESS': '192.0.2.10/24',
@@ -190,6 +192,18 @@ def test_linux_restore_only(tmp_path, phase, mode):
         assert read_state(tmp_path)["start"] == 0
     else:
         assert not (tmp_path / "rogue_dns.state").exists()
+
+
+def test_linux_restore_only_keeps_corrupt_state_on_failed_dns_query(tmp_path):
+    """A failed DNS query proves nothing, so the corrupt state stays for retry."""
+    env = prepare_linux(tmp_path, mode="dns_query_fail")
+    (tmp_path / "rogue_dns.state").write_text("{corrupt")
+    result = subprocess.run(["bash", str(tmp_path / "rogue_dns.sh"), "--restore-only"], env=env,
+                            capture_output=True, text=True, timeout=10)
+    assert result.returncode == 1
+    assert "DNS query on wlan0 failed, retrying" in result.stdout
+    assert (tmp_path / "rogue_dns.state").read_text() == "{corrupt"
+    assert "connection up" not in calls(tmp_path)
 
 
 def test_linux_sigterm_mid_static_restores(tmp_path):

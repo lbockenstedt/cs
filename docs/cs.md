@@ -211,8 +211,9 @@ changes, so a profile an operator configured as static comes back unchanged.
 Windows removes that single manual address and its manual default route,
 enables DHCP and resets DNS. Without the fingerprint the adapter may be using
 an operator's own static configuration, so nothing is changed and the event is
-logged (`no rogue_dns settings on <adapter>, leaving it`). In every case a
-valid `phase=dhcp` state is written. A normal (non-restore) launch still
+logged (`no rogue_dns settings on <adapter>, leaving it`). Either way a valid
+`phase=dhcp` state is written. If the adapter query itself fails, nothing is
+changed and the corrupt state is kept, so the next cycle retries. A normal (non-restore) launch still
 refuses to touch the network on a corrupt state.
 
 **Unknown process state.** If a process check itself fails (`pgrep` error, or a
