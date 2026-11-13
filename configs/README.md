@@ -236,7 +236,8 @@ force-kills it after 10 seconds. This is checked every cycle and, while
 `rogue_dns=off`, a stale `phase=static` with no running instance triggers a
 restore-only pass (`rogue_dns.sh --restore-only` / `rogue_dns.ps1 -RestoreOnly`).
 A corrupt state file only restores when the adapter still shows rogue_dns's
-own settings; an operator's static configuration is left alone. The periodic
+own settings (on Windows: DHCP off, DNS exactly `rogue_dns_server`, one manual
+address and a manual default route); an operator's static configuration is left alone. The periodic
 headless-Firefox cleanup spares the rogue_dns browser. See [Rogue DNS recovery and configuration](../docs/cs.md#rogue-dns--static-ip--fixed-dns)
 for the platform-specific restore behaviour and state-file paths.
 

@@ -2,13 +2,14 @@
 # An absent keyed CIM object throws just as NetTCPIP does; broad enumeration
 # returns an empty set, allowing idempotent recovery after any completed step.
 $script:scenario = $env:SCENARIO
-$script:manual = $script:scenario -in @('stale','no_ip','no_route','neither','restore_fail','dns_restore_fail','corrupt_restore','corrupt_operator','incomplete_restore')
+$script:manual = $script:scenario -in @('stale','no_ip','no_route','neither','restore_fail','dns_restore_fail','corrupt_restore','corrupt_operator','corrupt_no_route','incomplete_restore')
 # corrupt_restore/incomplete_restore still resolve through rogue_dns_server (its
-# fingerprint); corrupt_operator is an operator's own static config.
+# fingerprint); corrupt_operator is an operator's own static config, and
+# corrupt_no_route lacks the manual default route rogue_dns always adds.
 $script:dns = '192.0.2.1'
-if ($script:scenario -in @('corrupt_restore','incomplete_restore')) { $script:dns = '192.0.2.53' }
+if ($script:scenario -in @('corrupt_restore','corrupt_no_route','incomplete_restore')) { $script:dns = '192.0.2.53' }
 $script:hasIp = $script:scenario -notin @('no_ip','neither','no_lease')
-$script:hasRoute = $script:scenario -notin @('no_route','neither')
+$script:hasRoute = $script:scenario -notin @('no_route','neither','corrupt_no_route')
 $script:origin = 'Dhcp'
 if ($script:manual) { $script:origin = 'Manual' }
 function Add-TestCall {
@@ -40,6 +41,8 @@ function Get-NetRoute {
 }
 function Get-DnsClientServerAddress {
     [CmdletBinding()] param($InterfaceIndex, $AddressFamily)
+    # The orchestrator asks for a stop after launch but before the static apply.
+    if ($script:scenario -eq 'cancel_before_apply') { Set-Content -LiteralPath (Join-Path $env:TEST_ROOT 'rogue_dns.stop') -Value 'stop' }
     [pscustomobject]@{ ServerAddresses = @($script:dns) }
 }
 function Get-NetIPInterface {

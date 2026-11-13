@@ -502,10 +502,16 @@ fi
 #------------------------------------------------------------
 rogue_dns_stop_grace=10
 rogue_dns_retry=0
+# Run pgrep/pkill ("$@") on rogue_dns.sh processes. Match only the command line
+# run_simulation launches (bash /usr/local/scripts/rogue_dns.sh ...), so an
+# editor or `tail -f rogue_dns.sh` is never counted as running or signalled.
+rogue_dns_procs() {
+  "$@" -f '^(/usr/bin/|/bin/)?bash /usr/local/scripts/rogue_dns\.sh( |$)'
+}
 # 0 = running, 1 = not running, 2 = unknown. pgrep exits 1 for "no match" and
 # 2+ when the check itself failed; never treat a failed check as "not running".
 rogue_dns_running() {
-  pgrep -f '[r]ogue_dns.sh' >/dev/null
+  rogue_dns_procs pgrep >/dev/null
   local rc=$?
   (( rc <= 1 )) && return "$rc"
   echo "rogue_dns: process check failed (pgrep rc=$rc); retrying" | tee -a ${LOG_FILE}
@@ -517,7 +523,7 @@ reconcile_rogue_dns() {
   rogue_dns_running; rc=$?
   if (( stop && rc == 0 )); then
     echo "rogue_dns: disabled or kill switch on — stopping running instance" | tee -a ${LOG_FILE}
-    pkill -TERM -f '[r]ogue_dns.sh'
+    rogue_dns_procs pkill -TERM
     for (( i = 0; i < rogue_dns_stop_grace; i++ )); do
       rogue_dns_running; rc=$?
       (( rc == 0 )) || break
@@ -525,7 +531,7 @@ reconcile_rogue_dns() {
     done
     if (( rc == 0 )); then
       echo "rogue_dns: did not exit in ${rogue_dns_stop_grace}s — force-killing" | tee -a ${LOG_FILE}
-      pkill -KILL -f '[r]ogue_dns.sh'
+      rogue_dns_procs pkill -KILL
       sleep 1
       rogue_dns_running; rc=$?
     fi
@@ -558,21 +564,23 @@ PY
 # moved; on kill switch or rogue_dns=off, stop it now. With rogue_dns off it
 # costs nothing unless a stop is still owed (rogue_dns_retry).
 rogue_dns_gate() {
-  local ks flag user bucket
+  local ks flag gflag user bucket
   if [[ "$rogue_dns" != "on" ]]; then
     (( rogue_dns_retry )) && reconcile_rogue_dns
     return 0
   fi
   ks=$(tr -d '[:space:]' < /usr/local/scripts/kill_switch.txt 2>/dev/null)
   if [[ "$(stat -c %y /usr/local/scripts/simulation.conf 2>/dev/null)" != "$_cfg_mtime" ]]; then
-    process_ini_file '/usr/local/scripts/simulation.conf'
-    flag=$(get_value "$username" kill_switch)
-    [[ -n $flag ]] || flag=$(get_value simulation kill_switch)
+    # Parse in a subshell: the rest of this iteration keeps the cycle's parsed
+    # config (and its applied overrides) unchanged.
+    { read -r flag; read -r gflag; read -r user; read -r bucket; } < <(
+      process_ini_file '/usr/local/scripts/simulation.conf' >/dev/null
+      printf '%s\n' "$(get_value "$username" kill_switch)" "$(get_value simulation kill_switch)" \
+        "$(get_value "$username" rogue_dns)" "$(get_value "$simulation_id" rogue_dns)")
+    [[ -n $flag ]] || flag=$gflag
     [[ $flag == on ]] && ks=on
     # Compare with the cycle-start sources: an unrelated conf write must not
     # turn an ambient-rolled rogue_dns off.
-    user=$(get_value "$username" rogue_dns)
-    bucket=$(get_value "$simulation_id" rogue_dns)
     flag=
     if [[ $user != "${_rogue_dns_user:-}" ]]; then
       if [[ -n $user ]]; then flag=$user
@@ -1266,7 +1274,7 @@ echo Closing Firefox | tee -a ${LOG_FILE}
 kill_headless_firefox() {
   local pid keep=" " queue kids ff
   local rc
-  queue=$(pgrep -f '[r]ogue_dns.sh'); rc=$?
+  queue=$(rogue_dns_procs pgrep); rc=$?
   # Unknown (pgrep error, rc 2+): a rogue_dns browser can't be told apart from
   # ours, whatever the rogue_dns flag says, so skip this cleanup.
   (( rc <= 1 )) || return 0

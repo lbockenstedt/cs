@@ -179,7 +179,14 @@ that state file while recovery is pending.
 or turning the kill switch on (config or the emergency global switch) stops a
 running instance, not only future dispatch. The orchestrator asks it to stop
 gracefully so its own cleanup restores DHCP (Linux sends `SIGTERM`; Windows
-creates `C:\Scripts\rogue_dns.stop`, which the script checks every second). If
+creates `C:\Scripts\rogue_dns.stop`, which the script checks every second and
+just before it applies the static settings). Only the orchestrator removes the
+stop marker: after it has confirmed no instance is running, and just before a
+new launch. A stop requested right after a launch is therefore never lost.
+Process checks, signals and force-kills match only the process the orchestrator
+launches: on Linux the command line `bash /usr/local/scripts/rogue_dns.sh`, on
+Windows a PowerShell process running `rogue_dns.ps1`. An editor or
+`tail -f rogue_dns.sh` is never counted as running, signalled or killed. If
 it has not exited after 10 seconds, the orchestrator force-kills it and runs a
 restore-only pass. Both orchestrators check this at the start of every cycle
 and again on every loop iteration (Linux `rogue_dns_gate`, Windows
@@ -187,7 +194,8 @@ and again on every loop iteration (Linux `rogue_dns_gate`, Windows
 while `rogue_dns` is on: it re-reads the global `kill_switch.txt` every
 iteration and re-parses `simulation.conf` (kill switch and this client's
 `rogue_dns` value) only when the file's modification time (sub-second) has
-changed since the cycle started. With `rogue_dns` off it does nothing, unless a
+changed since the cycle started. That re-read never replaces the configuration
+parsed at the start of the cycle, so the rest of the iteration keeps using it. With `rogue_dns` off it does nothing, unless a
 stop request could not be confirmed (the instance was still running, or the
 process check failed); that stop is then retried every iteration until it is
 confirmed. With the kill switch on there are no loop iterations (the
@@ -208,7 +216,8 @@ restore-only pass. With no trustworthy captured values, that pass only undoes
 what rogue_dns itself could have applied. It acts only when the wireless
 adapter still shows rogue_dns's fingerprint: on Linux, the device's DNS is
 exactly `rogue_dns_server`; on Windows, DHCP is disabled, DNS is exactly
-`rogue_dns_server` and there is a single manual IPv4 address. Linux then
+`rogue_dns_server`, there is a single manual IPv4 address and there is a
+manual default route. Linux then
 re-applies and reconnects the device's saved profile. That drops only runtime
 changes, so a profile an operator configured as static comes back unchanged.
 Windows removes that single manual address and its manual default route,
@@ -221,11 +230,12 @@ refuses to touch the network on a corrupt state.
 
 **Unknown process state.** If a process check itself fails (`pgrep` error, or a
 failed or empty `Win32_Process` query), the result is unknown, and unknown is
-never treated as "not running". The orchestrator neither restores nor launches
-rogue_dns, and on Windows no other simulation (`www_traffic`, `ping_test`,
-`iperf` and the rest) is launched either, so a failed query cannot start
-duplicates. The headless Firefox cleanup is skipped, whatever the `rogue_dns`
-value, because rogue_dns's browser can't be told apart. A stop request whose
+never treated as "not running" for rogue_dns. The orchestrator neither restores
+nor launches rogue_dns, and while `rogue_dns` is on it does not browse. Other
+simulations are unaffected and keep their old rule on both platforms: a failed
+check counts as not running, so they launch as before. The headless Firefox
+cleanup is skipped, whatever the `rogue_dns` value, because rogue_dns's browser
+can't be told apart. A stop request whose
 outcome is unknown keeps the Windows stop marker in place and is retried on the
 next iteration. While `rogue_dns` is on, the orchestrators' normal and fallback
 browsing runs only when rogue_dns is definitely not running, so `www_traffic=on`

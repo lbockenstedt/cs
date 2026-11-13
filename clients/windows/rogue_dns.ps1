@@ -7,6 +7,8 @@ Write-SimVersionBanner 'rogue_dns.ps1' $version
 $statePath = 'C:\Scripts\rogue_dns.state'
 # The orchestrator creates this to cancel a running static phase gracefully
 # (Windows has no SIGTERM): the loop exits and the finally block restores DHCP.
+# Only the orchestrator removes it (before a launch), so a stop requested just
+# after launch is never lost.
 $stopPath = 'C:\Scripts\rogue_dns.stop'
 
 function Save-RogueDnsState {
@@ -57,8 +59,9 @@ try {
             if (-not $RestoreOnly) { throw }
             # Corrupt state: we don't know what was applied. Act only on rogue_dns's
             # own fingerprint (Wi-Fi adapter with DHCP off, DNS = rogue_dns_server
-            # only, one manual IPv4 address); anything else may be operator static
-            # config, so leave it and just rewrite a valid dhcp state.
+            # only, one manual IPv4 address, a manual default route); anything else
+            # may be operator static config, so leave it and just rewrite a valid
+            # dhcp state.
             $name = Get-WlanAdapter
             if (-not $name) { throw 'Unreadable rogue_dns state and no wireless adapter' }
             $adapter = Get-NetAdapter -Name $name -ErrorAction Stop
@@ -67,10 +70,10 @@ try {
             $dns = @((Get-DnsClientServerAddress -InterfaceIndex $idx -AddressFamily IPv4 -ErrorAction Stop).ServerAddresses)
             $manual = @(Get-NetIPAddress -ErrorAction Stop |
                 Where-Object { $_.InterfaceIndex -eq $idx -and $_.AddressFamily -eq 'IPv4' -and $_.PrefixOrigin -eq 'Manual' })
-            if ($dhcp -eq 'Disabled' -and $dns.Count -eq 1 -and $dns[0] -eq [string]$settings.rogue_dns_server -and $manual.Count -eq 1) {
+            $route = Get-NetRoute -ErrorAction Stop |
+                Where-Object { $_.InterfaceIndex -eq $idx -and $_.DestinationPrefix -eq '0.0.0.0/0' -and $_.Protocol -eq 'NetMgmt' } | Select-Object -First 1
+            if ($dhcp -eq 'Disabled' -and $dns.Count -eq 1 -and $dns[0] -eq [string]$settings.rogue_dns_server -and $manual.Count -eq 1 -and $route) {
                 Write-SimLog "rogue_dns: unreadable state; $name uses rogue_dns_server, restoring DHCP"
-                $route = Get-NetRoute -ErrorAction Stop |
-                    Where-Object { $_.InterfaceIndex -eq $idx -and $_.DestinationPrefix -eq '0.0.0.0/0' -and $_.Protocol -eq 'NetMgmt' } | Select-Object -First 1
                 Restore-RogueDnsDhcp @{ adapter = [string]$adapter.InterfaceGuid; address = $manual[0].IPAddress; gateway = $route.NextHop }
             } else {
                 Write-SimLog "rogue_dns: unreadable state; no rogue_dns settings on $name, leaving it"
@@ -107,9 +110,9 @@ try {
     $state = @{ phase = 'static'; start = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds(); adapter = [string]$adapter.InterfaceGuid
         address = $lease.IPAddress; prefix = $lease.PrefixLength; gateway = $route.NextHop
         dns = @((Get-DnsClientServerAddress -InterfaceIndex $idx -AddressFamily IPv4).ServerAddresses) }
+    if (Test-Path -LiteralPath $stopPath) { Write-SimLog 'rogue_dns: stop requested before apply; skipping'; return }
     # Persist before the first mutation so reboot/Stop-Process can recover.
     Save-RogueDnsState $state
-    Remove-Item -LiteralPath $stopPath -Force -ErrorAction SilentlyContinue
     try {
         Set-NetIPInterface -InterfaceIndex $idx -AddressFamily IPv4 -Dhcp Disabled -ErrorAction Stop
         Get-NetIPAddress -ErrorAction Stop |
