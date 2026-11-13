@@ -50,7 +50,7 @@ try {
     if (Test-Path -LiteralPath $statePath) {
         try {
             $state = Get-Content -LiteralPath $statePath -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
-            if ($state.phase -notin @('static','dhcp') -or $null -eq $state.start) { throw 'Invalid rogue_dns state' }
+            if ($state.phase -notin @('static','dhcp') -or -not ($state.start -is [int] -or $state.start -is [long])) { throw 'Invalid rogue_dns state' }
             # A static state must carry everything the restore needs, else it is corrupt.
             if ($state.phase -eq 'static' -and -not ($state.adapter -and $state.address -and $state.gateway)) { throw 'Incomplete rogue_dns state' }
         } catch {

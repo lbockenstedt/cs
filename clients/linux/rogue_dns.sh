@@ -51,7 +51,7 @@ if [[ -f "$state_file" ]]; then
   state=$(python3 - "$state_file" <<'PY'
 import json, sys
 s = json.load(open(sys.argv[1]))
-assert s['phase'] in ('dhcp', 'static') and isinstance(s['start'], int)
+assert s['phase'] in ('dhcp', 'static') and type(s['start']) is int
 # A static state must carry everything restore_dhcp needs, else it is corrupt.
 assert s['phase'] == 'dhcp' or all(s.get(k) for k in ('adapter', 'address', 'gateway', 'connection'))
 for key in ('phase', 'start', 'adapter', 'address', 'gateway', 'dns', 'connection'):

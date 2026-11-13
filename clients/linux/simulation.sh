@@ -450,6 +450,9 @@ apply_overrides
 # A [username] override can re-set sim_load to non-numeric — re-coerce so the
 # `-lt` gate stays safe.
 [[ "$sim_load" =~ ^[0-9]+$ ]] || sim_load=0
+# Cycle-start rogue_dns sources, compared by rogue_dns_gate.
+_rogue_dns_user=$(get_value "$username" rogue_dns)
+_rogue_dns_bucket=$(get_value "$simulation_id" rogue_dns)
 #------------------------------------------------------------
 #End User/Device Specific Overrides
 #------------------------------------------------------------
@@ -535,7 +538,7 @@ reconcile_rogue_dns() {
   phase=$(python3 - "$state" 2>/dev/null <<'PY'
 import json, sys
 s = json.load(open(sys.argv[1]))
-assert s['phase'] in ('dhcp', 'static') and isinstance(s['start'], int)
+assert s['phase'] in ('dhcp', 'static') and type(s['start']) is int
 assert s['phase'] == 'dhcp' or all(s.get(k) for k in ('adapter', 'address', 'gateway', 'connection'))
 print(s['phase'])
 PY
@@ -555,7 +558,7 @@ PY
 # moved; on kill switch or rogue_dns=off, stop it now. With rogue_dns off it
 # costs nothing unless a stop is still owed (rogue_dns_retry).
 rogue_dns_gate() {
-  local ks flag
+  local ks flag user bucket
   if [[ "$rogue_dns" != "on" ]]; then
     (( rogue_dns_retry )) && reconcile_rogue_dns
     return 0
@@ -566,8 +569,17 @@ rogue_dns_gate() {
     flag=$(get_value "$username" kill_switch)
     [[ -n $flag ]] || flag=$(get_value simulation kill_switch)
     [[ $flag == on ]] && ks=on
-    flag=$(get_value "$username" rogue_dns)
-    [[ -n $flag || "${random_pool:-off}" == "on" ]] || flag=$(get_value "$simulation_id" rogue_dns)
+    # Compare with the cycle-start sources: an unrelated conf write must not
+    # turn an ambient-rolled rogue_dns off.
+    user=$(get_value "$username" rogue_dns)
+    bucket=$(get_value "$simulation_id" rogue_dns)
+    flag=
+    if [[ $user != "${_rogue_dns_user:-}" ]]; then
+      if [[ -n $user ]]; then flag=$user
+      elif [[ "${random_pool:-off}" != "on" ]]; then flag=${bucket:-off}; fi
+    elif [[ -z $user && "${random_pool:-off}" != "on" && $bucket != "${_rogue_dns_bucket:-}" ]]; then
+      flag=${bucket:-off}
+    fi
   fi
   [[ $ks == on || ( -n $flag && $flag != on ) ]] || return 0
   echo "rogue_dns: kill switch on or rogue_dns turned off mid-cycle — stopping" | tee -a ${LOG_FILE}
@@ -1236,7 +1248,11 @@ else
  # config change that turns the kill switch back OFF (update.sh pulls a fresh
  # simulation.conf; init_simulation_context re-reads it next outer loop).
  if [[ "$rapid_update" == "on" ]]; then source '/usr/local/scripts/update.sh'; fi
- sleep 300
+ # Sliced so a rogue_dns stop still owed is retried while kill-switched.
+ for (( _ks = 0; _ks < 30; _ks++ )); do
+  (( rogue_dns_retry )) && reconcile_rogue_dns
+  sleep 10
+ done
 fi
 #------------------------------------------------------------
 #Killing Firefox simulation
@@ -1248,7 +1264,7 @@ echo Closing Firefox | tee -a ${LOG_FILE}
 # A running rogue_dns.sh owns its static-phase browser (and stops it itself each
 # browse interval), so spare every process under it.
 kill_headless_firefox() {
-  local pid keep=" " queue
+  local pid keep=" " queue kids ff
   local rc
   queue=$(pgrep -f '[r]ogue_dns.sh'); rc=$?
   # Unknown (pgrep error, rc 2+): a rogue_dns browser can't be told apart from
@@ -1258,9 +1274,13 @@ kill_headless_firefox() {
   while [[ -n ${queue// } ]]; do
     read -r pid queue <<< "$queue"
     keep+="$pid "
-    queue+=" $(pgrep -P "$pid" | tr '\n' ' ')"
+    kids=$(pgrep -P "$pid"); rc=$?
+    (( rc <= 1 )) || return 0
+    queue+=" ${kids//$'\n'/ }"
   done
-  for pid in $(pgrep -f 'firefox-esr.*--headless'); do
+  ff=$(pgrep -f 'firefox-esr.*--headless'); rc=$?
+  (( rc <= 1 )) || return 0
+  for pid in $ff; do
     [[ $keep == *" $pid "* ]] || kill "$pid" 2>/dev/null
   done
   return 0

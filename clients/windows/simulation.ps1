@@ -461,10 +461,14 @@ $script:rogueDnsRetry = $false
 # $script:rogueDnsRetry, and Update-RogueDnsGate retries it every iteration.
 function Sync-RogueDns {
     $stop = $script:rogue_dns -ne 'on' -or $script:kill_switch -eq 'on'
+    # Write the marker before process discovery: a failed query must not keep a
+    # live instance in its static phase. It is removed only on a definite 'stopped'.
+    if ($stop -and -not (Test-Path -LiteralPath $rogueDnsStopPath)) {
+        Set-Content -LiteralPath $rogueDnsStopPath -Value 'stop' -ErrorAction SilentlyContinue
+    }
     $run = Get-ScriptRunState -ScriptName 'rogue_dns.ps1'
     if ($stop -and $run -eq 'running') {
         Write-SimLog 'rogue_dns: disabled or kill switch on; stopping running instance'
-        Set-Content -LiteralPath $rogueDnsStopPath -Value 'stop' -ErrorAction SilentlyContinue
         for ($i = 0; $i -lt $rogueDnsStopGrace -and $run -ne 'stopped'; $i++) {
             Start-Sleep -Seconds 1
             $run = Get-ScriptRunState -ScriptName 'rogue_dns.ps1'
@@ -490,7 +494,7 @@ function Sync-RogueDns {
     $phase = $null
     try {
         $state = Get-Content -LiteralPath $rogueDnsStatePath -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
-        if ($state.phase -in @('static','dhcp') -and $null -ne $state.start -and
+        if ($state.phase -in @('static','dhcp') -and ($state.start -is [int] -or $state.start -is [long]) -and
             ($state.phase -eq 'dhcp' -or ($state.adapter -and $state.address -and $state.gateway))) { $phase = $state.phase }
     } catch { }
     if ($phase -eq 'dhcp') { return }
@@ -520,8 +524,15 @@ function Update-RogueDnsGate {
         $get = { param($section, $key) if ($ini.ContainsKey($section)) { [string]$ini[$section][$key] } }
         $kill = & $get $script:username 'kill_switch'
         if (-not $kill) { $kill = & $get 'simulation' 'kill_switch' }
-        $flag = & $get $script:username 'rogue_dns'
-        if (-not $flag -and $script:random_pool -ne 'on') { $flag = & $get $script:simulation_id 'rogue_dns' }
+        # Compare with the cycle-start sources: an unrelated conf write must not
+        # turn an ambient-rolled rogue_dns off.
+        $user = [string](& $get $script:username 'rogue_dns')
+        $bucket = [string](& $get $script:simulation_id 'rogue_dns')
+        if ($user -ne [string]$script:rogueDnsUser) {
+            if ($user) { $flag = $user } elseif ($script:random_pool -ne 'on') { $flag = $bucket; if (-not $flag) { $flag = 'off' } }
+        } elseif (-not $user -and $script:random_pool -ne 'on' -and $bucket -ne [string]$script:rogueDnsBucket) {
+            $flag = $bucket; if (-not $flag) { $flag = 'off' }
+        }
     }
     if (Test-Path -LiteralPath $killSwitchPath) {
         $globalKill = ([string](Get-Content -LiteralPath $killSwitchPath -ErrorAction SilentlyContinue | Select-Object -First 1)).Trim()
@@ -681,6 +692,8 @@ while ($true) {
         'dns_bad_record_1','dns_bad_record_2','dns_bad_record_3','iperf_server',
         'collab_app','collab_bw','collab_time','collab_server','dot1x_password','dot1x_eap','web_server','client_offline'
     )
+    $script:rogueDnsUser = [string](get_value $script:username 'rogue_dns')
+    $script:rogueDnsBucket = [string](get_value $script:simulation_id 'rogue_dns')
 
     if (Test-Path -LiteralPath $killSwitchPath) {
         $globalKillRaw = Get-Content -LiteralPath $killSwitchPath -ErrorAction SilentlyContinue | Select-Object -First 1
@@ -913,7 +926,11 @@ while ($true) {
         if ($script:rapid_update -eq 'on') {
             . 'C:\Scripts\update.ps1'
         }
-        Start-Sleep -Seconds 300
+        # Sliced so a rogue_dns stop still owed is retried while kill-switched.
+        for ($ks = 0; $ks -lt 30; $ks++) {
+            if ($script:rogueDnsRetry) { Sync-RogueDns }
+            Start-Sleep -Seconds 10
+        }
     }
 
     if ($restartCycle) {

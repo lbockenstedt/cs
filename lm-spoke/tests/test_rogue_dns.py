@@ -653,6 +653,13 @@ Set-Content -LiteralPath (Join-Path $env:TEST_ROOT 'rogue_dns.state') -Value '{"
     ("idle_dhcp", "Sync-RogueDns", "off", "off", False, "", "dhcp", "", [], ["restore-only", "stop "]),
     ("corrupt_state", "Sync-RogueDns", "off", "off", False, "", "corrupt", "", ["rogue_dns state unreadable", "restore-only True"], ["stop "]),
     ("cim_fail_stale", "Sync-RogueDns", "off", "off", False, "cim_fail", "static", "", ["process check failed", "retry True"], ["restore-only"]),
+    # Unknown process state with a live instance: the marker is still written for it to see.
+    ("stop_unknown_live", "Sync-RogueDns", "off", "on", True, "cim_fail", "static", "", ["process check failed", "retry True"], ["restore-only", "stop 10"]),
+    # Malformed start (string/bool/object/array) is corrupt: restore-only handles it.
+    ("malformed_start_str", "Sync-RogueDns", "off", "off", False, "", "dhcp_bad:\"broken\"", "", ["rogue_dns state unreadable", "restore-only True"], []),
+    ("malformed_start_bool", "Sync-RogueDns", "off", "off", False, "", "dhcp_bad:true", "", ["rogue_dns state unreadable", "restore-only True"], []),
+    ("malformed_start_obj", "Sync-RogueDns", "off", "off", False, "", "dhcp_bad:{}", "", ["rogue_dns state unreadable", "restore-only True"], []),
+    ("malformed_start_arr", "Sync-RogueDns", "off", "off", False, "", "dhcp_bad:[1]", "", ["rogue_dns state unreadable", "restore-only True"], []),
     ("cim_fail_during_stop", "Sync-RogueDns", "off", "off", True, "cim_fail_late", "static", "",
      ["instance state unknown after stop request; keeping stop marker", "retry True"], ["restore-only", "stop 10", "force-killing"]),
     # Unknown (failed or empty query) counts as running: no duplicate launches.
@@ -696,7 +703,10 @@ def test_windows_orchestrator_cancels_and_recovers(tmp_path, scenario, action, f
     (tmp_path / "simulation.conf").write_text(conf)
     if scenario == "midcycle_kill_file":
         (tmp_path / "kill_switch.txt").write_text("on\n")
-    (tmp_path / "rogue_dns.state").write_text("{corrupt" if phase == "corrupt" else json.dumps({"phase": phase, "start": 1}))
+    if phase.startswith("dhcp_bad:"):
+        (tmp_path / "rogue_dns.state").write_text('{"phase": "dhcp", "start": ' + phase.split(":", 1)[1] + '}')
+    else:
+        (tmp_path / "rogue_dns.state").write_text("{corrupt" if phase == "corrupt" else json.dumps({"phase": phase, "start": 1}))
     procs = [dict(ProcessId=1, ParentProcessId=0, Name="powershell", CommandLine="powershell -File simulation.ps1")]
     if running:
         procs += [dict(ProcessId=10, ParentProcessId=1, Name="powershell", CommandLine="powershell -File C:/Scripts/rogue_dns.ps1"),
@@ -714,8 +724,9 @@ def test_windows_orchestrator_cancels_and_recovers(tmp_path, scenario, action, f
         assert text in log, log
     for text in absent:
         assert text not in log, log
-    assert (tmp_path / "rogue_dns.stop").exists() == (scenario == "cim_fail_during_stop")
-    if action == "Sync-RogueDns" and scenario not in {"on_and_running", "cim_fail_stale", "cim_fail_during_stop"}:
+    # The marker is kept whenever a stop is owed but the process state is unknown.
+    assert (tmp_path / "rogue_dns.stop").exists() == (scenario in {"cim_fail_during_stop", "cim_fail_stale", "stop_unknown_live"})
+    if action == "Sync-RogueDns" and scenario not in {"on_and_running", "cim_fail_stale", "cim_fail_during_stop", "stop_unknown_live"}:
         assert read_state(tmp_path)["phase"] == "dhcp"
 
 
