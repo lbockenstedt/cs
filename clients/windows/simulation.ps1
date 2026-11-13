@@ -672,6 +672,7 @@ while ($true) {
         }
     }
     Sync-RogueDns
+    $script:wwwConfigured = [string]$script:www_traffic
 
     $global:rn = Get-Random -Minimum 1 -Maximum 61
     $global:rn_iperf_port = 5201 + (Get-Random -Minimum 0 -Maximum 10)
@@ -872,7 +873,7 @@ while ($true) {
                 if (($z % 10) -eq 0) {
                     Write-SimDebug 'Closing Firefox'
                     Stop-SimFirefox
-                    $script:www_traffic = 'on'
+                    if ($script:wwwConfigured -eq 'on') { $script:www_traffic = 'on' }
                     # Re-arm the DHCP-phase fallback browse every 10 iterations
                     # (Linux parity: it fills _www_iters whenever rogue_dns is on).
                     if ($script:rogue_dns -eq 'on' -and (Get-ScriptRunState -ScriptName 'rogue_dns.ps1') -eq 'stopped') {

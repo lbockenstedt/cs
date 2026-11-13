@@ -604,7 +604,8 @@ def test_windows_orchestrator_wiring():
     assert "-RestoreOnly" not in source.split("\nwhile ($true) {", 1)[0].split("function Sync-RogueDns", 1)[0]
     assert "if ($script:rogue_dns -eq 'on') { Update-RogueDnsGate }" in loop
     assert "wwwTrafficConfigured" not in source
-    assert "Stop-SimFirefox\n                    $script:www_traffic = 'on'\n" in source
+    assert "if ($script:wwwConfigured -eq 'on') { $script:www_traffic = 'on' }" in source
+    assert "$script:www_traffic = 'on'\n" not in source
     assert "Stop-Process -Name firefox" not in source
     # Dispatch launches only on a definite 'stopped', never on a failed query.
     assert "if ($rogueDnsRun -eq 'stopped') { Run-Simulation -ScriptName 'rogue_dns.ps1' }" in loop
