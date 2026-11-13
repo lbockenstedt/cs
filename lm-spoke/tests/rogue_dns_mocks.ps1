@@ -2,7 +2,11 @@
 # An absent keyed CIM object throws just as NetTCPIP does; broad enumeration
 # returns an empty set, allowing idempotent recovery after any completed step.
 $script:scenario = $env:SCENARIO
-$script:manual = $script:scenario -in @('stale','no_ip','no_route','neither','restore_fail','dns_restore_fail','corrupt_restore')
+$script:manual = $script:scenario -in @('stale','no_ip','no_route','neither','restore_fail','dns_restore_fail','corrupt_restore','corrupt_operator','incomplete_restore')
+# corrupt_restore/incomplete_restore still resolve through rogue_dns_server (its
+# fingerprint); corrupt_operator is an operator's own static config.
+$script:dns = '192.0.2.1'
+if ($script:scenario -in @('corrupt_restore','incomplete_restore')) { $script:dns = '192.0.2.53' }
 $script:hasIp = $script:scenario -notin @('no_ip','neither','no_lease')
 $script:hasRoute = $script:scenario -notin @('no_route','neither')
 $script:origin = 'Dhcp'
@@ -36,7 +40,13 @@ function Get-NetRoute {
 }
 function Get-DnsClientServerAddress {
     [CmdletBinding()] param($InterfaceIndex, $AddressFamily)
-    [pscustomobject]@{ ServerAddresses = @('192.0.2.1') }
+    [pscustomobject]@{ ServerAddresses = @($script:dns) }
+}
+function Get-NetIPInterface {
+    [CmdletBinding()] param($InterfaceIndex, $AddressFamily)
+    $dhcp = 'Enabled'
+    if ($script:manual) { $dhcp = 'Disabled' }
+    [pscustomobject]@{ InterfaceIndex = 7; Dhcp = $dhcp }
 }
 function Remove-NetIPAddress {
     [CmdletBinding(SupportsShouldProcess)] param([Parameter(ValueFromPipeline)]$InputObject)

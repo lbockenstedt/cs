@@ -181,10 +181,15 @@ running instance, not only future dispatch. The orchestrator asks it to stop
 gracefully so its own cleanup restores DHCP (Linux sends `SIGTERM`; Windows
 creates `C:\Scripts\rogue_dns.stop`, which the script checks every second). If
 it has not exited after 10 seconds, the orchestrator force-kills it and runs a
-restore-only pass. Linux picks up the change within one loop iteration, through its existing
-reload break on a changed `simulation.conf` or a `USR1`. Windows re-checks the
-kill switch and this client's `rogue_dns` value on every loop iteration (about
-every 15 seconds) while the flag is on.
+restore-only pass. Both orchestrators check this at the start of every cycle
+and again on every loop iteration (Linux `rogue_dns_gate`, Windows
+`Update-RogueDnsGate`). To keep the per-iteration check cheap, it only runs
+while `rogue_dns` is on: it re-reads the global `kill_switch.txt` every
+iteration and re-parses `simulation.conf` (kill switch and this client's
+`rogue_dns` value) only when the file's modification time has changed since
+the cycle started. With `rogue_dns` off it does nothing, unless a stop request
+could not be confirmed (the instance was still running, or the process check
+failed); that stop is then retried every iteration until it is confirmed.
 
 **Per-cycle recovery.** On every orchestrator cycle, whatever the `rogue_dns`
 value or kill switch, if no instance is running and the state file says
@@ -193,18 +198,38 @@ value or kill switch, if no instance is running and the state file says
 Windows. Restore-only mode restores a stale static phase and exits; it never
 writes a new DHCP start or applies static. A crash, reboot or force-kill
 therefore cannot leave a client on the rogue DNS server, even after the
-simulation has been disabled. An unreadable or corrupt state file is logged
-(`rogue_dns state unreadable`) and also gets a restore-only pass: with no
-captured values, Linux re-activates the wireless device's profile and Windows
-removes the Wi-Fi adapter's manual address/route, enables DHCP and resets DNS.
-Both then write a valid `phase=dhcp` state. A normal (non-restore) launch still
-refuses to touch the network on a corrupt state. If the process check itself
-fails (`pgrep` error, failed `Win32_Process` query), the result is unknown: the
-orchestrator logs it and neither restores nor launches until the next check.
-A stop request whose outcome is unknown keeps the Windows stop marker in place
-and retries next cycle. While `rogue_dns` is on, the orchestrators' normal and
-fallback browsing runs only when rogue_dns is definitely not running, so
-`www_traffic=on` never browses during the static phase or on a failed check.
+simulation has been disabled. An unreadable, corrupt or incomplete state file
+(for example a `phase=static` without the captured adapter, address, gateway
+or Linux connection) is logged (`rogue_dns state unreadable`) and also gets a
+restore-only pass. With no trustworthy captured values, that pass only undoes
+what rogue_dns itself could have applied. It acts only when the wireless
+adapter still shows rogue_dns's fingerprint: on Linux, the device's DNS is
+exactly `rogue_dns_server`; on Windows, DHCP is disabled, DNS is exactly
+`rogue_dns_server` and there is a single manual IPv4 address. Linux then
+re-applies and reconnects the device's saved profile. That drops only runtime
+changes, so a profile an operator configured as static comes back unchanged.
+Windows removes that single manual address and its manual default route,
+enables DHCP and resets DNS. Without the fingerprint the adapter may be using
+an operator's own static configuration, so nothing is changed and the event is
+logged (`no rogue_dns settings on <adapter>, leaving it`). In every case a
+valid `phase=dhcp` state is written. A normal (non-restore) launch still
+refuses to touch the network on a corrupt state.
+
+**Unknown process state.** If a process check itself fails (`pgrep` error, or a
+failed or empty `Win32_Process` query), the result is unknown, and unknown is
+never treated as "not running". The orchestrator neither restores nor launches
+rogue_dns, and on Windows no other simulation (`www_traffic`, `ping_test`,
+`iperf` and the rest) is launched either, so a failed query cannot start
+duplicates. The headless Firefox cleanup is skipped, whatever the `rogue_dns`
+value, because rogue_dns's browser can't be told apart. A stop request whose
+outcome is unknown keeps the Windows stop marker in place and is retried on the
+next iteration. While `rogue_dns` is on, the orchestrators' normal and fallback
+browsing runs only when rogue_dns is definitely not running, so `www_traffic=on`
+never browses during the static phase or on a failed check. Fallback browsing
+is scheduled exactly as before this change: Linux picks its five browse
+iterations at the start of a cycle when `www_traffic` is on, or when
+`rogue_dns` is on and definitely not running; Windows browses on the first
+iteration and re-arms every 10 iterations.
 
 **Permissions (Linux).** Like the other Linux sims, `rogue_dns.sh` runs `nmcli`
 unprivileged. The NetworkManager polkit rule `50-client-sim-nm.rules`

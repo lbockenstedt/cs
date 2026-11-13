@@ -17,14 +17,7 @@ function Save-RogueDnsState {
 function Restore-RogueDnsDhcp {
     param($State)
     # Resolve the captured adapter identity, not a potentially recycled ifIndex.
-    # Without a usable state (corrupt file), fall back to the Wi-Fi adapter.
-    if ($State.adapter) {
-        $adapter = Get-NetAdapter -ErrorAction Stop | Where-Object { [string]$_.InterfaceGuid -eq $State.adapter } | Select-Object -First 1
-    } else {
-        $name = Get-WlanAdapter
-        $adapter = $null
-        if ($name) { $adapter = Get-NetAdapter -Name $name -ErrorAction Stop }
-    }
+    $adapter = Get-NetAdapter -ErrorAction Stop | Where-Object { [string]$_.InterfaceGuid -eq $State.adapter } | Select-Object -First 1
     if (-not $adapter) { throw 'Captured wireless adapter is unavailable' }
     $idx = $adapter.ifIndex
     # Remove only our manual address/routes. A second recovery is safe after a
@@ -32,27 +25,57 @@ function Restore-RogueDnsDhcp {
     # Enumerate then filter: CIM's keyed query throws ObjectNotFound when a
     # previous recovery already removed the address. Real query errors still fail.
     Get-NetIPAddress -ErrorAction Stop |
-        Where-Object { $_.InterfaceIndex -eq $idx -and (-not $State.address -or $_.IPAddress -eq $State.address) -and $_.PrefixOrigin -eq 'Manual' } |
+        Where-Object { $_.InterfaceIndex -eq $idx -and $_.IPAddress -eq $State.address -and $_.PrefixOrigin -eq 'Manual' } |
         Remove-NetIPAddress -Confirm:$false -ErrorAction Stop
     Get-NetRoute -ErrorAction Stop |
-        Where-Object { $_.InterfaceIndex -eq $idx -and $_.DestinationPrefix -eq '0.0.0.0/0' -and (-not $State.gateway -or $_.NextHop -eq $State.gateway) -and $_.Protocol -eq 'NetMgmt' } |
+        Where-Object { $_.InterfaceIndex -eq $idx -and $_.DestinationPrefix -eq '0.0.0.0/0' -and $_.NextHop -eq $State.gateway -and $_.Protocol -eq 'NetMgmt' } |
         Remove-NetRoute -Confirm:$false -ErrorAction Stop
     Set-NetIPInterface -InterfaceIndex $idx -AddressFamily IPv4 -Dhcp Enabled -ErrorAction Stop
     Set-DnsClientServerAddress -InterfaceIndex $idx -ResetServerAddresses -ErrorAction Stop
     Save-RogueDnsState @{ phase = 'dhcp'; start = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds() }
 }
 
+$settings = @{}
+$overrides = Get-SimOverrides
+foreach ($key in @('rogue_dns_server','rogue_dns_dhcp_interval','rogue_dns_duration','rogue_dns_browse_interval')) {
+    $section = 'simulation'
+    if ($key -eq 'rogue_dns_server') { $section = 'address' }
+    $settings[$key] = get_value $section $key
+    if ($overrides.ContainsKey($key) -and -not [string]::IsNullOrWhiteSpace($overrides[$key])) { $settings[$key] = $overrides[$key] }
+}
+foreach ($entry in @{ rogue_dns_dhcp_interval = 1800; rogue_dns_duration = 3600; rogue_dns_browse_interval = 60 }.GetEnumerator()) {
+    if ([string]$settings[$entry.Key] -notmatch '^[1-9][0-9]{0,7}$') { $settings[$entry.Key] = $entry.Value }
+}
 try {
     if (Test-Path -LiteralPath $statePath) {
         try {
             $state = Get-Content -LiteralPath $statePath -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
             if ($state.phase -notin @('static','dhcp') -or $null -eq $state.start) { throw 'Invalid rogue_dns state' }
+            # A static state must carry everything the restore needs, else it is corrupt.
+            if ($state.phase -eq 'static' -and -not ($state.adapter -and $state.address -and $state.gateway)) { throw 'Incomplete rogue_dns state' }
         } catch {
             if (-not $RestoreOnly) { throw }
-            # DHCP is the safe direction: restore the Wi-Fi adapter's manual
-            # addressing and DNS, then rewrite a valid dhcp state.
-            Write-SimLog 'rogue_dns: unreadable state; restoring DHCP on the wireless adapter'
-            Restore-RogueDnsDhcp @{}
+            # Corrupt state: we don't know what was applied. Act only on rogue_dns's
+            # own fingerprint (Wi-Fi adapter with DHCP off, DNS = rogue_dns_server
+            # only, one manual IPv4 address); anything else may be operator static
+            # config, so leave it and just rewrite a valid dhcp state.
+            $name = Get-WlanAdapter
+            if (-not $name) { throw 'Unreadable rogue_dns state and no wireless adapter' }
+            $adapter = Get-NetAdapter -Name $name -ErrorAction Stop
+            $idx = $adapter.ifIndex
+            $dhcp = [string](Get-NetIPInterface -InterfaceIndex $idx -AddressFamily IPv4 -ErrorAction Stop).Dhcp
+            $dns = @((Get-DnsClientServerAddress -InterfaceIndex $idx -AddressFamily IPv4 -ErrorAction Stop).ServerAddresses)
+            $manual = @(Get-NetIPAddress -ErrorAction Stop |
+                Where-Object { $_.InterfaceIndex -eq $idx -and $_.AddressFamily -eq 'IPv4' -and $_.PrefixOrigin -eq 'Manual' })
+            if ($dhcp -eq 'Disabled' -and $dns.Count -eq 1 -and $dns[0] -eq [string]$settings.rogue_dns_server -and $manual.Count -eq 1) {
+                Write-SimLog "rogue_dns: unreadable state; $name uses rogue_dns_server, restoring DHCP"
+                $route = Get-NetRoute -ErrorAction Stop |
+                    Where-Object { $_.InterfaceIndex -eq $idx -and $_.DestinationPrefix -eq '0.0.0.0/0' -and $_.Protocol -eq 'NetMgmt' } | Select-Object -First 1
+                Restore-RogueDnsDhcp @{ adapter = [string]$adapter.InterfaceGuid; address = $manual[0].IPAddress; gateway = $route.NextHop }
+            } else {
+                Write-SimLog "rogue_dns: unreadable state; no rogue_dns settings on $name, leaving it"
+                Save-RogueDnsState @{ phase = 'dhcp'; start = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds() }
+            }
             return
         }
         if ($state.phase -eq 'static') {
@@ -64,17 +87,6 @@ try {
         return
     }
     if ($RestoreOnly) { return }
-    $settings = @{}
-    $overrides = Get-SimOverrides
-    foreach ($key in @('rogue_dns_server','rogue_dns_dhcp_interval','rogue_dns_duration','rogue_dns_browse_interval')) {
-        $section = 'simulation'
-        if ($key -eq 'rogue_dns_server') { $section = 'address' }
-        $settings[$key] = get_value $section $key
-        if ($overrides.ContainsKey($key) -and -not [string]::IsNullOrWhiteSpace($overrides[$key])) { $settings[$key] = $overrides[$key] }
-    }
-    foreach ($entry in @{ rogue_dns_dhcp_interval = 1800; rogue_dns_duration = 3600; rogue_dns_browse_interval = 60 }.GetEnumerator()) {
-        if ([string]$settings[$entry.Key] -notmatch '^[1-9][0-9]{0,7}$') { $settings[$entry.Key] = $entry.Value }
-    }
     if (([DateTimeOffset]::UtcNow.ToUnixTimeSeconds() - [long]$state.start) -lt [int]$settings.rogue_dns_dhcp_interval) { return }
     $server = [string]$settings.rogue_dns_server
     $ip = $null

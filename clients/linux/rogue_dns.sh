@@ -52,18 +52,28 @@ if [[ -f "$state_file" ]]; then
 import json, sys
 s = json.load(open(sys.argv[1]))
 assert s['phase'] in ('dhcp', 'static') and isinstance(s['start'], int)
+# A static state must carry everything restore_dhcp needs, else it is corrupt.
+assert s['phase'] == 'dhcp' or all(s.get(k) for k in ('adapter', 'address', 'gateway', 'connection'))
 for key in ('phase', 'start', 'adapter', 'address', 'gateway', 'dns', 'connection'):
     print(s.get(key, ''))
 PY
   ) || {
     (( restore_only )) || { echo 'rogue_dns: unreadable state; refusing network changes' | tee -a "$log"; exit 1; }
-    # Restore-only on a corrupt state: DHCP is the safe direction. Rediscover the
-    # wireless device and its profile, restore, and rewrite a valid dhcp state.
-    echo 'rogue_dns: unreadable state; restoring DHCP on the wireless device' | tee -a "$log"
+    # Restore-only on a corrupt state: we don't know what was applied. Act only
+    # on rogue_dns's own fingerprint (the wireless device's DNS is exactly
+    # rogue_dns_server); anything else may be operator config, so leave it and
+    # just rewrite a valid dhcp state. restore_dhcp re-applies the saved
+    # profile, so it only ever drops runtime (device modify) changes.
     wl=$(nmcli -t -f DEVICE,TYPE device status | awk -F: '$2=="wifi" {print $1; exit}')
-    [[ -n $wl ]] || { echo 'rogue_dns: no wireless device to restore' | tee -a "$log"; exit 1; }
-    connection=$(nmcli -g GENERAL.CON-UUID device show "$wl")
-    restore_dhcp
+    [[ -n $wl ]] || { echo 'rogue_dns: unreadable state and no wireless device' | tee -a "$log"; exit 1; }
+    if [[ -n $rogue_dns_server && "$(nmcli -g IP4.DNS device show "$wl")" == "$rogue_dns_server" ]]; then
+      echo "rogue_dns: unreadable state; $wl uses rogue_dns_server, restoring DHCP" | tee -a "$log"
+      connection=$(nmcli -g GENERAL.CON-UUID device show "$wl")
+      restore_dhcp
+      exit $?
+    fi
+    echo "rogue_dns: unreadable state; no rogue_dns settings on $wl, leaving it" | tee -a "$log"
+    write_state dhcp
     exit $?
   }
   mapfile -t saved <<< "$state"

@@ -494,21 +494,25 @@ fi
 # Off or kill switch: TERM a running rogue_dns.sh (its EXIT trap restores DHCP),
 # KILL it after a short grace. Then, with no instance left, a phase=static state
 # means a restore is still owed (crash, reboot, force-kill): restore-only pass.
+# A stop that can't be confirmed (still running, or a failed process check) sets
+# rogue_dns_retry, and rogue_dns_gate retries it every iteration.
 #------------------------------------------------------------
 rogue_dns_stop_grace=10
+rogue_dns_retry=0
 # 0 = running, 1 = not running, 2 = unknown. pgrep exits 1 for "no match" and
 # 2+ when the check itself failed; never treat a failed check as "not running".
 rogue_dns_running() {
   pgrep -f '[r]ogue_dns.sh' >/dev/null
   local rc=$?
   (( rc <= 1 )) && return "$rc"
-  echo "rogue_dns: process check failed (pgrep rc=$rc); retrying next cycle" | tee -a ${LOG_FILE}
+  echo "rogue_dns: process check failed (pgrep rc=$rc); retrying" | tee -a ${LOG_FILE}
   return 2
 }
 reconcile_rogue_dns() {
-  local i rc phase state=/usr/local/scripts/rogue_dns.state
+  local i rc phase stop=0 state=/usr/local/scripts/rogue_dns.state
+  [[ "${rogue_dns:-off}" != "on" || "${kill_switch:-off}" == "on" ]] && stop=1
   rogue_dns_running; rc=$?
-  if [[ "${rogue_dns:-off}" != "on" || "${kill_switch:-off}" == "on" ]] && (( rc == 0 )); then
+  if (( stop && rc == 0 )); then
     echo "rogue_dns: disabled or kill switch on — stopping running instance" | tee -a ${LOG_FILE}
     pkill -TERM -f '[r]ogue_dns.sh'
     for (( i = 0; i < rogue_dns_stop_grace; i++ )); do
@@ -523,24 +527,52 @@ reconcile_rogue_dns() {
       rogue_dns_running; rc=$?
     fi
   fi
+  rogue_dns_retry=0
+  (( stop && rc != 1 )) && rogue_dns_retry=1
   (( rc == 1 )) && [[ -e $state ]] || return 0
-  # Same validity rule as rogue_dns.sh. Unreadable/corrupt means unknown, and
-  # restoring DHCP is the safe direction, so restore in that case too.
+  # Same validity rule as rogue_dns.sh. Unreadable/corrupt (including a static
+  # state missing what restore needs) means unknown: restore-only handles it.
   phase=$(python3 - "$state" 2>/dev/null <<'PY'
 import json, sys
 s = json.load(open(sys.argv[1]))
 assert s['phase'] in ('dhcp', 'static') and isinstance(s['start'], int)
+assert s['phase'] == 'dhcp' or all(s.get(k) for k in ('adapter', 'address', 'gateway', 'connection'))
 print(s['phase'])
 PY
   )
   if [[ $phase == static ]]; then
     echo "rogue_dns: static state with no running instance — restoring DHCP" | tee -a ${LOG_FILE}
   elif [[ $phase != dhcp ]]; then
-    echo "rogue_dns: rogue_dns state unreadable — restoring DHCP" | tee -a ${LOG_FILE}
+    echo "rogue_dns: rogue_dns state unreadable — restore-only pass" | tee -a ${LOG_FILE}
   else
     return 0
   fi
   bash /usr/local/scripts/rogue_dns.sh --restore-only >> ${LOG_FILE} 2>&1
+}
+# Per-iteration twin of Windows Update-RogueDnsGate: the outer cycle (and its
+# reconcile) runs only every ~25 min. While rogue_dns is on, re-read the global
+# kill switch file every iteration, and simulation.conf only when its mtime
+# moved; on kill switch or rogue_dns=off, stop it now. With rogue_dns off it
+# costs nothing unless a stop is still owed (rogue_dns_retry).
+rogue_dns_gate() {
+  local ks flag
+  if [[ "$rogue_dns" != "on" ]]; then
+    (( rogue_dns_retry )) && reconcile_rogue_dns
+    return 0
+  fi
+  ks=$(tr -d '[:space:]' < /usr/local/scripts/kill_switch.txt 2>/dev/null)
+  if [[ "$(stat -c %Y /usr/local/scripts/simulation.conf 2>/dev/null)" != "$_cfg_mtime" ]]; then
+    process_ini_file '/usr/local/scripts/simulation.conf'
+    flag=$(get_value "$username" kill_switch)
+    [[ -n $flag ]] || flag=$(get_value simulation kill_switch)
+    [[ $flag == on ]] && ks=on
+    flag=$(get_value "$username" rogue_dns)
+    [[ -n $flag || "${random_pool:-off}" == "on" ]] || flag=$(get_value "$simulation_id" rogue_dns)
+  fi
+  [[ $ks == on || ( -n $flag && $flag != on ) ]] || return 0
+  echo "rogue_dns: kill switch on or rogue_dns turned off mid-cycle — stopping" | tee -a ${LOG_FILE}
+  rogue_dns=off
+  reconcile_rogue_dns
 }
 # Fallback/www browse on iteration $1. While rogue_dns is on, browse only when it
 # is definitely not running (rc 1): never during its static phase, and never on
@@ -820,11 +852,8 @@ if [ "$kill_switch" != "on" ]; then
  # the first iteration. The page just generates a request for stats — it does
  # nothing with the content and may hang; all instances are killed at loop end.
  declare -a _www_iters=()
- # Fill for rogue_dns even if a static phase is running now: the per-iteration
- # pgrep check below suppresses browsing until it ends, and the DHCP-phase
- # fallback then still fires this cycle (Windows re-arms rogueDnsBrowseReady
- # every 10 iterations for the same reason).
- if [[ "$www_traffic" == "on" || "$rogue_dns" == "on" ]]; then
+ # rogue_dns adds the DHCP-phase fallback only when it is definitely not running.
+ if [[ "$www_traffic" == "on" ]] || { [[ "$rogue_dns" == "on" ]] && { rogue_dns_running; (( $? == 1 )); }; }; then
   for (( _wi=0; _wi<5; _wi++ )); do
    _www_iters+=("$(( 1 + RANDOM % 100 ))")
   done
@@ -877,6 +906,7 @@ if [ "$kill_switch" != "on" ]; then
   # init_simulation_context and re-reads every flag. A pushed change then lands on
   # the next pass instead of waiting out the full 100-iteration cycle.
   #------------------------------------------------------------
+  rogue_dns_gate
   if [[ "${_sim_reload:-0}" == 1 || "$(stat -c %Y /usr/local/scripts/simulation.conf 2>/dev/null)" != "$_cfg_mtime" ]]; then
     echo "Config changed — reloading simulation" | tee -a ${LOG_FILE}
     break
@@ -1219,10 +1249,11 @@ echo Closing Firefox | tee -a ${LOG_FILE}
 # browse interval), so spare every process under it.
 kill_headless_firefox() {
   local pid keep=" " queue
-  queue=$(pgrep -f '[r]ogue_dns.sh')
-  # Unknown (pgrep error) with rogue_dns on: its browser can't be told apart,
-  # so skip this cleanup rather than risk killing it.
-  (( $? <= 1 )) || [[ "${rogue_dns:-off}" != "on" ]] || return 0
+  local rc
+  queue=$(pgrep -f '[r]ogue_dns.sh'); rc=$?
+  # Unknown (pgrep error, rc 2+): a rogue_dns browser can't be told apart from
+  # ours, whatever the rogue_dns flag says, so skip this cleanup.
+  (( rc <= 1 )) || return 0
   queue=${queue//$'\n'/ }
   while [[ -n ${queue// } ]]; do
     read -r pid queue <<< "$queue"
