@@ -200,8 +200,11 @@ never copies the file to Linux clients) and re-parses `simulation.conf` (kill sw
 `rogue_dns` value) only when the file's modification time (sub-second) has
 changed since the cycle started. Each platform reads the kill switch with the
 same rule as its main loop: Linux stops only on `on`, Windows on anything but
-`off`. A conf change to the bucket's `rogue_dns` value never stops an
-instance that an ambient roll (random pool, or the hub engine) turned on. That re-read never replaces the configuration
+`off` (including a blank value). A conf change to the bucket's `rogue_dns`
+value never stops an instance that an ambient roll (random pool, or the hub
+engine) turned on. Removing this client's `[username]` override falls back to
+what the cycle would have run without it (the bucket or the ambient roll), so
+an engine-assigned rogue_dns stops when the engine drops the assignment. That re-read never replaces the configuration
 parsed at the start of the cycle, so the rest of the iteration keeps using it. With `rogue_dns` off it does nothing, unless a
 stop request could not be confirmed (the instance was still running, or the
 process check failed); that stop is then retried every iteration until it is

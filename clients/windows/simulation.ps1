@@ -540,16 +540,23 @@ function Update-RogueDnsGate {
     $flag = $null
     $stamp = (Get-Item -LiteralPath $simConfPath -ErrorAction SilentlyContinue).LastWriteTimeUtc
     if ($stamp -ne $script:simConfStamp) {
+        $script:simConfStamp = $stamp
         $ini = Parse-IniFile $simConfPath
         $get = { param($section, $key) if ($ini.ContainsKey($section)) { [string]$ini[$section][$key] } }
         $kill = & $get $script:username 'kill_switch'
         if (-not $kill) { $kill = & $get 'simulation' 'kill_switch' }
+        # Parsed, so never $null: a blank kill switch is kill-switched, as in the main loop.
+        $kill = "$kill"
         # Compare with the cycle-start sources: an unrelated conf write must not
         # turn an ambient-rolled rogue_dns off.
         $user = [string](& $get $script:username 'rogue_dns')
         $bucket = [string](& $get $script:simulation_id 'rogue_dns')
         if ($user -ne [string]$script:rogueDnsUser) {
-            if ($user) { $flag = $user } elseif ($script:random_pool -ne 'on') { $flag = $bucket; if (-not $flag) { $flag = 'off' } }
+            # A removed override falls back to what the cycle would have run without it.
+            if ($user) { $flag = $user }
+            elseif ($script:random_pool -eq 'on') { $flag = [string]$script:rogueDnsBase }
+            else { $flag = $bucket }
+            if (-not $flag) { $flag = 'off' }
         } elseif (-not $user -and $script:random_pool -ne 'on' -and $bucket -ne [string]$script:rogueDnsBucket) {
             $flag = $bucket; if (-not $flag) { $flag = 'off' }
         }
@@ -558,7 +565,7 @@ function Update-RogueDnsGate {
         $globalKill = ([string](Get-Content -LiteralPath $killSwitchPath -ErrorAction SilentlyContinue | Select-Object -First 1)).Trim()
         if ($globalKill) { $kill = $globalKill }
     }
-    if (($kill -and $kill -ne 'off') -or ($flag -and $flag -ne 'on')) {
+    if (($null -ne $kill -and $kill -ne 'off') -or ($flag -and $flag -ne 'on')) {
         Write-SimLog 'rogue_dns: kill switch on or rogue_dns turned off mid-cycle; stopping'
         $script:rogue_dns = 'off'
         Sync-RogueDns
@@ -703,6 +710,8 @@ while ($true) {
     # password by the same rule rather than deriving a per-client value).
     $script:mac_auth_fail_mac = get_value 'address' 'mac_auth_fail_mac'
 
+    # rogue_dns from the bucket or ambient roll, before any [username] override.
+    $script:rogueDnsBase = $script:rogue_dns
     Apply-UserOverrides -Section $script:username -Names @(
         'kill_switch','sim_load','public_repo','repo_location','site_based_ssid','iperf_bw',
         'wsite','sim_phy','ssid','ssidpw','ssid_auth','dhcp_fail','dns_fail','dns_latency','collab','assoc_fail','port_flap','ping_test',

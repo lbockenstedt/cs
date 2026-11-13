@@ -439,6 +439,19 @@ def test_linux_unrelated_rogue_dns_cmdline_is_ignored(tmp_path, running):
         subprocess.run(["pkill", "-f", f"{tmp_path}/bin/firefox-esr"], check=False)
 
 
+@pytest.mark.parametrize("api,file,expected", [
+    ("on", None, "on"), ("off", "on", "on"), ("", None, "off"), ("off", "off", "off"),
+])
+def test_linux_read_gkill_switch(tmp_path, api, file, expected):
+    """Hub API or local file 'on' means on; a missing file logs no error."""
+    if file is not None:
+        (tmp_path / "kill_switch.txt").write_text(file + "\n")
+    script = (linux_orchestrator(tmp_path, "read_gkill_switch")
+              + f"server_url=http://hub.test\ncurl() {{ echo {api}; }}\nread_gkill_switch\n")
+    result = subprocess.run(["bash", "-c", script], capture_output=True, text=True, check=True, timeout=5)
+    assert result.stdout.strip() == expected and not result.stderr
+
+
 def test_linux_gate_reparse_keeps_cycle_config(tmp_path):
     """The gate re-reads simulation.conf without replacing the cycle's parsed config."""
     env = prepare_linux(tmp_path)
@@ -471,6 +484,10 @@ def test_linux_gate_reparse_keeps_cycle_config(tmp_path):
     ("kill_api_checked_recently", "on", False, "", 0, False),  # at most once a minute
     # Hub-engine ambient (web_server=on) rolled rogue_dns locally: a bucket change can't stop it.
     ("conf_off_engine_ambient", "on", True, "", 0, False),
+    # The engine removes the [username] override that turned rogue_dns on: stop,
+    # unless the cycle's own ambient roll had it on too.
+    ("override_removed_engine_ambient", "on", True, "", 0, True),
+    ("override_removed_rolled_on", "on", True, "", 0, False),
 ])
 def test_linux_per_iteration_gate(tmp_path, scenario, flag, conf_changed, kill_file, retry, stopped):
     """rogue_dns_gate stops a running static phase within the iteration (twin of Update-RogueDnsGate)."""
@@ -491,7 +508,9 @@ def test_linux_per_iteration_gate(tmp_path, scenario, flag, conf_changed, kill_f
         + "server_url=http://hub.test\n"
         + f"curl() {{ echo {'on' if scenario.startswith('kill_api') else 'off'}; }}\n"
         + f"_gks_checked={0 if scenario == 'kill_api_checked_recently' else -60}\n"
-        + f"web_server={'on' if scenario.endswith('engine_ambient') else 'off'}\n"
+        + f"web_server={'on' if 'ambient' in scenario or 'rolled' in scenario else 'off'}\n"
+        + ("_rogue_dns_user=on\n" if scenario.startswith("override_removed") else "")
+        + f"_rogue_dns_base={'on' if scenario.endswith('rolled_on') else 'off'}\n"
         + "rogue_dns_gate\n")
     try:
         subprocess.run(["bash", str(script)], env=env, check=True, timeout=15)
@@ -716,6 +735,7 @@ function Test-WwwRunning { Test-ScriptRunning -ScriptName 'www_traffic.ps1' }
 $script:username = 'tester'
 $script:simulation_id = 's0'
 $script:random_pool = 'off'
+if ($env:OVERRIDE_REMOVED) { $script:random_pool = 'on'; $script:rogueDnsUser = 'on'; $script:rogueDnsBase = $env:OVERRIDE_REMOVED }
 $script:rogue_dns = $env:FLAG
 $script:kill_switch = $env:KILL
 $script:www_traffic = $env:WWW
@@ -725,6 +745,7 @@ if ($null -ne $result) { Add-Event "result $result" }
 Add-Event "flag $script:rogue_dns"
 Add-Event "retry $script:rogueDnsRetry"
 Add-Event "www $script:www_traffic ready $script:rogueDnsBrowseReady"
+if (Test-Path -LiteralPath $simConfPath) { Add-Event "stamp synced $($script:simConfStamp -eq (Get-Item -LiteralPath $simConfPath).LastWriteTimeUtc)" }
 """
 
 FAKE_WINDOWS_ROGUE = """param([switch]$RestoreOnly)
@@ -772,12 +793,16 @@ Set-Content -LiteralPath (Join-Path $env:TEST_ROOT 'rogue_dns.state') -Value '{"
     # Unknown re-arms too: Test-WwwBrowseDue re-checks at use time (browse_unknown).
     ("rearm_unknown", "Invoke-Rearm", "on", "off", False, "cim_fail", "dhcp", "", ["www on ready True"], []),
     ("rearm_no_rogue_dns", "Invoke-Rearm", "off", "off", False, "", "dhcp", "", ["www on ready False"], []),
-    ("midcycle_off", "Update-RogueDnsGate", "on", "off", True, "", "static", "[s0]\nrogue_dns=off\n", ["cleanup", "flag off"], ["restore-only"]),
-    ("midcycle_kill_file", "Update-RogueDnsGate", "on", "off", True, "", "static", "[s0]\nrogue_dns=on\n", ["cleanup", "flag off"], ["restore-only"]),
+    ("midcycle_off", "Update-RogueDnsGate", "on", "off", True, "", "static", "[simulation]\nkill_switch=off\n[s0]\nrogue_dns=off\n", ["cleanup", "flag off"], ["restore-only"]),
+    ("midcycle_kill_file", "Update-RogueDnsGate", "on", "off", True, "", "static", "[simulation]\nkill_switch=off\n[s0]\nrogue_dns=on\n", ["cleanup", "flag off"], ["restore-only"]),
+    ("midcycle_kill_conf_blank", "Update-RogueDnsGate", "on", "off", True, "", "static", "[s0]\nrogue_dns=on\n", ["cleanup", "flag off"], ["restore-only"]),
     ("midcycle_kill_conf_odd", "Update-RogueDnsGate", "on", "off", True, "", "static", "[simulation]\nkill_switch=maybe\n[s0]\nrogue_dns=on\n", ["cleanup", "flag off"], ["restore-only"]),
-    ("midcycle_still_on", "Update-RogueDnsGate", "on", "off", True, "", "static", "[s0]\nrogue_dns=on\n", ["flag on"], ["cleanup"]),
+    # Random pool: a removed [username] override stops rogue_dns unless the roll had it on.
+    ("midcycle_override_removed", "Update-RogueDnsGate", "on", "off", True, "", "static", "[simulation]\nkill_switch=off\n[s0]\nrogue_dns=on\n", ["cleanup", "flag off"], ["restore-only"]),
+    ("midcycle_override_removed_rolled_on", "Update-RogueDnsGate", "on", "off", True, "", "static", "[simulation]\nkill_switch=off\n[s0]\nrogue_dns=on\n", ["flag on"], ["cleanup"]),
+    ("midcycle_still_on", "Update-RogueDnsGate", "on", "off", True, "", "static", "[simulation]\nkill_switch=off\n[s0]\nrogue_dns=on\n", ["flag on", "stamp synced True"], ["cleanup"]),
     # simulation.conf unchanged since the cycle start: not re-parsed, so no stop.
-    ("midcycle_conf_same", "Update-RogueDnsGate", "on", "off", True, "", "static", "[s0]\nrogue_dns=off\n", ["flag on"], ["cleanup"]),
+    ("midcycle_conf_same", "Update-RogueDnsGate", "on", "off", True, "", "static", "[simulation]\nkill_switch=off\n[s0]\nrogue_dns=off\n", ["flag on"], ["cleanup"]),
     # A stop the last Sync-RogueDns couldn't confirm is retried every iteration.
     ("retry_owed", "Update-RogueDnsGate", "off", "off", True, "", "static", "", ["cleanup", "retry False"], []),
     ("off_idle", "Update-RogueDnsGate", "off", "off", True, "", "static", "", [], ["cleanup", "stop "]),
@@ -827,7 +852,8 @@ def test_windows_orchestrator_cancels_and_recovers(tmp_path, scenario, action, f
     (tmp_path / "procs.json").write_text(json.dumps(procs))
     env = dict(os.environ, TEST_ROOT=str(tmp_path), ACTION=action, FLAG=flag, KILL=kill, MODE=mode,
                WWW="on" if scenario.startswith("browse") else "off",
-               CONF_SAME="1" if scenario == "midcycle_conf_same" else "", RETRY="1" if scenario == "retry_owed" else "")
+               CONF_SAME="1" if scenario == "midcycle_conf_same" else "",
+               OVERRIDE_REMOVED=("on" if scenario.endswith("rolled_on") else "off") if "override_removed" in scenario else "", RETRY="1" if scenario == "retry_owed" else "")
     result = subprocess.run([powershell, "-NoProfile", "-NonInteractive", "-File", str(tmp_path / "harness.ps1")],
                             env=env, capture_output=True, text=True, timeout=30)
     assert result.returncode == 0 and not result.stderr, result.stdout + result.stderr

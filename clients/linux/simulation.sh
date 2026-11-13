@@ -446,6 +446,8 @@ mac_auth_fail_mac=$(get_value 'address' 'mac_auth_fail_mac')
 #User/Device Specific Overrides — apply_override + the shared SUPERSET
 #CS_OVERRIDE_KEYS list live in common.sh (kept in sync with dashboard.sh).
 #------------------------------------------------------------
+# rogue_dns from the bucket or ambient roll, before any [username] override.
+_rogue_dns_base=$rogue_dns
 apply_overrides
 # A [username] override can re-set sim_load to non-numeric — re-coerce so the
 # `-lt` gate stays safe.
@@ -488,7 +490,7 @@ _rsleep 5
 read_gkill_switch() {
   local api="" file=""
   [[ -n "${server_url:-}" ]] && api=$(curl -sf --max-time 5 "${server_url%/}/api/kill-switch" 2>/dev/null | tr -d '[:space:]')
-  file=$(tr -d '[:space:]' < /usr/local/scripts/kill_switch.txt 2>/dev/null)
+  [[ -f /usr/local/scripts/kill_switch.txt ]] && file=$(tr -d '[:space:]' < /usr/local/scripts/kill_switch.txt)
   if [[ $api == on || $file == on ]]; then echo on; else echo off; fi
 }
 gkill_switch=$(read_gkill_switch)
@@ -588,8 +590,10 @@ rogue_dns_gate() {
     [[ "${random_pool:-off}" == on || "${web_server:-off}" == on ]] && ambient=on
     flag=
     if [[ $user != "${_rogue_dns_user:-}" ]]; then
+      # A removed override falls back to what the cycle would have run without it.
       if [[ -n $user ]]; then flag=$user
-      elif [[ $ambient != on ]]; then flag=${bucket:-off}; fi
+      elif [[ $ambient == on ]]; then flag=${_rogue_dns_base:-off}
+      else flag=${bucket:-off}; fi
     elif [[ -z $user && $ambient != on && $bucket != "${_rogue_dns_bucket:-}" ]]; then
       flag=${bucket:-off}
     fi
