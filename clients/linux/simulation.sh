@@ -561,7 +561,7 @@ rogue_dns_gate() {
     return 0
   fi
   ks=$(tr -d '[:space:]' < /usr/local/scripts/kill_switch.txt 2>/dev/null)
-  if [[ "$(stat -c %Y /usr/local/scripts/simulation.conf 2>/dev/null)" != "$_cfg_mtime" ]]; then
+  if [[ "$(stat -c %y /usr/local/scripts/simulation.conf 2>/dev/null)" != "$_cfg_mtime" ]]; then
     process_ini_file '/usr/local/scripts/simulation.conf'
     flag=$(get_value "$username" kill_switch)
     [[ -n $flag ]] || flag=$(get_value simulation kill_switch)
@@ -846,7 +846,7 @@ fi
 echo Kill Switch is $kill_switch | tee -a ${LOG_FILE}
 if [ "$kill_switch" != "on" ]; then
  # Snapshot the config's mtime so the loop can spot a pushed change mid-cycle.
- _cfg_mtime=$(stat -c %Y /usr/local/scripts/simulation.conf 2>/dev/null)
+ _cfg_mtime=$(stat -c %y /usr/local/scripts/simulation.conf 2>/dev/null)
  # Pick up to 5 random iteration indices (1..100) to open a web page on, so the
  # fleet spreads web traffic across the loop instead of opening a single page at
  # the first iteration. The page just generates a request for stats — it does
@@ -907,7 +907,7 @@ if [ "$kill_switch" != "on" ]; then
   # the next pass instead of waiting out the full 100-iteration cycle.
   #------------------------------------------------------------
   rogue_dns_gate
-  if [[ "${_sim_reload:-0}" == 1 || "$(stat -c %Y /usr/local/scripts/simulation.conf 2>/dev/null)" != "$_cfg_mtime" ]]; then
+  if [[ "${_sim_reload:-0}" == 1 || "$(stat -c %y /usr/local/scripts/simulation.conf 2>/dev/null)" != "$_cfg_mtime" ]]; then
     echo "Config changed — reloading simulation" | tee -a ${LOG_FILE}
     break
   fi

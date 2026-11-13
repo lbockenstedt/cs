@@ -451,6 +451,13 @@ def test_linux_firefox_kill_spares_rogue_dns_browser(tmp_path):
         subprocess.run(["pkill", "-f", f"{tmp_path}/bin/firefox-esr"], check=False)
 
 
+def test_linux_conf_change_stamp_is_sub_second():
+    """A conf rewrite in the same second as the cycle start must still count as a change."""
+    source = (ROOT / "clients/linux/simulation.sh").read_text()
+    stamps = [line for line in source.splitlines() if "stat -c" in line and "simulation.conf" in line]
+    assert len(stamps) == 3 and all("stat -c %y " in line for line in stamps)
+
+
 def test_linux_per_client_override(tmp_path):
     """The real singular apply_override helper overrides the blank global DNS."""
     env = prepare_linux(tmp_path, server="", override="rogue_dns_server=192.0.2.99")

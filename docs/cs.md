@@ -186,7 +186,7 @@ and again on every loop iteration (Linux `rogue_dns_gate`, Windows
 `Update-RogueDnsGate`). To keep the per-iteration check cheap, it only runs
 while `rogue_dns` is on: it re-reads the global `kill_switch.txt` every
 iteration and re-parses `simulation.conf` (kill switch and this client's
-`rogue_dns` value) only when the file's modification time has changed since
+`rogue_dns` value) only when the file's modification time (sub-second) has changed since
 the cycle started. With `rogue_dns` off it does nothing, unless a stop request
 could not be confirmed (the instance was still running, or the process check
 failed); that stop is then retried every iteration until it is confirmed.
