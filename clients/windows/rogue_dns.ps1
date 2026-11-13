@@ -5,6 +5,9 @@ $version = '0.01'
 $global:iniConfig = Parse-IniFile 'C:\Scripts\simulation.conf'
 Write-SimVersionBanner 'rogue_dns.ps1' $version
 $statePath = 'C:\Scripts\rogue_dns.state'
+# The orchestrator creates this to cancel a running static phase gracefully
+# (Windows has no SIGTERM): the loop exits and the finally block restores DHCP.
+$stopPath = 'C:\Scripts\rogue_dns.stop'
 
 function Save-RogueDnsState {
     param($State)
@@ -78,6 +81,7 @@ try {
         dns = @((Get-DnsClientServerAddress -InterfaceIndex $idx -AddressFamily IPv4).ServerAddresses) }
     # Persist before the first mutation so reboot/Stop-Process can recover.
     Save-RogueDnsState $state
+    Remove-Item -LiteralPath $stopPath -Force -ErrorAction SilentlyContinue
     try {
         Set-NetIPInterface -InterfaceIndex $idx -AddressFamily IPv4 -Dhcp Disabled -ErrorAction Stop
         Get-NetIPAddress -ErrorAction Stop |
@@ -91,7 +95,7 @@ try {
         if (-not $firefoxCommand) { $firefoxCommand = Get-Command firefox -ErrorAction SilentlyContinue }
         $firefox = $null
         $clock = [System.Diagnostics.Stopwatch]::StartNew()
-        while ($clock.Elapsed.TotalSeconds -lt [int]$settings.rogue_dns_duration) {
+        while ($clock.Elapsed.TotalSeconds -lt [int]$settings.rogue_dns_duration -and -not (Test-Path -LiteralPath $stopPath)) {
             $next = [Math]::Min([int]$settings.rogue_dns_duration, $clock.Elapsed.TotalSeconds + [int]$settings.rogue_dns_browse_interval)
             # Start-Process is asynchronous; retain only our browser's handle.
             if ($firefoxCommand -and $wwwfile.Count -gt 0) {
@@ -100,13 +104,14 @@ try {
                     $firefox = Start-Process -FilePath $firefoxCommand.Source -ArgumentList '--headless', $url -WindowStyle Hidden -PassThru -ErrorAction Stop
                 } catch { Write-SimLog "rogue_dns: browser launch failed: $($_.Exception.Message)" }
             }
-            while ($clock.Elapsed.TotalSeconds -lt $next) {
-                # Chunk long intervals: Start-Sleep -Milliseconds takes Int32.
-                Start-Sleep -Milliseconds ([int](1000 * [Math]::Max(0, [Math]::Min(60, $next - $clock.Elapsed.TotalSeconds))))
+            while ($clock.Elapsed.TotalSeconds -lt $next -and -not (Test-Path -LiteralPath $stopPath)) {
+                # One-second chunks so a stop request is seen promptly.
+                Start-Sleep -Milliseconds ([int](1000 * [Math]::Max(0, [Math]::Min(1, $next - $clock.Elapsed.TotalSeconds))))
             }
             if ($firefox -and -not $firefox.HasExited) { $firefox | Stop-Process -Force -ErrorAction SilentlyContinue }
             $firefox = $null
         }
+        if (Test-Path -LiteralPath $stopPath) { Write-SimLog 'rogue_dns: stop requested; restoring DHCP' }
     } finally {
         try {
             if ($firefox -and -not $firefox.HasExited) { $firefox | Stop-Process -Force -ErrorAction SilentlyContinue }

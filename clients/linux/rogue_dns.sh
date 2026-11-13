@@ -1,5 +1,9 @@
 #!/bin/bash
 version=0.01
+# --restore-only: recover a stale static phase and exit; never start a new one.
+# The orchestrator runs it every cycle that finds phase=static and no instance.
+restore_only=0
+[[ ${1:-} == --restore-only ]] && restore_only=1
 source '/usr/local/scripts/ini-parser.sh'
 source '/usr/local/scripts/common.sh'
 # common.sh has its own version variable; report this script's fleet baseline.
@@ -59,10 +63,11 @@ PY
     restore_dhcp
     exit $?
   fi
-else
+elif (( ! restore_only )); then
   write_state dhcp || exit 1
   exit 0
 fi
+(( restore_only )) && exit 0
 (( $(date +%s) - start >= rogue_dns_dhcp_interval )) || exit 0
 if ! python3 - "$rogue_dns_server" <<'PY'
 import ipaddress, sys
@@ -102,8 +107,12 @@ stop_browse() {
 write_state static || exit 1
 trap 'rc=$?; stop_browse; restore_dhcp || rc=1; exit "$rc"' EXIT
 trap 'exit 0' INT TERM HUP
+# Unprivileged nmcli like every other Linux sim: 50-client-sim-nm.rules grants
+# the sim user NetworkManager network-control. If the apply is refused (no
+# polkit rule, no root), stop here: the EXIT trap restores DHCP and keeps rc=1,
+# so nothing stays half-applied and the browse loop never starts.
 if ! nmcli device modify "$wl" ipv4.method manual ipv4.addresses "$address" ipv4.gateway "$gateway" ipv4.dns "$rogue_dns_server" ipv4.ignore-auto-dns yes >> "$log" 2>&1; then
-  echo 'rogue_dns: static apply failed' | tee -a "$log"
+  echo 'rogue_dns: static apply failed; restoring DHCP' | tee -a "$log"
   exit 1
 fi
 end=$(( $(date +%s) + rogue_dns_duration ))

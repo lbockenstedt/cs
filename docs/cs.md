@@ -168,14 +168,47 @@ manual address/gateway, enables DHCP and resets DNS server addresses.
 A trap (Linux) or `finally` (Windows) restores DHCP on normal completion or a
 handled interruption. An unhandled kill, reboot or update can bypass cleanup:
 a stale `phase=static` at the next script launch triggers DHCP recovery and
-restarts the 30-minute window instead of applying static again. Windows also
-performs this recovery at orchestrator startup because its static settings
-persist across reboots. Windows recovery tolerates an already-removed address
+restarts the 30-minute window instead of applying static again. Windows recovery tolerates an already-removed address
 or route after partial cleanup, and never removes a newly acquired DHCP lease.
 A failed apply or restore returns a non-zero exit status; a failed restore
 retains the static state for retry. Only successful restoration starts a new
 DHCP window. Check `sim.log` in the platform's scripts directory. Do not delete
 that state file while recovery is pending.
+
+**Cancellation.** Turning `rogue_dns` off (bucket, override or random-pool roll)
+or turning the kill switch on (config or the emergency global switch) stops a
+running instance, not only future dispatch. The orchestrator asks it to stop
+gracefully so its own cleanup restores DHCP (Linux sends `SIGTERM`; Windows
+creates `C:\Scripts\rogue_dns.stop`, which the script checks every second). If
+it has not exited after 10 seconds, the orchestrator force-kills it and runs a
+restore-only pass. Linux picks up the change within one loop iteration, through its existing
+reload break on a changed `simulation.conf` or a `USR1`. Windows re-checks the
+kill switch and this client's `rogue_dns` value on every loop iteration (about
+every 15 seconds) while the flag is on.
+
+**Per-cycle recovery.** On every orchestrator cycle, whatever the `rogue_dns`
+value or kill switch, if no instance is running and the state file says
+`phase=static`, the orchestrator runs a restore-only pass:
+`rogue_dns.sh --restore-only` on Linux, `rogue_dns.ps1 -RestoreOnly` on
+Windows. Restore-only mode restores a stale static phase and exits; it never
+writes a new DHCP start or applies static. A crash, reboot or force-kill
+therefore cannot leave a client on the rogue DNS server, even after the
+simulation has been disabled.
+
+**Permissions (Linux).** Like the other Linux sims, `rogue_dns.sh` runs `nmcli`
+unprivileged. The NetworkManager polkit rule `50-client-sim-nm.rules`
+(installed by `update.sh`) authorises it. If the static apply is refused, for
+example because the rule is missing, the script logs
+`static apply failed; restoring DHCP`, restores straight away and exits
+non-zero. It never browses on a half-applied configuration.
+
+**Browser cleanup.** The orchestrators' periodic headless Firefox cleanup skips
+processes inside a running rogue_dns instance's process tree, so the
+static-phase browser is not killed mid-request; rogue_dns stops its own browser
+each browse interval and on exit. On Windows, a Firefox launch that hands off to
+an already-running Firefox instance can leave a page outside that tree. The
+next cleanup then closes it, which is harmless because rogue_dns launches a
+fresh page on its next browse interval.
 
 ## WWW Discover — Network Diagnostics
 

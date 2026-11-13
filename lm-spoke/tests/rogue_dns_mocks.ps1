@@ -81,7 +81,11 @@ function Set-DnsClientServerAddress {
     if ($ResetServerAddresses) {
         if ($script:scenario -eq 'dns_restore_fail') { throw 'DNS reset failed' }
         Add-TestCall 'dns reset'
-    } else { Add-TestCall "dns $ServerAddresses" }
+    } else {
+        Add-TestCall "dns $ServerAddresses"
+        # The orchestrator cancels mid-static by creating the stop file.
+        if ($script:scenario -eq 'cancel') { Set-Content -LiteralPath (Join-Path $env:TEST_ROOT 'rogue_dns.stop') -Value 'stop' }
+    }
 }
 # Tests never start real Firefox, even if installed on the runner.
 function Get-Command {

@@ -490,6 +490,37 @@ if [[ "$gkill_switch" == "off" ]] && [[ -f '/usr/local/scripts/kill_switch.txt' 
   [[ "$_gks" == "on" || "$_gks" == "off" ]] && gkill_switch="$_gks"
 fi
 #------------------------------------------------------------
+# Rogue DNS lifecycle — runs EVERY cycle, outside the rogue_dns flag gate.
+# Off or kill switch: TERM a running rogue_dns.sh (its EXIT trap restores DHCP),
+# KILL it after a short grace. Then, with no instance left, a phase=static state
+# means a restore is still owed (crash, reboot, force-kill): restore-only pass.
+#------------------------------------------------------------
+rogue_dns_stop_grace=10
+reconcile_rogue_dns() {
+  local i
+  if [[ "${rogue_dns:-off}" != "on" || "${kill_switch:-off}" == "on" ]] && pgrep -f '[r]ogue_dns.sh' >/dev/null; then
+    echo "rogue_dns: disabled or kill switch on — stopping running instance" | tee -a ${LOG_FILE}
+    pkill -TERM -f '[r]ogue_dns.sh'
+    for (( i = 0; i < rogue_dns_stop_grace; i++ )); do
+      pgrep -f '[r]ogue_dns.sh' >/dev/null || break
+      sleep 1
+    done
+    if pgrep -f '[r]ogue_dns.sh' >/dev/null; then
+      echo "rogue_dns: did not exit in ${rogue_dns_stop_grace}s — force-killing" | tee -a ${LOG_FILE}
+      pkill -KILL -f '[r]ogue_dns.sh'
+      sleep 1
+    fi
+  fi
+  if ! pgrep -f '[r]ogue_dns.sh' >/dev/null && grep -Eq '"phase": *"static"' /usr/local/scripts/rogue_dns.state 2>/dev/null; then
+    echo "rogue_dns: static state with no running instance — restoring DHCP" | tee -a ${LOG_FILE}
+    bash /usr/local/scripts/rogue_dns.sh --restore-only >> ${LOG_FILE} 2>&1
+  fi
+}
+# The emergency kill switch cancels rogue_dns too: a static IP and rogue DNS
+# must not outlive an emergency stop.
+[[ "$gkill_switch" == "on" ]] && rogue_dns=off
+reconcile_rogue_dns
+#------------------------------------------------------------
 #Generating a random number to have some variance in the scripts
 #------------------------------------------------------------
 rn=$((1 + RANDOM % 60))
@@ -1143,7 +1174,22 @@ echo Closing Firefox | tee -a ${LOG_FILE}
 # Scoped to our headless instances (firefox-esr --headless) so we never touch an
 # interactive firefox, and to the cpulimit wrappers that spawn them. Foreground
 # so the kill is confirmed before we proceed to apt_update / offline sleep.
-pkill -f 'firefox-esr.*--headless' || true
+# A running rogue_dns.sh owns its static-phase browser (and stops it itself each
+# browse interval), so spare every process under it.
+kill_headless_firefox() {
+  local pid keep=" " queue
+  queue=$(pgrep -f '[r]ogue_dns.sh' | tr '\n' ' ')
+  while [[ -n ${queue// } ]]; do
+    read -r pid queue <<< "$queue"
+    keep+="$pid "
+    queue+=" $(pgrep -P "$pid" | tr '\n' ' ')"
+  done
+  for pid in $(pgrep -f 'firefox-esr.*--headless'); do
+    [[ $keep == *" $pid "* ]] || kill "$pid" 2>/dev/null
+  done
+  return 0
+}
+kill_headless_firefox
 #------------------------------------------------------------
 #End Kill switch Check
 #------------------------------------------------------------
