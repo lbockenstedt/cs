@@ -99,10 +99,11 @@ QT_GRACE_S_DEFAULT = 3600.0          # 1h after first heartbeat before "never co
 # by design, the reason a client can't connect, so no-IP/no-SSID is expected and
 # must NOT trigger a shed. The one nuance is the DNS sims below.
 QT_EXCLUDE_NONISOLATING_SIMS = frozenset({
-    "dns_fail", "dns_latency",
+    "dns_fail", "dns_latency", "rogue_dns",
 })                                   # exclusive/failure sims that STILL associate
                                      # and get an IP (they only break/slow DNS
-                                     # *after* the client is online) — a client
+                                     # *after* the client is online; rogue_dns
+                                     # keeps its DHCP-leased address) — a client
                                      # running one of these that never got an IP
                                      # is a genuine bad-dongle case we DO want to
                                      # shed, so they are NOT no-IP-by-design.
