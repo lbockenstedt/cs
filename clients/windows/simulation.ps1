@@ -365,12 +365,21 @@ function Clear-WifiMacSpoof {
     Write-SimDebug "  [mac_auth_fail] cleared NetworkAddress override on '$AdapterName' before maintenance reconnect (actual_iface_mac=$actualMac)"
 }
 
+# 'running', 'stopped' or 'unknown'. A failed (or empty) process query is
+# unknown, never "not running": callers that would launch or restore must wait.
+function Get-ScriptRunState {
+    param([string]$ScriptName)
+
+    try { $procs = @(Get-CimInstance Win32_Process -ErrorAction Stop) } catch { return 'unknown' }
+    if (-not $procs.Count) { return 'unknown' }
+    if ($procs | Where-Object { $_.CommandLine -like "*${ScriptName}*" } | Select-Object -First 1) { return 'running' }
+    return 'stopped'
+}
+
 function Test-ScriptRunning {
     param([string]$ScriptName)
 
-    return [bool](Get-CimInstance Win32_Process -ErrorAction SilentlyContinue |
-        Where-Object { $_.CommandLine -like "*${ScriptName}*" } |
-        Select-Object -First 1)
+    return (Get-ScriptRunState -ScriptName $ScriptName) -eq 'running'
 }
 
 function Run-Simulation {
@@ -445,7 +454,9 @@ $rogueDnsStopGrace = 10
 # it after a short grace. Then, with no instance left, phase=static means a
 # restore is still owed (reboot, crash, force-kill): run a restore-only pass.
 function Sync-RogueDns {
-    if (($script:rogue_dns -ne 'on' -or $script:kill_switch -eq 'on') -and (Test-ScriptRunning -ScriptName 'rogue_dns.ps1')) {
+    $run = Get-ScriptRunState -ScriptName 'rogue_dns.ps1'
+    if ($run -eq 'unknown') { Write-SimLog 'rogue_dns: process check failed; retrying next cycle'; return }
+    if (($script:rogue_dns -ne 'on' -or $script:kill_switch -eq 'on') -and $run -eq 'running') {
         Write-SimLog 'rogue_dns: disabled or kill switch on; stopping running instance'
         Set-Content -LiteralPath $rogueDnsStopPath -Value 'stop' -ErrorAction SilentlyContinue
         for ($i = 0; $i -lt $rogueDnsStopGrace -and (Test-ScriptRunning -ScriptName 'rogue_dns.ps1'); $i++) {
@@ -458,15 +469,24 @@ function Sync-RogueDns {
             Wait-Process -Id ($stuck | ForEach-Object { $_.ProcessId }) -Timeout 5 -ErrorAction SilentlyContinue
         }
         Remove-Item -LiteralPath $rogueDnsStopPath -Force -ErrorAction SilentlyContinue
+        $run = Get-ScriptRunState -ScriptName 'rogue_dns.ps1'
+        if ($run -eq 'unknown') { Write-SimLog 'rogue_dns: process check failed; retrying next cycle'; return }
     }
-    if ((Test-Path -LiteralPath $rogueDnsScript) -and -not (Test-ScriptRunning -ScriptName 'rogue_dns.ps1')) {
-        $state = $null
-        try { $state = Get-Content -LiteralPath $rogueDnsStatePath -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop } catch { }
-        if ($state.phase -eq 'static') {
-            Write-SimLog 'rogue_dns: static state with no running instance; restoring DHCP'
-            & $rogueDnsScript -RestoreOnly
-        }
+    if ($run -ne 'stopped' -or -not (Test-Path -LiteralPath $rogueDnsScript) -or -not (Test-Path -LiteralPath $rogueDnsStatePath)) { return }
+    # Same validity rule as rogue_dns.ps1. Unreadable/corrupt means unknown, and
+    # restoring DHCP is the safe direction, so restore in that case too.
+    $phase = $null
+    try {
+        $state = Get-Content -LiteralPath $rogueDnsStatePath -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
+        if ($state.phase -in @('static','dhcp') -and $null -ne $state.start) { $phase = $state.phase }
+    } catch { }
+    if ($phase -eq 'dhcp') { return }
+    if ($phase -eq 'static') {
+        Write-SimLog 'rogue_dns: static state with no running instance; restoring DHCP'
+    } else {
+        Write-SimLog 'rogue_dns: rogue_dns state unreadable; restoring DHCP'
     }
+    & $rogueDnsScript -RestoreOnly
 }
 
 # The outer loop re-reads config only once per cycle (~25 min), so while
@@ -791,8 +811,11 @@ while ($true) {
                     $script:www_traffic = 'off'
                     $script:rogueDnsBrowseReady = $false
                 }
-                if ($script:rogue_dns -eq 'on' -and -not (Test-ScriptRunning -ScriptName 'rogue_dns.ps1')) {
-                    Run-Simulation -ScriptName 'rogue_dns.ps1'
+                # Launch only on a definite 'stopped'; a failed check waits.
+                if ($script:rogue_dns -eq 'on') {
+                    $rogueDnsRun = Get-ScriptRunState -ScriptName 'rogue_dns.ps1'
+                    if ($rogueDnsRun -eq 'stopped') { Run-Simulation -ScriptName 'rogue_dns.ps1' }
+                    elseif ($rogueDnsRun -eq 'unknown') { Write-SimLog 'rogue_dns: process check failed; not launching this iteration' }
                 }
                 if ($script:www_discover -eq 'on' -and -not (Test-ScriptRunning -ScriptName 'www_discover.ps1')) {
                     Run-Simulation -ScriptName 'www_discover.ps1'
@@ -832,6 +855,8 @@ while ($true) {
                     Write-SimDebug 'Closing Firefox'
                     Stop-SimFirefox
                     $script:www_traffic = 'on'
+                    # Re-arm the DHCP-phase fallback browse every 10 iterations
+                    # (Linux parity: it fills _www_iters whenever rogue_dns is on).
                     if ($script:rogue_dns -eq 'on' -and -not (Test-ScriptRunning -ScriptName 'rogue_dns.ps1')) {
                         $script:rogueDnsBrowseReady = $true
                     }

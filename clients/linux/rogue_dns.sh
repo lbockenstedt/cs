@@ -55,7 +55,17 @@ assert s['phase'] in ('dhcp', 'static') and isinstance(s['start'], int)
 for key in ('phase', 'start', 'adapter', 'address', 'gateway', 'dns', 'connection'):
     print(s.get(key, ''))
 PY
-  ) || { echo 'rogue_dns: unreadable state; refusing network changes' | tee -a "$log"; exit 1; }
+  ) || {
+    (( restore_only )) || { echo 'rogue_dns: unreadable state; refusing network changes' | tee -a "$log"; exit 1; }
+    # Restore-only on a corrupt state: DHCP is the safe direction. Rediscover the
+    # wireless device and its profile, restore, and rewrite a valid dhcp state.
+    echo 'rogue_dns: unreadable state; restoring DHCP on the wireless device' | tee -a "$log"
+    wl=$(nmcli -t -f DEVICE,TYPE device status | awk -F: '$2=="wifi" {print $1; exit}')
+    [[ -n $wl ]] || { echo 'rogue_dns: no wireless device to restore' | tee -a "$log"; exit 1; }
+    connection=$(nmcli -g GENERAL.CON-UUID device show "$wl")
+    restore_dhcp
+    exit $?
+  }
   mapfile -t saved <<< "$state"
   phase=${saved[0]}; start=${saved[1]}; wl=${saved[2]}; address=${saved[3]}
   gateway=${saved[4]}; dns=${saved[5]}; connection=${saved[6]}

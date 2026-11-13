@@ -2,7 +2,7 @@
 # An absent keyed CIM object throws just as NetTCPIP does; broad enumeration
 # returns an empty set, allowing idempotent recovery after any completed step.
 $script:scenario = $env:SCENARIO
-$script:manual = $script:scenario -in @('stale','no_ip','no_route','neither','restore_fail','dns_restore_fail')
+$script:manual = $script:scenario -in @('stale','no_ip','no_route','neither','restore_fail','dns_restore_fail','corrupt_restore')
 $script:hasIp = $script:scenario -notin @('no_ip','neither','no_lease')
 $script:hasRoute = $script:scenario -notin @('no_route','neither')
 $script:origin = 'Dhcp'

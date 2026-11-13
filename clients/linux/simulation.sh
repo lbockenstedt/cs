@@ -496,25 +496,51 @@ fi
 # means a restore is still owed (crash, reboot, force-kill): restore-only pass.
 #------------------------------------------------------------
 rogue_dns_stop_grace=10
+# 0 = running, 1 = not running, 2 = unknown. pgrep exits 1 for "no match" and
+# 2+ when the check itself failed; never treat a failed check as "not running".
+rogue_dns_running() {
+  pgrep -f '[r]ogue_dns.sh' >/dev/null
+  local rc=$?
+  (( rc <= 1 )) && return "$rc"
+  echo "rogue_dns: process check failed (pgrep rc=$rc); retrying next cycle" | tee -a ${LOG_FILE}
+  return 2
+}
 reconcile_rogue_dns() {
-  local i
-  if [[ "${rogue_dns:-off}" != "on" || "${kill_switch:-off}" == "on" ]] && pgrep -f '[r]ogue_dns.sh' >/dev/null; then
+  local i rc phase state=/usr/local/scripts/rogue_dns.state
+  rogue_dns_running; rc=$?
+  if [[ "${rogue_dns:-off}" != "on" || "${kill_switch:-off}" == "on" ]] && (( rc == 0 )); then
     echo "rogue_dns: disabled or kill switch on — stopping running instance" | tee -a ${LOG_FILE}
     pkill -TERM -f '[r]ogue_dns.sh'
     for (( i = 0; i < rogue_dns_stop_grace; i++ )); do
-      pgrep -f '[r]ogue_dns.sh' >/dev/null || break
+      rogue_dns_running; rc=$?
+      (( rc == 0 )) || break
       sleep 1
     done
-    if pgrep -f '[r]ogue_dns.sh' >/dev/null; then
+    if (( rc == 0 )); then
       echo "rogue_dns: did not exit in ${rogue_dns_stop_grace}s — force-killing" | tee -a ${LOG_FILE}
       pkill -KILL -f '[r]ogue_dns.sh'
       sleep 1
+      rogue_dns_running; rc=$?
     fi
   fi
-  if ! pgrep -f '[r]ogue_dns.sh' >/dev/null && grep -Eq '"phase": *"static"' /usr/local/scripts/rogue_dns.state 2>/dev/null; then
+  (( rc == 1 )) && [[ -e $state ]] || return 0
+  # Same validity rule as rogue_dns.sh. Unreadable/corrupt means unknown, and
+  # restoring DHCP is the safe direction, so restore in that case too.
+  phase=$(python3 - "$state" 2>/dev/null <<'PY'
+import json, sys
+s = json.load(open(sys.argv[1]))
+assert s['phase'] in ('dhcp', 'static') and isinstance(s['start'], int)
+print(s['phase'])
+PY
+  )
+  if [[ $phase == static ]]; then
     echo "rogue_dns: static state with no running instance — restoring DHCP" | tee -a ${LOG_FILE}
-    bash /usr/local/scripts/rogue_dns.sh --restore-only >> ${LOG_FILE} 2>&1
+  elif [[ $phase != dhcp ]]; then
+    echo "rogue_dns: rogue_dns state unreadable — restoring DHCP" | tee -a ${LOG_FILE}
+  else
+    return 0
   fi
+  bash /usr/local/scripts/rogue_dns.sh --restore-only >> ${LOG_FILE} 2>&1
 }
 # The emergency kill switch cancels rogue_dns too: a static IP and rogue DNS
 # must not outlive an emergency stop.
@@ -784,7 +810,11 @@ if [ "$kill_switch" != "on" ]; then
  # the first iteration. The page just generates a request for stats — it does
  # nothing with the content and may hang; all instances are killed at loop end.
  declare -a _www_iters=()
- if [[ "$www_traffic" == "on" ]] || { [[ "$rogue_dns" == "on" ]] && ! pgrep -f '[r]ogue_dns.sh' >/dev/null; }; then
+ # Fill for rogue_dns even if a static phase is running now: the per-iteration
+ # pgrep check below suppresses browsing until it ends, and the DHCP-phase
+ # fallback then still fires this cycle (Windows re-arms rogueDnsBrowseReady
+ # every 10 iterations for the same reason).
+ if [[ "$www_traffic" == "on" || "$rogue_dns" == "on" ]]; then
   for (( _wi=0; _wi<5; _wi++ )); do
    _www_iters+=("$(( 1 + RANDOM % 100 ))")
   done
@@ -1076,7 +1106,8 @@ if [ "$kill_switch" != "on" ]; then
    #------------------------------------------------------------
    #Running Rogue DNS simulation (async; pause is not a runtime timeout)
    #------------------------------------------------------------
-   if [[ "$rogue_dns" == "on" ]] && ! pgrep -f '[r]ogue_dns.sh' >/dev/null; then
+   # Launch only on a definite "not running"; a failed check waits a cycle.
+   if [[ "$rogue_dns" == "on" ]] && { rogue_dns_running; (( $? == 1 )); }; then
     run_simulation "rogue_dns.sh" 0
    fi
    #------------------------------------------------------------

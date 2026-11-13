@@ -17,7 +17,14 @@ function Save-RogueDnsState {
 function Restore-RogueDnsDhcp {
     param($State)
     # Resolve the captured adapter identity, not a potentially recycled ifIndex.
-    $adapter = Get-NetAdapter -ErrorAction Stop | Where-Object { [string]$_.InterfaceGuid -eq $State.adapter } | Select-Object -First 1
+    # Without a usable state (corrupt file), fall back to the Wi-Fi adapter.
+    if ($State.adapter) {
+        $adapter = Get-NetAdapter -ErrorAction Stop | Where-Object { [string]$_.InterfaceGuid -eq $State.adapter } | Select-Object -First 1
+    } else {
+        $name = Get-WlanAdapter
+        $adapter = $null
+        if ($name) { $adapter = Get-NetAdapter -Name $name -ErrorAction Stop }
+    }
     if (-not $adapter) { throw 'Captured wireless adapter is unavailable' }
     $idx = $adapter.ifIndex
     # Remove only our manual address/routes. A second recovery is safe after a
@@ -25,10 +32,10 @@ function Restore-RogueDnsDhcp {
     # Enumerate then filter: CIM's keyed query throws ObjectNotFound when a
     # previous recovery already removed the address. Real query errors still fail.
     Get-NetIPAddress -ErrorAction Stop |
-        Where-Object { $_.InterfaceIndex -eq $idx -and $_.IPAddress -eq $State.address -and $_.PrefixOrigin -eq 'Manual' } |
+        Where-Object { $_.InterfaceIndex -eq $idx -and (-not $State.address -or $_.IPAddress -eq $State.address) -and $_.PrefixOrigin -eq 'Manual' } |
         Remove-NetIPAddress -Confirm:$false -ErrorAction Stop
     Get-NetRoute -ErrorAction Stop |
-        Where-Object { $_.InterfaceIndex -eq $idx -and $_.DestinationPrefix -eq '0.0.0.0/0' -and $_.NextHop -eq $State.gateway -and $_.Protocol -eq 'NetMgmt' } |
+        Where-Object { $_.InterfaceIndex -eq $idx -and $_.DestinationPrefix -eq '0.0.0.0/0' -and (-not $State.gateway -or $_.NextHop -eq $State.gateway) -and $_.Protocol -eq 'NetMgmt' } |
         Remove-NetRoute -Confirm:$false -ErrorAction Stop
     Set-NetIPInterface -InterfaceIndex $idx -AddressFamily IPv4 -Dhcp Enabled -ErrorAction Stop
     Set-DnsClientServerAddress -InterfaceIndex $idx -ResetServerAddresses -ErrorAction Stop
@@ -37,8 +44,17 @@ function Restore-RogueDnsDhcp {
 
 try {
     if (Test-Path -LiteralPath $statePath) {
-        $state = Get-Content -LiteralPath $statePath -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
-        if ($state.phase -notin @('static','dhcp') -or $null -eq $state.start) { throw 'Invalid rogue_dns state' }
+        try {
+            $state = Get-Content -LiteralPath $statePath -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
+            if ($state.phase -notin @('static','dhcp') -or $null -eq $state.start) { throw 'Invalid rogue_dns state' }
+        } catch {
+            if (-not $RestoreOnly) { throw }
+            # DHCP is the safe direction: restore the Wi-Fi adapter's manual
+            # addressing and DNS, then rewrite a valid dhcp state.
+            Write-SimLog 'rogue_dns: unreadable state; restoring DHCP on the wireless adapter'
+            Restore-RogueDnsDhcp @{}
+            return
+        }
         if ($state.phase -eq 'static') {
             Restore-RogueDnsDhcp $state
             return

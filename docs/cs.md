@@ -193,7 +193,14 @@ value or kill switch, if no instance is running and the state file says
 Windows. Restore-only mode restores a stale static phase and exits; it never
 writes a new DHCP start or applies static. A crash, reboot or force-kill
 therefore cannot leave a client on the rogue DNS server, even after the
-simulation has been disabled.
+simulation has been disabled. An unreadable or corrupt state file is logged
+(`rogue_dns state unreadable`) and also gets a restore-only pass: with no
+captured values, Linux re-activates the wireless device's profile and Windows
+removes the Wi-Fi adapter's manual address/route, enables DHCP and resets DNS.
+Both then write a valid `phase=dhcp` state. A normal (non-restore) launch still
+refuses to touch the network on a corrupt state. If the process check itself
+fails (`pgrep` error, failed `Win32_Process` query), the result is unknown: the
+orchestrator logs it and neither restores nor launches until the next check.
 
 **Permissions (Linux).** Like the other Linux sims, `rogue_dns.sh` runs `nmcli`
 unprivileged. The NetworkManager polkit rule `50-client-sim-nm.rules`
