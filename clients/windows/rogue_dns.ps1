@@ -1,0 +1,121 @@
+param([switch]$RestoreOnly)
+$version = '0.01'
+. 'C:\Scripts\ini-parser.ps1'
+. 'C:\Scripts\common.ps1'
+$global:iniConfig = Parse-IniFile 'C:\Scripts\simulation.conf'
+Write-SimVersionBanner 'rogue_dns.ps1' $version
+$statePath = 'C:\Scripts\rogue_dns.state'
+
+function Save-RogueDnsState {
+    param($State)
+    $State | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath "$statePath.new" -Encoding UTF8 -ErrorAction Stop
+    Move-Item -LiteralPath "$statePath.new" -Destination $statePath -Force -ErrorAction Stop
+}
+function Restore-RogueDnsDhcp {
+    param($State)
+    # Resolve the captured adapter identity, not a potentially recycled ifIndex.
+    $adapter = Get-NetAdapter -ErrorAction Stop | Where-Object { [string]$_.InterfaceGuid -eq $State.adapter } | Select-Object -First 1
+    if (-not $adapter) { throw 'Captured wireless adapter is unavailable' }
+    $idx = $adapter.ifIndex
+    # Remove only our manual address/routes. A second recovery is safe after a
+    # partial restore; never remove a newly acquired DHCP lease.
+    # Enumerate then filter: CIM's keyed query throws ObjectNotFound when a
+    # previous recovery already removed the address. Real query errors still fail.
+    Get-NetIPAddress -ErrorAction Stop |
+        Where-Object { $_.InterfaceIndex -eq $idx -and $_.IPAddress -eq $State.address -and $_.PrefixOrigin -eq 'Manual' } |
+        Remove-NetIPAddress -Confirm:$false -ErrorAction Stop
+    Get-NetRoute -ErrorAction Stop |
+        Where-Object { $_.InterfaceIndex -eq $idx -and $_.DestinationPrefix -eq '0.0.0.0/0' -and $_.NextHop -eq $State.gateway -and $_.Protocol -eq 'NetMgmt' } |
+        Remove-NetRoute -Confirm:$false -ErrorAction Stop
+    Set-NetIPInterface -InterfaceIndex $idx -AddressFamily IPv4 -Dhcp Enabled -ErrorAction Stop
+    Set-DnsClientServerAddress -InterfaceIndex $idx -ResetServerAddresses -ErrorAction Stop
+    Save-RogueDnsState @{ phase = 'dhcp'; start = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds() }
+}
+
+try {
+    if (Test-Path -LiteralPath $statePath) {
+        $state = Get-Content -LiteralPath $statePath -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
+        if ($state.phase -notin @('static','dhcp') -or $null -eq $state.start) { throw 'Invalid rogue_dns state' }
+        if ($state.phase -eq 'static') {
+            Restore-RogueDnsDhcp $state
+            return
+        }
+    } else {
+        if (-not $RestoreOnly) { Save-RogueDnsState @{ phase = 'dhcp'; start = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds() } }
+        return
+    }
+    if ($RestoreOnly) { return }
+    $settings = @{}
+    $overrides = Get-SimOverrides
+    foreach ($key in @('rogue_dns_server','rogue_dns_dhcp_interval','rogue_dns_duration','rogue_dns_browse_interval')) {
+        $section = 'simulation'
+        if ($key -eq 'rogue_dns_server') { $section = 'address' }
+        $settings[$key] = get_value $section $key
+        if ($overrides.ContainsKey($key) -and -not [string]::IsNullOrWhiteSpace($overrides[$key])) { $settings[$key] = $overrides[$key] }
+    }
+    foreach ($entry in @{ rogue_dns_dhcp_interval = 1800; rogue_dns_duration = 3600; rogue_dns_browse_interval = 60 }.GetEnumerator()) {
+        if ([string]$settings[$entry.Key] -notmatch '^[1-9][0-9]{0,7}$') { $settings[$entry.Key] = $entry.Value }
+    }
+    if (([DateTimeOffset]::UtcNow.ToUnixTimeSeconds() - [long]$state.start) -lt [int]$settings.rogue_dns_dhcp_interval) { return }
+    $server = [string]$settings.rogue_dns_server
+    $ip = $null
+    if ($server -notmatch '^\d{1,3}(\.\d{1,3}){3}$' -or -not [System.Net.IPAddress]::TryParse($server, [ref]$ip) -or
+        $ip.AddressFamily -ne [System.Net.Sockets.AddressFamily]::InterNetwork -or
+        $ip.GetAddressBytes()[0] -eq 0 -or $ip.GetAddressBytes()[0] -eq 127 -or $ip.GetAddressBytes()[0] -ge 224) {
+        Write-SimLog 'rogue_dns: blank or invalid rogue_dns_server; skipping'
+        return
+    }
+    $name = Get-WlanAdapter
+    if (-not $name) { Write-SimLog 'rogue_dns: no wireless lease'; return }
+    $adapter = Get-NetAdapter -Name $name -ErrorAction Stop
+    $idx = $adapter.ifIndex
+    $lease = Get-NetIPAddress -ErrorAction Stop |
+        Where-Object { $_.InterfaceIndex -eq $idx -and $_.AddressFamily -eq 'IPv4' -and $_.PrefixOrigin -eq 'Dhcp' -and $_.IPAddress -notmatch '^169\.254\.' } | Select-Object -First 1
+    $route = Get-NetRoute -ErrorAction Stop | Where-Object { $_.InterfaceIndex -eq $idx -and $_.DestinationPrefix -eq '0.0.0.0/0' } | Sort-Object RouteMetric | Select-Object -First 1
+    if (-not $lease -or -not $route) { Write-SimLog 'rogue_dns: no DHCP lease; skipping'; return }
+    $state = @{ phase = 'static'; start = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds(); adapter = [string]$adapter.InterfaceGuid
+        address = $lease.IPAddress; prefix = $lease.PrefixLength; gateway = $route.NextHop
+        dns = @((Get-DnsClientServerAddress -InterfaceIndex $idx -AddressFamily IPv4).ServerAddresses) }
+    # Persist before the first mutation so reboot/Stop-Process can recover.
+    Save-RogueDnsState $state
+    try {
+        Set-NetIPInterface -InterfaceIndex $idx -AddressFamily IPv4 -Dhcp Disabled -ErrorAction Stop
+        Get-NetIPAddress -ErrorAction Stop |
+            Where-Object { $_.InterfaceIndex -eq $idx -and $_.IPAddress -eq $state.address } | Remove-NetIPAddress -Confirm:$false -ErrorAction Stop
+        Get-NetRoute -ErrorAction Stop |
+            Where-Object { $_.InterfaceIndex -eq $idx -and $_.DestinationPrefix -eq '0.0.0.0/0' -and $_.NextHop -eq $state.gateway } | Remove-NetRoute -Confirm:$false -ErrorAction Stop
+        New-NetIPAddress -InterfaceIndex $idx -IPAddress $state.address -PrefixLength $state.prefix -DefaultGateway $state.gateway -ErrorAction Stop | Out-Null
+        Set-DnsClientServerAddress -InterfaceIndex $idx -ServerAddresses $server -ErrorAction Stop
+        $wwwfile = @(Get-Content -LiteralPath 'C:\Scripts\websites.txt' -ErrorAction SilentlyContinue | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+        $firefoxCommand = Get-Command firefox.exe -ErrorAction SilentlyContinue
+        if (-not $firefoxCommand) { $firefoxCommand = Get-Command firefox -ErrorAction SilentlyContinue }
+        $firefox = $null
+        $clock = [System.Diagnostics.Stopwatch]::StartNew()
+        while ($clock.Elapsed.TotalSeconds -lt [int]$settings.rogue_dns_duration) {
+            $next = [Math]::Min([int]$settings.rogue_dns_duration, $clock.Elapsed.TotalSeconds + [int]$settings.rogue_dns_browse_interval)
+            # Start-Process is asynchronous; retain only our browser's handle.
+            if ($firefoxCommand -and $wwwfile.Count -gt 0) {
+                try {
+                    $url = Get-Random -InputObject $wwwfile
+                    $firefox = Start-Process -FilePath $firefoxCommand.Source -ArgumentList '--headless', $url -WindowStyle Hidden -PassThru -ErrorAction Stop
+                } catch { Write-SimLog "rogue_dns: browser launch failed: $($_.Exception.Message)" }
+            }
+            while ($clock.Elapsed.TotalSeconds -lt $next) {
+                # Chunk long intervals: Start-Sleep -Milliseconds takes Int32.
+                Start-Sleep -Milliseconds ([int](1000 * [Math]::Max(0, [Math]::Min(60, $next - $clock.Elapsed.TotalSeconds))))
+            }
+            if ($firefox -and -not $firefox.HasExited) { $firefox | Stop-Process -Force -ErrorAction SilentlyContinue }
+            $firefox = $null
+        }
+    } finally {
+        try {
+            if ($firefox -and -not $firefox.HasExited) { $firefox | Stop-Process -Force -ErrorAction SilentlyContinue }
+        } finally {
+            Restore-RogueDnsDhcp $state
+        }
+    }
+} catch {
+    # Failed restore deliberately retains phase=static for the next attempt.
+    Write-SimLog "rogue_dns: $($_.Exception.Message)"
+    exit 1
+}
