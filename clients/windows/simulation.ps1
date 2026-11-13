@@ -365,12 +365,41 @@ function Clear-WifiMacSpoof {
     Write-SimDebug "  [mac_auth_fail] cleared NetworkAddress override on '$AdapterName' before maintenance reconnect (actual_iface_mac=$actualMac)"
 }
 
+# The command that dot-sources a sim; Run-Simulation launches exactly this.
+function Get-SimLaunchCommand {
+    param([string]$ScriptName)
+
+    return ". $(Convert-ToSingleQuotedLiteral (Join-Path $scriptRoot $ScriptName))"
+}
+
+# A sim process is the powershell.exe Run-Simulation starts, dot-sourcing the
+# script by its full path. An editor, PowerShell ISE or another PowerShell
+# command that merely mentions the file is never counted as running (or
+# force-killed), like Linux's anchored rogue_dns match.
+function Test-SimProcess {
+    param($Process, [string]$ScriptName)
+
+    return $Process.Name -eq 'powershell.exe' -and ([string]$Process.CommandLine).Contains("; $(Get-SimLaunchCommand $ScriptName)")
+}
+
+# 'running', 'stopped' or 'unknown'. A failed (or empty) process query is
+# unknown, never "not running": callers that would launch or restore must wait.
+function Get-ScriptRunState {
+    param([string]$ScriptName)
+
+    try { $procs = @(Get-CimInstance Win32_Process -ErrorAction Stop) } catch { return 'unknown' }
+    if (-not $procs.Count) { return 'unknown' }
+    if ($procs | Where-Object { Test-SimProcess $_ $ScriptName } | Select-Object -First 1) { return 'running' }
+    return 'stopped'
+}
+
+# Generic sims keep the old rule (and Linux run_simulation's): a failed query
+# counts as not running. rogue_dns callers use Get-ScriptRunState instead, so an
+# unknown state never launches, browses over or restores rogue_dns.
 function Test-ScriptRunning {
     param([string]$ScriptName)
 
-    return [bool](Get-CimInstance Win32_Process -ErrorAction SilentlyContinue |
-        Where-Object { $_.CommandLine -like "*${ScriptName}*" } |
-        Select-Object -First 1)
+    return (Get-ScriptRunState -ScriptName $ScriptName) -eq 'running'
 }
 
 function Run-Simulation {
@@ -388,7 +417,7 @@ function Run-Simulation {
         "`$global:rn_ping_size = $($global:rn_ping_size)",
         "`$global:ping_address = $(Convert-ToSingleQuotedLiteral $script:ping_address)",
         "`$global:iperf_server = $(Convert-ToSingleQuotedLiteral $script:iperf_server)",
-        ". $(Convert-ToSingleQuotedLiteral $scriptPath)"
+        (Get-SimLaunchCommand $ScriptName)
     ) -join '; '
 
     Start-Process powershell -ArgumentList @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-Command', $command) -WindowStyle Hidden | Out-Null
@@ -434,13 +463,148 @@ function Apply-UserOverrides {
     }
 }
 
-# Windows manual addressing persists across reboot. Recover before connecting,
-# even if the sim flag is now off; never interrupt a still-running instance.
-if ((Test-Path 'C:\Scripts\rogue_dns.ps1') -and -not (Test-ScriptRunning -ScriptName 'rogue_dns.ps1')) {
-    & 'C:\Scripts\rogue_dns.ps1' -RestoreOnly
+$rogueDnsScript = 'C:\Scripts\rogue_dns.ps1'
+$rogueDnsStatePath = 'C:\Scripts\rogue_dns.state'
+$rogueDnsStopPath = 'C:\Scripts\rogue_dns.stop'
+$rogueDnsStopGrace = 10
+$simConfPath = 'C:\Scripts\simulation.conf'
+$script:simConfStamp = $null
+$script:rogueDnsRetry = $false
+
+# Rogue DNS lifecycle, run EVERY cycle outside the rogue_dns flag gate (Windows
+# manual addressing also survives reboot). Off or kill switch: ask a running
+# instance to stop via the stop file (its finally restores DHCP) and force-kill
+# it after a short grace. Then, with no instance left, phase=static means a
+# restore is still owed (reboot, crash, force-kill): run a restore-only pass.
+# A stop that can't be confirmed (still running, or a failed process query) sets
+# $script:rogueDnsRetry, and Update-RogueDnsGate retries it every iteration.
+function Sync-RogueDns {
+    # Like the main loop, anything but kill_switch=off counts as kill-switched.
+    $stop = $script:rogue_dns -ne 'on' -or $script:kill_switch -ne 'off'
+    # Write the marker before process discovery: a failed query must not keep a
+    # live instance in its static phase. It is removed only on a definite 'stopped'.
+    if ($stop -and -not (Test-Path -LiteralPath $rogueDnsStopPath)) {
+        Set-Content -LiteralPath $rogueDnsStopPath -Value 'stop' -ErrorAction SilentlyContinue
+    }
+    $run = Get-ScriptRunState -ScriptName 'rogue_dns.ps1'
+    if ($stop -and $run -eq 'running') {
+        Write-SimLog 'rogue_dns: disabled or kill switch on; stopping running instance'
+        for ($i = 0; $i -lt $rogueDnsStopGrace -and $run -ne 'stopped'; $i++) {
+            Start-Sleep -Seconds 1
+            $run = Get-ScriptRunState -ScriptName 'rogue_dns.ps1'
+        }
+        if ($run -eq 'running') {
+            $stuck = @(Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | Where-Object { Test-SimProcess $_ 'rogue_dns.ps1' })
+            Write-SimLog "rogue_dns: did not exit in ${rogueDnsStopGrace}s; force-killing"
+            $stuck | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
+            if ($stuck.Count) { Wait-Process -Id ($stuck | ForEach-Object { $_.ProcessId }) -Timeout 5 -ErrorAction SilentlyContinue }
+            $run = Get-ScriptRunState -ScriptName 'rogue_dns.ps1'
+        }
+        # Only a definite 'stopped' ends the stop request. Unknown (failed query)
+        # or still running: keep the marker so the instance still sees it.
+        if ($run -ne 'stopped') { Write-SimLog "rogue_dns: instance state $run after stop request; keeping stop marker, retrying" }
+    }
+    $script:rogueDnsRetry = $stop -and $run -ne 'stopped'
+    if ($run -eq 'unknown') { Write-SimLog 'rogue_dns: process check failed; retrying'; return }
+    if ($run -ne 'stopped') { return }
+    Remove-Item -LiteralPath $rogueDnsStopPath -Force -ErrorAction SilentlyContinue
+    if (-not (Test-Path -LiteralPath $rogueDnsScript) -or -not (Test-Path -LiteralPath $rogueDnsStatePath)) { return }
+    # Same validity rule as rogue_dns.ps1. Unreadable/corrupt (including a static
+    # state missing what restore needs) means unknown: restore-only handles it.
+    $phase = $null
+    try {
+        $state = Get-Content -LiteralPath $rogueDnsStatePath -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
+        if ($state.phase -in @('static','dhcp') -and ($state.start -is [int] -or $state.start -is [long]) -and
+            ($state.phase -eq 'dhcp' -or ($state.adapter -and $state.address -and $state.gateway))) { $phase = $state.phase }
+    } catch { }
+    if ($phase -eq 'dhcp') { return }
+    if ($phase -eq 'static') {
+        Write-SimLog 'rogue_dns: static state with no running instance; restoring DHCP'
+    } else {
+        Write-SimLog 'rogue_dns: rogue_dns state unreadable; restore-only pass'
+    }
+    & $rogueDnsScript -RestoreOnly
+}
+
+# Per-iteration twin of Linux rogue_dns_gate: the outer cycle (and its
+# Sync-RogueDns) runs only every ~25 min. While rogue_dns is on, re-read the
+# global kill switch file every iteration, and simulation.conf only when its
+# write time moved; on kill switch or rogue_dns=off, stop it now. With
+# rogue_dns off it costs nothing unless a stop is still owed ($script:rogueDnsRetry).
+function Update-RogueDnsGate {
+    if ($script:rogue_dns -ne 'on') {
+        if ($script:rogueDnsRetry) { Sync-RogueDns }
+        return
+    }
+    $kill = $null
+    $flag = $null
+    $stamp = (Get-Item -LiteralPath $simConfPath -ErrorAction SilentlyContinue).LastWriteTimeUtc
+    if ($stamp -ne $script:simConfStamp) {
+        $script:simConfStamp = $stamp
+        $ini = Parse-IniFile $simConfPath
+        $get = { param($section, $key) if ($ini.ContainsKey($section)) { [string]$ini[$section][$key] } }
+        $kill = & $get $script:username 'kill_switch'
+        if (-not $kill) { $kill = & $get 'simulation' 'kill_switch' }
+        # Parsed, so never $null: a blank kill switch is kill-switched, as in the main loop.
+        $kill = "$kill"
+        # Compare with the cycle-start sources: an unrelated conf write must not
+        # turn an ambient-rolled rogue_dns off.
+        $user = [string](& $get $script:username 'rogue_dns')
+        $bucket = [string](& $get $script:simulation_id 'rogue_dns')
+        if ($user -ne [string]$script:rogueDnsUser) {
+            # A removed override falls back to what the cycle would have run without it.
+            if ($user) { $flag = $user }
+            elseif ($script:random_pool -eq 'on') { $flag = [string]$script:rogueDnsBase }
+            else { $flag = $bucket }
+            if (-not $flag) { $flag = 'off' }
+        } elseif (-not $user -and $script:random_pool -ne 'on' -and $bucket -ne [string]$script:rogueDnsBucket) {
+            $flag = $bucket; if (-not $flag) { $flag = 'off' }
+        }
+    }
+    if (Test-Path -LiteralPath $killSwitchPath) {
+        $globalKill = ([string](Get-Content -LiteralPath $killSwitchPath -ErrorAction SilentlyContinue | Select-Object -First 1)).Trim()
+        if ($globalKill) { $kill = $globalKill }
+    }
+    if (($null -ne $kill -and $kill -ne 'off') -or ($flag -and $flag -ne 'on')) {
+        Write-SimLog 'rogue_dns: kill switch on or rogue_dns turned off mid-cycle; stopping'
+        $script:rogue_dns = 'off'
+        Sync-RogueDns
+    }
+}
+
+# www_traffic/fallback browse dispatch. While rogue_dns is on and not definitely
+# stopped (static phase, or a failed process query), never browse: the static
+# phase does its own browsing. Clients without rogue_dns behave exactly as before.
+function Test-WwwBrowseDue {
+    if ($script:rogue_dns -eq 'on' -and (Get-ScriptRunState -ScriptName 'rogue_dns.ps1') -ne 'stopped') { return $false }
+    return ($script:www_traffic -eq 'on' -or ($script:rogue_dns -eq 'on' -and $script:rogueDnsBrowseReady)) -and
+        -not (Test-ScriptRunning -ScriptName 'www_traffic.ps1')
+}
+
+# Close headless browsers, sparing the process tree of a running rogue_dns.ps1:
+# that browser is its static-phase traffic and it stops it itself.
+function Stop-SimFirefox {
+    # A failed or empty query is unknown: a rogue_dns browser can't be told apart
+    # from ours, whatever the rogue_dns flag says, so skip this cleanup.
+    try { $procs = @(Get-CimInstance Win32_Process -ErrorAction Stop) } catch { return }
+    if (-not $procs.Count) { return }
+    $keep = @{}
+    $queue = [System.Collections.Generic.Queue[int]]::new()
+    $procs | Where-Object { Test-SimProcess $_ 'rogue_dns.ps1' } | ForEach-Object { $queue.Enqueue([int]$_.ProcessId) }
+    while ($queue.Count) {
+        $id = $queue.Dequeue()
+        if ($keep.ContainsKey($id)) { continue }
+        $keep[$id] = $true
+        $procs | Where-Object { [int]$_.ParentProcessId -eq $id } | ForEach-Object { $queue.Enqueue([int]$_.ProcessId) }
+    }
+    Get-Process -Name firefox -ErrorAction SilentlyContinue |
+        Where-Object { -not $keep.ContainsKey([int]$_.Id) } |
+        Stop-Process -ErrorAction SilentlyContinue
 }
 
 while ($true) {
+    # Snapshot before parsing: Update-RogueDnsGate re-parses only if it moves.
+    $script:simConfStamp = (Get-Item -LiteralPath $simConfPath -ErrorAction SilentlyContinue).LastWriteTimeUtc
     $global:iniConfig = Parse-IniFile 'C:\Scripts\simulation.conf'
 
     $script:username = Get-SimUsername
@@ -546,6 +710,8 @@ while ($true) {
     # password by the same rule rather than deriving a per-client value).
     $script:mac_auth_fail_mac = get_value 'address' 'mac_auth_fail_mac'
 
+    # rogue_dns from the bucket or ambient roll, before any [username] override.
+    $script:rogueDnsBase = $script:rogue_dns
     Apply-UserOverrides -Section $script:username -Names @(
         'kill_switch','sim_load','public_repo','repo_location','site_based_ssid','iperf_bw',
         'wsite','sim_phy','ssid','ssidpw','ssid_auth','dhcp_fail','dns_fail','dns_latency','collab','assoc_fail','port_flap','ping_test',
@@ -555,7 +721,8 @@ while ($true) {
         'dns_bad_record_1','dns_bad_record_2','dns_bad_record_3','iperf_server',
         'collab_app','collab_bw','collab_time','collab_server','dot1x_password','dot1x_eap','web_server','client_offline'
     )
-    $script:wwwTrafficConfigured = $script:www_traffic
+    $script:rogueDnsUser = [string](get_value $script:username 'rogue_dns')
+    $script:rogueDnsBucket = [string](get_value $script:simulation_id 'rogue_dns')
 
     if (Test-Path -LiteralPath $killSwitchPath) {
         $globalKillRaw = Get-Content -LiteralPath $killSwitchPath -ErrorAction SilentlyContinue | Select-Object -First 1
@@ -567,6 +734,7 @@ while ($true) {
             $script:kill_switch = $globalKill
         }
     }
+    Sync-RogueDns
 
     $global:rn = Get-Random -Minimum 1 -Maximum 61
     $global:rn_iperf_port = 5201 + (Get-Random -Minimum 0 -Maximum 10)
@@ -638,6 +806,7 @@ while ($true) {
             $gateway = Get-DefaultGateway
             $script:gateway_reachable = Test-GatewayReachable -Gateway $gateway
             Send-Status -Iteration $z
+            Update-RogueDnsGate
             if ((($script:ssidpw_fail -eq 'on') -or ($script:auth_fail -eq 'on') -or ($script:mac_auth_fail -eq 'on')) -and $null -ne $wladapter) {
                 $correctSsidpw = get_value $script:simulation_id 'ssidpw'
                 if ($script:ssidpw_fail -eq 'on') {
@@ -717,14 +886,21 @@ while ($true) {
                     }
                 }
 
-                if (($script:www_traffic -eq 'on' -or ($script:rogue_dns -eq 'on' -and $script:rogueDnsBrowseReady -and -not (Test-ScriptRunning -ScriptName 'rogue_dns.ps1'))) -and -not (Test-ScriptRunning -ScriptName 'www_traffic.ps1')) {
+                if (Test-WwwBrowseDue) {
                     Run-Simulation -ScriptName 'www_traffic.ps1'
                     Write-SimDebug 'Running WWW Traffic Simulation'
                     $script:www_traffic = 'off'
                     $script:rogueDnsBrowseReady = $false
                 }
-                if ($script:rogue_dns -eq 'on' -and -not (Test-ScriptRunning -ScriptName 'rogue_dns.ps1')) {
-                    Run-Simulation -ScriptName 'rogue_dns.ps1'
+                # Launch only on a definite 'stopped'; a failed check waits.
+                if ($script:rogue_dns -eq 'on') {
+                    $rogueDnsRun = Get-ScriptRunState -ScriptName 'rogue_dns.ps1'
+                    if ($rogueDnsRun -eq 'stopped') {
+                        # Definitely stopped and still wanted: any marker is stale.
+                        Remove-Item -LiteralPath $rogueDnsStopPath -Force -ErrorAction SilentlyContinue
+                        Run-Simulation -ScriptName 'rogue_dns.ps1'
+                    }
+                    elseif ($rogueDnsRun -eq 'unknown') { Write-SimLog 'rogue_dns: process check failed; not launching this iteration' }
                 }
                 if ($script:www_discover -eq 'on' -and -not (Test-ScriptRunning -ScriptName 'www_discover.ps1')) {
                     Run-Simulation -ScriptName 'www_discover.ps1'
@@ -762,9 +938,10 @@ while ($true) {
                 Start-Sleep -Seconds 10
                 if (($z % 10) -eq 0) {
                     Write-SimDebug 'Closing Firefox'
-                    Stop-Process -Name firefox -ErrorAction SilentlyContinue
-                    if ($script:wwwTrafficConfigured -eq 'on') { $script:www_traffic = 'on' }
-                    if ($script:rogue_dns -eq 'on' -and -not (Test-ScriptRunning -ScriptName 'rogue_dns.ps1')) {
+                    Stop-SimFirefox
+                    $script:www_traffic = 'on'
+                    # Unless definitely running: Test-WwwBrowseDue re-checks at use time.
+                    if ($script:rogue_dns -eq 'on' -and (Get-ScriptRunState -ScriptName 'rogue_dns.ps1') -ne 'running') {
                         $script:rogueDnsBrowseReady = $true
                     }
                 }
@@ -783,7 +960,11 @@ while ($true) {
         if ($script:rapid_update -eq 'on') {
             . 'C:\Scripts\update.ps1'
         }
-        Start-Sleep -Seconds 300
+        # Sliced so a rogue_dns stop still owed is retried while kill-switched.
+        for ($ks = 0; $ks -lt 30; $ks++) {
+            if ($script:rogueDnsRetry) { Sync-RogueDns }
+            Start-Sleep -Seconds 10
+        }
     }
 
     if ($restartCycle) {
@@ -791,7 +972,7 @@ while ($true) {
     }
 
     Write-SimDebug 'Closing Firefox'
-    Stop-Process -Name firefox -ErrorAction SilentlyContinue
+    Stop-SimFirefox
     Write-SimDebug 'Running Updates'
     Start-Process powershell -ArgumentList @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', 'C:\Scripts\apt_update.ps1') -WindowStyle Hidden | Out-Null
 

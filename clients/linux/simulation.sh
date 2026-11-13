@@ -446,10 +446,15 @@ mac_auth_fail_mac=$(get_value 'address' 'mac_auth_fail_mac')
 #User/Device Specific Overrides — apply_override + the shared SUPERSET
 #CS_OVERRIDE_KEYS list live in common.sh (kept in sync with dashboard.sh).
 #------------------------------------------------------------
+# rogue_dns from the bucket or ambient roll, before any [username] override.
+_rogue_dns_base=$rogue_dns
 apply_overrides
 # A [username] override can re-set sim_load to non-numeric — re-coerce so the
 # `-lt` gate stays safe.
 [[ "$sim_load" =~ ^[0-9]+$ ]] || sim_load=0
+# Cycle-start rogue_dns sources, compared by rogue_dns_gate.
+_rogue_dns_user=$(get_value "$username" rogue_dns)
+_rogue_dns_bucket=$(get_value "$simulation_id" rogue_dns)
 #------------------------------------------------------------
 #End User/Device Specific Overrides
 #------------------------------------------------------------
@@ -480,15 +485,138 @@ _rsleep 5
 #------------------------------------------------------------
 #Checking global kill switch config
 #------------------------------------------------------------
-gkill_switch="off"
-if [[ -n "${server_url:-}" ]]; then
-  _gks=$(curl -sf --max-time 5 "${server_url%/}/api/kill-switch" 2>/dev/null | tr -d '[:space:]')
-  [[ "$_gks" == "on" || "$_gks" == "off" ]] && gkill_switch="$_gks"
-fi
-if [[ "$gkill_switch" == "off" ]] && [[ -f '/usr/local/scripts/kill_switch.txt' ]]; then
-  _gks=$(cat /usr/local/scripts/kill_switch.txt 2>/dev/null | tr -d '[:space:]')
-  [[ "$_gks" == "on" || "$_gks" == "off" ]] && gkill_switch="$_gks"
-fi
+# 'on' when the hub API or the local kill_switch.txt fallback says on. update.sh
+# never copies the file, so the API is the live source on a fleet client.
+read_gkill_switch() {
+  local api="" file=""
+  [[ -n "${server_url:-}" ]] && api=$(curl -sf --max-time 5 "${server_url%/}/api/kill-switch" 2>/dev/null | tr -d '[:space:]')
+  [[ -f /usr/local/scripts/kill_switch.txt ]] && file=$(tr -d '[:space:]' < /usr/local/scripts/kill_switch.txt)
+  if [[ $api == on || $file == on ]]; then echo on; else echo off; fi
+}
+gkill_switch=$(read_gkill_switch)
+_gks_checked=$SECONDS
+#------------------------------------------------------------
+# Rogue DNS lifecycle — runs EVERY cycle, outside the rogue_dns flag gate.
+# Off or kill switch: TERM a running rogue_dns.sh (its EXIT trap restores DHCP),
+# KILL it after a short grace. Then, with no instance left, a phase=static state
+# means a restore is still owed (crash, reboot, force-kill): restore-only pass.
+# A stop that can't be confirmed (still running, or a failed process check) sets
+# rogue_dns_retry, and rogue_dns_gate retries it every iteration.
+#------------------------------------------------------------
+rogue_dns_stop_grace=10
+rogue_dns_retry=0
+# Run pgrep/pkill ("$@") on rogue_dns.sh processes. Match only the command line
+# run_simulation launches (bash /usr/local/scripts/rogue_dns.sh ...), so an
+# editor or `tail -f rogue_dns.sh` is never counted as running or signalled.
+rogue_dns_procs() {
+  "$@" -f '^(/usr/bin/|/bin/)?bash /usr/local/scripts/rogue_dns\.sh( |$)'
+}
+# 0 = running, 1 = not running, 2 = unknown. pgrep exits 1 for "no match" and
+# 2+ when the check itself failed; never treat a failed check as "not running".
+rogue_dns_running() {
+  rogue_dns_procs pgrep >/dev/null
+  local rc=$?
+  (( rc <= 1 )) && return "$rc"
+  echo "rogue_dns: process check failed (pgrep rc=$rc); retrying" | tee -a ${LOG_FILE}
+  return 2
+}
+reconcile_rogue_dns() {
+  local i rc phase stop=0 state=/usr/local/scripts/rogue_dns.state
+  [[ "${rogue_dns:-off}" != "on" || "${kill_switch:-off}" == "on" ]] && stop=1
+  rogue_dns_running; rc=$?
+  if (( stop && rc == 0 )); then
+    echo "rogue_dns: disabled or kill switch on — stopping running instance" | tee -a ${LOG_FILE}
+    rogue_dns_procs pkill -TERM
+    for (( i = 0; i < rogue_dns_stop_grace; i++ )); do
+      rogue_dns_running; rc=$?
+      (( rc == 0 )) || break
+      sleep 1
+    done
+    if (( rc == 0 )); then
+      echo "rogue_dns: did not exit in ${rogue_dns_stop_grace}s — force-killing" | tee -a ${LOG_FILE}
+      rogue_dns_procs pkill -KILL
+      sleep 1
+      rogue_dns_running; rc=$?
+    fi
+  fi
+  rogue_dns_retry=0
+  (( stop && rc != 1 )) && rogue_dns_retry=1
+  (( rc == 1 )) && [[ -e $state ]] || return 0
+  # Same validity rule as rogue_dns.sh. Unreadable/corrupt (including a static
+  # state missing what restore needs) means unknown: restore-only handles it.
+  phase=$(python3 - "$state" 2>/dev/null <<'PY'
+import json, sys
+s = json.load(open(sys.argv[1]))
+assert s['phase'] in ('dhcp', 'static') and type(s['start']) is int
+assert s['phase'] == 'dhcp' or all(s.get(k) for k in ('adapter', 'address', 'gateway', 'connection'))
+print(s['phase'])
+PY
+  )
+  if [[ $phase == static ]]; then
+    echo "rogue_dns: static state with no running instance — restoring DHCP" | tee -a ${LOG_FILE}
+  elif [[ $phase != dhcp ]]; then
+    echo "rogue_dns: rogue_dns state unreadable — restore-only pass" | tee -a ${LOG_FILE}
+  else
+    return 0
+  fi
+  bash /usr/local/scripts/rogue_dns.sh --restore-only >> ${LOG_FILE} 2>&1
+}
+# Per-iteration twin of Windows Update-RogueDnsGate: the outer cycle (and its
+# reconcile) runs only every ~25 min. While rogue_dns is on, re-read the global
+# kill switch (hub API + file) at most once a minute, and simulation.conf only
+# when its mtime moved; on kill switch or rogue_dns=off, stop it now. With rogue_dns off it
+# costs nothing unless a stop is still owed (rogue_dns_retry).
+rogue_dns_gate() {
+  local ks="" flag gflag user bucket ambient=off
+  if [[ "$rogue_dns" != "on" ]]; then
+    (( rogue_dns_retry )) && reconcile_rogue_dns
+    return 0
+  fi
+  if (( SECONDS - _gks_checked >= 60 )); then
+    _gks_checked=$SECONDS
+    ks=$(read_gkill_switch)
+  fi
+  if [[ "$(stat -c %y /usr/local/scripts/simulation.conf 2>/dev/null)" != "$_cfg_mtime" ]]; then
+    # Parse in a subshell: the rest of this iteration keeps the cycle's parsed
+    # config (and its applied overrides) unchanged.
+    { read -r flag; read -r gflag; read -r user; read -r bucket; } < <(
+      process_ini_file '/usr/local/scripts/simulation.conf' >/dev/null
+      printf '%s\n' "$(get_value "$username" kill_switch)" "$(get_value simulation kill_switch)" \
+        "$(get_value "$username" rogue_dns)" "$(get_value "$simulation_id" rogue_dns)")
+    [[ -n $flag ]] || flag=$gflag
+    [[ $flag == on ]] && ks=on
+    # Compare with the cycle-start sources: an unrelated conf write must not
+    # turn an ambient-rolled rogue_dns (random pool or hub engine) off.
+    [[ "${random_pool:-off}" == on || "${web_server:-off}" == on ]] && ambient=on
+    flag=
+    if [[ $user != "${_rogue_dns_user:-}" ]]; then
+      # A removed override falls back to what the cycle would have run without it.
+      if [[ -n $user ]]; then flag=$user
+      elif [[ $ambient == on ]]; then flag=${_rogue_dns_base:-off}
+      else flag=${bucket:-off}; fi
+    elif [[ -z $user && $ambient != on && $bucket != "${_rogue_dns_bucket:-}" ]]; then
+      flag=${bucket:-off}
+    fi
+  fi
+  [[ $ks == on || ( -n $flag && $flag != on ) ]] || return 0
+  echo "rogue_dns: kill switch on or rogue_dns turned off mid-cycle — stopping" | tee -a ${LOG_FILE}
+  rogue_dns=off
+  reconcile_rogue_dns
+}
+# Fallback/www browse on iteration $1. While rogue_dns is on, browse only when it
+# is definitely not running (rc 1): never during its static phase, and never on
+# a failed check. Clients without rogue_dns behave exactly as before.
+www_browse_due() {
+  [[ " ${_www_iters[*]} " == *" $1 "* ]] || return 1
+  [[ "$www_traffic" == "on" || "$rogue_dns" == "on" ]] || return 1
+  [[ "$rogue_dns" == "on" ]] || return 0
+  rogue_dns_running
+  (( $? == 1 ))
+}
+# The emergency kill switch cancels rogue_dns too: a static IP and rogue DNS
+# must not outlive an emergency stop.
+[[ "$gkill_switch" == "on" ]] && rogue_dns=off
+reconcile_rogue_dns
 #------------------------------------------------------------
 #Generating a random number to have some variance in the scripts
 #------------------------------------------------------------
@@ -747,13 +875,15 @@ fi
 echo Kill Switch is $kill_switch | tee -a ${LOG_FILE}
 if [ "$kill_switch" != "on" ]; then
  # Snapshot the config's mtime so the loop can spot a pushed change mid-cycle.
- _cfg_mtime=$(stat -c %Y /usr/local/scripts/simulation.conf 2>/dev/null)
+ _cfg_mtime=$(stat -c %y /usr/local/scripts/simulation.conf 2>/dev/null)
  # Pick up to 5 random iteration indices (1..100) to open a web page on, so the
  # fleet spreads web traffic across the loop instead of opening a single page at
  # the first iteration. The page just generates a request for stats — it does
  # nothing with the content and may hang; all instances are killed at loop end.
  declare -a _www_iters=()
- if [[ "$www_traffic" == "on" ]] || { [[ "$rogue_dns" == "on" ]] && ! pgrep -f '[r]ogue_dns.sh' >/dev/null; }; then
+ # rogue_dns adds the DHCP-phase fallback unless it is definitely running; a
+ # failed check still schedules, because www_browse_due re-checks at use time.
+ if [[ "$www_traffic" == "on" ]] || { [[ "$rogue_dns" == "on" ]] && { rogue_dns_running; (( $? != 0 )); }; }; then
   for (( _wi=0; _wi<5; _wi++ )); do
    _www_iters+=("$(( 1 + RANDOM % 100 ))")
   done
@@ -806,7 +936,8 @@ if [ "$kill_switch" != "on" ]; then
   # init_simulation_context and re-reads every flag. A pushed change then lands on
   # the next pass instead of waiting out the full 100-iteration cycle.
   #------------------------------------------------------------
-  if [[ "${_sim_reload:-0}" == 1 || "$(stat -c %Y /usr/local/scripts/simulation.conf 2>/dev/null)" != "$_cfg_mtime" ]]; then
+  rogue_dns_gate
+  if [[ "${_sim_reload:-0}" == 1 || "$(stat -c %y /usr/local/scripts/simulation.conf 2>/dev/null)" != "$_cfg_mtime" ]]; then
     echo "Config changed — reloading simulation" | tee -a ${LOG_FILE}
     break
   fi
@@ -1015,7 +1146,7 @@ if [ "$kill_switch" != "on" ]; then
    #------------------------------------------------------------
    #Running WWW Traffic Simulation
    #------------------------------------------------------------
-    if { [[ "$www_traffic" == "on" ]] || { [[ "$rogue_dns" == "on" ]] && ! pgrep -f '[r]ogue_dns.sh' >/dev/null; }; } && [[ " ${_www_iters[*]} " == *" $z "* ]]; then
+    if www_browse_due "$z"; then
      echo Running WWW Traffic simulation | tee -a ${LOG_FILE}
      wwwfile=($(< /usr/local/scripts/websites.txt))
      if [[ ${#wwwfile[@]} -eq 0 ]]; then
@@ -1045,7 +1176,8 @@ if [ "$kill_switch" != "on" ]; then
    #------------------------------------------------------------
    #Running Rogue DNS simulation (async; pause is not a runtime timeout)
    #------------------------------------------------------------
-   if [[ "$rogue_dns" == "on" ]] && ! pgrep -f '[r]ogue_dns.sh' >/dev/null; then
+   # Launch only on a definite "not running"; a failed check waits a cycle.
+   if [[ "$rogue_dns" == "on" ]] && { rogue_dns_running; (( $? == 1 )); }; then
     run_simulation "rogue_dns.sh" 0
    fi
    #------------------------------------------------------------
@@ -1134,7 +1266,11 @@ else
  # config change that turns the kill switch back OFF (update.sh pulls a fresh
  # simulation.conf; init_simulation_context re-reads it next outer loop).
  if [[ "$rapid_update" == "on" ]]; then source '/usr/local/scripts/update.sh'; fi
- sleep 300
+ # Sliced so a rogue_dns stop still owed is retried while kill-switched.
+ for (( _ks = 0; _ks < 30; _ks++ )); do
+  (( rogue_dns_retry )) && reconcile_rogue_dns
+  sleep 10
+ done
 fi
 #------------------------------------------------------------
 #Killing Firefox simulation
@@ -1143,7 +1279,31 @@ echo Closing Firefox | tee -a ${LOG_FILE}
 # Scoped to our headless instances (firefox-esr --headless) so we never touch an
 # interactive firefox, and to the cpulimit wrappers that spawn them. Foreground
 # so the kill is confirmed before we proceed to apt_update / offline sleep.
-pkill -f 'firefox-esr.*--headless' || true
+# A running rogue_dns.sh owns its static-phase browser (and stops it itself each
+# browse interval), so spare every process under it.
+kill_headless_firefox() {
+  local pid keep=" " queue kids ff
+  local rc
+  queue=$(rogue_dns_procs pgrep); rc=$?
+  # Unknown (pgrep error, rc 2+): a rogue_dns browser can't be told apart from
+  # ours, whatever the rogue_dns flag says, so skip this cleanup.
+  (( rc <= 1 )) || return 0
+  queue=${queue//$'\n'/ }
+  while [[ -n ${queue// } ]]; do
+    read -r pid queue <<< "$queue"
+    keep+="$pid "
+    kids=$(pgrep -P "$pid"); rc=$?
+    (( rc <= 1 )) || return 0
+    queue+=" ${kids//$'\n'/ }"
+  done
+  ff=$(pgrep -f 'firefox-esr.*--headless'); rc=$?
+  (( rc <= 1 )) || return 0
+  for pid in $ff; do
+    [[ $keep == *" $pid "* ]] || kill "$pid" 2>/dev/null
+  done
+  return 0
+}
+kill_headless_firefox
 #------------------------------------------------------------
 #End Kill switch Check
 #------------------------------------------------------------

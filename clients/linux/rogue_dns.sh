@@ -1,5 +1,9 @@
 #!/bin/bash
 version=0.01
+# --restore-only: recover a stale static phase and exit; never start a new one.
+# The orchestrator runs it every cycle that finds phase=static and no instance.
+restore_only=0
+[[ ${1:-} == --restore-only ]] && restore_only=1
 source '/usr/local/scripts/ini-parser.sh'
 source '/usr/local/scripts/common.sh'
 # common.sh has its own version variable; report this script's fleet baseline.
@@ -38,7 +42,7 @@ restore_dhcp() {
   if nmcli connection up uuid "$connection" ifname "$wl" >> "$log" 2>&1; then
     write_state dhcp
   else
-    echo 'rogue_dns: DHCP restore failed; retaining static state for retry' | tee -a "$log"
+    echo 'rogue_dns: DHCP restore failed; retaining state for retry' | tee -a "$log"
     return 1
   fi
 }
@@ -47,11 +51,38 @@ if [[ -f "$state_file" ]]; then
   state=$(python3 - "$state_file" <<'PY'
 import json, sys
 s = json.load(open(sys.argv[1]))
-assert s['phase'] in ('dhcp', 'static') and isinstance(s['start'], int)
+assert s['phase'] in ('dhcp', 'static') and type(s['start']) is int
+# A static state must carry everything restore_dhcp needs, else it is corrupt.
+assert s['phase'] == 'dhcp' or all(s.get(k) for k in ('adapter', 'address', 'gateway', 'connection'))
 for key in ('phase', 'start', 'adapter', 'address', 'gateway', 'dns', 'connection'):
     print(s.get(key, ''))
 PY
-  ) || { echo 'rogue_dns: unreadable state; refusing network changes' | tee -a "$log"; exit 1; }
+  ) || {
+    (( restore_only )) || { echo 'rogue_dns: unreadable state; refusing network changes' | tee -a "$log"; exit 1; }
+    # Restore-only on a corrupt state: we don't know what was applied. Act only
+    # on rogue_dns's own fingerprint (a wireless device's DNS is exactly
+    # rogue_dns_server); anything else may be operator config, so leave it and
+    # just rewrite a valid dhcp state. restore_dhcp re-applies the saved
+    # profile, so it only ever drops runtime (device modify) changes. Every
+    # wireless device is checked: the applied one was the first *connected*
+    # device at the time, which need not be the first one listed now.
+    devices=$(nmcli -t -f DEVICE,TYPE device status | awk -F: '$2=="wifi" {print $1}')
+    [[ -n $devices ]] || { echo 'rogue_dns: unreadable state and no wireless device' | tee -a "$log"; exit 1; }
+    restored=0
+    for wl in $devices; do
+      # A failed query proves nothing, so keep the corrupt state and retry.
+      wl_dns=$(nmcli -g IP4.DNS device show "$wl") || { echo "rogue_dns: unreadable state; DNS query on $wl failed, retrying" | tee -a "$log"; exit 1; }
+      [[ -n $rogue_dns_server && $wl_dns == "$rogue_dns_server" ]] || continue
+      echo "rogue_dns: unreadable state; $wl uses rogue_dns_server, restoring DHCP" | tee -a "$log"
+      connection=$(nmcli -g GENERAL.CON-UUID device show "$wl")
+      restore_dhcp || exit 1
+      restored=1
+    done
+    (( restored )) && exit 0
+    echo "rogue_dns: unreadable state; no rogue_dns settings on ${devices//$'\n'/ }, leaving it" | tee -a "$log"
+    write_state dhcp
+    exit $?
+  }
   mapfile -t saved <<< "$state"
   phase=${saved[0]}; start=${saved[1]}; wl=${saved[2]}; address=${saved[3]}
   gateway=${saved[4]}; dns=${saved[5]}; connection=${saved[6]}
@@ -59,10 +90,11 @@ PY
     restore_dhcp
     exit $?
   fi
-else
+elif (( ! restore_only )); then
   write_state dhcp || exit 1
   exit 0
 fi
+(( restore_only )) && exit 0
 (( $(date +%s) - start >= rogue_dns_dhcp_interval )) || exit 0
 if ! python3 - "$rogue_dns_server" <<'PY'
 import ipaddress, sys
@@ -102,8 +134,12 @@ stop_browse() {
 write_state static || exit 1
 trap 'rc=$?; stop_browse; restore_dhcp || rc=1; exit "$rc"' EXIT
 trap 'exit 0' INT TERM HUP
+# Unprivileged nmcli like every other Linux sim: 50-client-sim-nm.rules grants
+# the sim user NetworkManager network-control. If the apply is refused (no
+# polkit rule, no root), stop here: the EXIT trap restores DHCP and keeps rc=1,
+# so nothing stays half-applied and the browse loop never starts.
 if ! nmcli device modify "$wl" ipv4.method manual ipv4.addresses "$address" ipv4.gateway "$gateway" ipv4.dns "$rogue_dns_server" ipv4.ignore-auto-dns yes >> "$log" 2>&1; then
-  echo 'rogue_dns: static apply failed' | tee -a "$log"
+  echo 'rogue_dns: static apply failed; restoring DHCP' | tee -a "$log"
   exit 1
 fi
 end=$(( $(date +%s) + rogue_dns_duration ))

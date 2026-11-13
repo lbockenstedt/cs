@@ -229,8 +229,18 @@ no DNS server installation; supply a reachable DNS server before enabling it.
 Invalid/blank DNS or a missing DHCP lease is logged and skips network changes.
 
 The scripts restore DHCP and automatic DNS on completion and use persistent
-phase state for recovery after a crash/reboot; Windows also restores stale
-static state at orchestrator startup. See [Rogue DNS recovery and configuration](../docs/cs.md#rogue-dns--static-ip--fixed-dns)
+phase state for recovery after a crash/reboot. Turning `rogue_dns` off or the
+kill switch on stops a running instance gracefully, so DHCP is restored, and
+force-kills it after 10 seconds. This is checked every cycle and, while
+`rogue_dns` is on, every loop iteration (Linux polls the hub's global kill
+switch at most once a minute). On every orchestrator cycle, even with
+`rogue_dns=off`, a stale `phase=static` with no running instance triggers a
+restore-only pass (`rogue_dns.sh --restore-only` / `rogue_dns.ps1 -RestoreOnly`).
+A corrupt state file only restores when the adapter still shows rogue_dns's
+own settings (on Linux: any wireless device whose DNS is exactly
+`rogue_dns_server`; on Windows: DHCP off, DNS exactly `rogue_dns_server`, one manual
+address and a manual default route); an operator's static configuration is left alone. The periodic
+headless-Firefox cleanup spares the rogue_dns browser. See [Rogue DNS recovery and configuration](../docs/cs.md#rogue-dns--static-ip--fixed-dns)
 for the platform-specific restore behaviour and state-file paths.
 
 #### How many clients does a simulation need to fire an alert?

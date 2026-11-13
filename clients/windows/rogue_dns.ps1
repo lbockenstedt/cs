@@ -5,6 +5,11 @@ $version = '0.01'
 $global:iniConfig = Parse-IniFile 'C:\Scripts\simulation.conf'
 Write-SimVersionBanner 'rogue_dns.ps1' $version
 $statePath = 'C:\Scripts\rogue_dns.state'
+# The orchestrator creates this to cancel a running static phase gracefully
+# (Windows has no SIGTERM): the loop exits and the finally block restores DHCP.
+# Only the orchestrator removes it (before a launch), so a stop requested just
+# after launch is never lost.
+$stopPath = 'C:\Scripts\rogue_dns.stop'
 
 function Save-RogueDnsState {
     param($State)
@@ -32,10 +37,50 @@ function Restore-RogueDnsDhcp {
     Save-RogueDnsState @{ phase = 'dhcp'; start = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds() }
 }
 
+$settings = @{}
+$overrides = Get-SimOverrides
+foreach ($key in @('rogue_dns_server','rogue_dns_dhcp_interval','rogue_dns_duration','rogue_dns_browse_interval')) {
+    $section = 'simulation'
+    if ($key -eq 'rogue_dns_server') { $section = 'address' }
+    $settings[$key] = get_value $section $key
+    if ($overrides.ContainsKey($key) -and -not [string]::IsNullOrWhiteSpace($overrides[$key])) { $settings[$key] = $overrides[$key] }
+}
+foreach ($entry in @{ rogue_dns_dhcp_interval = 1800; rogue_dns_duration = 3600; rogue_dns_browse_interval = 60 }.GetEnumerator()) {
+    if ([string]$settings[$entry.Key] -notmatch '^[1-9][0-9]{0,7}$') { $settings[$entry.Key] = $entry.Value }
+}
 try {
     if (Test-Path -LiteralPath $statePath) {
-        $state = Get-Content -LiteralPath $statePath -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
-        if ($state.phase -notin @('static','dhcp') -or $null -eq $state.start) { throw 'Invalid rogue_dns state' }
+        try {
+            $state = Get-Content -LiteralPath $statePath -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
+            if ($state.phase -notin @('static','dhcp') -or -not ($state.start -is [int] -or $state.start -is [long])) { throw 'Invalid rogue_dns state' }
+            # A static state must carry everything the restore needs, else it is corrupt.
+            if ($state.phase -eq 'static' -and -not ($state.adapter -and $state.address -and $state.gateway)) { throw 'Incomplete rogue_dns state' }
+        } catch {
+            if (-not $RestoreOnly) { throw }
+            # Corrupt state: we don't know what was applied. Act only on rogue_dns's
+            # own fingerprint (Wi-Fi adapter with DHCP off, DNS = rogue_dns_server
+            # only, one manual IPv4 address, a manual default route); anything else
+            # may be operator static config, so leave it and just rewrite a valid
+            # dhcp state.
+            $name = Get-WlanAdapter
+            if (-not $name) { throw 'Unreadable rogue_dns state and no wireless adapter' }
+            $adapter = Get-NetAdapter -Name $name -ErrorAction Stop
+            $idx = $adapter.ifIndex
+            $dhcp = [string](Get-NetIPInterface -InterfaceIndex $idx -AddressFamily IPv4 -ErrorAction Stop).Dhcp
+            $dns = @((Get-DnsClientServerAddress -InterfaceIndex $idx -AddressFamily IPv4 -ErrorAction Stop).ServerAddresses)
+            $manual = @(Get-NetIPAddress -ErrorAction Stop |
+                Where-Object { $_.InterfaceIndex -eq $idx -and $_.AddressFamily -eq 'IPv4' -and $_.PrefixOrigin -eq 'Manual' })
+            $route = Get-NetRoute -ErrorAction Stop |
+                Where-Object { $_.InterfaceIndex -eq $idx -and $_.DestinationPrefix -eq '0.0.0.0/0' -and $_.Protocol -eq 'NetMgmt' } | Select-Object -First 1
+            if ($dhcp -eq 'Disabled' -and $dns.Count -eq 1 -and $dns[0] -eq [string]$settings.rogue_dns_server -and $manual.Count -eq 1 -and $route) {
+                Write-SimLog "rogue_dns: unreadable state; $name uses rogue_dns_server, restoring DHCP"
+                Restore-RogueDnsDhcp @{ adapter = [string]$adapter.InterfaceGuid; address = $manual[0].IPAddress; gateway = $route.NextHop }
+            } else {
+                Write-SimLog "rogue_dns: unreadable state; no rogue_dns settings on $name, leaving it"
+                Save-RogueDnsState @{ phase = 'dhcp'; start = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds() }
+            }
+            return
+        }
         if ($state.phase -eq 'static') {
             Restore-RogueDnsDhcp $state
             return
@@ -45,17 +90,6 @@ try {
         return
     }
     if ($RestoreOnly) { return }
-    $settings = @{}
-    $overrides = Get-SimOverrides
-    foreach ($key in @('rogue_dns_server','rogue_dns_dhcp_interval','rogue_dns_duration','rogue_dns_browse_interval')) {
-        $section = 'simulation'
-        if ($key -eq 'rogue_dns_server') { $section = 'address' }
-        $settings[$key] = get_value $section $key
-        if ($overrides.ContainsKey($key) -and -not [string]::IsNullOrWhiteSpace($overrides[$key])) { $settings[$key] = $overrides[$key] }
-    }
-    foreach ($entry in @{ rogue_dns_dhcp_interval = 1800; rogue_dns_duration = 3600; rogue_dns_browse_interval = 60 }.GetEnumerator()) {
-        if ([string]$settings[$entry.Key] -notmatch '^[1-9][0-9]{0,7}$') { $settings[$entry.Key] = $entry.Value }
-    }
     if (([DateTimeOffset]::UtcNow.ToUnixTimeSeconds() - [long]$state.start) -lt [int]$settings.rogue_dns_dhcp_interval) { return }
     $server = [string]$settings.rogue_dns_server
     $ip = $null
@@ -76,6 +110,7 @@ try {
     $state = @{ phase = 'static'; start = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds(); adapter = [string]$adapter.InterfaceGuid
         address = $lease.IPAddress; prefix = $lease.PrefixLength; gateway = $route.NextHop
         dns = @((Get-DnsClientServerAddress -InterfaceIndex $idx -AddressFamily IPv4).ServerAddresses) }
+    if (Test-Path -LiteralPath $stopPath) { Write-SimLog 'rogue_dns: stop requested before apply; skipping'; return }
     # Persist before the first mutation so reboot/Stop-Process can recover.
     Save-RogueDnsState $state
     try {
@@ -91,7 +126,7 @@ try {
         if (-not $firefoxCommand) { $firefoxCommand = Get-Command firefox -ErrorAction SilentlyContinue }
         $firefox = $null
         $clock = [System.Diagnostics.Stopwatch]::StartNew()
-        while ($clock.Elapsed.TotalSeconds -lt [int]$settings.rogue_dns_duration) {
+        while ($clock.Elapsed.TotalSeconds -lt [int]$settings.rogue_dns_duration -and -not (Test-Path -LiteralPath $stopPath)) {
             $next = [Math]::Min([int]$settings.rogue_dns_duration, $clock.Elapsed.TotalSeconds + [int]$settings.rogue_dns_browse_interval)
             # Start-Process is asynchronous; retain only our browser's handle.
             if ($firefoxCommand -and $wwwfile.Count -gt 0) {
@@ -100,13 +135,14 @@ try {
                     $firefox = Start-Process -FilePath $firefoxCommand.Source -ArgumentList '--headless', $url -WindowStyle Hidden -PassThru -ErrorAction Stop
                 } catch { Write-SimLog "rogue_dns: browser launch failed: $($_.Exception.Message)" }
             }
-            while ($clock.Elapsed.TotalSeconds -lt $next) {
-                # Chunk long intervals: Start-Sleep -Milliseconds takes Int32.
-                Start-Sleep -Milliseconds ([int](1000 * [Math]::Max(0, [Math]::Min(60, $next - $clock.Elapsed.TotalSeconds))))
+            while ($clock.Elapsed.TotalSeconds -lt $next -and -not (Test-Path -LiteralPath $stopPath)) {
+                # One-second chunks so a stop request is seen promptly.
+                Start-Sleep -Milliseconds ([int](1000 * [Math]::Max(0, [Math]::Min(1, $next - $clock.Elapsed.TotalSeconds))))
             }
             if ($firefox -and -not $firefox.HasExited) { $firefox | Stop-Process -Force -ErrorAction SilentlyContinue }
             $firefox = $null
         }
+        if (Test-Path -LiteralPath $stopPath) { Write-SimLog 'rogue_dns: stop requested; restoring DHCP' }
     } finally {
         try {
             if ($firefox -and -not $firefox.HasExited) { $firefox | Stop-Process -Force -ErrorAction SilentlyContinue }
