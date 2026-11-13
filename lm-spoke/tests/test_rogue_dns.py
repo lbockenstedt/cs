@@ -53,6 +53,8 @@ else:
     for name, body in {
         "firefox-esr": 'echo "browser $*" >> "$TEST_ROOT/calls"\n',
         "cpulimit": 'shift 4\nexec "$@"\n',
+        # timeout -k 1 <delay> <cmd>: not on every host (macOS), so mock it too.
+        "timeout": 'shift 3\nexec "$@"\n',
     }.items():
         executable = bin_dir / name
         executable.write_text("#!/bin/bash\n" + body)
