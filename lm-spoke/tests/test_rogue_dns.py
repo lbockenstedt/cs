@@ -42,9 +42,12 @@ if args[:2] == ['connection', 'up']:
 if args[:2] == ['device', 'reapply']:
     sys.exit(0)
 if args[0] == '-t':
-    print('wlan0:wifi:connected')
+    # two_wifi: rogue_dns applied to the connected wlan0, listed after wlan1.
+    print('wlan1:wifi:disconnected\\nwlan0:wifi:connected' if mode == 'two_wifi' else 'wlan0:wifi:connected')
 elif mode == 'dns_query_fail' and args[1] == 'IP4.DNS':
     sys.exit(10)
+elif mode == 'two_wifi' and args[1] == 'IP4.DNS':
+    print('192.0.2.53' if args[-1] == 'wlan0' else '')
 else:
     # rogue_applied: the device still resolves through rogue_dns_server.
     values = {'GENERAL.CON-UUID': 'test-uuid', 'IP4.ADDRESS': '192.0.2.10/24',
@@ -194,6 +197,18 @@ def test_linux_restore_only(tmp_path, phase, mode):
         assert not (tmp_path / "rogue_dns.state").exists()
 
 
+def test_linux_restore_only_corrupt_checks_every_wireless_device(tmp_path):
+    """The rogue_dns-configured device is found even when it isn't listed first."""
+    env = prepare_linux(tmp_path, mode="two_wifi")
+    (tmp_path / "rogue_dns.state").write_text("{corrupt")
+    result = subprocess.run(["bash", str(tmp_path / "rogue_dns.sh"), "--restore-only"], env=env,
+                            capture_output=True, text=True, timeout=10)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "connection up uuid test-uuid ifname wlan0" in calls(tmp_path)
+    assert "ifname wlan1" not in calls(tmp_path)
+    assert read_state(tmp_path)["phase"] == "dhcp"
+
+
 def test_linux_restore_only_keeps_corrupt_state_on_failed_dns_query(tmp_path):
     """A failed DNS query proves nothing, so the corrupt state stays for retry."""
     env = prepare_linux(tmp_path, mode="dns_query_fail")
@@ -341,7 +356,7 @@ def test_linux_reconcile_runs_every_cycle_outside_flag_gate():
     """Recovery must not sit behind the rogue_dns flag or the kill-switch gate."""
     source = (ROOT / "clients/linux/simulation.sh").read_text()
     call = source.index('[[ "$gkill_switch" == "on" ]] && rogue_dns=off\nreconcile_rogue_dns\n')
-    assert source.index("gkill_switch=\"off\"") < call < source.index('if [ "$kill_switch" != "on" ]')
+    assert source.index("gkill_switch=$(read_gkill_switch)") < call < source.index('if [ "$kill_switch" != "on" ]')
     assert "\npkill -f 'firefox-esr.*--headless'" not in source
     assert "\nkill_headless_firefox\n" in source
 
@@ -370,12 +385,12 @@ def test_linux_www_browse_gated_on_rogue_dns_state(tmp_path, www, rogue, pgrep_r
 
 @pytest.mark.parametrize("www,pgrep_rc,filled", [
     ("off", 0, 0),   # static phase running at cycle start: no fallback this cycle
-    ("off", 2, 0),   # failed check is unknown, not "not running"
+    ("off", 2, 5),   # failed check is unknown: schedule, www_browse_due re-checks at use time
     ("off", 1, 5),   # DHCP phase: fallback browsing
     ("on", 0, 5),    # www_traffic=on is unchanged
 ])
 def test_linux_www_iters_fill_as_before(tmp_path, www, pgrep_rc, filled):
-    """_www_iters fills as on dev: www_traffic=on, or rogue_dns=on and definitely not running."""
+    """_www_iters fills as on dev: www_traffic=on, or rogue_dns=on and not definitely running."""
     source = (ROOT / "clients/linux/simulation.sh").read_text()
     block = source.split(" declare -a _www_iters=()\n", 1)[1].split("\n fi\n", 1)[0] + "\n fi\n"
     script = (linux_orchestrator(tmp_path, "rogue_dns_running")
@@ -451,22 +466,32 @@ def test_linux_gate_reparse_keeps_cycle_config(tmp_path):
     ("still_on", "on", True, "", 0, False),
     ("retry_owed", "off", False, "", 1, True),       # a stop the last reconcile couldn't confirm
     ("off_idle", "off", False, "", 0, False),        # costs nothing, never checks
+    # update.sh never copies kill_switch.txt to Linux: the hub API is the live source.
+    ("kill_api", "on", False, "", 0, True),
+    ("kill_api_checked_recently", "on", False, "", 0, False),  # at most once a minute
+    # Hub-engine ambient (web_server=on) rolled rogue_dns locally: a bucket change can't stop it.
+    ("conf_off_engine_ambient", "on", True, "", 0, False),
 ])
 def test_linux_per_iteration_gate(tmp_path, scenario, flag, conf_changed, kill_file, retry, stopped):
     """rogue_dns_gate stops a running static phase within the iteration (twin of Update-RogueDnsGate)."""
     env = prepare_linux(tmp_path)
     seed_state(tmp_path, "static")
     conf = tmp_path / "simulation.conf"
-    conf.write_text(conf.read_text() + ("[s0]\nrogue_dns=off\n" if scenario in ("conf_off", "conf_unchanged") else "[s0]\nrogue_dns=on\n"))
+    off = scenario in ("conf_off", "conf_unchanged", "conf_off_engine_ambient")
+    conf.write_text(conf.read_text() + ("[s0]\nrogue_dns=off\n" if off else "[s0]\nrogue_dns=on\n"))
     if kill_file:
         (tmp_path / "kill_switch.txt").write_text(kill_file + "\n")
     proc = start_fake_linux_rogue(tmp_path, env)
     script = tmp_path / "orchestrator.sh"
     script.write_text(
         f"source {tmp_path}/ini-parser.sh\n"
-        + linux_orchestrator(tmp_path, "rogue_dns_running", "reconcile_rogue_dns", "rogue_dns_gate")
+        + linux_orchestrator(tmp_path, "read_gkill_switch", "rogue_dns_running", "reconcile_rogue_dns", "rogue_dns_gate")
         + "stat() { echo 2; }\n" + f"_cfg_mtime={1 if conf_changed else 2}\n"
         + f"username=tester\nsimulation_id=s0\nrogue_dns={flag}\nkill_switch=off\nrogue_dns_retry={retry}\n"
+        + "server_url=http://hub.test\n"
+        + f"curl() {{ echo {'on' if scenario.startswith('kill_api') else 'off'}; }}\n"
+        + f"_gks_checked={0 if scenario == 'kill_api_checked_recently' else -60}\n"
+        + f"web_server={'on' if scenario.endswith('engine_ambient') else 'off'}\n"
         + "rogue_dns_gate\n")
     try:
         subprocess.run(["bash", str(script)], env=env, check=True, timeout=15)
@@ -670,12 +695,13 @@ function Stop-Process { [CmdletBinding()] param([Parameter(ValueFromPipelineByPr
 # A graceful rogue_dns.ps1 sees the stop file, restores DHCP in its finally, exits.
 function Start-Sleep { [CmdletBinding()] param($Seconds, $Milliseconds)
     if ($env:MODE -ne 'stuck' -and (Test-Path (Join-Path $root 'rogue_dns.stop'))) {
-        Set-Procs @(Get-Procs | Where-Object { $_.CommandLine -notlike '*rogue_dns.ps1*' })
+        Set-Procs @(Get-Procs | Where-Object { [int]$_.ProcessId -ne 10 })
         Set-Content -LiteralPath (Join-Path $root 'rogue_dns.state') -Value '{"phase": "dhcp", "start": 1}'
         Add-Event 'cleanup'
     } }
 . (Join-Path $root 'ini-parser.ps1')
 $killSwitchPath = Join-Path $root 'kill_switch.txt'
+$scriptRoot = $root
 $rogueDnsScript = Join-Path $root 'rogue_dns.ps1'
 $rogueDnsStatePath = Join-Path $root 'rogue_dns.state'
 $rogueDnsStopPath = Join-Path $root 'rogue_dns.stop'
@@ -710,6 +736,8 @@ Set-Content -LiteralPath (Join-Path $env:TEST_ROOT 'rogue_dns.state') -Value '{"
 @pytest.mark.parametrize("scenario,action,flag,kill,running,mode,phase,conf,expected,absent", [
     ("on_to_off_static", "Sync-RogueDns", "off", "off", True, "", "static", "", ["cleanup"], ["restore-only", "stop 10"]),
     ("kill_switch_static", "Sync-RogueDns", "on", "on", True, "", "static", "", ["cleanup"], ["restore-only", "stop 10"]),
+    # Like the main loop, anything but kill_switch=off (a blank or odd value) is kill-switched.
+    ("kill_switch_blank", "Sync-RogueDns", "on", "", True, "", "static", "", ["cleanup"], ["restore-only", "stop 10"]),
     ("unresponsive", "Sync-RogueDns", "off", "off", True, "stuck", "static", "", ["stop 10", "force-killing", "restore-only True"], ["cleanup"]),
     ("stale_while_off", "Sync-RogueDns", "off", "off", False, "", "static", "", ["restore-only True"], ["stop "]),
     ("on_and_running", "Sync-RogueDns", "on", "off", True, "", "static", "", [], ["cleanup", "restore-only", "stop "]),
@@ -738,13 +766,15 @@ Set-Content -LiteralPath (Join-Path $env:TEST_ROOT 'rogue_dns.state') -Value '{"
     # Without rogue_dns a failed query browses as before cs#258.
     ("browse_unknown_no_rogue_dns", "Test-WwwBrowseDue", "off", "off", True, "cim_fail", "static", "", ["result True"], []),
     # The every-10-iterations re-arm: www_traffic always (as before cs#258, no
-    # configured-value latch); rogue_dns fallback only when definitely stopped.
+    # configured-value latch); rogue_dns fallback unless definitely running.
     ("rearm_stopped", "Invoke-Rearm", "on", "off", False, "", "dhcp", "", ["www on ready True"], []),
     ("rearm_static", "Invoke-Rearm", "on", "off", True, "", "static", "", ["www on ready False"], []),
-    ("rearm_unknown", "Invoke-Rearm", "on", "off", False, "cim_fail", "dhcp", "", ["www on ready False"], []),
+    # Unknown re-arms too: Test-WwwBrowseDue re-checks at use time (browse_unknown).
+    ("rearm_unknown", "Invoke-Rearm", "on", "off", False, "cim_fail", "dhcp", "", ["www on ready True"], []),
     ("rearm_no_rogue_dns", "Invoke-Rearm", "off", "off", False, "", "dhcp", "", ["www on ready False"], []),
     ("midcycle_off", "Update-RogueDnsGate", "on", "off", True, "", "static", "[s0]\nrogue_dns=off\n", ["cleanup", "flag off"], ["restore-only"]),
     ("midcycle_kill_file", "Update-RogueDnsGate", "on", "off", True, "", "static", "[s0]\nrogue_dns=on\n", ["cleanup", "flag off"], ["restore-only"]),
+    ("midcycle_kill_conf_odd", "Update-RogueDnsGate", "on", "off", True, "", "static", "[simulation]\nkill_switch=maybe\n[s0]\nrogue_dns=on\n", ["cleanup", "flag off"], ["restore-only"]),
     ("midcycle_still_on", "Update-RogueDnsGate", "on", "off", True, "", "static", "[s0]\nrogue_dns=on\n", ["flag on"], ["cleanup"]),
     # simulation.conf unchanged since the cycle start: not re-parsed, so no stop.
     ("midcycle_conf_same", "Update-RogueDnsGate", "on", "off", True, "", "static", "[s0]\nrogue_dns=off\n", ["flag on"], ["cleanup"]),
@@ -763,7 +793,7 @@ def test_windows_orchestrator_cancels_and_recovers(tmp_path, scenario, action, f
         pytest.skip("PowerShell is not installed; run this harness on Windows CI")
     source = (ROOT / "clients/windows/simulation.ps1").read_text()
     functions = ""
-    for name in ("Test-SimProcess", "Get-ScriptRunState", "Test-ScriptRunning", "Sync-RogueDns", "Update-RogueDnsGate", "Stop-SimFirefox",
+    for name in ("Convert-ToSingleQuotedLiteral", "Get-SimLaunchCommand", "Test-SimProcess", "Get-ScriptRunState", "Test-ScriptRunning", "Sync-RogueDns", "Update-RogueDnsGate", "Stop-SimFirefox",
                  "Test-WwwBrowseDue"):
         functions += f"function {name} {{" + source.split(f"\nfunction {name} {{", 1)[1].split("\n}\n", 1)[0] + "\n}\n"
     # The main loop's re-arm block, run at iteration 10 from a cleared latch.
@@ -781,13 +811,19 @@ def test_windows_orchestrator_cancels_and_recovers(tmp_path, scenario, action, f
         (tmp_path / "rogue_dns.state").write_text('{"phase": "dhcp", "start": ' + phase.split(":", 1)[1] + '}')
     else:
         (tmp_path / "rogue_dns.state").write_text("{corrupt" if phase == "corrupt" else json.dumps({"phase": phase, "start": 1}))
-    procs = [dict(ProcessId=1, ParentProcessId=0, Name="powershell", CommandLine="powershell -File simulation.ps1")]
+    script = os.path.join(str(tmp_path), "rogue_dns.ps1")
+    procs = [dict(ProcessId=1, ParentProcessId=0, Name="powershell.exe", CommandLine="powershell -File simulation.ps1")]
     if running:
-        procs += [dict(ProcessId=10, ParentProcessId=1, Name="powershell", CommandLine="powershell -File C:/Scripts/rogue_dns.ps1"),
+        # Exactly what Run-Simulation starts.
+        procs += [dict(ProcessId=10, ParentProcessId=1, Name="powershell.exe",
+                       CommandLine=f"powershell -NoProfile -ExecutionPolicy Bypass -Command \"$global:rn = 1; . '{script}'\""),
                   dict(ProcessId=11, ParentProcessId=10, Name="firefox", CommandLine="firefox --headless https://rogue.test/")]
     procs.append(dict(ProcessId=12, ParentProcessId=1, Name="firefox", CommandLine="firefox --headless https://www.test/"))
-    # An editor with the script open is neither a running instance nor ever stopped.
-    procs.append(dict(ProcessId=13, ParentProcessId=1, Name="notepad", CommandLine="notepad C:/Scripts/rogue_dns.ps1"))
+    # Editors, PowerShell ISE and a PowerShell command that only reads the script
+    # are neither a running instance nor ever stopped.
+    procs += [dict(ProcessId=13, ParentProcessId=1, Name="notepad.exe", CommandLine=f"notepad {script}"),
+              dict(ProcessId=14, ParentProcessId=1, Name="powershell_ise.exe", CommandLine=f"powershell_ise.exe -File {script}"),
+              dict(ProcessId=15, ParentProcessId=1, Name="powershell.exe", CommandLine=f"powershell -Command \"Get-Content '{script}'\"")]
     (tmp_path / "procs.json").write_text(json.dumps(procs))
     env = dict(os.environ, TEST_ROOT=str(tmp_path), ACTION=action, FLAG=flag, KILL=kill, MODE=mode,
                WWW="on" if scenario.startswith("browse") else "off",
@@ -800,7 +836,8 @@ def test_windows_orchestrator_cancels_and_recovers(tmp_path, scenario, action, f
         assert text in log, log
     for text in absent:
         assert text not in log, log
-    assert "stop 13" not in log, log
+    for decoy in (13, 14, 15):
+        assert f"stop {decoy}" not in log, log
     # The marker is kept whenever a stop is owed but the process state is unknown.
     assert (tmp_path / "rogue_dns.stop").exists() == (scenario in {"cim_fail_during_stop", "cim_fail_stale", "stop_unknown_live"})
     if action == "Sync-RogueDns" and scenario not in {"on_and_running", "cim_fail_stale", "cim_fail_during_stop", "stop_unknown_live"}:

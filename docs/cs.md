@@ -185,22 +185,29 @@ stop marker: after it has confirmed no instance is running, and just before a
 new launch. A stop requested right after a launch is therefore never lost.
 Process checks, signals and force-kills match only the process the orchestrator
 launches: on Linux the command line `bash /usr/local/scripts/rogue_dns.sh`, on
-Windows a PowerShell process running `rogue_dns.ps1`. An editor or
+Windows a `powershell.exe` whose command dot-sources
+`C:\Scripts\rogue_dns.ps1`, exactly as `Run-Simulation` starts it. An editor,
+PowerShell ISE, another PowerShell command that only mentions the file, or
 `tail -f rogue_dns.sh` is never counted as running, signalled or killed. If
 it has not exited after 10 seconds, the orchestrator force-kills it and runs a
 restore-only pass. Both orchestrators check this at the start of every cycle
 and again on every loop iteration (Linux `rogue_dns_gate`, Windows
 `Update-RogueDnsGate`). To keep the per-iteration check cheap, it only runs
-while `rogue_dns` is on: it re-reads the global `kill_switch.txt` every
-iteration and re-parses `simulation.conf` (kill switch and this client's
+while `rogue_dns` is on: it re-reads the global kill switch (Windows: the
+`kill_switch.txt` file, every iteration; Linux: the hub's `/api/kill-switch`
+with the local file as fallback, at most once a minute, because `update.sh`
+never copies the file to Linux clients) and re-parses `simulation.conf` (kill switch and this client's
 `rogue_dns` value) only when the file's modification time (sub-second) has
-changed since the cycle started. That re-read never replaces the configuration
+changed since the cycle started. Each platform reads the kill switch with the
+same rule as its main loop: Linux stops only on `on`, Windows on anything but
+`off`. A conf change to the bucket's `rogue_dns` value never stops an
+instance that an ambient roll (random pool, or the hub engine) turned on. That re-read never replaces the configuration
 parsed at the start of the cycle, so the rest of the iteration keeps using it. With `rogue_dns` off it does nothing, unless a
 stop request could not be confirmed (the instance was still running, or the
 process check failed); that stop is then retried every iteration until it is
-confirmed. With the kill switch on there are no loop iterations (the
-orchestrator sleeps for 5 minutes between cycles), so the retry happens on the
-next cycle.
+confirmed. With the kill switch on there are no loop iterations; the
+orchestrator's 5-minute kill-switch sleep retries an owed stop every 10
+seconds instead.
 
 **Per-cycle recovery.** On every orchestrator cycle, whatever the `rogue_dns`
 value or kill switch, if no instance is running and the state file says
@@ -214,8 +221,9 @@ simulation has been disabled. An unreadable, corrupt or incomplete state file
 or Linux connection) is logged (`rogue_dns state unreadable`) and also gets a
 restore-only pass. With no trustworthy captured values, that pass only undoes
 what rogue_dns itself could have applied. It acts only when the wireless
-adapter still shows rogue_dns's fingerprint: on Linux, the device's DNS is
-exactly `rogue_dns_server`; on Windows, DHCP is disabled, DNS is exactly
+adapter still shows rogue_dns's fingerprint: on Linux, a wireless device's DNS
+is exactly `rogue_dns_server` (every wireless device is checked, because the
+one rogue_dns applied to need not be listed first); on Windows, DHCP is disabled, DNS is exactly
 `rogue_dns_server`, there is a single manual IPv4 address and there is a
 manual default route. Linux then
 re-applies and reconnects the device's saved profile. That drops only runtime
@@ -240,10 +248,12 @@ outcome is unknown keeps the Windows stop marker in place and is retried on the
 next iteration. While `rogue_dns` is on, the orchestrators' normal and fallback
 browsing runs only when rogue_dns is definitely not running, so `www_traffic=on`
 never browses during the static phase or on a failed check. Fallback browsing
-is scheduled exactly as before this change: Linux picks its five browse
+is scheduled as before this change: Linux picks its five browse
 iterations at the start of a cycle when `www_traffic` is on, or when
-`rogue_dns` is on and definitely not running; Windows browses on the first
-iteration and re-arms every 10 iterations.
+`rogue_dns` is on and not definitely running; Windows browses on the first
+iteration and re-arms every 10 iterations (the rogue_dns fallback re-arms
+unless it is definitely running). A failed check still schedules, because
+each browse re-checks the process state at use time.
 
 **Permissions (Linux).** Like the other Linux sims, `rogue_dns.sh` runs `nmcli`
 unprivileged. The NetworkManager polkit rule `50-client-sim-nm.rules`

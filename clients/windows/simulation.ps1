@@ -365,13 +365,21 @@ function Clear-WifiMacSpoof {
     Write-SimDebug "  [mac_auth_fail] cleared NetworkAddress override on '$AdapterName' before maintenance reconnect (actual_iface_mac=$actualMac)"
 }
 
-# A sim process is the PowerShell host Run-Simulation starts. Matching the host
-# as well as the script name means an editor with the file open is never
-# counted as running (or force-killed), like Linux's anchored rogue_dns match.
+# The command that dot-sources a sim; Run-Simulation launches exactly this.
+function Get-SimLaunchCommand {
+    param([string]$ScriptName)
+
+    return ". $(Convert-ToSingleQuotedLiteral (Join-Path $scriptRoot $ScriptName))"
+}
+
+# A sim process is the powershell.exe Run-Simulation starts, dot-sourcing the
+# script by its full path. An editor, PowerShell ISE or another PowerShell
+# command that merely mentions the file is never counted as running (or
+# force-killed), like Linux's anchored rogue_dns match.
 function Test-SimProcess {
     param($Process, [string]$ScriptName)
 
-    return $Process.Name -like 'powershell*' -and $Process.CommandLine -like "*${ScriptName}*"
+    return $Process.Name -eq 'powershell.exe' -and ([string]$Process.CommandLine).Contains("; $(Get-SimLaunchCommand $ScriptName)")
 }
 
 # 'running', 'stopped' or 'unknown'. A failed (or empty) process query is
@@ -409,7 +417,7 @@ function Run-Simulation {
         "`$global:rn_ping_size = $($global:rn_ping_size)",
         "`$global:ping_address = $(Convert-ToSingleQuotedLiteral $script:ping_address)",
         "`$global:iperf_server = $(Convert-ToSingleQuotedLiteral $script:iperf_server)",
-        ". $(Convert-ToSingleQuotedLiteral $scriptPath)"
+        (Get-SimLaunchCommand $ScriptName)
     ) -join '; '
 
     Start-Process powershell -ArgumentList @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-Command', $command) -WindowStyle Hidden | Out-Null
@@ -471,7 +479,8 @@ $script:rogueDnsRetry = $false
 # A stop that can't be confirmed (still running, or a failed process query) sets
 # $script:rogueDnsRetry, and Update-RogueDnsGate retries it every iteration.
 function Sync-RogueDns {
-    $stop = $script:rogue_dns -ne 'on' -or $script:kill_switch -eq 'on'
+    # Like the main loop, anything but kill_switch=off counts as kill-switched.
+    $stop = $script:rogue_dns -ne 'on' -or $script:kill_switch -ne 'off'
     # Write the marker before process discovery: a failed query must not keep a
     # live instance in its static phase. It is removed only on a definite 'stopped'.
     if ($stop -and -not (Test-Path -LiteralPath $rogueDnsStopPath)) {
@@ -549,7 +558,7 @@ function Update-RogueDnsGate {
         $globalKill = ([string](Get-Content -LiteralPath $killSwitchPath -ErrorAction SilentlyContinue | Select-Object -First 1)).Trim()
         if ($globalKill) { $kill = $globalKill }
     }
-    if ($kill -eq 'on' -or ($flag -and $flag -ne 'on')) {
+    if (($kill -and $kill -ne 'off') -or ($flag -and $flag -ne 'on')) {
         Write-SimLog 'rogue_dns: kill switch on or rogue_dns turned off mid-cycle; stopping'
         $script:rogue_dns = 'off'
         Sync-RogueDns
@@ -922,7 +931,8 @@ while ($true) {
                     Write-SimDebug 'Closing Firefox'
                     Stop-SimFirefox
                     $script:www_traffic = 'on'
-                    if ($script:rogue_dns -eq 'on' -and (Get-ScriptRunState -ScriptName 'rogue_dns.ps1') -eq 'stopped') {
+                    # Unless definitely running: Test-WwwBrowseDue re-checks at use time.
+                    if ($script:rogue_dns -eq 'on' -and (Get-ScriptRunState -ScriptName 'rogue_dns.ps1') -ne 'running') {
                         $script:rogueDnsBrowseReady = $true
                     }
                 }

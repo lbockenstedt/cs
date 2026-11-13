@@ -60,21 +60,26 @@ PY
   ) || {
     (( restore_only )) || { echo 'rogue_dns: unreadable state; refusing network changes' | tee -a "$log"; exit 1; }
     # Restore-only on a corrupt state: we don't know what was applied. Act only
-    # on rogue_dns's own fingerprint (the wireless device's DNS is exactly
+    # on rogue_dns's own fingerprint (a wireless device's DNS is exactly
     # rogue_dns_server); anything else may be operator config, so leave it and
     # just rewrite a valid dhcp state. restore_dhcp re-applies the saved
-    # profile, so it only ever drops runtime (device modify) changes.
-    wl=$(nmcli -t -f DEVICE,TYPE device status | awk -F: '$2=="wifi" {print $1; exit}')
-    [[ -n $wl ]] || { echo 'rogue_dns: unreadable state and no wireless device' | tee -a "$log"; exit 1; }
-    # A failed query proves nothing, so keep the corrupt state and retry.
-    wl_dns=$(nmcli -g IP4.DNS device show "$wl") || { echo "rogue_dns: unreadable state; DNS query on $wl failed, retrying" | tee -a "$log"; exit 1; }
-    if [[ -n $rogue_dns_server && $wl_dns == "$rogue_dns_server" ]]; then
+    # profile, so it only ever drops runtime (device modify) changes. Every
+    # wireless device is checked: the applied one was the first *connected*
+    # device at the time, which need not be the first one listed now.
+    devices=$(nmcli -t -f DEVICE,TYPE device status | awk -F: '$2=="wifi" {print $1}')
+    [[ -n $devices ]] || { echo 'rogue_dns: unreadable state and no wireless device' | tee -a "$log"; exit 1; }
+    restored=0
+    for wl in $devices; do
+      # A failed query proves nothing, so keep the corrupt state and retry.
+      wl_dns=$(nmcli -g IP4.DNS device show "$wl") || { echo "rogue_dns: unreadable state; DNS query on $wl failed, retrying" | tee -a "$log"; exit 1; }
+      [[ -n $rogue_dns_server && $wl_dns == "$rogue_dns_server" ]] || continue
       echo "rogue_dns: unreadable state; $wl uses rogue_dns_server, restoring DHCP" | tee -a "$log"
       connection=$(nmcli -g GENERAL.CON-UUID device show "$wl")
-      restore_dhcp
-      exit $?
-    fi
-    echo "rogue_dns: unreadable state; no rogue_dns settings on $wl, leaving it" | tee -a "$log"
+      restore_dhcp || exit 1
+      restored=1
+    done
+    (( restored )) && exit 0
+    echo "rogue_dns: unreadable state; no rogue_dns settings on ${devices//$'\n'/ }, leaving it" | tee -a "$log"
     write_state dhcp
     exit $?
   }

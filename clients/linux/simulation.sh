@@ -483,15 +483,16 @@ _rsleep 5
 #------------------------------------------------------------
 #Checking global kill switch config
 #------------------------------------------------------------
-gkill_switch="off"
-if [[ -n "${server_url:-}" ]]; then
-  _gks=$(curl -sf --max-time 5 "${server_url%/}/api/kill-switch" 2>/dev/null | tr -d '[:space:]')
-  [[ "$_gks" == "on" || "$_gks" == "off" ]] && gkill_switch="$_gks"
-fi
-if [[ "$gkill_switch" == "off" ]] && [[ -f '/usr/local/scripts/kill_switch.txt' ]]; then
-  _gks=$(cat /usr/local/scripts/kill_switch.txt 2>/dev/null | tr -d '[:space:]')
-  [[ "$_gks" == "on" || "$_gks" == "off" ]] && gkill_switch="$_gks"
-fi
+# 'on' when the hub API or the local kill_switch.txt fallback says on. update.sh
+# never copies the file, so the API is the live source on a fleet client.
+read_gkill_switch() {
+  local api="" file=""
+  [[ -n "${server_url:-}" ]] && api=$(curl -sf --max-time 5 "${server_url%/}/api/kill-switch" 2>/dev/null | tr -d '[:space:]')
+  file=$(tr -d '[:space:]' < /usr/local/scripts/kill_switch.txt 2>/dev/null)
+  if [[ $api == on || $file == on ]]; then echo on; else echo off; fi
+}
+gkill_switch=$(read_gkill_switch)
+_gks_checked=$SECONDS
 #------------------------------------------------------------
 # Rogue DNS lifecycle — runs EVERY cycle, outside the rogue_dns flag gate.
 # Off or kill switch: TERM a running rogue_dns.sh (its EXIT trap restores DHCP),
@@ -560,16 +561,19 @@ PY
 }
 # Per-iteration twin of Windows Update-RogueDnsGate: the outer cycle (and its
 # reconcile) runs only every ~25 min. While rogue_dns is on, re-read the global
-# kill switch file every iteration, and simulation.conf only when its mtime
-# moved; on kill switch or rogue_dns=off, stop it now. With rogue_dns off it
+# kill switch (hub API + file) at most once a minute, and simulation.conf only
+# when its mtime moved; on kill switch or rogue_dns=off, stop it now. With rogue_dns off it
 # costs nothing unless a stop is still owed (rogue_dns_retry).
 rogue_dns_gate() {
-  local ks flag gflag user bucket
+  local ks="" flag gflag user bucket ambient=off
   if [[ "$rogue_dns" != "on" ]]; then
     (( rogue_dns_retry )) && reconcile_rogue_dns
     return 0
   fi
-  ks=$(tr -d '[:space:]' < /usr/local/scripts/kill_switch.txt 2>/dev/null)
+  if (( SECONDS - _gks_checked >= 60 )); then
+    _gks_checked=$SECONDS
+    ks=$(read_gkill_switch)
+  fi
   if [[ "$(stat -c %y /usr/local/scripts/simulation.conf 2>/dev/null)" != "$_cfg_mtime" ]]; then
     # Parse in a subshell: the rest of this iteration keeps the cycle's parsed
     # config (and its applied overrides) unchanged.
@@ -580,12 +584,13 @@ rogue_dns_gate() {
     [[ -n $flag ]] || flag=$gflag
     [[ $flag == on ]] && ks=on
     # Compare with the cycle-start sources: an unrelated conf write must not
-    # turn an ambient-rolled rogue_dns off.
+    # turn an ambient-rolled rogue_dns (random pool or hub engine) off.
+    [[ "${random_pool:-off}" == on || "${web_server:-off}" == on ]] && ambient=on
     flag=
     if [[ $user != "${_rogue_dns_user:-}" ]]; then
       if [[ -n $user ]]; then flag=$user
-      elif [[ "${random_pool:-off}" != "on" ]]; then flag=${bucket:-off}; fi
-    elif [[ -z $user && "${random_pool:-off}" != "on" && $bucket != "${_rogue_dns_bucket:-}" ]]; then
+      elif [[ $ambient != on ]]; then flag=${bucket:-off}; fi
+    elif [[ -z $user && $ambient != on && $bucket != "${_rogue_dns_bucket:-}" ]]; then
       flag=${bucket:-off}
     fi
   fi
@@ -872,8 +877,9 @@ if [ "$kill_switch" != "on" ]; then
  # the first iteration. The page just generates a request for stats — it does
  # nothing with the content and may hang; all instances are killed at loop end.
  declare -a _www_iters=()
- # rogue_dns adds the DHCP-phase fallback only when it is definitely not running.
- if [[ "$www_traffic" == "on" ]] || { [[ "$rogue_dns" == "on" ]] && { rogue_dns_running; (( $? == 1 )); }; }; then
+ # rogue_dns adds the DHCP-phase fallback unless it is definitely running; a
+ # failed check still schedules, because www_browse_due re-checks at use time.
+ if [[ "$www_traffic" == "on" ]] || { [[ "$rogue_dns" == "on" ]] && { rogue_dns_running; (( $? != 0 )); }; }; then
   for (( _wi=0; _wi<5; _wi++ )); do
    _www_iters+=("$(( 1 + RANDOM % 100 ))")
   done
