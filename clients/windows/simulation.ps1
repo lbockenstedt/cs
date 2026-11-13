@@ -459,18 +459,22 @@ function Sync-RogueDns {
     if (($script:rogue_dns -ne 'on' -or $script:kill_switch -eq 'on') -and $run -eq 'running') {
         Write-SimLog 'rogue_dns: disabled or kill switch on; stopping running instance'
         Set-Content -LiteralPath $rogueDnsStopPath -Value 'stop' -ErrorAction SilentlyContinue
-        for ($i = 0; $i -lt $rogueDnsStopGrace -and (Test-ScriptRunning -ScriptName 'rogue_dns.ps1'); $i++) {
+        for ($i = 0; $i -lt $rogueDnsStopGrace -and $run -ne 'stopped'; $i++) {
             Start-Sleep -Seconds 1
+            $run = Get-ScriptRunState -ScriptName 'rogue_dns.ps1'
         }
-        $stuck = @(Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | Where-Object { $_.CommandLine -like '*rogue_dns.ps1*' })
-        if ($stuck.Count) {
+        if ($run -eq 'running') {
+            $stuck = @(Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | Where-Object { $_.CommandLine -like '*rogue_dns.ps1*' })
             Write-SimLog "rogue_dns: did not exit in ${rogueDnsStopGrace}s; force-killing"
             $stuck | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
-            Wait-Process -Id ($stuck | ForEach-Object { $_.ProcessId }) -Timeout 5 -ErrorAction SilentlyContinue
+            if ($stuck.Count) { Wait-Process -Id ($stuck | ForEach-Object { $_.ProcessId }) -Timeout 5 -ErrorAction SilentlyContinue }
+            $run = Get-ScriptRunState -ScriptName 'rogue_dns.ps1'
         }
+        # Only a definite 'stopped' ends the stop request. Unknown (failed query)
+        # or still running: keep the marker so the instance still sees it, and
+        # retry next cycle without restoring.
+        if ($run -ne 'stopped') { Write-SimLog "rogue_dns: instance state $run after stop request; keeping stop marker, retrying next cycle"; return }
         Remove-Item -LiteralPath $rogueDnsStopPath -Force -ErrorAction SilentlyContinue
-        $run = Get-ScriptRunState -ScriptName 'rogue_dns.ps1'
-        if ($run -eq 'unknown') { Write-SimLog 'rogue_dns: process check failed; retrying next cycle'; return }
     }
     if ($run -ne 'stopped' -or -not (Test-Path -LiteralPath $rogueDnsScript) -or -not (Test-Path -LiteralPath $rogueDnsStatePath)) { return }
     # Same validity rule as rogue_dns.ps1. Unreadable/corrupt means unknown, and
@@ -509,10 +513,24 @@ function Update-RogueDnsGate {
     }
 }
 
+# Fallback/www browse dispatch. $script:www_traffic doubles as the launch latch
+# and is re-armed every 10 iterations, so check the rogue_dns guard FIRST: while
+# rogue_dns is on and not definitely stopped (static phase, or a failed process
+# query), never browse. Clients without rogue_dns behave exactly as before.
+function Test-WwwBrowseDue {
+    if ($script:rogue_dns -eq 'on' -and (Get-ScriptRunState -ScriptName 'rogue_dns.ps1') -ne 'stopped') { return $false }
+    return ($script:www_traffic -eq 'on' -or ($script:rogue_dns -eq 'on' -and $script:rogueDnsBrowseReady)) -and
+        -not (Test-ScriptRunning -ScriptName 'www_traffic.ps1')
+}
+
 # Close headless browsers, sparing the process tree of a running rogue_dns.ps1:
 # that browser is its static-phase traffic and it stops it itself.
 function Stop-SimFirefox {
-    $procs = @(Get-CimInstance Win32_Process -ErrorAction SilentlyContinue)
+    $procs = @()
+    try { $procs = @(Get-CimInstance Win32_Process -ErrorAction Stop) } catch {
+        # Unknown with rogue_dns on: its browser can't be told apart, so skip.
+        if ($script:rogue_dns -eq 'on') { return }
+    }
     $keep = @{}
     $queue = [System.Collections.Generic.Queue[int]]::new()
     $procs | Where-Object { $_.CommandLine -like '*rogue_dns.ps1*' } | ForEach-Object { $queue.Enqueue([int]$_.ProcessId) }
@@ -805,7 +823,7 @@ while ($true) {
                     }
                 }
 
-                if (($script:www_traffic -eq 'on' -or ($script:rogue_dns -eq 'on' -and $script:rogueDnsBrowseReady -and -not (Test-ScriptRunning -ScriptName 'rogue_dns.ps1'))) -and -not (Test-ScriptRunning -ScriptName 'www_traffic.ps1')) {
+                if (Test-WwwBrowseDue) {
                     Run-Simulation -ScriptName 'www_traffic.ps1'
                     Write-SimDebug 'Running WWW Traffic Simulation'
                     $script:www_traffic = 'off'
@@ -857,7 +875,7 @@ while ($true) {
                     $script:www_traffic = 'on'
                     # Re-arm the DHCP-phase fallback browse every 10 iterations
                     # (Linux parity: it fills _www_iters whenever rogue_dns is on).
-                    if ($script:rogue_dns -eq 'on' -and -not (Test-ScriptRunning -ScriptName 'rogue_dns.ps1')) {
+                    if ($script:rogue_dns -eq 'on' -and (Get-ScriptRunState -ScriptName 'rogue_dns.ps1') -eq 'stopped') {
                         $script:rogueDnsBrowseReady = $true
                     }
                 }

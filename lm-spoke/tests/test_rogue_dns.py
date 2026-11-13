@@ -318,6 +318,22 @@ def test_linux_dispatch_waits_on_failed_process_check():
     assert '[[ "$rogue_dns" == "on" ]] && { rogue_dns_running; (( $? == 1 )); }; then\n    run_simulation "rogue_dns.sh" 0' in source
 
 
+@pytest.mark.parametrize("www,rogue,pgrep_rc,due", [
+    ("on", "on", 0, False),   # static phase running: www_traffic=on must not browse
+    ("on", "on", 2, False),   # failed check is unknown, not "not running"
+    ("off", "on", 1, True),   # DHCP-phase fallback
+    ("on", "off", 2, True),   # no rogue_dns: unchanged, no process check
+    ("off", "off", 1, False),
+])
+def test_linux_www_browse_gated_on_rogue_dns_state(tmp_path, www, rogue, pgrep_rc, due):
+    """Browsing while rogue_dns is on needs a definite not-running (rc 1)."""
+    script = (linux_orchestrator(tmp_path, "rogue_dns_running", "www_browse_due")
+              + f"pgrep() {{ return {pgrep_rc}; }}\nwww_traffic={www}\nrogue_dns={rogue}\n_www_iters=(7)\n"
+              + "www_browse_due 3 && echo wrong-iteration\nwww_browse_due 7 && echo due || echo idle\n")
+    out = subprocess.run(["bash", "-c", script], capture_output=True, text=True, check=True, timeout=5).stdout
+    assert out.splitlines()[-1] == ("due" if due else "idle") and "wrong-iteration" not in out
+
+
 def test_linux_www_iters_filled_while_static_phase_runs(tmp_path):
     """A static phase running at cycle start must not cancel the cycle's fallback browsing."""
     source = (ROOT / "clients/linux/simulation.sh").read_text()
@@ -365,7 +381,9 @@ def test_linux_dispatch_is_guarded_async_and_uncapped(tmp_path):
     assert 'nohup bash "/usr/local/scripts/$script"' in helper
     assert "timeout" not in helper
     assert "if pgrep -f" in helper
-    assert "[[ \"$rogue_dns\" == \"on\" ]] && ! pgrep -f '[r]ogue_dns.sh'" in source
+    assert '    if www_browse_due "$z"; then\n' in source
+    # Every rogue_dns process check goes through the three-state helper.
+    assert "! pgrep -f '[r]ogue_dns.sh'" not in source
     assert 'run_simulation "rogue_dns.sh" 0' in source
     # A delayed child creates its marker independently of the launcher's return.
     (tmp_path / "rogue_dns.sh").write_text(f'sleep 1\ntouch "{tmp_path}/finished"\n')
@@ -475,7 +493,11 @@ function Get-Procs { if (Test-Path $procFile) { @(Get-Content $procFile -Raw | C
 function Set-Procs($procs) { ConvertTo-Json -InputObject @($procs) -Depth 3 | Set-Content $procFile }
 function Add-Event($text) { Add-Content -LiteralPath (Join-Path $root 'events') -Value $text }
 function Get-CimInstance { [CmdletBinding()] param($ClassName)
-    if ($env:MODE -eq 'cim_fail') { Write-Error 'RPC server unavailable' } else { Get-Procs } }
+    $script:cimCalls++
+    # cim_fail_late: the first query works, every later one fails.
+    if ($env:MODE -eq 'cim_fail' -or ($env:MODE -eq 'cim_fail_late' -and $script:cimCalls -gt 1)) {
+        Write-Error 'RPC server unavailable'
+    } else { Get-Procs } }
 function Write-SimLog { param($Message) Add-Event "log $Message" }
 function Wait-Process { [CmdletBinding()] param($Id, $Timeout) }
 function Get-Process { [CmdletBinding()] param($Name)
@@ -501,7 +523,10 @@ $script:simulation_id = 's0'
 $script:random_pool = 'off'
 $script:rogue_dns = $env:FLAG
 $script:kill_switch = $env:KILL
-& $env:ACTION
+$script:www_traffic = $env:WWW
+$script:rogueDnsBrowseReady = $true
+$result = & $env:ACTION
+if ($null -ne $result) { Add-Event "result $result" }
 Add-Event "flag $script:rogue_dns"
 """
 
@@ -520,6 +545,13 @@ Set-Content -LiteralPath (Join-Path $env:TEST_ROOT 'rogue_dns.state') -Value '{"
     ("idle_dhcp", "Sync-RogueDns", "off", "off", False, "", "dhcp", "", [], ["restore-only", "stop "]),
     ("corrupt_state", "Sync-RogueDns", "off", "off", False, "", "corrupt", "", ["rogue_dns state unreadable", "restore-only True"], ["stop "]),
     ("cim_fail_stale", "Sync-RogueDns", "off", "off", False, "cim_fail", "static", "", ["process check failed"], ["restore-only"]),
+    ("cim_fail_during_stop", "Sync-RogueDns", "off", "off", True, "cim_fail_late", "static", "",
+     ["instance state unknown after stop request; keeping stop marker"], ["restore-only", "stop 10", "force-killing"]),
+    # www_traffic=on is also the re-armed launch latch: it must not browse during the static phase.
+    ("browse_static_www_on", "Test-WwwBrowseDue", "on", "off", True, "", "static", "", ["result False"], []),
+    ("browse_unknown", "Test-WwwBrowseDue", "on", "off", False, "cim_fail", "dhcp", "", ["result False"], []),
+    ("browse_dhcp_fallback", "Test-WwwBrowseDue", "on", "off", False, "", "dhcp", "", ["result True"], []),
+    ("browse_no_rogue_dns", "Test-WwwBrowseDue", "off", "off", True, "cim_fail", "static", "", ["result True"], []),
     ("midcycle_off", "Update-RogueDnsGate", "on", "off", True, "", "static", "[s0]\nrogue_dns=off\n", ["cleanup", "flag off"], ["restore-only"]),
     ("midcycle_kill_file", "Update-RogueDnsGate", "on", "off", True, "", "static", "[s0]\nrogue_dns=on\n", ["cleanup", "flag off"], ["restore-only"]),
     ("midcycle_still_on", "Update-RogueDnsGate", "on", "off", True, "", "static", "[s0]\nrogue_dns=on\n", ["flag on"], ["cleanup"]),
@@ -532,7 +564,8 @@ def test_windows_orchestrator_cancels_and_recovers(tmp_path, scenario, action, f
         pytest.skip("PowerShell is not installed; run this harness on Windows CI")
     source = (ROOT / "clients/windows/simulation.ps1").read_text()
     functions = ""
-    for name in ("Get-ScriptRunState", "Test-ScriptRunning", "Sync-RogueDns", "Update-RogueDnsGate", "Stop-SimFirefox"):
+    for name in ("Get-ScriptRunState", "Test-ScriptRunning", "Sync-RogueDns", "Update-RogueDnsGate", "Stop-SimFirefox",
+                 "Test-WwwBrowseDue"):
         functions += f"function {name} {{" + source.split(f"\nfunction {name} {{", 1)[1].split("\n}\n", 1)[0] + "\n}\n"
     (tmp_path / "functions.ps1").write_text(functions.replace("C:\\Scripts\\", str(tmp_path) + "/"))
     (tmp_path / "ini-parser.ps1").write_text((ROOT / "clients/windows/ini-parser.ps1").read_text())
@@ -548,7 +581,8 @@ def test_windows_orchestrator_cancels_and_recovers(tmp_path, scenario, action, f
                   dict(ProcessId=11, ParentProcessId=10, Name="firefox", CommandLine="firefox --headless https://rogue.test/")]
     procs.append(dict(ProcessId=12, ParentProcessId=1, Name="firefox", CommandLine="firefox --headless https://www.test/"))
     (tmp_path / "procs.json").write_text(json.dumps(procs))
-    env = dict(os.environ, TEST_ROOT=str(tmp_path), ACTION=action, FLAG=flag, KILL=kill, MODE=mode)
+    env = dict(os.environ, TEST_ROOT=str(tmp_path), ACTION=action, FLAG=flag, KILL=kill, MODE=mode,
+               WWW="on" if scenario.startswith("browse") else "off")
     result = subprocess.run([powershell, "-NoProfile", "-NonInteractive", "-File", str(tmp_path / "harness.ps1")],
                             env=env, capture_output=True, text=True, timeout=30)
     assert result.returncode == 0 and not result.stderr, result.stdout + result.stderr
@@ -557,8 +591,8 @@ def test_windows_orchestrator_cancels_and_recovers(tmp_path, scenario, action, f
         assert text in log, log
     for text in absent:
         assert text not in log, log
-    assert not (tmp_path / "rogue_dns.stop").exists()
-    if action == "Sync-RogueDns" and scenario not in {"on_and_running", "cim_fail_stale"}:
+    assert (tmp_path / "rogue_dns.stop").exists() == (scenario == "cim_fail_during_stop")
+    if action == "Sync-RogueDns" and scenario not in {"on_and_running", "cim_fail_stale", "cim_fail_during_stop"}:
         assert read_state(tmp_path)["phase"] == "dhcp"
 
 
@@ -574,4 +608,5 @@ def test_windows_orchestrator_wiring():
     assert "Stop-Process -Name firefox" not in source
     # Dispatch launches only on a definite 'stopped', never on a failed query.
     assert "if ($rogueDnsRun -eq 'stopped') { Run-Simulation -ScriptName 'rogue_dns.ps1' }" in loop
-    assert "-not (Test-ScriptRunning -ScriptName 'rogue_dns.ps1')) {\n                    Run-Simulation" not in loop
+    assert "Test-ScriptRunning -ScriptName 'rogue_dns.ps1'" not in source
+    assert "                if (Test-WwwBrowseDue) {\n" in loop

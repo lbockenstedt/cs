@@ -201,6 +201,10 @@ Both then write a valid `phase=dhcp` state. A normal (non-restore) launch still
 refuses to touch the network on a corrupt state. If the process check itself
 fails (`pgrep` error, failed `Win32_Process` query), the result is unknown: the
 orchestrator logs it and neither restores nor launches until the next check.
+A stop request whose outcome is unknown keeps the Windows stop marker in place
+and retries next cycle. While `rogue_dns` is on, the orchestrators' normal and
+fallback browsing runs only when rogue_dns is definitely not running, so
+`www_traffic=on` never browses during the static phase or on a failed check.
 
 **Permissions (Linux).** Like the other Linux sims, `rogue_dns.sh` runs `nmcli`
 unprivileged. The NetworkManager polkit rule `50-client-sim-nm.rules`

@@ -542,6 +542,16 @@ PY
   fi
   bash /usr/local/scripts/rogue_dns.sh --restore-only >> ${LOG_FILE} 2>&1
 }
+# Fallback/www browse on iteration $1. While rogue_dns is on, browse only when it
+# is definitely not running (rc 1): never during its static phase, and never on
+# a failed check. Clients without rogue_dns behave exactly as before.
+www_browse_due() {
+  [[ " ${_www_iters[*]} " == *" $1 "* ]] || return 1
+  [[ "$www_traffic" == "on" || "$rogue_dns" == "on" ]] || return 1
+  [[ "$rogue_dns" == "on" ]] || return 0
+  rogue_dns_running
+  (( $? == 1 ))
+}
 # The emergency kill switch cancels rogue_dns too: a static IP and rogue DNS
 # must not outlive an emergency stop.
 [[ "$gkill_switch" == "on" ]] && rogue_dns=off
@@ -1076,7 +1086,7 @@ if [ "$kill_switch" != "on" ]; then
    #------------------------------------------------------------
    #Running WWW Traffic Simulation
    #------------------------------------------------------------
-    if { [[ "$www_traffic" == "on" ]] || { [[ "$rogue_dns" == "on" ]] && ! pgrep -f '[r]ogue_dns.sh' >/dev/null; }; } && [[ " ${_www_iters[*]} " == *" $z "* ]]; then
+    if www_browse_due "$z"; then
      echo Running WWW Traffic simulation | tee -a ${LOG_FILE}
      wwwfile=($(< /usr/local/scripts/websites.txt))
      if [[ ${#wwwfile[@]} -eq 0 ]]; then
@@ -1209,7 +1219,11 @@ echo Closing Firefox | tee -a ${LOG_FILE}
 # browse interval), so spare every process under it.
 kill_headless_firefox() {
   local pid keep=" " queue
-  queue=$(pgrep -f '[r]ogue_dns.sh' | tr '\n' ' ')
+  queue=$(pgrep -f '[r]ogue_dns.sh')
+  # Unknown (pgrep error) with rogue_dns on: its browser can't be told apart,
+  # so skip this cleanup rather than risk killing it.
+  (( $? <= 1 )) || [[ "${rogue_dns:-off}" != "on" ]] || return 0
+  queue=${queue//$'\n'/ }
   while [[ -n ${queue// } ]]; do
     read -r pid queue <<< "$queue"
     keep+="$pid "
