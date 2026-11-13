@@ -115,7 +115,7 @@ function Send-Status {
         }
 
         $activeSimulations = @()
-        foreach ($name in @('dns_fail','dns_latency','collab','iperf','download','www_traffic','www_discover','ping_test','ssidpw_fail','auth_fail','mac_auth_fail','dhcp_fail','client_offline')) {
+        foreach ($name in @('dns_fail','dns_latency','collab','iperf','download','www_traffic','www_discover','rogue_dns','ping_test','ssidpw_fail','auth_fail','mac_auth_fail','dhcp_fail','client_offline')) {
             if ((Get-Variable -Name $name -Scope Script -ValueOnly -ErrorAction SilentlyContinue) -eq 'on') {
                 $activeSimulations += $name
             }
@@ -145,6 +145,7 @@ function Send-Status {
                 client_offline = [string]$script:client_offline
                 iperf = [string]$script:iperf
                 www_traffic = [string]$script:www_traffic
+                rogue_dns = [string]$script:rogue_dns
                 www_discover = [string]$script:www_discover
                 download = [string]$script:download
                 ping_test = [string]$script:ping_test
@@ -433,6 +434,12 @@ function Apply-UserOverrides {
     }
 }
 
+# Windows manual addressing persists across reboot. Recover before connecting,
+# even if the sim flag is now off; never interrupt a still-running instance.
+if ((Test-Path 'C:\Scripts\rogue_dns.ps1') -and -not (Test-ScriptRunning -ScriptName 'rogue_dns.ps1')) {
+    & 'C:\Scripts\rogue_dns.ps1' -RestoreOnly
+}
+
 while ($true) {
     $global:iniConfig = Parse-IniFile 'C:\Scripts\simulation.conf'
 
@@ -485,6 +492,9 @@ while ($true) {
     $script:download = get_value $script:simulation_id 'download'
     $script:iperf = get_value $script:simulation_id 'iperf'
     $script:www_traffic = get_value $script:simulation_id 'www_traffic'
+    $script:rogue_dns = get_value $script:simulation_id 'rogue_dns'
+    if (-not $script:rogue_dns) { $script:rogue_dns = 'off' }
+    $script:rogueDnsBrowseReady = $true
     $script:www_discover = get_value $script:simulation_id 'www_discover'
     if (-not $script:www_discover) { $script:www_discover = 'off' }
     $script:dns_latency = get_value $script:simulation_id 'dns_latency'
@@ -512,7 +522,7 @@ while ($true) {
         $randomBucket = 's' + (Get-Random -Minimum 0 -Maximum 10)
         Write-SimLog "Ambient random pool: rolling behaviour from bucket $randomBucket"
         $randomizableList = $randomizableSims -split '\s+' | Where-Object { $_ }
-        foreach ($sim in @('dhcp_fail','dns_fail','dns_latency','collab','assoc_fail','port_flap','ssidpw_fail','auth_fail','mac_auth_fail','ping_test','download','iperf','www_traffic','www_discover')) {
+        foreach ($sim in @('dhcp_fail','dns_fail','dns_latency','collab','assoc_fail','port_flap','ssidpw_fail','auth_fail','mac_auth_fail','ping_test','download','iperf','www_traffic','www_discover','rogue_dns')) {
             if ($randomizableList -contains $sim) {
                 Set-Variable -Name $sim -Scope Script -Value (get_value $randomBucket $sim)
             } else {
@@ -540,10 +550,12 @@ while ($true) {
         'kill_switch','sim_load','public_repo','repo_location','site_based_ssid','iperf_bw',
         'wsite','sim_phy','ssid','ssidpw','ssid_auth','dhcp_fail','dns_fail','dns_latency','collab','assoc_fail','port_flap','ping_test',
         'download','iperf','www_traffic','www_discover','ssidpw_fail','auth_fail','mac_auth_fail','mac_auth_fail_mac','smb_address','ping_address',
+        'rogue_dns','rogue_dns_server','rogue_dns_dhcp_interval','rogue_dns_duration','rogue_dns_browse_interval',
         'dns_bad_ip_1','dns_bad_ip_2','dns_bad_ip_3',
         'dns_bad_record_1','dns_bad_record_2','dns_bad_record_3','iperf_server',
         'collab_app','collab_bw','collab_time','collab_server','dot1x_password','dot1x_eap','web_server','client_offline'
     )
+    $script:wwwTrafficConfigured = $script:www_traffic
 
     if (Test-Path -LiteralPath $killSwitchPath) {
         $globalKillRaw = Get-Content -LiteralPath $killSwitchPath -ErrorAction SilentlyContinue | Select-Object -First 1
@@ -705,10 +717,14 @@ while ($true) {
                     }
                 }
 
-                if ($script:www_traffic -eq 'on' -and -not (Test-ScriptRunning -ScriptName 'www_traffic.ps1')) {
+                if (($script:www_traffic -eq 'on' -or ($script:rogue_dns -eq 'on' -and $script:rogueDnsBrowseReady -and -not (Test-ScriptRunning -ScriptName 'rogue_dns.ps1'))) -and -not (Test-ScriptRunning -ScriptName 'www_traffic.ps1')) {
                     Run-Simulation -ScriptName 'www_traffic.ps1'
                     Write-SimDebug 'Running WWW Traffic Simulation'
                     $script:www_traffic = 'off'
+                    $script:rogueDnsBrowseReady = $false
+                }
+                if ($script:rogue_dns -eq 'on' -and -not (Test-ScriptRunning -ScriptName 'rogue_dns.ps1')) {
+                    Run-Simulation -ScriptName 'rogue_dns.ps1'
                 }
                 if ($script:www_discover -eq 'on' -and -not (Test-ScriptRunning -ScriptName 'www_discover.ps1')) {
                     Run-Simulation -ScriptName 'www_discover.ps1'
@@ -747,7 +763,10 @@ while ($true) {
                 if (($z % 10) -eq 0) {
                     Write-SimDebug 'Closing Firefox'
                     Stop-Process -Name firefox -ErrorAction SilentlyContinue
-                    $script:www_traffic = 'on'
+                    if ($script:wwwTrafficConfigured -eq 'on') { $script:www_traffic = 'on' }
+                    if ($script:rogue_dns -eq 'on' -and -not (Test-ScriptRunning -ScriptName 'rogue_dns.ps1')) {
+                        $script:rogueDnsBrowseReady = $true
+                    }
                 }
                 Write-SimDebug 'End of simulation'
                 # (rapid_update now runs at the TOP of the loop so it fires for
