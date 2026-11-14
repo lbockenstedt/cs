@@ -117,6 +117,66 @@ Implementation: `local_ui_routes.py` answers the same `/sim/api/*` REST contract
 
 **Use the kill switch (emergency stop).** Simulations → **Clients** → the banner at the top: **"⛔ Emergency Stop"** halts all sims (clients poll `/api/kill-switch` and stand down); **"▶ Resume Sims"** re-enables. This is global; the per-client `kill_switch` override above stops just one client.
 
+## Rogue DNS — static IP + fixed DNS
+
+`rogue_dns` runs on Linux and Windows wireless clients and generates no alert.
+Enable `rogue_dns=on` for the selected clients through engine config buckets
+(`[s0]`–`[s9]`, default `off`) or per-client overrides. In the sim-conf engine
+config editor, set `rogue_dns_server` under **address** to the IPv4 address of
+an existing local DNS server. This simulation does not install a DNS server.
+
+| Section | Key | Default | Purpose |
+|---------|-----|---------|---------|
+| `[s0]`–`[s9]` | `rogue_dns` | `off` | Enable the wireless simulation |
+| `[address]` | `rogue_dns_server` | blank | DNS server IPv4 address during the static phase |
+| `[simulation]` | `rogue_dns_dhcp_interval` | `1800` | Seconds on DHCP before each static phase |
+| `[simulation]` | `rogue_dns_duration` | `3600` | Seconds to hold the static configuration |
+| `[simulation]` | `rogue_dns_browse_interval` | `60` | Seconds between static-phase web requests |
+
+The repeating cycle is **30 minutes DHCP → 60 minutes static → DHCP** with
+these defaults. The first script launch records the DHCP phase start and
+returns immediately; subsequent launches do nothing until the DHCP interval
+has elapsed. While `rogue_dns=on` and its script is not running, the
+orchestrators provide the normal `www_traffic`-style browsing fallback, using
+the same pacing and `websites.txt`. Enabling `www_traffic` as well leaves its
+normal browsing behaviour unchanged.
+
+When due, the script captures the wireless DHCP lease's IPv4 address, prefix,
+gateway and DNS, then applies the **same IP/mask/gateway** as static with
+`rogue_dns_server` as DNS. Blank/invalid DNS input or a missing wireless DHCP
+lease causes a logged skip without network changes. During the static phase,
+headless Firefox browses a random `websites.txt` URL every
+`rogue_dns_browse_interval` seconds. After the hold, DHCP and automatic DNS are
+restored, a new DHCP phase start is recorded, and normal dispatch/browsing
+resumes. The orchestrators guard against duplicate script instances; the
+simulation never kills its own script process. Static-phase browser launches
+are asynchronous and owned by the script, with cleanup at each browse interval
+and on exit so a stalled browser cannot accumulate overlapping requests. The
+Linux dispatch helper uses `nohup` in the background; its second argument is
+an inter-simulation pause, not a runtime timeout.
+
+### Recovery and operational caveats
+
+Phase and captured network values are persisted as JSON in
+`/usr/local/scripts/rogue_dns.state` on Linux and
+`C:\Scripts\rogue_dns.state` on Windows, not in temporary storage. Linux uses
+runtime-only NetworkManager device changes, leaving the DHCP profile untouched;
+restoration reapplies/reconnects that profile. Windows disables DHCP and sets
+the address and DNS on the Wi-Fi adapter; restoration removes the simulation's
+manual address/gateway, enables DHCP and resets DNS server addresses.
+
+A trap (Linux) or `finally` (Windows) restores DHCP on normal completion or a
+handled interruption. An unhandled kill, reboot or update can bypass cleanup:
+a stale `phase=static` at the next script launch triggers DHCP recovery and
+restarts the 30-minute window instead of applying static again. Windows also
+performs this recovery at orchestrator startup because its static settings
+persist across reboots. Windows recovery tolerates an already-removed address
+or route after partial cleanup, and never removes a newly acquired DHCP lease.
+A failed apply or restore returns a non-zero exit status; a failed restore
+retains the static state for retry. Only successful restoration starts a new
+DHCP window. Check `sim.log` in the platform's scripts directory. Do not delete
+that state file while recovery is pending.
+
 ## WWW Discover — Network Diagnostics
 
 `www_discover` is an independent Linux/Windows browsing simulation, default
