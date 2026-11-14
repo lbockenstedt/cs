@@ -2418,7 +2418,7 @@ window.csDemoClear = async function (btn) {
 // Alphabetical so the sim knobs + the Simulation facet dropdown list in order.
 const CS_CONTROL_FLAGS = ['assoc_fail', 'auth_fail', 'client_offline', 'collab', 'dhcp_fail', 'dns_fail',
     'dns_latency', 'download', 'iperf', 'kill_switch', 'mac_auth_fail', 'ping_test', 'port_flap',
-    'ssidpw_fail', 'www_discover', 'www_traffic'];
+    'rogue_dns', 'ssidpw_fail', 'www_discover', 'www_traffic'];
 
 
 
@@ -4246,7 +4246,7 @@ const CS_ONOFF_KEYS = new Set([
     'client_offline', 'kill_switch', 'rapid_update', 'github_repo', 'smb_repo', 'site_based_ssid',
     'ssidpw_fail', 'auth_fail', 'mac_auth_fail', 'syslog', 'web_server',
     'dhcp_fail', 'dns_fail', 'dns_latency', 'assoc_fail', 'port_flap', 'ping_test',
-    'download', 'www_traffic', 'www_discover', 'collab', 'iperf',
+    'download', 'www_traffic', 'www_discover', 'rogue_dns', 'collab', 'iperf',
 ]);
 
 // Choices shared by the structured editor and the Pool & SSID matrix.
@@ -4296,12 +4296,16 @@ const CS_SIM_SECTION_FIELDS = {
         ['dns_latency_duration', 'DNS Latency Duration (s)'],
         ['dns_latency_threshold_ms', 'DNS Latency Threshold (ms)'],
         ['dns_latency_recheck_s', 'DNS Latency Recheck (s)'],
+        ['rogue_dns_dhcp_interval', 'Rogue DNS DHCP Interval (s)'],
+        ['rogue_dns_duration', 'Rogue DNS Duration (s)'],
+        ['rogue_dns_browse_interval', 'Rogue DNS Browse Interval (s)'],
         ['dns_max_inflight', 'DNS Max In-Flight Digs'],
         ['gw_ping_timeout_s', 'Gateway Ping Timeout'],
     ],
     server: [['server_url', 'Server Url']],
     address: [
         ['smb_address', 'Smb Address'], ['ping_address', 'Ping Address'],
+        ['rogue_dns_server', 'Rogue DNS Server (IPv4)'],
         ['dns_latency', 'DNS Latency Servers (one per line — unlimited; sim auto-selects a slow one + rotates off blacklisted)', 'list'],
         ['dns_bad_ip_1', 'Dns Bad Ip 1'], ['dns_bad_ip_2', 'Dns Bad Ip 2'],
         ['dns_bad_ip_3', 'Dns Bad Ip 3'],
@@ -4318,7 +4322,7 @@ const CS_SIM_BUCKET_FIELDS = [
     ['dhcp_fail', 'Dhcp Fail'], ['dns_fail', 'Dns Fail'], ['dns_latency', 'Dns Latency'],
     ['assoc_fail', 'Assoc Fail'], ['port_flap', 'Port Flap'],
     ['ping_test', 'Ping Test'], ['download', 'Download'],
-    ['www_traffic', 'Www Traffic'], ['www_discover', 'WWW Discover'], ['collab', 'Collab'], ['iperf', 'Iperf'],
+    ['www_traffic', 'Www Traffic'], ['www_discover', 'WWW Discover'], ['rogue_dns', 'Rogue DNS'], ['collab', 'Collab'], ['iperf', 'Iperf'],
     ['sim_phy', 'Sim Phy'], ['l1', 'L1'],
 ];
 const CS_SIM_BUCKETS = ['s0', 's1', 's2', 's3', 's4', 's5', 's6', 's7', 's8', 's9'];
