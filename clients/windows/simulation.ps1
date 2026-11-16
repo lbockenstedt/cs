@@ -382,24 +382,36 @@ function Test-SimProcess {
     return $Process.Name -eq 'powershell.exe' -and ([string]$Process.CommandLine).Contains("; $(Get-SimLaunchCommand $ScriptName)")
 }
 
-# 'running', 'stopped' or 'unknown'. A failed (or empty) process query is
-# unknown, never "not running": callers that would launch or restore must wait.
+# 'running', 'stopped' or 'unknown'. A successful empty query proves absence;
+# a failed query or an unreadable possible host does not.
 function Get-ScriptRunState {
     param([string]$ScriptName)
 
     try { $procs = @(Get-CimInstance Win32_Process -ErrorAction Stop) } catch { return 'unknown' }
-    if (-not $procs.Count) { return 'unknown' }
-    if ($procs | Where-Object { Test-SimProcess $_ $ScriptName } | Select-Object -First 1) { return 'running' }
+    $unknown = $false
+    foreach ($proc in $procs) {
+        if ($ScriptName -eq 'rogue_dns.ps1') {
+            # Destructive lifecycle operations require our exact launch match.
+            if (Test-SimProcess $proc $ScriptName) { return 'running' }
+            $possibleHost = $proc.Name -eq 'powershell.exe'
+        } else {
+            # Preserve generic sims' historical filename match, including -File
+            # launches in pwsh/ISE, like Linux's generic path-based pgrep.
+            if ([string]$proc.CommandLine -match [regex]::Escape($ScriptName)) { return 'running' }
+            $possibleHost = $proc.Name -in @('powershell.exe', 'pwsh.exe', 'powershell_ise.exe')
+        }
+        if ($possibleHost -and [string]::IsNullOrWhiteSpace([string]$proc.CommandLine)) { $unknown = $true }
+    }
+    if ($unknown) { return 'unknown' }
     return 'stopped'
 }
 
-# Generic sims keep the old rule (and Linux run_simulation's): a failed query
-# counts as not running. rogue_dns callers use Get-ScriptRunState instead, so an
-# unknown state never launches, browses over or restores rogue_dns.
+# Like Linux run_simulation, generic launch guards also wait on unknown state.
+# Lifecycle callers use the three-state result directly before restoring.
 function Test-ScriptRunning {
     param([string]$ScriptName)
 
-    return (Get-ScriptRunState -ScriptName $ScriptName) -eq 'running'
+    return (Get-ScriptRunState -ScriptName $ScriptName) -ne 'stopped'
 }
 
 function Run-Simulation {
@@ -572,13 +584,15 @@ function Update-RogueDnsGate {
     }
 }
 
-# www_traffic/fallback browse dispatch. While rogue_dns is on and not definitely
-# stopped (static phase, or a failed process query), never browse: the static
-# phase does its own browsing. Clients without rogue_dns behave exactly as before.
+# Match Linux: explicit WWW traffic is independent of the rogue_dns phase.
+# Only additional fallback traffic requires a definitely stopped rogue instance.
+# The WWW single-instance guard still blocks duplicate/unknown WWW launches.
 function Test-WwwBrowseDue {
-    if ($script:rogue_dns -eq 'on' -and (Get-ScriptRunState -ScriptName 'rogue_dns.ps1') -ne 'stopped') { return $false }
-    return ($script:www_traffic -eq 'on' -or ($script:rogue_dns -eq 'on' -and $script:rogueDnsBrowseReady)) -and
-        -not (Test-ScriptRunning -ScriptName 'www_traffic.ps1')
+    $due = $script:www_traffic -eq 'on'
+    if (-not $due -and $script:rogue_dns -eq 'on' -and $script:rogueDnsBrowseReady) {
+        $due = (Get-ScriptRunState -ScriptName 'rogue_dns.ps1') -eq 'stopped'
+    }
+    return $due -and -not (Test-ScriptRunning -ScriptName 'www_traffic.ps1')
 }
 
 # Close headless browsers, sparing the process tree of a running rogue_dns.ps1:
@@ -590,7 +604,12 @@ function Stop-SimFirefox {
     if (-not $procs.Count) { return }
     $keep = @{}
     $queue = [System.Collections.Generic.Queue[int]]::new()
-    $procs | Where-Object { Test-SimProcess $_ 'rogue_dns.ps1' } | ForEach-Object { $queue.Enqueue([int]$_.ProcessId) }
+    # An unreadable PowerShell host might own rogue_dns. Protect its subtree,
+    # not every browser on the machine: unrelated WWW browsers still get cleaned.
+    $procs | Where-Object {
+        (Test-SimProcess $_ 'rogue_dns.ps1') -or
+        ($_.Name -eq 'powershell.exe' -and [string]::IsNullOrWhiteSpace([string]$_.CommandLine))
+    } | ForEach-Object { $queue.Enqueue([int]$_.ProcessId) }
     while ($queue.Count) {
         $id = $queue.Dequeue()
         if ($keep.ContainsKey($id)) { continue }

@@ -223,9 +223,15 @@ The cycle repeats continuously: DHCP browsing for 30 minutes, then the same
 wireless lease address/prefix/gateway made static with the configured DNS for
 60 minutes, then DHCP again. When the rogue DNS script is not running, an
 enabled `rogue_dns` flag provides `www_traffic`-style browsing using the normal
-pacing and `websites.txt`, even with `www_traffic=off`. During the static hold,
-Firefox continues browsing random URLs from that list. There is no alert and
-no DNS server installation; supply a reachable DNS server before enabling it.
+pacing and `websites.txt`, even with `www_traffic=off`. This additional fallback
+requires a definite process absence. On both platforms, `www_traffic=on` keeps
+its normal browsing schedule independently of the rogue DNS phase; Windows
+also retains its fleet-wide every-ten-iterations WWW re-arm. During the static
+hold, both ordinary WWW traffic and the simulation's own browser use the rogue
+resolver intentionally. Process-query failures block new script launches on
+both platforms, including generic simulations; a successful empty query does
+not. There is no alert and no DNS server installation; supply a reachable DNS
+server before enabling it.
 Invalid/blank DNS or a missing DHCP lease is logged and skips network changes.
 
 The scripts restore DHCP and automatic DNS on completion and use persistent

@@ -603,13 +603,12 @@ rogue_dns_gate() {
   rogue_dns=off
   reconcile_rogue_dns
 }
-# Fallback/www browse on iteration $1. While rogue_dns is on, browse only when it
-# is definitely not running (rc 1): never during its static phase, and never on
-# a failed check. Clients without rogue_dns behave exactly as before.
+# Explicit WWW traffic keeps its normal schedule, including during a static
+# phase. Only the additional rogue_dns fallback requires definite absence.
 www_browse_due() {
   [[ " ${_www_iters[*]} " == *" $1 "* ]] || return 1
-  [[ "$www_traffic" == "on" || "$rogue_dns" == "on" ]] || return 1
-  [[ "$rogue_dns" == "on" ]] || return 0
+  [[ "$www_traffic" == "on" ]] && return 0
+  [[ "$rogue_dns" == "on" ]] || return 1
   rogue_dns_running
   (( $? == 1 ))
 }
@@ -754,7 +753,15 @@ run_simulation() {
   # stacking that pegged CPU. Match the exact script PATH so dns_fail.sh never
   # matches dns_latency.sh; `pgrep -f` matches the launched `bash <path>` line
   # (not run_simulation, whose cmdline is simulation.sh, nor tee's).
-  if pgrep -f "/usr/local/scripts/$script" >/dev/null 2>&1; then
+  local process_rc
+  if [[ "$script" == rogue_dns.sh ]]; then
+    rogue_dns_procs pgrep >/dev/null 2>&1
+  else
+    pgrep -f "/usr/local/scripts/$script" >/dev/null 2>&1
+  fi
+  process_rc=$?
+  # Only rc 1 proves absence. Errors must not launch duplicate simulations.
+  if (( process_rc != 1 )); then
     _rsleep "$sleep_time"
     return
   fi
@@ -881,9 +888,9 @@ if [ "$kill_switch" != "on" ]; then
  # the first iteration. The page just generates a request for stats — it does
  # nothing with the content and may hang; all instances are killed at loop end.
  declare -a _www_iters=()
- # rogue_dns adds the DHCP-phase fallback unless it is definitely running; a
- # failed check still schedules, because www_browse_due re-checks at use time.
- if [[ "$www_traffic" == "on" ]] || { [[ "$rogue_dns" == "on" ]] && { rogue_dns_running; (( $? != 0 )); }; }; then
+ # Allocate candidate slots for either source. www_browse_due alone decides
+ # eligibility at use time: a static phase may end during this cycle.
+ if [[ "$www_traffic" == "on" || "$rogue_dns" == "on" ]]; then
   for (( _wi=0; _wi<5; _wi++ )); do
    _www_iters+=("$(( 1 + RANDOM % 100 ))")
   done

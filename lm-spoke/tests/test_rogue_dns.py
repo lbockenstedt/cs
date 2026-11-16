@@ -368,14 +368,16 @@ def test_linux_dispatch_waits_on_failed_process_check():
 
 
 @pytest.mark.parametrize("www,rogue,pgrep_rc,due", [
-    ("on", "on", 0, False),   # static phase running: www_traffic=on must not browse
-    ("on", "on", 2, False),   # failed check is unknown, not "not running"
+    ("on", "on", 0, True),    # explicit WWW traffic is independent of the phase
+    ("on", "on", 2, True),    # explicit WWW traffic needs no rogue process query
+    ("off", "on", 0, False),  # no fallback during the static phase
+    ("off", "on", 2, False),  # unknown is not absence
     ("off", "on", 1, True),   # DHCP-phase fallback
     ("on", "off", 2, True),   # no rogue_dns: unchanged, no process check
     ("off", "off", 1, False),
 ])
 def test_linux_www_browse_gated_on_rogue_dns_state(tmp_path, www, rogue, pgrep_rc, due):
-    """Browsing while rogue_dns is on needs a definite not-running (rc 1)."""
+    """Only rogue_dns fallback browsing needs definite absence (rc 1)."""
     script = (linux_orchestrator(tmp_path, "rogue_dns_running", "www_browse_due")
               + f"pgrep() {{ return {pgrep_rc}; }}\nwww_traffic={www}\nrogue_dns={rogue}\n_www_iters=(7)\n"
               + "www_browse_due 3 && echo wrong-iteration\nwww_browse_due 7 && echo due || echo idle\n")
@@ -384,13 +386,13 @@ def test_linux_www_browse_gated_on_rogue_dns_state(tmp_path, www, rogue, pgrep_r
 
 
 @pytest.mark.parametrize("www,pgrep_rc,filled", [
-    ("off", 0, 0),   # static phase running at cycle start: no fallback this cycle
+    ("off", 0, 5),   # candidate slots survive a static phase ending mid-cycle
     ("off", 2, 5),   # failed check is unknown: schedule, www_browse_due re-checks at use time
     ("off", 1, 5),   # DHCP phase: fallback browsing
     ("on", 0, 5),    # www_traffic=on is unchanged
 ])
 def test_linux_www_iters_fill_as_before(tmp_path, www, pgrep_rc, filled):
-    """_www_iters fills as on dev: www_traffic=on, or rogue_dns=on and not definitely running."""
+    """Allocate candidates; only www_browse_due evaluates live process state."""
     source = (ROOT / "clients/linux/simulation.sh").read_text()
     block = source.split(" declare -a _www_iters=()\n", 1)[1].split("\n fi\n", 1)[0] + "\n fi\n"
     script = (linux_orchestrator(tmp_path, "rogue_dns_running")
@@ -559,21 +561,32 @@ def test_linux_per_client_override(tmp_path):
     assert "ipv4.dns 192.0.2.99" in calls(tmp_path)
 
 
+@pytest.mark.parametrize("name", ["rogue_dns.sh", "ping_test.sh"])
+@pytest.mark.parametrize("rc,launched", [(0, False), (1, True), (2, False)])
+def test_linux_dispatch_requires_definite_absence(tmp_path, name, rc, launched):
+    (tmp_path / name).write_text(":\n")
+    script = linux_orchestrator(tmp_path, "run_simulation")
+    script += (f"pgrep() {{ return {rc}; }}\n"
+               f"nohup() {{ touch '{tmp_path}/launched'; }}\n"
+               f"_rsleep() {{ :; }}\nrun_simulation {name} 0\nwait\n")
+    subprocess.run(["bash", "-c", script], check=True, timeout=5)
+    assert (tmp_path / "launched").exists() == launched
+
+
 def test_linux_dispatch_is_guarded_async_and_uncapped(tmp_path):
     """Execute the actual helper against a long sim; the second arg is a pause."""
     source = (ROOT / "clients/linux/simulation.sh").read_text()
     helper = source.split("run_simulation() {", 1)[1].split("\n}", 1)[0]
     assert 'nohup bash "/usr/local/scripts/$script"' in helper
     assert "timeout" not in helper
-    assert "if pgrep -f" in helper
+    assert 'if (( process_rc != 1 )); then' in helper
     assert '    if www_browse_due "$z"; then\n' in source
     # Every rogue_dns process check goes through the three-state helper.
     assert "[r]ogue_dns.sh" not in source
     assert 'run_simulation "rogue_dns.sh" 0' in source
     # A delayed child creates its marker independently of the launcher's return.
     (tmp_path / "rogue_dns.sh").write_text(f'sleep 1\ntouch "{tmp_path}/finished"\n')
-    script = "run_simulation() {" + helper + "\n}\n"
-    script = script.replace("/usr/local/scripts", str(tmp_path))
+    script = linux_orchestrator(tmp_path, "run_simulation")
     script += '_rsleep() { :; }\nrun_simulation rogue_dns.sh 0\nrun_simulation rogue_dns.sh 0\n'
     subprocess.run(["bash", "-c", script], check=True, timeout=5)
     # No assertion based on wall time: async ownership and lack of a cap above
@@ -767,6 +780,8 @@ Set-Content -LiteralPath (Join-Path $env:TEST_ROOT 'rogue_dns.state') -Value '{"
     ("cim_fail_stale", "Sync-RogueDns", "off", "off", False, "cim_fail", "static", "", ["process check failed", "retry True"], ["restore-only"]),
     # Unknown process state with a live instance: the marker is still written for it to see.
     ("stop_unknown_live", "Sync-RogueDns", "off", "on", True, "cim_fail", "static", "", ["process check failed", "retry True"], ["restore-only", "stop 10"]),
+    ("stop_hidden_live", "Sync-RogueDns", "off", "on", True, "hidden", "static", "", ["process check failed", "retry True"], ["restore-only", "stop 10"]),
+    ("firefox_hidden", "Stop-SimFirefox", "off", "off", True, "hidden", "static", "", ["stop 12"], ["stop 10", "stop 11"]),
     # Malformed start (string/bool/object/array) is corrupt: restore-only handles it.
     ("malformed_start_str", "Sync-RogueDns", "off", "off", False, "", "dhcp_bad:\"broken\"", "", ["rogue_dns state unreadable", "restore-only True"], []),
     ("malformed_start_bool", "Sync-RogueDns", "off", "off", False, "", "dhcp_bad:true", "", ["rogue_dns state unreadable", "restore-only True"], []),
@@ -774,18 +789,20 @@ Set-Content -LiteralPath (Join-Path $env:TEST_ROOT 'rogue_dns.state') -Value '{"
     ("malformed_start_arr", "Sync-RogueDns", "off", "off", False, "", "dhcp_bad:[1]", "", ["rogue_dns state unreadable", "restore-only True"], []),
     ("cim_fail_during_stop", "Sync-RogueDns", "off", "off", True, "cim_fail_late", "static", "",
      ["instance state unknown after stop request; keeping stop marker", "retry True"], ["restore-only", "stop 10", "force-killing"]),
-    # Other sims keep the old rule: a failed or empty query is "not running", so
-    # a Win32_Process failure doesn't block ping/iperf/www_traffic launches.
-    ("launch_unknown", "Test-WwwRunning", "off", "off", False, "cim_fail", "dhcp", "", ["result False"], []),
+    # Generic sims also block launches on failure, but not on a successful empty query.
+    ("launch_unknown", "Test-WwwRunning", "off", "off", False, "cim_fail", "dhcp", "", ["result True"], []),
     ("launch_empty", "Test-WwwRunning", "off", "off", False, "cim_empty", "dhcp", "", ["result False"], []),
     ("launch_stopped", "Test-WwwRunning", "off", "off", False, "", "dhcp", "", ["result False"], []),
-    # www_traffic=on is also the launch latch (re-armed every 10 iterations): never browse during the static phase.
-    ("browse_static_www_on", "Test-WwwBrowseDue", "on", "off", True, "", "static", "", ["result False"], []),
+    # Match Linux: explicit WWW traffic continues even during the static phase.
+    ("browse_static_www_on", "Test-WwwBrowseDue", "on", "off", True, "", "static", "", ["result True"], []),
+    ("fallback_static", "Test-WwwBrowseDue", "on", "off", True, "", "static", "", ["result False"], []),
+    ("fallback_unknown", "Test-WwwBrowseDue", "on", "off", False, "cim_fail", "dhcp", "", ["result False"], []),
+    ("fallback_stopped", "Test-WwwBrowseDue", "on", "off", False, "", "dhcp", "", ["result True"], []),
     ("browse_unknown", "Test-WwwBrowseDue", "on", "off", False, "cim_fail", "dhcp", "", ["result False"], []),
     ("browse_dhcp_fallback", "Test-WwwBrowseDue", "on", "off", False, "", "dhcp", "", ["result True"], []),
     ("browse_no_rogue_dns", "Test-WwwBrowseDue", "off", "off", True, "", "static", "", ["result True"], []),
-    # Without rogue_dns a failed query browses as before cs#258.
-    ("browse_unknown_no_rogue_dns", "Test-WwwBrowseDue", "off", "off", True, "cim_fail", "static", "", ["result True"], []),
+    # Unknown WWW process state blocks a duplicate launch even without rogue_dns.
+    ("browse_unknown_no_rogue_dns", "Test-WwwBrowseDue", "off", "off", True, "cim_fail", "static", "", ["result False"], []),
     # The every-10-iterations re-arm: www_traffic always (as before cs#258, no
     # configured-value latch); rogue_dns fallback unless definitely running.
     ("rearm_stopped", "Invoke-Rearm", "on", "off", False, "", "dhcp", "", ["www on ready True"], []),
@@ -849,6 +866,8 @@ def test_windows_orchestrator_cancels_and_recovers(tmp_path, scenario, action, f
     procs += [dict(ProcessId=13, ParentProcessId=1, Name="notepad.exe", CommandLine=f"notepad {script}"),
               dict(ProcessId=14, ParentProcessId=1, Name="powershell_ise.exe", CommandLine=f"powershell_ise.exe -File {script}"),
               dict(ProcessId=15, ParentProcessId=1, Name="powershell.exe", CommandLine=f"powershell -Command \"Get-Content '{script}'\"")]
+    if mode == "hidden":
+        next(proc for proc in procs if proc["ProcessId"] == 10)["CommandLine"] = None
     (tmp_path / "procs.json").write_text(json.dumps(procs))
     env = dict(os.environ, TEST_ROOT=str(tmp_path), ACTION=action, FLAG=flag, KILL=kill, MODE=mode,
                WWW="on" if scenario.startswith("browse") else "off",
@@ -865,9 +884,47 @@ def test_windows_orchestrator_cancels_and_recovers(tmp_path, scenario, action, f
     for decoy in (13, 14, 15):
         assert f"stop {decoy}" not in log, log
     # The marker is kept whenever a stop is owed but the process state is unknown.
-    assert (tmp_path / "rogue_dns.stop").exists() == (scenario in {"cim_fail_during_stop", "cim_fail_stale", "stop_unknown_live"})
-    if action == "Sync-RogueDns" and scenario not in {"on_and_running", "cim_fail_stale", "cim_fail_during_stop", "stop_unknown_live"}:
+    assert (tmp_path / "rogue_dns.stop").exists() == (scenario in {"cim_fail_during_stop", "cim_fail_stale", "stop_unknown_live", "stop_hidden_live"})
+    if action == "Sync-RogueDns" and scenario not in {"on_and_running", "cim_fail_stale", "cim_fail_during_stop", "stop_unknown_live", "stop_hidden_live"}:
         assert read_state(tmp_path)["phase"] == "dhcp"
+    if scenario == "stop_hidden_live":
+        assert read_state(tmp_path)["phase"] == "static"
+
+
+@pytest.mark.parametrize("name,command,sim,expected", [
+    (None, None, "rogue_dns.ps1", "stopped"),
+    ("powershell.exe", None, "rogue_dns.ps1", "unknown"),
+    ("powershell.exe", "   ", "rogue_dns.ps1", "unknown"),
+    ("notepad.exe", None, "rogue_dns.ps1", "stopped"),
+    ("powershell.exe", None, "ping_test.ps1", "unknown"),
+    ("pwsh.exe", None, "ping_test.ps1", "unknown"),
+    ("powershell_ise.exe", " ", "ping_test.ps1", "unknown"),
+    ("pwsh.exe", "pwsh -File C:/Scripts/ping_test.ps1", "ping_test.ps1", "running"),
+    ("powershell.exe", "powershell -File C:/Scripts/ping_test.ps1", "ping_test.ps1", "running"),
+])
+def test_windows_process_state_coverage(tmp_path, name, command, sim, expected):
+    powershell = shutil.which("powershell") or shutil.which("pwsh")
+    if not powershell:
+        pytest.skip("PowerShell is not installed")
+    source = (ROOT / "clients/windows/simulation.ps1").read_text()
+    functions = ""
+    for function in ("Convert-ToSingleQuotedLiteral", "Get-SimLaunchCommand", "Test-SimProcess", "Get-ScriptRunState", "Test-ScriptRunning"):
+        functions += f"function {function} {{" + source.split(f"\nfunction {function} {{", 1)[1].split("\n}\n", 1)[0] + "\n}\n"
+    procs = [] if name is None else [dict(Name=name, CommandLine=command)]
+    (tmp_path / "procs.json").write_text(json.dumps(procs))
+    script = functions + """
+$scriptRoot = $env:TEST_ROOT
+function Get-CimInstance { [CmdletBinding()] param($ClassName)
+    Get-Content (Join-Path $env:TEST_ROOT 'procs.json') -Raw | ConvertFrom-Json
+}
+Get-ScriptRunState $env:SIM
+Test-ScriptRunning $env:SIM
+"""
+    (tmp_path / "test.ps1").write_text(script)
+    result = subprocess.run([powershell, "-NoProfile", "-NonInteractive", "-File", str(tmp_path / "test.ps1")],
+                            env=dict(os.environ, TEST_ROOT=str(tmp_path), SIM=sim), capture_output=True, text=True, timeout=15)
+    assert result.returncode == 0 and not result.stderr, result.stdout + result.stderr
+    assert result.stdout.splitlines() == [expected, str(expected != "stopped")]
 
 
 def test_windows_orchestrator_wiring():
