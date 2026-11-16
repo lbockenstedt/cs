@@ -243,3 +243,10 @@ def test_windows_mocked_state_machine(tmp_path, scenario):
             assert "new ip" in operations
         if scenario == "override":
             assert "dns 192.0.2.99" in operations
+
+
+def test_rogue_dns_client_without_ip_can_be_quarantined():
+    """rogue_dns keeps an IP throughout (DHCP, then static), so a client that
+    never got one is a bad dongle: it must not be in the quarantine exclusions."""
+    from sim_quota_engine import _default_qt_exclude_sims
+    assert "rogue_dns" not in _default_qt_exclude_sims()

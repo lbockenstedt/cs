@@ -301,7 +301,6 @@ def test_default_qt_exclude_derives_from_exclusive_list():
     assert derived == exclusive - set(QT_EXCLUDE_NONISOLATING_SIMS)
     assert derived == set(QT_EXCLUDE_SIMS_DEFAULT)          # identical today
     assert "dns_fail" not in derived and "dns_latency" not in derived
-    assert "rogue_dns" not in derived                       # keeps an IP (static)
     assert "dhcp_fail" in derived                            # no-IP-by-design
 
 
