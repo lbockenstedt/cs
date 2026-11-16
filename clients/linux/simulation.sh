@@ -333,7 +333,7 @@ if [[ "$web_server" == "on" ]]; then
   # Start every sim OFF. The engine turns failure sims on via the [username]
   # override applied further down; the roll below is what turns AMBIENT traffic on.
   for sim in dhcp_fail dns_fail dns_latency assoc_fail port_flap ssidpw_fail auth_fail \
-             mac_auth_fail ping_test download iperf www_traffic www_discover collab client_offline; do declare -g "$sim=off"; done
+             mac_auth_fail ping_test download iperf www_traffic www_discover rogue_dns collab client_offline; do declare -g "$sim=off"; done
   #
   # Ambient distribution — two-step model (level, then weighted split)
   # ------------------------------------------------------------------
@@ -399,6 +399,8 @@ else
   download=$(get_value $simulation_id 'download')
   iperf=$(get_value $simulation_id 'iperf')
   www_traffic=$(get_value $simulation_id 'www_traffic')
+  rogue_dns=$(get_value $simulation_id 'rogue_dns')
+  rogue_dns="${rogue_dns:-off}"
   www_discover=$(get_value $simulation_id 'www_discover')
   www_discover="${www_discover:-off}"
   collab=$(get_value $simulation_id 'collab')
@@ -410,7 +412,7 @@ else
     random_bucket="s$(( RANDOM % 10 ))"
     echo "Ambient random pool: rolling behaviour from bucket ${random_bucket}" | tee -a ${LOG_FILE}
     for sim in dhcp_fail dns_fail assoc_fail port_flap ssidpw_fail auth_fail \
-               mac_auth_fail ping_test download iperf www_traffic www_discover collab; do
+               mac_auth_fail ping_test download iperf www_traffic www_discover rogue_dns collab; do
       if [[ " $randomizable_sims " == *" $sim "* ]]; then
         declare -g "$sim=$(get_value $random_bucket "$sim")"
       else
@@ -538,7 +540,7 @@ report_status() {
   # (its heartbeat rides a separate backend network, so absence here ≠ offline).
   sim_ip=$(ip -4 -o route get 1.1.1.1 2>/dev/null | grep -oP 'src \K\S+' | head -n1)
   [[ "${gateway_reachable:-}" == "true" ]] && gateway_json=true
-  for sim in dns_fail dns_latency assoc_fail port_flap iperf download www_traffic www_discover ping_test ssidpw_fail auth_fail mac_auth_fail dhcp_fail collab client_offline; do
+  for sim in dns_fail dns_latency assoc_fail port_flap iperf download www_traffic www_discover rogue_dns ping_test ssidpw_fail auth_fail mac_auth_fail dhcp_fail collab client_offline; do
     if [[ "${!sim}" == "on" ]]; then
       [[ $first == true ]] && first=false || active_simulations+=","
       active_simulations+="\"$sim\""
@@ -560,11 +562,11 @@ report_status() {
   detect_adapter_inventory
   local payload
   printf -v payload \
-    '{"hostname":"%s","simulation_id":"%s","platform":"%s","iteration":%s,"connected_ssid":"%s","ip":"%s","gateway_reachable":%s,"dns_ceiling":%s,"active_simulations":[%s],"errors":%s,"adapters":%s,"config":{"kill_switch":"%s","dns_fail":"%s","dns_latency":"%s","iperf":"%s","www_traffic":"%s","www_discover":"%s","download":"%s","ping_test":"%s","ssidpw_fail":"%s","auth_fail":"%s","mac_auth_fail":"%s","dhcp_fail":"%s","collab":"%s","client_offline":"%s"}}' \
+    '{"hostname":"%s","simulation_id":"%s","platform":"%s","iteration":%s,"connected_ssid":"%s","ip":"%s","gateway_reachable":%s,"dns_ceiling":%s,"active_simulations":[%s],"errors":%s,"adapters":%s,"config":{"kill_switch":"%s","dns_fail":"%s","dns_latency":"%s","iperf":"%s","www_traffic":"%s","www_discover":"%s","rogue_dns":"%s","download":"%s","ping_test":"%s","ssidpw_fail":"%s","auth_fail":"%s","mac_auth_fail":"%s","dhcp_fail":"%s","collab":"%s","client_offline":"%s"}}' \
     "$(json_escape "$hostname")" "$(json_escape "${simulation_id:-}")" "$(json_escape "$platform")" \
     "$iteration" "$(json_escape "${connected_ssid:-}")" "$(json_escape "${sim_ip:-}")" "$gateway_json" "$dns_ceiling" "$active_simulations" "$errors_json" "$adapters_json" \
     "$(json_escape "${kill_switch:-off}")" "$(json_escape "${dns_fail:-off}")" "$(json_escape "${dns_latency:-off}")" "$(json_escape "${iperf:-off}")" \
-    "$(json_escape "${www_traffic:-off}")" "$(json_escape "${www_discover:-off}")" "$(json_escape "${download:-off}")" "$(json_escape "${ping_test:-off}")" \
+    "$(json_escape "${www_traffic:-off}")" "$(json_escape "${www_discover:-off}")" "$(json_escape "${rogue_dns:-off}")" "$(json_escape "${download:-off}")" "$(json_escape "${ping_test:-off}")" \
     "$(json_escape "${ssidpw_fail:-off}")" "$(json_escape "${auth_fail:-off}")" "$(json_escape "${mac_auth_fail:-off}")" "$(json_escape "${dhcp_fail:-off}")" \
     "$(json_escape "${collab:-off}")" "$(json_escape "${client_offline:-off}")"
   local status_file="/usr/local/scripts/client-status.json"
@@ -751,7 +753,7 @@ if [ "$kill_switch" != "on" ]; then
  # the first iteration. The page just generates a request for stats — it does
  # nothing with the content and may hang; all instances are killed at loop end.
  declare -a _www_iters=()
- if [[ "$www_traffic" == "on" ]]; then
+ if [[ "$www_traffic" == "on" ]] || { [[ "$rogue_dns" == "on" ]] && ! pgrep -f '[r]ogue_dns.sh' >/dev/null; }; then
   for (( _wi=0; _wi<5; _wi++ )); do
    _www_iters+=("$(( 1 + RANDOM % 100 ))")
   done
@@ -1013,7 +1015,7 @@ if [ "$kill_switch" != "on" ]; then
    #------------------------------------------------------------
    #Running WWW Traffic Simulation
    #------------------------------------------------------------
-    if [[ "$www_traffic" == "on" ]] && [[ " ${_www_iters[*]} " == *" $z "* ]]; then
+    if { [[ "$www_traffic" == "on" ]] || { [[ "$rogue_dns" == "on" ]] && ! pgrep -f '[r]ogue_dns.sh' >/dev/null; }; } && [[ " ${_www_iters[*]} " == *" $z "* ]]; then
      echo Running WWW Traffic simulation | tee -a ${LOG_FILE}
      wwwfile=($(< /usr/local/scripts/websites.txt))
      if [[ ${#wwwfile[@]} -eq 0 ]]; then
@@ -1040,6 +1042,12 @@ if [ "$kill_switch" != "on" ]; then
     fi
    #------------------------------------------------------------
    #End WWW Traffic Simulation
+   #------------------------------------------------------------
+   #Running Rogue DNS simulation (async; pause is not a runtime timeout)
+   #------------------------------------------------------------
+   if [[ "$rogue_dns" == "on" ]] && ! pgrep -f '[r]ogue_dns.sh' >/dev/null; then
+    run_simulation "rogue_dns.sh" 0
+   fi
    #------------------------------------------------------------
    #Running WWW Discover simulation
    #------------------------------------------------------------

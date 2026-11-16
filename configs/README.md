@@ -202,6 +202,37 @@ sim_phy=wireless        # wireless or ethernet
 | `iperf`       | Runs iPerf to `iperf_server` (bandwidth test)      | —                            |
 | `collab`      | Replays a Teams/Zoom/WebEx capture (or synthetic UDP) to `collab_server`; hub sink replays the server side back | — |
 
+#### Rogue DNS (wireless Linux/Windows)
+
+Set `rogue_dns=on` in the engine config buckets assigned to the selected clients;
+it defaults to `off` in all `[s0]`–`[s9]` buckets. Configure the existing local DNS
+server in the sim-conf editor's **address** section and the timings in
+**simulation**:
+
+```ini
+[address]
+rogue_dns_server=                 # required DNS server IPv4 address; blank skips static changes
+
+[simulation]
+rogue_dns_dhcp_interval=1800      # 30 minutes on DHCP before each static phase
+rogue_dns_duration=3600           # 60 minutes holding the same IP/mask/gateway as static
+rogue_dns_browse_interval=60      # seconds between static-phase headless web requests
+```
+
+The cycle repeats continuously: DHCP browsing for 30 minutes, then the same
+wireless lease address/prefix/gateway made static with the configured DNS for
+60 minutes, then DHCP again. When the rogue DNS script is not running, an
+enabled `rogue_dns` flag provides `www_traffic`-style browsing using the normal
+pacing and `websites.txt`, even with `www_traffic=off`. During the static hold,
+Firefox continues browsing random URLs from that list. There is no alert and
+no DNS server installation; supply a reachable DNS server before enabling it.
+Invalid/blank DNS or a missing DHCP lease is logged and skips network changes.
+
+The scripts restore DHCP and automatic DNS on completion and use persistent
+phase state for recovery after a crash/reboot; Windows also restores stale
+static state at orchestrator startup. See [Rogue DNS recovery and configuration](../docs/cs.md#rogue-dns--static-ip--fixed-dns)
+for the platform-specific restore behaviour and state-file paths.
+
 #### How many clients does a simulation need to fire an alert?
 
 Each alert or insight in Aruba Central has a minimum number of clients that must
