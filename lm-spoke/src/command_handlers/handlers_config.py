@@ -43,6 +43,8 @@ _CENTRAL_SECRET_FIELDS = frozenset({"client_secret", "access_token", "refresh_to
 # / tier_priority are merged into, and the override-text write path depends on
 # config_source + the github token.
 _CS_CONFIG_COUPLED = {
+    "central_config_clear_secrets": ("central_config",),
+    "central_on_prem_config_clear_secrets": ("central_on_prem_config",),
     "central_sites_config": ("qt_exclude_sims", "tier_priority"),
     "config_source": ("sim_conf_override", "user_conf_override"),
     "github_config": ("sim_conf_override", "user_conf_override"),

@@ -57,6 +57,12 @@ Dispatched in `CSSpoke.handle_command`. `*_GET_STATUS` falls back to
 | `CS_UPDATE_CONFIG` (`UPDATE_CONFIG`) | `{"content":"<ini>"}` | `{"status","message"}` (validates INI) |
 | `CS_UPDATE_USER_OVERRIDES` | `{"content":"<ini>"}` | `{"status","message"}` (validates INI) |
 
+Central config commands and `CS_CONFIG_UPDATE` accept `central_config_clear_secrets`
+and `central_on_prem_config_clear_secrets` lists of `client_secret`, `access_token`, or
+`refresh_token`, or nested `<field>_clear: true` flags. Clears remove local credentials
+and reload the poller; blank fields preserve them. Updated hubs persist nested flags
+for reconnect replay. Standalone Central status returns only public settings and `*_set` flags.
+
 ### Kill switch
 | Command | Payload | Response |
 |---|---|---|

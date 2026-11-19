@@ -234,7 +234,7 @@ def build_local_ui_router(spoke) -> APIRouter:
 
     @router.get("/aggregate/central-status")
     async def aggregate_central_status():
-        """Return the Central status plus the saved Central config."""
+        """Return Central status and public settings, never stored credentials."""
         # Saved Central config, and the status (or an empty list).
         cc = spoke.local_store.get_central_config()
         data: Dict[str, Any] = (
@@ -243,7 +243,21 @@ def build_local_ui_router(spoke) -> APIRouter:
         )
         # Merge hub-owned central config (mode + cluster creds) so the Setup →
         # Central API tab's form populates (mirrors the hub's get_central_status).
-        data["hub_central_config"] = {k: v for k, v in cc.items() if k != "mode"}
+        public = {key: cc[key] for key in (
+            "client_id", "customer_id", "cluster_url", "token_url",
+            "api_version", "poll_interval_s",
+        ) if key in cc}
+        public.update({f"{key}_set": bool(cc.get(key)) for key in (
+            "client_secret", "access_token", "refresh_token",
+        )})
+        thresholds = cc.get("cc_thresholds")
+        if isinstance(thresholds, dict):
+            public["cc_thresholds"] = {
+                key: value for key, value in thresholds.items()
+                if key in ("warn_pct", "error_pct", "die_off_pct", "min_peak")
+                and isinstance(value, (int, float)) and not isinstance(value, bool)
+            }
+        data["hub_central_config"] = public
         if cc.get("mode"):
             data["mode"] = cc["mode"]
         return data

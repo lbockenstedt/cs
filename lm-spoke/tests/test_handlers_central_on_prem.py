@@ -14,12 +14,15 @@ import json
 from pathlib import Path
 
 import pytest
+from fastapi import FastAPI
+from fastapi.testclient import TestClient
 
 from command_queue import CommandQueue, CSSettings
 from client_registry import ClientRegistry
 from central_poller import CentralPoller
 from cs_spoke import CSSpoke
 from local_store import LocalStore
+from local_ui_routes import build_local_ui_router
 
 CONFIGS = Path(__file__).resolve().parent.parent.parent / "configs"
 
@@ -229,6 +232,61 @@ def test_config_update_clears_secrets_from_both_central_slots(spoke_loop):
     assert "central_on_prem_config" in resp["applied"]
     assert "client_secret" not in spoke.local_store.get_central_config()
     assert "access_token" not in spoke.local_store.get_central_on_prem_config()
+
+
+@pytest.mark.parametrize("slot", ["central", "central_on_prem"])
+def test_full_push_applies_clear_list_when_config_is_unchanged(spoke_loop, slot):
+    """Changed clear lists must bring along the unchanged config they modify."""
+    spoke, loop = spoke_loop
+    key = f"{slot}_config"
+    setter = getattr(spoke.local_store, f"set_{key}")
+    getter = getattr(spoke.local_store, f"get_{key}")
+    payload = {key: {"client_id": "id"}, "full_config": True}
+    _run(loop, spoke.handle_command("CS_CONFIG_UPDATE", payload))
+    setter({"client_id": "id", "access_token": "stale-token"})
+    result = _run(loop, spoke.handle_command("CS_CONFIG_UPDATE", {
+        **payload, f"{key}_clear_secrets": ["access_token"],
+    }))
+    assert key in result["applied"]
+    assert "access_token" not in getter()
+
+
+@pytest.mark.parametrize("slot", ["central", "central_on_prem"])
+def test_reconnect_applies_persisted_clear_marker(spoke_loop, slot):
+    """Clear intent is delivered inside a persisted config, not only a patch."""
+    spoke, loop = spoke_loop
+    key = f"{slot}_config"
+    setter = getattr(spoke.local_store, f"set_{key}")
+    getter = getattr(spoke.local_store, f"get_{key}")
+    setter({"client_id": "id", "access_token": "stale-token"})
+    result = _run(loop, spoke.handle_command("CS_CONFIG_UPDATE", {
+        key: {"client_id": "id", "access_token_clear": True},
+        "full_config": True,
+    }))
+    assert key in result["applied"]
+    assert getter() == {"client_id": "id"}
+
+
+def test_local_status_redacts_credentials_and_reports_presence(spoke_loop):
+    """The standalone dashboard consumes the same redacted contract as LM."""
+    spoke, _ = spoke_loop
+    spoke.local_store.set_central_config({
+        "client_id": "id", "client_secret": "saved-secret",
+        "access_token": "kv:stored-ref", "refresh_token": "",
+        "unexpected": "hidden", "cc_thresholds": {
+            "warn_pct": 20, "error_pct": 50, "unexpected": "hidden"},
+    })
+    app = FastAPI()
+    app.include_router(build_local_ui_router(spoke))
+    response = TestClient(app).get("/sim/api/aggregate/central-status")
+    assert response.status_code == 200
+    assert response.json()["hub_central_config"] == {
+        "client_id": "id", "client_secret_set": True,
+        "access_token_set": True, "refresh_token_set": False,
+        "cc_thresholds": {"warn_pct": 20, "error_pct": 50},
+    }
+    for secret in ("saved-secret", "kv:stored-ref", "hidden"):
+        assert secret not in response.text
 
 
 def test_config_update_applies_central_on_prem_sites_config(spoke_loop):
