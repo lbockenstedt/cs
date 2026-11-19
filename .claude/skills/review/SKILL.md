@@ -133,7 +133,9 @@ example `<session folder>/files/review/<repo>`).
    and whatever is still broken remains an outage. If it did not help,
    it broke something that worked before, or the live check failed, was
    incomplete or could not run, revert it at once (fleet rule
-   3.9) unless the owner directs another mitigation. The revert undoes only
+   3.9) unless the owner directs another mitigation. Every inconclusive
+   outcome requires the revert, but is recorded as what it was (failed,
+   incomplete or not run), never as "did not help". The revert undoes only
    that fix and needs only smoke.sh and CI: what it brings back was
    reviewed, or is an earlier outage fix kept after its live check.
 
