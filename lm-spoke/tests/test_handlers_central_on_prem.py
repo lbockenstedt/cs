@@ -133,6 +133,11 @@ def test_set_central_on_prem_config_sentinel_merge_keeps_existing(spoke_loop):
     cfg = spoke.local_store.get_central_on_prem_config()
     assert cfg["client_id"] == "cid2"
     assert cfg["client_secret"] == "sec"  # kept (empty is a sentinel, not a wipe)
+    _run(loop, spoke.handle_command("CS_SET_CENTRAL_ON_PREM_CONFIG", {
+        "central_on_prem_config": {"client_secret_clear": True}}))
+    cfg = spoke.local_store.get_central_on_prem_config()
+    assert "client_secret" not in cfg
+    assert "client_secret_clear" not in cfg
 
 
 def test_get_central_on_prem_config_round_trips(spoke_loop):
@@ -205,6 +210,25 @@ def test_config_update_applies_central_on_prem_config(spoke_loop):
     assert cfg["client_id"] == "cid"
     # Cloud Central config + sites config untouched.
     assert spoke.local_store.get_central_config() == {}
+
+
+def test_config_update_clears_secrets_from_both_central_slots(spoke_loop):
+    spoke, loop = spoke_loop
+    spoke.local_store.set_central_config({"client_secret": "cloud-secret",
+                                          "client_id": "cloud-id"})
+    spoke.local_store.set_central_on_prem_config({"access_token": "on-prem-token",
+                                                  "client_id": "on-prem-id"})
+    resp = _run(loop, spoke.handle_command("CS_CONFIG_UPDATE", {
+        "central_config": {"client_id": "cloud-id"},
+        "central_config_clear_secrets": ["client_secret"],
+        "central_on_prem_config": {"client_id": "on-prem-id"},
+        "central_on_prem_config_clear_secrets": ["access_token"],
+    }))
+    assert resp["status"] == "SUCCESS"
+    assert "central_config" in resp["applied"]
+    assert "central_on_prem_config" in resp["applied"]
+    assert "client_secret" not in spoke.local_store.get_central_config()
+    assert "access_token" not in spoke.local_store.get_central_on_prem_config()
 
 
 def test_config_update_applies_central_on_prem_sites_config(spoke_loop):

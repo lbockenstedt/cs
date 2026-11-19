@@ -35,6 +35,7 @@ logger = logging.getLogger("CSSpoke")
 
 # Envelope keys that are not config values themselves.
 _CS_CONFIG_META_KEYS = ("config_hash", "full_config")
+_CENTRAL_SECRET_FIELDS = frozenset({"client_secret", "access_token", "refresh_token"})
 
 # Keys whose apply branch reads/rewrites state owned by another key, so when the
 # owner is re-applied by a full-config diff the dependants must ride along even
@@ -307,7 +308,8 @@ class ConfigCommandsMixin:
 
     async def _cmd_set_central_config(self, d):
         """Merge and save a Central API config patch."""
-        self._merge_central_config(d.get("central_config") or {})
+        self._merge_central_config(
+            d.get("central_config") or {}, d.get("central_config_clear_secrets"))
         return {"status": "SUCCESS"}
 
     async def _cmd_get_central_sites_config(self, d):
@@ -377,7 +379,9 @@ class ConfigCommandsMixin:
 
     async def _cmd_set_central_on_prem_config(self, d):
         """Merge and save a Central On-Prem API config patch."""
-        self._merge_central_on_prem_config(d.get("central_on_prem_config") or {})
+        self._merge_central_on_prem_config(
+            d.get("central_on_prem_config") or {},
+            d.get("central_on_prem_config_clear_secrets"))
         return {"status": "SUCCESS"}
 
     async def _cmd_get_central_on_prem_sites_config(self, d):
@@ -902,7 +906,8 @@ class ConfigCommandsMixin:
     }
 
     # Start from the stored config.
-    def _merge_central_config(self, cfg: Dict[str, Any]) -> Dict[str, Any]:
+    def _merge_central_config(self, cfg: Dict[str, Any],
+                              clear_fields=()) -> Dict[str, Any]:
         """Sentinel-merge a Central API config patch into local_store and rebuild
         the poller's ArubaClient. Shared by CS_SET_CENTRAL_CONFIG (standalone
         local UI) and the hub-pushed CS_CONFIG_UPDATE path (_apply_hub_config) so
@@ -913,15 +918,24 @@ class ConfigCommandsMixin:
         save — e.g. changing only Mode, or a hub push that omits unchanged
         secrets — never wipes creds). A new key with an empty value is still
         written (first-time provisioning of a placeholder field)."""
+        source = cfg if isinstance(cfg, dict) else {}
+        values = dict(source)
+        clear = {field for field in _CENTRAL_SECRET_FIELDS
+                 if values.pop(f"{field}_clear", False) is True}
+        if isinstance(clear_fields, (list, tuple)):
+            clear.update(field for field in clear_fields
+                         if isinstance(field, str) and field in _CENTRAL_SECRET_FIELDS)
         current = self.local_store.get_central_config()
         merged = dict(current)
         # Merge non-empty values, and new keys even when empty.
-        for k, v in (cfg or {}).items():
+        for k, v in values.items():
             # token_url is not a secret: blank means "override removed".
             if v not in (None, "") or k == "token_url":
                 merged[k] = v
             elif k not in current:
                 merged[k] = v
+        for field in clear:
+            merged.pop(field, None)
         # Save and reload the poller.
         self.local_store.set_central_config(merged)
         self.central_poller.reload()
@@ -952,7 +966,8 @@ class ConfigCommandsMixin:
         self.mist_poller.reload()
         return merged
 
-    def _merge_central_on_prem_config(self, cfg: Dict[str, Any]) -> Dict[str, Any]:
+    def _merge_central_on_prem_config(self, cfg: Dict[str, Any],
+                                      clear_fields=()) -> Dict[str, Any]:
         """Sentinel-merge a Central On-Prem API config patch into local_store and
         rebuild the on-prem poller's ArubaClient. Twin of ``_merge_central_config``:
         shared by CS_SET_CENTRAL_ON_PREM_CONFIG (standalone local UI) and the
@@ -965,14 +980,23 @@ class ConfigCommandsMixin:
         secrets — never wipes creds). A new key with an empty value is still
         written (first-time provisioning of a placeholder field)."""
         # Start from the stored config.
+        source = cfg if isinstance(cfg, dict) else {}
+        values = dict(source)
+        clear = {field for field in _CENTRAL_SECRET_FIELDS
+                 if values.pop(f"{field}_clear", False) is True}
+        if isinstance(clear_fields, (list, tuple)):
+            clear.update(field for field in clear_fields
+                         if isinstance(field, str) and field in _CENTRAL_SECRET_FIELDS)
         current = self.local_store.get_central_on_prem_config()
         merged = dict(current)
         # Merge non-empty values, and new keys even when empty.
-        for k, v in (cfg or {}).items():
+        for k, v in values.items():
             if v not in (None, ""):
                 merged[k] = v
             elif k not in current:
                 merged[k] = v
+        for field in clear:
+            merged.pop(field, None)
         # Save and reload the poller.
         self.local_store.set_central_on_prem_config(merged)
         self.central_on_prem_poller.reload()
@@ -1115,7 +1139,10 @@ class ConfigCommandsMixin:
         reloaded so a hub-side Config -> Sim Quotas save reaches this spoke.
         """
         # Central credentials.
-        self._apply_creds(patch, "central_config", self._merge_central_config, applied)
+        self._apply_creds(
+            patch, "central_config",
+            lambda cfg: self._merge_central_config(
+                cfg, patch.get("central_config_clear_secrets")), applied)
         # Hub processing modes: a "centralized" feature is polled by the HUB, so
         # its spoke poller goes idle (pollers check local_store.hub_polls each
         # cycle). Clear the relayed status now rather than waiting up to a poll
@@ -1133,8 +1160,10 @@ class ConfigCommandsMixin:
         self._apply_sites(patch, "central_sites_config", "central_poller", applied)
         self._apply_creds(patch, "mist_config", self._merge_mist_config, applied)
         self._apply_sites(patch, "mist_sites_config", "mist_poller", applied)
-        self._apply_creds(patch, "central_on_prem_config",
-                          self._merge_central_on_prem_config, applied)
+        self._apply_creds(
+            patch, "central_on_prem_config",
+            lambda cfg: self._merge_central_on_prem_config(
+                cfg, patch.get("central_on_prem_config_clear_secrets")), applied)
         self._apply_sites(patch, "central_on_prem_sites_config",
                           "central_on_prem_poller", applied)
 
