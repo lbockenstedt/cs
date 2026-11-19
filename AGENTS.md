@@ -113,10 +113,8 @@ Specialist agents live in `.github/agents/`; pick one in Copilot with
    normal two-panel review, and whatever is still broken remains an outage.
    If it did not help, it broke something that worked before (DNS back
    but login broken), or the live check failed, was incomplete or could
-   not run, revert it at once (rule 3.9) unless the owner directs
-   another mitigation. Every inconclusive outcome requires the revert,
-   but is recorded as what it was (failed, incomplete or not run), never
-   as "did not help". The revert undoes only that fix and needs only
+   not run (inconclusive counts as not helped), revert it at once (rule 3.9) unless the owner directs
+   another mitigation. The revert undoes only that fix and needs only
    smoke.sh and CI: what it brings back was reviewed, or is an earlier
    outage fix kept after its live check. The exception is for a person or
    a local session fixing a live outage; AB's own 0.90 bar (rule 10.3) does
@@ -137,6 +135,46 @@ Specialist agents live in `.github/agents/`; pick one in Copilot with
 
    Why: the NAC change grew during review from 6 files and 631 lines to 52
    files and 5,199 lines, and took 16 rounds.
+9. **Find everything in one review round, and fix it in one pass.**
+   - **What blocks.** A review finding blocks the change only when it is
+     one of these:
+     - a security hole, a cross-tenant leak included;
+     - a regression: something that worked before now breaks;
+     - a bug: new behaviour is wrong or missing against the stated intent,
+       on a path real input reaches;
+     - a crash;
+     - data loss;
+     - a breach of these rules in new or changed lines (rule 8's size
+       budget is a guide, not a breach).
+
+     Everything else is a follow-up, never a reason to Reject: an edge
+     case that fails safe, a pre-existing defect (an unfixed sibling copy
+     the intent does not promise to fix included), wording, or a
+     suggestion.
+   - **Reviewers list every finding in one pass,** not just the first, so
+     the author can fix them all before the next round.
+   - **Fix a class in one pass.** When a finding is one case of a class (a
+     missed tenant check, an unhandled state), first grep every call site
+     of that class in the change and its twins. Then write a state
+     matrix: each state the data can be in, against each site, and what
+     that site must do. Fix every cell, with a test for each state, before
+     the next round. Copies in code the change does not touch go in their
+     own change (rule 4).
+   - **Design review before a new mechanism.** Before adding a mechanism
+     mid-review to fix a finding (a ledger, a refresh floor, a fingerprint,
+     a sweep), get a design review of it from a second model (in Copilot,
+     the `rubber-duck` agent) or from the owner. Each new mechanism brings
+     edge cases of its own.
+   - **Log follow-ups; don't start them.** A follow-up found during review
+     goes under "Known follow-ups" in the commit message, or into a GitHub
+     issue, for the owner. Start it only when the owner asks, or when it
+     blocks the current change.
+
+   Why: in the NAC change, each reviewer reported one or two blockers a
+   round, the fixes covered only the cited sites, and four mechanisms
+   added mid-review each brought new findings, so it took 16 rounds.
+   Separately, one request turned into about ten changes, five of them a
+   chain of follow-ups.
 
 ## 2. Git, branches and promotion
 
