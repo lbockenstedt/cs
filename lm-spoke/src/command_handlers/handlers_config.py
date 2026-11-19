@@ -1140,6 +1140,10 @@ class ConfigCommandsMixin:
         hardware_checks, site_mappings, sim_quotas) are stored and the poller
         reloaded so a hub-side Config -> Sim Quotas save reaches this spoke.
         """
+        # A standalone clear list is a credential update, even without config values.
+        for key in ("central_config", "central_on_prem_config"):
+            if f"{key}_clear_secrets" in patch and key not in patch:
+                patch = {**patch, key: {}}
         # Central credentials.
         self._apply_creds(
             patch, "central_config",

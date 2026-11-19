@@ -252,6 +252,22 @@ def test_full_push_applies_clear_list_when_config_is_unchanged(spoke_loop, slot)
 
 
 @pytest.mark.parametrize("slot", ["central", "central_on_prem"])
+@pytest.mark.parametrize("full", [False, True])
+def test_clear_list_without_config_applies(spoke_loop, slot, full):
+    """A clear-only command must not report success without removing its secret."""
+    spoke, loop = spoke_loop
+    key = f"{slot}_config"
+    setter = getattr(spoke.local_store, f"set_{key}")
+    getter = getattr(spoke.local_store, f"get_{key}")
+    setter({"client_id": "id", "access_token": "stale-token"})
+    result = _run(loop, spoke.handle_command("CS_CONFIG_UPDATE", {
+        f"{key}_clear_secrets": ["access_token"], "full_config": full,
+    }))
+    assert key in result["applied"]
+    assert getter() == {"client_id": "id"}
+
+
+@pytest.mark.parametrize("slot", ["central", "central_on_prem"])
 def test_reconnect_applies_persisted_clear_marker(spoke_loop, slot):
     """Clear intent is delivered inside a persisted config, not only a patch."""
     spoke, loop = spoke_loop
