@@ -36,7 +36,7 @@ from pathlib import Path
 from typing import Any, Dict, Optional
 
 # FastAPI router and request objects for the HTTP routes.
-from fastapi import APIRouter, Request
+from fastapi import APIRouter, HTTPException, Request
 
 # INI parsing helpers for the config editor.
 import sim_config
@@ -89,10 +89,19 @@ def build_local_ui_router(spoke) -> APIRouter:
             body = await request.json()
         except Exception:  # noqa: BLE001
             body = {}
-        # Run the command with the trimmed pool name and return the result.
+        # Run the command with the trimmed pool name.
         d = await _cmd("CS_POOL_ADD_EXISTING",
                        {"pool": str((body or {}).get("pool") or "").strip()})
+        # Nothing ran (no pool, no agent list, or no agent to ask): fail with
+        # the reason, as the hub answers 503 when it has no spoke to ask, so
+        # the page shows the error instead of "Added 0 VM(s)". An ERROR with
+        # per-host errors (every agent failed) is returned for the page to list.
+        if d.get("status") == "ERROR" and not d.get("errors"):
+            raise HTTPException(status_code=503,
+                                detail=d.get("message") or "nothing ran")
+        # Return the result (the message says why when nothing was added).
         return {"status": d.get("status") or "SUCCESS",
+                "message": d.get("message") or "",
                 "added": d.get("added") or 0,
                 "errors": d.get("errors") or {}}
 

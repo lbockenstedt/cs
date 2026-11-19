@@ -740,13 +740,17 @@ class ConfigCommandsMixin:
                 "selected": str(self.settings.get("sim_pool", "") or "").strip()}
 
     async def _cmd_pool_add_existing(self, d):
-        """Add already-provisioned sim VMs to the configured pool on every agent."""
+        """Add already-provisioned sim VMs to the configured pool on every agent.
+
+        SUCCESS when every agent asked added its VMs, PARTIAL when only some
+        did, and ERROR, with a message, when none did or no agent was there
+        to ask (nothing ran, so that is not a success)."""
         # Retrofit: put already-provisioned sim VMs into the configured pool
         # (new clones get it via qm clone --pool). Fans out to every agent;
         # the agent guards to the sim VMID range so this can never sweep a
         # non-sim VM into the pool.
         # Work out the pool name.
-        pool = str((data or {}).get("pool")
+        pool = str((d or {}).get("pool")
                    or self.settings.get("sim_pool", "") or "").strip()
         if not pool:
             return {"status": "ERROR", "message": "no pool configured"}
@@ -756,13 +760,17 @@ class ConfigCommandsMixin:
             agents = self._get_agents().get("agents", [])
         except Exception as exc:  # noqa: BLE001
             return {"status": "ERROR", "message": f"agent list failed: {exc}"}
-        # Ask each agent to add its sim VMs to the pool.
+        # Ask each agent to add its sim VMs to the pool, counting the agents
+        # asked and the ones that succeeded (two agents can share a hostname,
+        # so the errors map is not a count).
+        asked = succeeded = 0
         for a in agents:
             aid = a.get("agent_id")
             hn = str(a.get("hostname") or aid or "?")
             # Skip agents without an id.
             if not aid:
                 continue
+            asked += 1
             try:
                 r = await self.control_plane.send_to_agent(
                     "PXMX_POOL_ADD_VMS", {"pool": pool}, agent_id=aid, timeout=60.0)
@@ -774,10 +782,19 @@ class ConfigCommandsMixin:
             d = (r or {}).get("payload", {}).get("data", r) if isinstance(r, dict) else {}
             if isinstance(d, dict) and d.get("status") == "SUCCESS":
                 added += int(d.get("added") or 0)
+                succeeded += 1
             else:
                 errors[hn] = str((d or {}).get("message") or "error")
-        # SUCCESS when no host failed, else PARTIAL.
-        return {"status": "SUCCESS" if not errors else "PARTIAL",
+        # No agent to ask: nothing ran.
+        if not asked:
+            return {"status": "ERROR", "message": "no connected agent to add the VMs",
+                    "pool": pool, "added": 0, "errors": {}}
+        # Every agent failed.
+        if not succeeded:
+            return {"status": "ERROR", "message": "no agent added the VMs",
+                    "pool": pool, "added": 0, "errors": errors}
+        # SUCCESS when every agent asked succeeded, else PARTIAL.
+        return {"status": "SUCCESS" if succeeded == asked else "PARTIAL",
                 "pool": pool, "added": added, "errors": errors}
 
     async def _cmd_get_pxmx_site_map(self, d):

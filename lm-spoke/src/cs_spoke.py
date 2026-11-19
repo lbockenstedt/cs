@@ -41,7 +41,7 @@ import uuid
 # Filesystem path handling.
 from pathlib import Path
 # Type hints only.
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 # Simulation state, profiles and kill switch.
 from simulation_engine import SimulationEngine

@@ -10,6 +10,8 @@ from __future__ import annotations
 # asyncio runs the two relay directions concurrently; base64 wraps binary VNC frames in JSON.
 import asyncio
 import base64
+# contextlib.suppress makes the best-effort shell_exit sends non-fatal.
+import contextlib
 # logging reports relay failures; time tracks session expiry; uuid makes session/request ids.
 import logging
 import time
@@ -109,79 +111,6 @@ async def _spoke_to_browser_shell(websocket: WebSocket, queue: asyncio.Queue, se
         # Stop once the remote shell has exited.
         if str(message.get("type") or "") == "shell_exit":
             return
-
-
-async def _request_vnc_proxy(
-    *,
-    proxmox_host: str,
-    proxmox_token: str,
-    node: str,
-    vmid: int,
-    vmtype: str,
-) -> dict[str, Any]:
-    """Ask a Proxmox API directly for a VNC proxy ticket and port for a VM.
-
-    Note: this direct path is not used by the relay endpoints below, which go via the spoke.
-    """
-    # Proxmox vncproxy endpoint for the VM; the node name is URL-encoded.
-    path = f"/api2/json/nodes/{urllib.parse.quote(node, safe='')}/{vmtype}/{vmid}/vncproxy"
-    # Proxmox API listens on port 8006.
-    url = f"https://{proxmox_host}:8006{path}"
-    # Proxmox normally uses a self-signed cert, so verification is off; request websocket mode.
-    async with httpx.AsyncClient(verify=False, timeout=20.0) as client:
-        response = await client.post(
-            url,
-            headers=_proxmox_headers(proxmox_token),
-            data={"websocket": 1},
-        )
-    # API errors become 502 Bad Gateway with Proxmox's message.
-    if not response.is_success:
-        raise HTTPException(status_code=502, detail=_proxmox_error_message(response))
-    # Parse the JSON reply; unparsable replies are a 502.
-    try:
-        payload = response.json()
-    except ValueError as exc:
-        raise HTTPException(status_code=502, detail="Invalid response from Proxmox vncproxy") from exc
-    # The useful values live under "data".
-    data = payload.get("data") if isinstance(payload, dict) else None
-    if not isinstance(data, dict):
-        raise HTTPException(status_code=502, detail="Missing Proxmox vncproxy response data")
-    # A ticket and port are both needed to open the VNC connection.
-    ticket = str(data.get("ticket") or "").strip()
-    port = data.get("port")
-    if not ticket or port is None:
-        raise HTTPException(status_code=502, detail="Proxmox vncproxy did not return ticket and port")
-    return {"ticket": ticket, "port": int(port)}
-
-
-async def _browser_to_proxmox(websocket: WebSocket, upstream) -> None:
-    """Copy browser WebSocket messages (binary or text) to an upstream Proxmox socket."""
-    # Read raw ASGI messages so both binary and text frames are handled.
-    while True:
-        message = await websocket.receive()
-        message_type = message.get("type")
-        # Browser closed: raise so the caller tears down the relay.
-        if message_type == "websocket.disconnect":
-            raise WebSocketDisconnect(code=message.get("code", 1000))
-        # Skip anything that is not a data message.
-        if message_type != "websocket.receive":
-            continue
-        # Forward binary frames as bytes, otherwise as text.
-        if message.get("bytes") is not None:
-            await upstream.send(message["bytes"])
-        elif message.get("text") is not None:
-            await upstream.send(message["text"])
-
-
-async def _proxmox_to_browser(upstream, websocket: WebSocket) -> None:
-    """Copy upstream Proxmox messages to the browser, keeping binary vs text framing."""
-    # Wait for the next upstream message and send it with the same type.
-    while True:
-        message = await upstream.recv()
-        if isinstance(message, bytes):
-            await websocket.send_bytes(message)
-        else:
-            await websocket.send_text(message)
 
 
 @router.get("/console", response_class=HTMLResponse, include_in_schema=False)
