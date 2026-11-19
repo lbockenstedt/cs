@@ -242,15 +242,15 @@ refuses to touch the network on a corrupt state.
 **Unknown process state.** If a process check itself fails (`pgrep` error, or a
 failed or empty `Win32_Process` query), the result is unknown, and unknown is
 never treated as "not running" for rogue_dns. The orchestrator neither restores
-nor launches rogue_dns, and while `rogue_dns` is on it does not browse. Other
+nor launches rogue_dns, and its additional fallback browsing is skipped. Other
 simulations are unaffected and keep their old rule on both platforms: a failed
 check counts as not running, so they launch as before. The headless Firefox
 cleanup is skipped, whatever the `rogue_dns` value, because rogue_dns's browser
 can't be told apart. A stop request whose
 outcome is unknown keeps the Windows stop marker in place and is retried on the
-next iteration. While `rogue_dns` is on, the orchestrators' normal and fallback
-browsing runs only when rogue_dns is definitely not running, so `www_traffic=on`
-never browses during the static phase or on a failed check. Fallback browsing
+next iteration. Explicit `www_traffic=on` browsing keeps its normal schedule,
+including during the static phase and on a failed check; only the additional
+rogue_dns fallback browsing requires rogue_dns to be definitely not running. Fallback browsing
 is scheduled as before this change: Linux picks its five browse
 iterations at the start of a cycle when `www_traffic` is on, or when
 `rogue_dns` is on and not definitely running; Windows browses on the first
