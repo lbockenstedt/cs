@@ -14,8 +14,8 @@ from typing import Any, Optional
 # uuid generates unique ids for new records.
 import uuid
 
-# Pydantic pieces: base class, model config, field options, aliases and a pre-validation hook.
-from pydantic import AliasChoices, BaseModel, ConfigDict, Field, model_validator
+# Pydantic pieces: base class, model config, field options, aliases and pre/post-validation hooks.
+from pydantic import AliasChoices, BaseModel, ConfigDict, Field, field_validator, model_validator
 
 
 def _now() -> datetime:
@@ -39,6 +39,17 @@ class User(BaseModel):
     # Per-tenant role assignments and creation time.
     tenant_roles: list[dict[str, str]] = Field(default_factory=list)
     created_at: datetime = Field(default_factory=_now)
+
+    @field_validator("tenant_roles")
+    @classmethod
+    def _one_role_per_tenant(cls, roles: list[dict[str, str]]) -> list[dict[str, str]]:
+        """Keep one role per tenant: the last one listed, which is the latest assigned.
+
+        Assigning a role used to append it, so a user saved before that
+        replaced the old one can hold two roles for one tenant. get_role read
+        the first, so a later downgrade or promotion never took effect.
+        """
+        return list({tr.get("tenant_id"): tr for tr in roles}.values())
 
     def get_role(self, tenant_id: str) -> Optional[str]:
         """Return this user's role in the given tenant, or None if not a member."""

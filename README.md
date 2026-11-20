@@ -190,3 +190,6 @@ Execute the comprehensive test suite from the repository root:
 ```bash
 pytest tests
 ```
+
+Install `lm-spoke/requirements-dev.txt` (pyflakes) as well; the undefined-name
+guard in `tests/test_undefined_names.py` needs it, and the run fails without it.

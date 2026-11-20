@@ -36,7 +36,7 @@ from pathlib import Path
 from typing import Any, Dict, Optional
 
 # FastAPI router and request objects for the HTTP routes.
-from fastapi import APIRouter, Request
+from fastapi import APIRouter, HTTPException, Request
 
 # INI parsing helpers for the config editor.
 import sim_config
@@ -89,10 +89,19 @@ def build_local_ui_router(spoke) -> APIRouter:
             body = await request.json()
         except Exception:  # noqa: BLE001
             body = {}
-        # Run the command with the trimmed pool name and return the result.
+        # Run the command with the trimmed pool name.
         d = await _cmd("CS_POOL_ADD_EXISTING",
                        {"pool": str((body or {}).get("pool") or "").strip()})
+        # Nothing ran (no pool, no agent list, or no agent to ask): fail with
+        # the reason, as the hub answers 503 when it has no spoke to ask, so
+        # the page shows the error instead of "Added 0 VM(s)". An ERROR with
+        # per-host errors (every agent failed) is returned for the page to list.
+        if d.get("status") == "ERROR" and not d.get("errors"):
+            raise HTTPException(status_code=503,
+                                detail=d.get("message") or "nothing ran")
+        # Return the result (the message says why when nothing was added).
         return {"status": d.get("status") or "SUCCESS",
+                "message": d.get("message") or "",
                 "added": d.get("added") or 0,
                 "errors": d.get("errors") or {}}
 
@@ -234,7 +243,7 @@ def build_local_ui_router(spoke) -> APIRouter:
 
     @router.get("/aggregate/central-status")
     async def aggregate_central_status():
-        """Return the Central status plus the saved Central config."""
+        """Return Central status and public settings, never stored credentials."""
         # Saved Central config, and the status (or an empty list).
         cc = spoke.local_store.get_central_config()
         data: Dict[str, Any] = (
@@ -243,7 +252,21 @@ def build_local_ui_router(spoke) -> APIRouter:
         )
         # Merge hub-owned central config (mode + cluster creds) so the Setup →
         # Central API tab's form populates (mirrors the hub's get_central_status).
-        data["hub_central_config"] = {k: v for k, v in cc.items() if k != "mode"}
+        public = {key: cc[key] for key in (
+            "client_id", "customer_id", "cluster_url", "token_url",
+            "api_version", "poll_interval_s",
+        ) if key in cc}
+        public.update({f"{key}_set": bool(cc.get(key)) for key in (
+            "client_secret", "access_token", "refresh_token",
+        )})
+        thresholds = cc.get("cc_thresholds")
+        if isinstance(thresholds, dict):
+            public["cc_thresholds"] = {
+                key: value for key, value in thresholds.items()
+                if key in ("warn_pct", "error_pct", "die_off_pct", "min_peak")
+                and isinstance(value, (int, float)) and not isinstance(value, bool)
+            }
+        data["hub_central_config"] = public
         if cc.get("mode"):
             data["mode"] = cc["mode"]
         return data
