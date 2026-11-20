@@ -117,6 +117,17 @@ function Get-FileSha256 {
 }
 
 #------------------------------------------------------------
+# True if $Name is a bare script file name the spoke may serve: letters, digits,
+# '.', '_' and '-', not starting with '.'. A served list or manifest is used to
+# build local paths, so a name with '\', '/' or '..' must never reach Join-Path.
+# Port of update.sh _safe_script_name.
+#------------------------------------------------------------
+function Test-SafeScriptName {
+    param([string]$Name)
+    return ($Name -cmatch '^[A-Za-z0-9][A-Za-z0-9._-]*$')
+}
+
+#------------------------------------------------------------
 # CONTENT-HASH sync decision — port of update.sh _scripts_sync_decision.
 # GETs <server_url>/api/scripts/manifest?platform=windows (flat JSON: file -> sha256).
 # Returns a PSCustomObject:
@@ -155,6 +166,7 @@ function Get-ScriptsSyncDecision {
     foreach ($p in $props) {
         $fname = $p.Name
         if ([string]::IsNullOrWhiteSpace($fname)) { continue }
+        if (-not (Test-SafeScriptName $fname)) { continue }
         $want = ''
         if ($null -ne $p.Value) { $want = ([string]$p.Value).Trim().ToLower() }
         if ([string]::IsNullOrEmpty($want)) { continue }
@@ -291,6 +303,10 @@ if ($web_server -eq 'on' -and $server_url) {
             $syncOk = $true
             foreach ($filename in $fileList) {
                 if ([string]::IsNullOrWhiteSpace($filename)) { continue }
+                if (-not (Test-SafeScriptName ([string]$filename))) {
+                    Write-UpdateLog '  ! WARNING: skipping unsafe script name from spoke'
+                    continue
+                }
                 if (Save-UrlToFile "$server_url/api/scripts/windows/$filename" (Join-Path $scriptRoot $filename) 30) {
                     Write-UpdateLog "  + $filename"
                 } else {
