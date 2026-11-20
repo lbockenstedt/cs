@@ -185,7 +185,7 @@ run_command() {
 }
 
 if [[ "${1:-}" == "--handle-command" ]]; then
-  run_command "${2:-{}}"
+  run_command "${2:-"{}"}"
   exit 0
 fi
 
