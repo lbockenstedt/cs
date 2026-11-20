@@ -99,6 +99,23 @@ one on first start, never left empty). Callers on the isolated sim segment
 everyone else must present it on `/ws/client` and the mutating/inbox HTTP routes
 (`X-Client-Key` header or `?api_key=`, `secrets.compare_digest`).
 
+The operator surface on the same port (the local dashboard `/`, every
+`/sim/api/*` route, and `GET /status`, `POST /simulate/trigger`,
+`GET|POST /config`) answers loopback callers only: a process on the spoke, or
+an SSH tunnel (`ssh -L 8080:127.0.0.1:8080 <spoke>`). The `Host` header must
+name loopback (`127.0.0.1`, `localhost`, `::1`), which stops DNS rebinding, and
+an API request a browser marks cross-site (`Sec-Fetch-Site`) or whose `Origin`
+is not that host is refused, so another web page open in the operator's
+browser can't drive the API through the tunnel. Everyone else gets 403, and
+`/` shows a short page saying how to reach it. Sim VMs are not trusted
+there, even on the sim segment, and `client_api_key` is not accepted, because
+every sim VM can fetch it from `/api/client/key`. There is no remote operator
+key: 8080 is plaintext by default, so a key sent to it could be read off the
+wire. The hub never calls these routes; it drives the spoke over its
+WebSocket command channel, so the Lab Manager WebUI is unaffected. The
+`UPDATE_SETTINGS` reply replaces `client_api_key` with a `client_api_key_set`
+flag.
+
 | Route | Purpose |
 |---|---|
 | `GET /api/health` | `{status, version, clients, repo_synced, repo_error}` (public) |
@@ -118,7 +135,9 @@ everyone else must present it on `/ws/client` and the mutating/inbox HTTP routes
 | `GET /api/inbox?hostname=` | `queue.poll_agent_inbox()` (key-gated) |
 | `POST /api/inbox/ack` | `{id, status, message, result}` → `queue.ack_command` (key-gated) |
 | `WS /ws/client?hostname=&platform=&api_key=` | primary agent channel (see below) |
-| `GET /status` · `POST /simulate/trigger` · `GET\|POST /config` · `GET /version` | mgmt (same as the old standalone surface) |
+| `GET /status` · `POST /simulate/trigger` · `GET\|POST /config` | mgmt (same as the old standalone surface; loopback only) |
+| `GET /version` | spoke version (public) |
+| `GET /` · `/sim/api/*` | local dashboard and its API (loopback only) |
 
 ### `/ws/client` protocol
 - Auth: sim-segment callers connect open (the t3 agent sends no key); else `secrets.compare_digest(api_key, key)`, close `4403` on mismatch. The linux agent fetches `/api/client/key` first (sim-segment only) when it wants to pass a key along.
