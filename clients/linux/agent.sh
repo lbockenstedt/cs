@@ -35,6 +35,33 @@ pid_is_active() {
   return 0
 }
 
+# sim_loop_pid: print the sim loop's PID from simulation.pid, but only when
+# that process is the system bash running exactly startup.sh or simulation.sh
+# (startup.sh sources the loop; update.sh and the loop re-exec it as
+# `bash .../simulation.sh`). The desktop user writes simulation.pid, and this
+# agent runs as root, so a stale or forged PID must never make root signal an
+# unrelated process (USR1 kills a process that doesn't trap it) or pass the
+# reboot guard. Every launch has argv `<bash> <script>`: the desktop entry
+# runs startup.sh by its #!/bin/bash line (argv[0] /bin/bash), and sudo,
+# update.sh and the re-exec run `bash <script>`. A decoy that merely carries
+# the path as another argument, or rewrites its own argv, is refused.
+sim_loop_pid() {
+  local pid exe
+  local -a argv=()
+  pid=$(cat /usr/local/scripts/simulation.pid 2>/dev/null || true)
+  pid_is_active "$pid" || return 1
+  # The running binary must be the system bash (" (deleted)" after a bash
+  # upgrade while the loop keeps running).
+  exe=$(readlink "/proc/$pid/exe" 2>/dev/null) || return 1
+  exe=${exe% (deleted)}
+  [[ "$exe" == /bin/bash || "$exe" == /usr/bin/bash ]] || return 1
+  mapfile -d '' -t argv 2>/dev/null < "/proc/$pid/cmdline" || return 1
+  [[ ${#argv[@]} -eq 2 ]] || return 1
+  [[ "${argv[0]}" == bash || "${argv[0]}" == /bin/bash || "${argv[0]}" == /usr/bin/bash ]] || return 1
+  [[ "${argv[1]}" == /usr/local/scripts/startup.sh || "${argv[1]}" == /usr/local/scripts/simulation.sh ]] || return 1
+  printf '%s\n' "$pid"
+}
+
 cleanup() {
   local current_pid=""
   current_pid=$(cat "$PID_FILE" 2>/dev/null || true)
@@ -96,8 +123,7 @@ run_command() {
     restart_sim)
       # simulation.sh is sourced by startup.sh (argv is startup.sh), so pgrep
       # can't find it — read the PID it wrote instead.
-      sim_pid=$(cat /usr/local/scripts/simulation.pid 2>/dev/null)
-      if [[ -n "$sim_pid" ]] && kill -0 "$sim_pid" 2>/dev/null; then
+      if sim_pid=$(sim_loop_pid); then
         # Sourced loop can't be cleanly re-exec'd — USR1 triggers a config
         # reload as best-effort; a full restart requires a reboot.
         kill -USR1 "$sim_pid" 2>/dev/null || true
@@ -107,8 +133,7 @@ run_command() {
       fi
       ;;
     reboot)
-      sim_pid=$(cat /usr/local/scripts/simulation.pid 2>/dev/null)
-      if [[ -z "$sim_pid" ]] || ! kill -0 "$sim_pid" 2>/dev/null; then
+      if ! sim_loop_pid >/dev/null; then
         echo "Early-boot guard: skipping reboot command — simulation not yet running" | tee -a "$debug"
         message="Skipped — early-boot protection (simulation not running)"
       else
@@ -129,8 +154,7 @@ run_command() {
       ks_val="${arg_value:-on}"
       if [[ "$ks_val" != "on" && "$ks_val" != "off" ]]; then ks_val="on"; fi
       sed -i "s/^kill_switch=.*/kill_switch=${ks_val}/" /usr/local/scripts/simulation.conf
-      sim_pid=$(cat /usr/local/scripts/simulation.pid 2>/dev/null)
-      if [[ -n "$sim_pid" ]] && kill -0 "$sim_pid" 2>/dev/null; then
+      if sim_pid=$(sim_loop_pid); then
         kill -USR1 "$sim_pid" 2>/dev/null || true
       fi
       if [[ "$ks_val" == "on" ]]; then
