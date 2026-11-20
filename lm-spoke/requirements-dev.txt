@@ -1,0 +1,6 @@
+# Dev/test dependencies (not installed on deployed spokes; install_cs.sh and
+# the Dockerfile read requirements.txt only).
+pyflakes>=3.0                 # tests/test_undefined_names.py imports it, so a
+                              # test run without it fails. ci.yml installs every
+                              # requirements*.txt it finds, so listing it here is
+                              # what runs the guard in CI.

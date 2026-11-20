@@ -266,6 +266,20 @@ def require_tenant_admin(tenant_id: str, user: User = Depends(get_current_user))
     return user
 
 
+def require_own_tenant_admin(tenant_id: str, user: User) -> User:
+    """Require the admin role in the tenant itself; being a superadmin is not enough (403).
+
+    For routes that change what a tenant's spoke runs, such as queueing a
+    command for it. A tenant's systems are never managed from outside the
+    tenant (fleet rules 5.5 and 6.3), so only the tenant's own admins pass:
+    a superadmin only when they also hold the admin role in that tenant.
+    """
+    # get_role is None for anyone who is not a member, superadmins included.
+    if user.get_role(tenant_id) != "admin":
+        raise HTTPException(status_code=403, detail="Tenant admin role required")
+    return user
+
+
 def require_tenant_member(tenant_id: str, user: User) -> User:
     """Like require_tenant_access but requires explicit tenant membership.
 

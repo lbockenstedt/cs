@@ -485,21 +485,6 @@ def purge_old_deleted_tenants(days: int = 30) -> list[str]:
 
             return purged_ids
 
-        # Never reached (after the return above): removes the tenant's user roles and folder.
-        users = _load_users()
-        changed = False
-        for user in users:
-            updated_roles = [tr for tr in user.tenant_roles if tr["tenant_id"] != tenant_id]
-            if len(updated_roles) != len(user.tenant_roles):
-                user.tenant_roles = updated_roles
-                changed = True
-        if changed:
-            _save_users(users)
-
-        tenant_dir = _data_dir() / tenant_id
-        if tenant_dir.exists():
-            shutil.rmtree(tenant_dir)
-
 
 def _pending_dir() -> Path:
     """Return the folder of pending spoke registrations."""

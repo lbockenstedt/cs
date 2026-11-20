@@ -3,6 +3,11 @@
 Provides MAC profile CRUD and push-to-spoke for T3 devices, plus
 global OUI pool management (superadmin).
 
+Changing a spoke's MAC profile, or pushing anything to the spoke, needs the
+admin role in the spoke's own tenant (auth.require_own_tenant_admin). A
+superadmin manages the global OUI pool, but needs that role to change a
+tenant's spoke here.
+
 MAC profile flow:
   1. Admin builds profile in hub UI  →  PUT /{tenant_id}/spokes/{spoke_id}/t3/mac-profile
   2. Hub stores profile + queues t3_mac_update command for spoke
@@ -84,7 +89,7 @@ def get_mac_profile(
 ):
     """Get the stored MAC profile for a spoke's T3 devices."""
     # Caller must have tenant access; spoke must exist and be approved.
-    _require_tenant_access(tenant_id, current_user)
+    auth.require_tenant_access(tenant_id, current_user)
     _get_approved_spoke(tenant_id, spoke_id)
     # Load the saved profile; 404 if none has been saved yet.
     profile = store.get_mac_profile(tenant_id, spoke_id)
@@ -101,8 +106,8 @@ async def save_mac_profile(
     current_user: User = Depends(auth.get_current_user),
 ):
     """Save a MAC profile and queue a t3_mac_update command to push it to the spoke."""
-    # Only tenant admins can change profiles; spoke must be approved.
-    _require_tenant_admin(tenant_id, current_user)
+    # Only the tenant's own admins can change profiles; spoke must be approved.
+    auth.require_own_tenant_admin(tenant_id, current_user)
     _get_approved_spoke(tenant_id, spoke_id)
 
     # Total interfaces must be between 1 and 25 (the T3 device's supported maximum).
@@ -160,8 +165,8 @@ def delete_mac_profile(
     current_user: User = Depends(auth.get_current_user),
 ):
     """Remove the stored MAC profile for a spoke."""
-    # Admin and spoke checks, then delete the stored profile.
-    _require_tenant_admin(tenant_id, current_user)
+    # Tenant-admin and spoke checks, then delete the stored profile.
+    auth.require_own_tenant_admin(tenant_id, current_user)
     _get_approved_spoke(tenant_id, spoke_id)
     store.delete_mac_profile(tenant_id, spoke_id)
     return {"status": "deleted"}
@@ -174,8 +179,8 @@ async def push_mac_profile(
     current_user: User = Depends(auth.get_current_user),
 ):
     """Re-queue a push of the existing saved MAC profile (e.g. after a spoke reconnects)."""
-    # Admin and spoke checks.
-    _require_tenant_admin(tenant_id, current_user)
+    # Tenant-admin and spoke checks.
+    auth.require_own_tenant_admin(tenant_id, current_user)
     _get_approved_spoke(tenant_id, spoke_id)
     # There must be a saved profile to re-send.
     profile = store.get_mac_profile(tenant_id, spoke_id)
@@ -205,7 +210,7 @@ def get_t3_devices(
 ):
     """Return T3 devices visible in the spoke's telemetry."""
     # Tenant access and spoke checks.
-    _require_tenant_access(tenant_id, current_user)
+    auth.require_tenant_access(tenant_id, current_user)
     spoke = _get_approved_spoke(tenant_id, spoke_id)
     # T3 info is a section of the spoke's latest telemetry (empty if not reported).
     t3_section = spoke.telemetry.get("t3") or {}
@@ -320,8 +325,8 @@ async def push_oui_pool_to_spoke(
     current_user: User = Depends(auth.get_current_user),
 ):
     """Queue a t3_oui_pool_update command to push the global OUI pool to a spoke."""
-    # Admin and spoke checks.
-    _require_tenant_admin(tenant_id, current_user)
+    # Tenant-admin and spoke checks.
+    auth.require_own_tenant_admin(tenant_id, current_user)
     _get_approved_spoke(tenant_id, spoke_id)
     # A pool must exist before it can be pushed.
     pool = store.get_oui_pool_raw()
