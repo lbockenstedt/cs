@@ -147,7 +147,9 @@ def test_t3_update_installs_only_its_own_downloads(tmp_path):
     tmpdir.mkdir()
     block = T3_UPDATE[T3_UPDATE.index('echo "Updating Simulation Script"'):
                       T3_UPDATE.index("sudo chmod -x /etc/udev")]
-    block = block.replace("/usr/scripts/", f"{dest}/").replace("/tmp/", f"{planted}/")
+    # /tmp/ first: on Linux tmp_path itself is under /tmp/, so rewriting it
+    # after dest is inserted would rewrite dest too.
+    block = block.replace("/tmp/", f"{planted}/").replace("/usr/scripts/", f"{dest}/")
     stub = ('wget() { case "$1" in *agent.sh) : > "$3";; *update_script.sh) echo half > "$3"; return 4;;'
             ' *) echo new > "$3";; esac; }\n'
             'chmod() { command chmod "$@"; }\ntee() { cat >/dev/null; }\n')
