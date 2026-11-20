@@ -515,10 +515,10 @@ The raw sample arrays in `resource_cache.json` stay local on the spoke; Hub only
 | Audit | `GET` | `/api/{tenant_id}/spokes/{spoke_id}/audit` | superadmin, admin, operator |
 | T3 devices | `GET` | `/api/{tenant_id}/spokes/{spoke_id}/t3/devices` | superadmin, admin, operator |
 | T3 mac-profile | `GET` | `/api/{tenant_id}/spokes/{spoke_id}/t3/mac-profile` | superadmin, admin, operator |
-| T3 mac-profile save | `PUT` | `/api/{tenant_id}/spokes/{spoke_id}/t3/mac-profile` | superadmin, admin |
-| T3 mac-profile delete | `DELETE` | `/api/{tenant_id}/spokes/{spoke_id}/t3/mac-profile` | superadmin, admin |
-| T3 push mac | `POST` | `/api/{tenant_id}/spokes/{spoke_id}/t3/push-mac` | superadmin, admin |
-| T3 push oui-pool | `POST` | `/api/{tenant_id}/spokes/{spoke_id}/t3/push-oui-pool` | superadmin, admin |
+| T3 mac-profile save | `PUT` | `/api/{tenant_id}/spokes/{spoke_id}/t3/mac-profile` | tenant admin (a superadmin only with that role) |
+| T3 mac-profile delete | `DELETE` | `/api/{tenant_id}/spokes/{spoke_id}/t3/mac-profile` | tenant admin (a superadmin only with that role) |
+| T3 push mac | `POST` | `/api/{tenant_id}/spokes/{spoke_id}/t3/push-mac` | tenant admin (a superadmin only with that role) |
+| T3 push oui-pool | `POST` | `/api/{tenant_id}/spokes/{spoke_id}/t3/push-oui-pool` | tenant admin (a superadmin only with that role) |
 | OUI pool | `GET` | `/api/oui-pool` | all |
 | OUI pool replace | `PUT` | `/api/oui-pool` | superadmin |
 | OUI pool import | `POST` | `/api/oui-pool/import-csv` | superadmin |

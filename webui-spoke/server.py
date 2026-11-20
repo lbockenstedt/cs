@@ -3965,6 +3965,18 @@ async def _close_all_shell_sessions(*, notify_exit: bool = False) -> None:
         await _cleanup_shell_session(session_id, notify_exit=notify_exit)
 
 
+async def _wait_for_fd_readable(fd: int) -> None:
+    """Wait until ``fd`` has data to read, without blocking the event loop."""
+    # The loop's reader callback resolves the future; always unregister the fd afterwards.
+    loop = asyncio.get_running_loop()
+    ready = loop.create_future()
+    loop.add_reader(fd, lambda: ready.done() or ready.set_result(None))
+    try:
+        await ready
+    finally:
+        loop.remove_reader(fd)
+
+
 async def _shell_reader_loop(session_id: str) -> None:
     """Read output from a shell's pty and send it to the hub until the shell ends.
 
@@ -5055,10 +5067,12 @@ async def relay_sync_once() -> None:
                     await _broadcast_reclone_state()
                 result = {"cleared": _status != "running", "previous_status": _status}
                 if cmd_id:
-                    async with httpx.AsyncClient(verify=False, timeout=10) as cli:
-                        ack_resp = await cli.post(f"{hub_base}/api/{hub_tenant_id}/spokes/{hub_spoke_id}/ack",
-                            json={"command_id": cmd_id, "status": "executed", "result": result},
-                            headers=headers)
+                    async with httpx.AsyncClient(timeout=10, verify=_hub_tls_verify()) as hc_ack:
+                        ack_resp = await hc_ack.post(f"{base}/ack", json={
+                            "command_id": cmd_id,
+                            "status": "executed",
+                            "result": result,
+                        }, headers=headers)
                         ack_resp.raise_for_status()
                 continue
 

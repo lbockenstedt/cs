@@ -1175,7 +1175,7 @@ def assign_tenant_role(
     payload: AssignRoleRequest,
     _: User = Depends(auth.require_superadmin),
 ):
-    """Give a user a role in a tenant (superadmins). "operator" is stored as "viewer"."""
+    """Give a user a role in a tenant, replacing any role they had there (superadmins). "operator" is stored as "viewer"."""
     # Load the user (404 if missing).
     user = store.get_user_by_id(user_id)
     if not user:
@@ -1184,8 +1184,10 @@ def assign_tenant_role(
     if not store.get_tenant(payload.tenant_id):
         raise HTTPException(status_code=404, detail="Tenant not found")
 
-    # Store the role, mapping operator to viewer.
+    # Store the role, mapping operator to viewer. It replaces the user's role
+    # in that tenant: a user holds one role per tenant (User.get_role reads one).
     normalized_role = "viewer" if payload.role == "operator" else payload.role
+    user.tenant_roles = [tr for tr in user.tenant_roles if tr["tenant_id"] != payload.tenant_id]
     user.tenant_roles.append({"tenant_id": payload.tenant_id, "role": normalized_role})
     store.save_user(user)
     return _user_response(user)
