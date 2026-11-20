@@ -48,10 +48,14 @@ import asyncio
 import logging
 # Used for environment variables, file permissions and the hard process exit.
 import os
+# Validates the GitHub owner, repo and branch names.
+import re
 # Generates a unique name for the temporary git credential helper script.
 import uuid as _uuid
 # Type hints only.
-from typing import Optional
+from typing import Any, Dict, Optional, Tuple
+# Parses an https repo URL into host and path.
+from urllib.parse import urlsplit
 
 # Dedicated logger so repo-sync messages can be filtered on their own.
 logger = logging.getLogger("CSRepoSync")
@@ -59,6 +63,77 @@ logger = logging.getLogger("CSRepoSync")
 # How often to fetch + reset onto the tenant's branch. Default 60s mirrors
 # SimQuotaEngine's RECONCILE_INTERVAL_S. Override with LM_CS_REPO_SYNC_INTERVAL.
 REPO_SYNC_INTERVAL_S = float(os.getenv("LM_CS_REPO_SYNC_INTERVAL") or 60.0)
+
+# GitHub owner (letters, digits, hyphens) and repo names, and a plain branch
+# name that git cannot read as an option or a revision expression.
+_GH_OWNER = re.compile(r"[A-Za-z0-9][A-Za-z0-9-]*")
+_GH_REPO = re.compile(r"[A-Za-z0-9_.-]+")
+_BRANCH = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_./-]{0,199}")
+
+
+def github_remote(gc: Dict[str, Any]) -> Optional[Tuple[str, str]]:
+    """Return ``(origin URL, branch)`` for the tenant's GitHub repo, or None
+    when ``repo_url`` is not a github.com repo or the branch is not a plain name.
+
+    Why: the spoke sets origin to this URL, hands the GitHub token to whatever
+    host it names (GIT_ASKPASS), then checks the fetched branch out over its own
+    code. The hub only ever talks to api.github.com (lm github_config_client),
+    so the value must name a github.com repo; origin is rebuilt as
+    ``https://github.com/<owner>/<repo>.git``, never another host, userinfo or
+    a string git could read as an option. Accepts the forms the hub accepts:
+    https://github.com/owner/repo(.git), git@github.com:owner/repo(.git) and
+    bare owner/repo.
+    """
+    # Read the configured URL and branch; the branch defaults to main.
+    raw = str(gc.get("repo_url") or "").strip()
+    branch = str(gc.get("repo_branch") or "").strip() or "main"
+    # Pick out the owner/repo path from each accepted form.
+    path = ""
+    if raw.startswith("git@github.com:"):
+        path = raw[len("git@github.com:"):]
+    elif "://" in raw:
+        try:
+            u = urlsplit(raw)
+            plain = (u.scheme == "https" and u.hostname == "github.com"
+                     and u.username is None and u.port in (None, 443)
+                     and not u.query and not u.fragment)
+        except ValueError:
+            plain = False
+        path = u.path if plain else ""
+    elif raw.count("/") == 1:
+        path = raw
+    # Exactly owner/repo, each a valid GitHub name.
+    path = path.strip("/")
+    if path.endswith(".git"):
+        path = path[:-4]
+    parts = path.split("/")
+    if (len(parts) != 2 or not _GH_OWNER.fullmatch(parts[0])
+            or not _GH_REPO.fullmatch(parts[1]) or parts[1] in (".", "..")):
+        return None
+    # A branch git accepts as a plain ref name: no ".." or trailing ".",
+    # and no "/"-separated component that is empty, starts with "." or ends
+    # with ".lock" (git check-ref-format rejects "a.lock/b" too).
+    comps = branch.split("/")
+    if (not _BRANCH.fullmatch(branch) or ".." in branch or branch.endswith(".")
+            or any(not c or c.startswith(".") or c.endswith(".lock") for c in comps)):
+        return None
+    return f"https://github.com/{parts[0]}/{parts[1]}.git", branch
+
+
+def rejection_reason(gc: Dict[str, Any]) -> str:
+    """Say why github_remote(gc) rejected the config, safe to log.
+
+    Why: a rejected repo_url may carry a token anywhere in it (userinfo,
+    or a token pasted where the host goes, which looks like any other
+    hostname), and WARNING lines reach the hub Logs view (rule 5.2). So no
+    part of the URL is logged; only the branch name is, when the URL itself
+    is valid and the branch is the problem.
+    """
+    # The URL is fine on its own, so the branch is what was rejected.
+    if github_remote({"repo_url": gc.get("repo_url")}) is not None:
+        branch = str(gc.get("repo_branch") or "").strip()
+        return f"branch {branch[:100]!r} is not a plain branch name"
+    return "repo_url is not a github.com owner/repo"
 
 
 class RepoSync:
@@ -74,6 +149,8 @@ class RepoSync:
         self.spoke = spoke
         # Handle of the background loop task, once started.
         self._task: Optional[asyncio.Task] = None
+        # The last rejected (repo_url, branch), so the 60s loop warns once per value.
+        self._rejected: Optional[Tuple[str, str]] = None
 
     def start(self) -> None:
         """Spawn the sync loop on the running event loop. Idempotent — a
@@ -131,7 +208,7 @@ class RepoSync:
         # Token, repository URL and branch; the branch defaults to main.
         token = str(gc.get("github_token") or "").strip()
         repo_url = str(gc.get("repo_url") or "").strip()
-        branch = str(gc.get("repo_branch") or "").strip() or "main"
+        remote = github_remote(gc)
         # The git checkout is the parent of the configs directory.
         repo_dir = spoke.settings.config_dir.parent
 
@@ -151,6 +228,10 @@ class RepoSync:
         # this returns here and the spoke never touches GitHub. Only a genuinely
         # standalone spoke (never overridden by a hub → flag stays 'github')
         # reaches the pull below. Do NOT re-enable spoke pulls under a hub.
+        # Any state that is not a rejection ends a run of rejections, so the
+        # same bad value warns again once it comes back.
+        if _source != "github" or not token or not repo_url:
+            self._rejected = None
         # Hub-managed spoke: never pull from GitHub here (see the comment above).
         if _source != "github":
             logger.debug("repo sync[%s]: skipped (source=%s → hub-managed, standalone-only path)",
@@ -164,6 +245,16 @@ class RepoSync:
         if not repo_url:
             logger.debug("repo sync[%s]: skipped (no repo_url)", sid)
             return
+        # Not a github.com repo or not a plain branch: never fetch it (see github_remote).
+        if remote is None:
+            seen = (repo_url, str(gc.get("repo_branch") or ""))
+            log = logger.debug if seen == self._rejected else logger.warning
+            self._rejected = seen
+            log("repo sync[%s]: skipped (%s)", sid, rejection_reason(gc))
+            return
+        repo_url, branch = remote
+        # A valid config ends the rejected run, so a later rejection warns again.
+        self._rejected = None
         # The config directory is not a git checkout, so there is nothing to sync.
         if not (repo_dir / ".git").exists():
             logger.debug("repo sync[%s]: skipped (%s is not a git repo)", sid, repo_dir)
