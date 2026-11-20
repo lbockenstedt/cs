@@ -123,3 +123,42 @@ def test_switch_back_to_distributed_resumes_polling(spoke_loop):
     loop.run_until_complete(spoke.central_poller._poll_once())
     assert clients["central_poller"].calls == 1
     assert "BARCELONA" in spoke.central_status["status"]
+
+
+class _TokenClient:
+    """A Central client whose token cache holds live secrets."""
+
+    api_version = "new_central"
+    _config_hash = "abcd1234"
+
+    def __init__(self, state):
+        self._state = state
+
+    @staticmethod
+    def is_configured():
+        return True
+
+    def _token_state(self):
+        return self._state
+
+    async def _ensure_token(self, client):
+        return self._state.get("access_token", "")
+
+
+@pytest.mark.parametrize("instance", ["central", "central_on_prem"])
+def test_test_connection_never_returns_tokens(spoke_loop, instance):
+    """The Test Central reply goes to the hub and the browser: it must not
+    carry the cached access or refresh token, only a summary."""
+    spoke, loop = spoke_loop
+    poller = spoke.central_poller if instance == "central" else spoke.central_on_prem_poller
+    poller._client = _TokenClient({"access_token": "SECRET-AT", "refresh_token": "SECRET-RT",
+                                   "expires_at": 9e9})
+    res = loop.run_until_complete(poller.test_connection())
+    row = res["spokes"][0]
+    assert "SECRET" not in repr(res)
+    assert row["token_valid"] is True
+    assert row["token_state"] == "present"
+
+    poller._client = _TokenClient({})
+    row = loop.run_until_complete(poller.test_connection())["spokes"][0]
+    assert row["token_state"] == "missing"
