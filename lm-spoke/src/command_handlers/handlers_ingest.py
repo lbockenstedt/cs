@@ -19,6 +19,7 @@ import asyncio
 
 # Used to live-push newly queued commands to connected agents.
 import client_api
+from command_queue import _alias_values
 # Type hints only.
 from typing import Any, Dict, Optional
 
@@ -234,13 +235,21 @@ class IngestCommandsMixin:
                     continue
                 # Deletes with a VM id are collected per host instead of queued one by one.
                 if iact == "delete_vm":
-                    # Accept either "vmid" or "vm_id".
+                    # Accept either "vmid" or "vm_id": the first one set, as
+                    # the agent reads it (None and "" count as unset).
                     iargs = it.get("args") or {}
-                    _vid = iargs.get("vmid", iargs.get("vm_id"))
+                    _vid = next(iter(_alias_values(iargs, ("vmid", "vm_id"))), None)
                     # Add to this host's delete list and move to the next item.
+                    # Check each id first, with the same safeguard enqueue
+                    # runs: delete_vms refuses the whole batch for one bad
+                    # id, and the agent fails only that VM (pxmx cs_sim.py
+                    # _delete_vms), so a bad id is this item's error alone.
                     if _vid is not None:
+                        reason = self.queue._refused("delete_vm", iargs)
+                        if reason:
+                            errors.append(reason)
+                            continue
                         del_by_host.setdefault(itgt, []).append(_vid)
-                        vm_count += 1
                         continue
                     # No vmid → fall through and enqueue as-is (the agent
                     # fails it explicitly rather than silently dropping).
@@ -263,6 +272,7 @@ class IngestCommandsMixin:
                     res = await self.queue.enqueue(_htgt, "delete_vms",
                                                    {"vmids": _vids})
                     results.append(res)
+                    vm_count += len(_vids)
                 # Record refusals.
                 except ValueError as exc:
                     errors.append(str(exc))
@@ -270,7 +280,8 @@ class IngestCommandsMixin:
             for _tgt in {str(it.get("target") or "proxmox").strip() or "proxmox"
                          for it in _items if isinstance(it, dict)}:
                 await client_api.push_pending(self, _tgt)
-            # Summarise how many commands were created and queued, plus any errors.
+            # Summarise how many commands were created, how many items were
+            # queued (refused ones are only in errors), plus any errors.
             return {"status": "SUCCESS",
                     "created": sum(1 for r in results if r.get("created")),
                     "commands": len(results),

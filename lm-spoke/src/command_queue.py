@@ -45,10 +45,21 @@ Semantics (ported from the legacy queue):
     for an already-terminal command re-records the result).
 
 Safeguard (defense-in-depth on top of the agent's execution-layer
-``cs_guard``): enqueue of a ``_VM_ACTIONS`` command on ``target=="proxmox"``
-refuses any ``vmid < SIM_VMIN`` (90000) or in ``protected_vmids`` (default
-``{1001}``; configurable per host from the hub). Sim VMs are 90001+, so the cs
-UI only ever manages sim VMs; the hub/system containers stay untouchable.
+``cs_guard``): enqueue of a ``_VM_ACTIONS`` or ``delete_vms`` command, for any
+target, refuses a ``vmid``/``vm_id`` (or any id in ``vmids``/``vm_ids``) that
+is not a whole number, is below ``SIM_VMIN`` (90000) or is in
+``protected_vmids`` (default ``{1001}``; configurable per host from the hub).
+Sim VMs are 90001+, so the cs UI only ever manages sim VMs; the hub/system
+containers stay untouchable. A command with no vmid at all is still queued:
+the agent fails it explicitly.
+
+Who may take a command: the Proxmox agents poll through the hub
+(``CS_POLL_AGENT_INBOX``) and get every command for their hostname plus the
+``"proxmox"`` (any host) ones. A sim client — anything on ``/ws/client`` or on
+the sim segment — is a *non-fleet* caller (``fleet=False``): it only gets, and
+may only ack, commands addressed to its own hostname whose action is in
+``SIM_CLIENT_ACTIONS``. Sim clients pick their own hostname and can fetch the
+client key, so neither proves they are a Proxmox agent.
 
 Source of truth: ``cs/webui-spoke/server.py``
   - enqueue:        ``_enqueue_command_locked`` (lines 4382-4413)
@@ -138,8 +149,35 @@ SIM_VMIN = 90000
 # VMIDs that are always protected (the hub/system container).
 DEFAULT_PROTECTED_VMIDS: Set[int] = {1001}
 
+# The only actions a sim client (``/ws/client`` or the sim segment) may take or
+# ack: the case arms of clients/linux/agent.sh and clients/t3/agent.sh. An
+# allowlist, so a new Proxmox action is never handed to a sim VM by default.
+SIM_CLIENT_ACTIONS = {"restart_sim", "reboot", "update_now", "kill_switch", "debug_mode"}
+
 
 # ── helpers ──────────────────────────────────────────────────────────────────
+
+def _strict_vmid(value: Any) -> Optional[int]:
+    """Return ``value`` as an int if it is a whole-number VM id, else None.
+
+    Accepts an int or a string of digits. Rejects bools (``int(True)`` is 1)
+    and floats, which ``int()`` would silently truncate."""
+    # Plain ints, but not bools.
+    if isinstance(value, int) and not isinstance(value, bool):
+        return value
+    # Digit strings, surrounding whitespace allowed.
+    if isinstance(value, str) and value.strip().isdigit():
+        return int(value.strip())
+    return None
+
+
+def _alias_values(args: Dict[str, Any], keys: tuple) -> list:
+    """Return the value of every alias in ``keys`` that is set.
+
+    None and "" count as unset, as they do for the agent's ``a or b``."""
+    # Keep each alias that carries a value.
+    return [args[k] for k in keys if args.get(k) not in (None, "")]
+
 
 def _normalize_action(value: Any) -> str:
     """Lowercase an action name and turn dashes into underscores."""
@@ -387,22 +425,35 @@ class CommandQueue:
 
     # ── safeguard ──────────────────────────────────────────────────────────
 
-    def _refused(self, target: str, action: str, args: Dict[str, Any]) -> Optional[str]:
-        """Return a refusal reason if the command must not be enqueued, else None."""
-        # Only proxmox VM actions are checked.
-        if target != "proxmox" or action not in _VM_ACTIONS:
+    def _refused(self, action: str, args: Dict[str, Any]) -> Optional[str]:
+        """Return a refusal reason if the command must not be enqueued, else None.
+
+        Checked for every target: a VM action addressed to one agent's hostname
+        is as dangerous as one addressed to ``"proxmox"`` (any agent)."""
+        # Collect the VM ids the action names; other actions are not checked.
+        # Every alias is checked, not just the first: the agent takes the
+        # first truthy one (``vmid or vm_id``), so a null or empty primary
+        # must not hide a protected id in the other alias.
+        if action in _VM_ACTIONS:
+            ids = _alias_values(args, ("vmid", "vm_id"))
+        elif action == "delete_vms":
+            ids = []
+            for raw in _alias_values(args, ("vmids", "vm_ids")):
+                if not isinstance(raw, list):
+                    return "vmids must be a list of VM ids"
+                ids.extend(raw)
+        else:
             return None
-        # A missing or non-numeric vmid is left for the agent to check.
-        vmid = args.get("vmid")
-        try:
-            v = int(vmid)
-        except (TypeError, ValueError):
-            return None  # agent validates; do not block ambiguous enqueue
-        # Protected and out-of-range VMIDs are refused.
-        if v in self.protected_vmids:
-            return f"VM {v} is protected (hub/system container)"
-        if v < self.sim_vmin:
-            return f"VM {v} outside Client-Simulation range (>= {self.sim_vmin})"
+        # A missing vmid is left for the agent to fail explicitly; anything
+        # else must be a whole number in the sim range and not protected.
+        for vmid in ids:
+            v = _strict_vmid(vmid)
+            if v is None:
+                return f"VM id {vmid!r} is not a whole number"
+            if v in self.protected_vmids:
+                return f"VM {v} is protected (hub/system container)"
+            if v < self.sim_vmin:
+                return f"VM {v} outside Client-Simulation range (>= {self.sim_vmin})"
         return None
 
     # ── public API (called from CSSpoke.handle_command) ────────────────────
@@ -421,8 +472,7 @@ class CommandQueue:
             nargs = dict(args or {})
 
             # Refuse commands the safeguard rejects.
-            reason = self._refused("proxmox" if ntarget == "proxmox" else ntarget,
-                                   naction, nargs)
+            reason = self._refused(naction, nargs)
             if reason:
                 raise ValueError(reason)
 
@@ -442,18 +492,27 @@ class CommandQueue:
             return {"command": cmd, "created": True,
                     "expired": expired, "purged": purged}
 
-    def _command_matches_agent(self, cmd: Dict[str, Any], hostname: str) -> bool:
-        """Return True if ``cmd`` is meant for the agent on ``hostname``."""
-        # Exact target match, or a "proxmox" target (any agent).
+    def _command_matches_agent(self, cmd: Dict[str, Any], hostname: str,
+                               fleet: bool = True) -> bool:
+        """Return True if ``cmd`` is meant for the agent on ``hostname``.
+
+        ``fleet=False`` is a sim client: it never matches a ``"proxmox"``
+        (any agent) command, and only matches actions in SIM_CLIENT_ACTIONS,
+        so a sim VM claiming a Proxmox host's name still gets no VM action."""
+        # A sim client only ever takes sim-client actions.
+        if not fleet and cmd.get("action") not in SIM_CLIENT_ACTIONS:
+            return False
+        # A "proxmox" target means any Proxmox agent, never a sim client.
+        if cmd.get("target") == "proxmox":
+            return fleet
+        # Exact target match, or a hostname alias.
         if cmd.get("target") == hostname:
             return True
-        if cmd.get("target") == "proxmox":
-            return True
-        # Otherwise compare hostname aliases.
         return _hostnames_match(cmd.get("target", ""), hostname)
 
     async def poll_agent_inbox(self, hostname: str,
-                                max_retries: int = 0) -> Dict[str, Any]:
+                                max_retries: int = 0,
+                                fleet: bool = True) -> Dict[str, Any]:
         """Reset stale delivered→pending, cleanup, return serialized pending for
         this host, and mark them delivered. Returns
         ``{commands, expired, purged, reset, delivered, gave_up}``.
@@ -467,7 +526,10 @@ class CommandQueue:
         relay timeout. ``max_retries <= 0`` preserves the old unbounded
         re-send behavior (re-send every STALE_DELIVERED_SECS until the command
         expires). A running long op that streams CS_PROGRESS never hits this:
-        ``touch_command`` refreshes ``updated_at`` on each progress frame."""
+        ``touch_command`` refreshes ``updated_at`` on each progress frame.
+
+        ``fleet=False`` is a sim-client poll (see ``_command_matches_agent``):
+        it neither receives nor resets Proxmox commands."""
         # Normalise the hostname, then clean up under the lock.
         hn = _normalize_hostname(hostname)
         async with self.lock:
@@ -483,7 +545,7 @@ class CommandQueue:
             for cmd in self.commands:
                 if cmd.get("status") == "delivered" and \
                         (now - float(cmd.get("updated_at", now))) > STALE_DELIVERED_SECS and \
-                        self._command_matches_agent(cmd, hn):
+                        self._command_matches_agent(cmd, hn, fleet):
                     # delete_vm / reclone_vm: the 30s reset is a non-budgeted
                     # RE-PROBE ("is the agent back yet?"), not a give-up step.
                     # The few-minutes bound is owned by the verify-sweep below
@@ -523,7 +585,7 @@ class CommandQueue:
             for cmd in self.commands:
                 if cmd.get("status") != "delivered" or \
                         cmd.get("action") not in _VERIFY_ACTIONS or \
-                        not self._command_matches_agent(cmd, hn):
+                        not self._command_matches_agent(cmd, hn, fleet):
                     continue
                 last_contact = float(cmd.get("last_contact",
                                              cmd.get("updated_at", now)))
@@ -554,7 +616,7 @@ class CommandQueue:
 
             # Collect this host's pending commands and mark them delivered.
             pending = [c for c in self.commands
-                       if c.get("status") == "pending" and self._command_matches_agent(c, hn)]
+                       if c.get("status") == "pending" and self._command_matches_agent(c, hn, fleet)]
             delivered_ids = [c["id"] for c in pending]
             for cmd in self.commands:
                 if cmd["id"] in set(delivered_ids) and cmd.get("status") == "pending":
@@ -579,9 +641,17 @@ class CommandQueue:
             }
 
     async def ack_command(self, cmd_id: str, status: str,
-                          message: Any = None, result: Any = None) -> Dict[str, Any]:
+                          message: Any = None, result: Any = None,
+                          hostname: Optional[str] = None,
+                          fleet: bool = True) -> Dict[str, Any]:
         """Idempotent terminal update. ``status`` must be ``completed`` or
-        ``failed`` (long-op ``CS_COMMAND_RESULT`` in Phase E maps here)."""
+        ``failed`` (long-op ``CS_COMMAND_RESULT`` in Phase E maps here).
+
+        A sim client passes ``fleet=False`` and its ``hostname``: it may only
+        ack a command it could have been handed (``_command_matches_agent``),
+        so it can't mark a Proxmox delete or another client's command done.
+        Any other command reads as "Command not found", so a caller can't
+        probe which ids exist."""
         # Only completed or failed are allowed.
         status = str(status or "").strip().lower()
         if status not in ("completed", "failed"):
@@ -591,6 +661,10 @@ class CommandQueue:
         async with self.lock:
             self._cleanup()
             cmd = next((c for c in self.commands if c.get("id") == cmd_id), None)
+            # A sim client may only ack its own sim-client commands.
+            if cmd and not fleet and not self._command_matches_agent(
+                    cmd, _normalize_hostname(hostname or ""), fleet=False):
+                cmd = None
             if not cmd:
                 return {"ok": False, "message": "Command not found"}
             # Record the result, message and timestamps, then save.
