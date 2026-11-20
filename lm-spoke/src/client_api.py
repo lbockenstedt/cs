@@ -31,6 +31,10 @@ key on the WS socket and the mutating/inbox HTTP routes (header
 key isn't disclosed to whatever else reaches port 8080 (it binds 0.0.0.0). The
 linux agent, running on-segment, fetches ``/api/client/key`` first when it
 wants to pass a key along.
+
+The operator surface (the dashboard ``/``, ``/sim/api/*``, ``/status``,
+``/config``, ``/simulate/trigger``) answers loopback callers only; see
+``_require_admin_dep``.
 """
 
 # Allow modern type-hint syntax without evaluating annotations at import time.
@@ -48,6 +52,8 @@ import secrets
 from pathlib import Path
 # Type hints only.
 from typing import Any, Dict, List, Optional
+# Parses Host / Origin values for the operator-surface checks.
+from urllib.parse import urlsplit
 
 # FastAPI routing, errors, query params and WebSocket support.
 from fastapi import (
@@ -203,6 +209,96 @@ def _require_key_dep(spoke):
     return _dep
 
 
+def _is_loopback(host: Optional[str]) -> bool:
+    """Return True if ``host`` is a loopback address (v4, v6 or v4-mapped)."""
+    # Non-IP values (e.g. a test client's "testclient") are never loopback.
+    try:
+        addr = ipaddress.ip_address(host)
+    except (ValueError, TypeError):
+        return False
+    # Unwrap "::ffff:127.0.0.1" the same way _on_sim_segment does.
+    mapped = getattr(addr, "ipv4_mapped", None)
+    return (mapped or addr).is_loopback
+
+
+# Host names a loopback caller may use; anything else in Host is DNS rebinding.
+_LOOPBACK_NAMES = {"127.0.0.1", "localhost", "::1"}
+
+
+def _host_name(netloc: str) -> str:
+    """Return the lower-case host part of a ``host[:port]`` value (IPv6-aware)."""
+    # urlsplit handles "[::1]:8080" and "localhost:9090" alike.
+    return (urlsplit("//" + (netloc or "")).hostname or "").lower()
+
+
+def _admin_refusal(request: Request, browser_api: bool = True) -> Optional[str]:
+    """Return why ``request`` may not use the operator surface, or None.
+
+    Loopback only. Port 8080 binds 0.0.0.0 and the sim VMs share it, so
+    network position on the sim segment is NOT trusted, and client_api_key is
+    NOT accepted: /api/client/key hands that key to every sim VM. A separate
+    operator key was rejected in review: 8080 is plaintext by default (sim
+    agents hard-code http://169.253.1.1:8080, see control_plane), so a key
+    sent to it could be sniffed, and it would sit unencrypted in
+    cs_settings.json. Operators use the hub WebUI, which drives the spoke over
+    its WebSocket command channel and never calls these routes, or reach this
+    page through an SSH tunnel. uvicorn trusts X-Forwarded-For only from
+    127.0.0.1 (its default), so a remote caller cannot claim loopback.
+
+    A loopback peer is not enough on its own, because the operator's browser
+    is a loopback peer too while a tunnel is open:
+    - Host must name loopback, so a DNS-rebound page (Host: evil.example)
+      can't read or drive the API.
+    - For the API routes (``browser_api``), a request a browser marks as
+      cross-site (Sec-Fetch-Site) or whose Origin is not this host is refused,
+      so another site can't post to it (Starlette parses JSON whatever the
+      Content-Type, so a text/plain "simple" POST would otherwise work).
+      Non-browser local callers (curl) send neither header and pass."""
+    # Step 1: the TCP peer must be the spoke itself (or an SSH tunnel).
+    remote_host = request.client.host if request.client else None
+    if not _is_loopback(remote_host):
+        return "local operator UI is loopback-only"
+    # Step 2: the browser must have addressed the spoke by a loopback name.
+    host = request.headers.get("host", "")
+    if _host_name(host) not in _LOOPBACK_NAMES:
+        return "Host must be a loopback address"
+    if not browser_api:
+        return None
+    # Step 3: refuse cross-site browser requests.
+    site = request.headers.get("sec-fetch-site")
+    if site is not None and site not in ("same-origin", "none"):
+        return "cross-site request refused"
+    origin = request.headers.get("origin")
+    if origin is not None and urlsplit(origin).netloc.lower() != host.lower():
+        return "cross-origin request refused"
+    return None
+
+
+def _require_admin_dep():
+    """FastAPI dependency for the operator surface: the /sim/api dashboard
+    router and the /status, /config and /simulate/trigger management routes.
+    See ``_admin_refusal`` for the checks."""
+    def _dep(request: Request) -> None:
+        """Raise 403 unless ``_admin_refusal`` finds nothing wrong."""
+        # Refuse with the reason (it names no secret).
+        reason = _admin_refusal(request)
+        if reason:
+            raise HTTPException(status_code=403, detail=reason)
+    # Return the dependency.
+    return _dep
+
+
+# Shown at / to a non-loopback browser. Plain HTML; no data from the spoke.
+_REMOTE_HTML = """<!doctype html><html><head><meta charset="utf-8">
+<title>Client Simulation</title></head>
+<body style="font-family:sans-serif;max-width:32rem;margin:4rem auto">
+<h2>Client Simulation</h2>
+<p>This spoke's local dashboard is available only on the spoke itself. Use
+the Lab Manager WebUI, or open this page through an SSH tunnel
+(<code>ssh -L 8080:127.0.0.1:8080 &lt;spoke&gt;</code>, then
+<code>http://127.0.0.1:8080/</code>).</p></body></html>"""
+
+
 def _exclusive_sim_ids() -> set:
     """The sim_ids that are EXCLUSIVE (``multi_capable=False``) — a failure sim
     that monopolizes its client (dhcp_fail, dns_fail, assoc_fail, auth_fail,
@@ -326,10 +422,12 @@ def build_client_api_app(spoke) -> FastAPI:
     operator surface (kill switch, clients/control panel, commands, inbox,
     script download). The local dashboard at ``/`` (``local_ui_routes.py``) and
     ``/static/*`` are mounted here too. A client-API key (``_require_key_dep``)
-    gates mutating routes when set; absent = open (the t3 agent path)."""
+    gates the mutating client routes for off-segment callers; the operator
+    surface is loopback-only (``_require_admin_dep``)."""
     # Create the app and the key-check dependency.
     app = FastAPI(title="cs spoke client API", docs_url=None, redoc_url=None)
     require_key = _require_key_dep(spoke)
+    require_admin = _require_admin_dep()
 
     # ── health / kill switch ───────────────────────────────────────────────
     @app.get("/api/health")
@@ -931,26 +1029,26 @@ def build_client_api_app(spoke) -> FastAPI:
                     logger.debug("client WS close: sim-quota nudge failed: %s", exc)
 
     # ── mgmt (kept from standalone, folded in so standalone == hub) ────────
-    @app.get("/status")
+    @app.get("/status", dependencies=[Depends(require_admin)])
     async def mgmt_status() -> Dict[str, Any]:
         """Return the engine's current state."""
         # Delegate to the engine.
         return spoke.engine.get_current_state()
 
-    @app.post("/simulate/trigger")
+    @app.post("/simulate/trigger", dependencies=[Depends(require_admin)])
     async def mgmt_trigger() -> Dict[str, Any]:
         """Run one simulation iteration now."""
         # Delegate to the engine.
         return await spoke.engine.run_iteration()
 
-    @app.post("/config")
+    @app.post("/config", dependencies=[Depends(require_admin)])
     async def mgmt_config_post(body: Dict[str, Any]) -> Dict[str, Any]:
         """Update the engine config and return the new state."""
         # Apply, then report.
         spoke.engine.update_config(body)
         return spoke.engine.get_current_state()
 
-    @app.get("/config")
+    @app.get("/config", dependencies=[Depends(require_admin)])
     async def mgmt_config_get() -> Dict[str, Any]:
         """Return the engine's current config/state."""
         # Delegate to the engine.
@@ -967,14 +1065,21 @@ def build_client_api_app(spoke) -> FastAPI:
     # Available in both --standalone and hub-connected mode (same client API
     # surface either way, per run_standalone_mode's design) so a small
     # deployment gets a working local UI without needing an LM hub at all.
-    app.include_router(build_local_ui_router(spoke))
+    # Every /sim/api route is operator-only (see _require_admin_dep).
+    app.include_router(build_local_ui_router(spoke),
+                       dependencies=[Depends(require_admin)])
+
     # Mount static files and the dashboard if the folder exists.
     if _STATIC_DIR.is_dir():
         app.mount("/static", StaticFiles(directory=str(_STATIC_DIR)), name="static")
 
         @app.get("/")
-        async def dashboard() -> HTMLResponse:
+        async def dashboard(request: Request) -> HTMLResponse:
             """Serve the dashboard HTML with a cache-busting version for sim-views.js."""
+            # Not on the spoke: explain how to reach the dashboard instead.
+            # (A top-level page load; its API calls get the full check.)
+            if _admin_refusal(request, browser_api=False):
+                return HTMLResponse(_REMOTE_HTML, status_code=403)
             # Serve dashboard.html with a cache-busting version stamped into the
             # sim-views.js <script src>. Without it the un-versioned
             # /static/sim-views.js is held by the browser cache, so a JS change
