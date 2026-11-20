@@ -177,7 +177,12 @@ The Client Simulation Suite uses a distributed versioning system where each scri
 - **Key Features**:
   - INI format parsing
   - Section management
-  - Key-value extraction
+  - Key-value extraction (splits on the first `=`, so values may contain `=`)
+  - No inline comments: `;` and `#` inside a value are part of it, as in the
+    default Python configparser that writes the file, so passphrases such as
+    `ab#12;x` or `ab #12` are read whole. Whole-line `;`/`#` comments are skipped
+  - `clients/lib/ini-parser.sh` is canonical; `clients/linux/` and `clients/t3/`
+    are byte-identical copies (checked by `lm-spoke/tests/test_client_ini_parsers.py`)
 
 ---
 
@@ -300,6 +305,7 @@ The Client Simulation Suite uses a distributed versioning system where each scri
   - INI file parsing
   - Hashtable creation
   - Config management
+  - Same rule as `ini-parser.sh`: no inline comments, whole-line `;`/`#` comments skipped
 
 ---
 

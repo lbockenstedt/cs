@@ -3,9 +3,10 @@
 #
 # The expected values below are the captured output of the ORIGINAL
 # (pre-fork-elimination) parser over the same sample INI, so this test pins the
-# fork-free rewrite to the legacy behavior: name cleansing, inline comments,
-# CRLF handling, single-quote escaping, first-match-wins on duplicate keys, and
-# no stale/doubled values after a re-parse.
+# fork-free rewrite to the legacy behavior: name cleansing, CRLF handling, single-quote escaping, first-match-wins on duplicate keys, and
+# no stale/doubled values after a re-parse. Inline comments are the exception:
+# the parser now reads ; and # inside a value as part of it, as configparser
+# (the spoke's writer) does.
 #
 # Usage: bash clients/tests/ini_parser_test.sh [path-to-ini-parser.sh]
 # Defaults to clients/lib/ini-parser.sh (falls back to clients/linux/).
@@ -30,7 +31,7 @@ trap 'rm -rf "$TMPDIR_T"' EXIT
 CONF="$TMPDIR_T/sample.conf"
 
 # Sample INI: orphan key, duplicate key (first wins), padded key/values, a CRLF
-# line, empty value, single quotes, inline ;/# comments, spaces in key + value,
+# line, empty value, single quotes, ;/# inside values, spaces in key + value,
 # punctuation-heavy section name, bucket + username sections.
 {
     printf 'orphan=value0\n'
@@ -54,6 +55,14 @@ CONF="$TMPDIR_T/sample.conf"
     printf '[kbell]\n'
     printf 'simulation_id=s7\n'
     printf "ssidpw=pa'ss\n"
+    # configparser (the spoke's writer) never strips inline comments, so these
+    # are whole values: ;/# with or without whitespace before them, a leading
+    # #, and = inside the value.
+    printf 'pw_hash = ab#12;x\n'
+    printf 'pw_lead = #ab\n'
+    printf 'pw_b64 = YWI=c==\n'
+    printf 'pw_tab=v1\t# tab comment\n'
+    printf 'pw_space = ab #12 ;x\n'
     printf '; comment\n'
     printf '# comment2\n'
 } > "$CONF"
@@ -82,9 +91,9 @@ run_all_checks() {
     expect simulation empty_key       ''
     # Single quotes survive the SINGLE_QUOTE escape round-trip.
     expect simulation quoted          "it's a test"
-    # Inline ;/# comments stripped, trailing spaces trimmed.
-    expect simulation inline          'value'
-    expect simulation inline2         'value2'
+    # ;/# after whitespace stay in the value (configparser keeps them too).
+    expect simulation inline          'value ; trailing comment'
+    expect simulation inline2         'value2 # trailing comment'
     # Key with a space is cleansed to underscore; value keeps inner spaces.
     expect simulation spaced_value    'has spaces inside'
     # Punctuation-heavy names: stored case-preserved, but get_value lowercases
@@ -97,6 +106,11 @@ run_all_checks() {
     expect missing_section anything   ''
     expect kbell      simulation_id   's7'
     expect kbell      ssidpw          "pa'ss"
+    expect kbell      pw_hash         'ab#12;x'
+    expect kbell      pw_lead         '#ab'
+    expect kbell      pw_b64          'YWI=c=='
+    expect kbell      pw_tab          $'v1\t# tab comment'
+    expect kbell      pw_space        'ab #12 ;x'
     # Case-insensitive lookup of lowercase-stored names (query is case-folded).
     expect SIMULATION KILL_SWITCH     'off'
 }
