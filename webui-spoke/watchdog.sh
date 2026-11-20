@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+# webui-watchdog: restart-only
+# install-lxc.sh looks for the line above: an installed watchdog without it is
+# an old one that re-ran the installer as root, and is disabled at once.
 set -uo pipefail
 
 STATE_DIR="${STATE_DIR:-/var/lib/webui-watchdog}"
@@ -7,13 +10,9 @@ LOG_FILE="${LOG_FILE:-/var/log/webui-watchdog.log}"
 INSTALL_DIR="${INSTALL_DIR:-/opt/client-sim-dashboard}"
 ENV_FILE="${ENV_FILE:-${INSTALL_DIR}/.env}"
 WEBUI_SERVICE="${WEBUI_SERVICE:-client-sim-dashboard}"
-INSTALLER_PATH="${INSTALLER_PATH:-/opt/client-sim-repo/webui-spoke/install-lxc.sh}"
-INSTALLER_TMP_PATH="${INSTALLER_TMP_PATH:-/tmp/install-lxc-latest.sh}"
 HEALTH_PATH="${HEALTH_PATH:-/api/health}"
 PORT="${PORT:-8000}"
-REPO_BRANCH="${REPO_BRANCH:-main}"
 FAILURE_COUNT=0
-INSTALLED_VERSION=""
 SCHEME="http"
 
 log() {
@@ -21,7 +20,7 @@ log() {
 }
 
 load_port() {
-  local env_port env_branch env_inst_ver env_tls
+  local env_port env_tls
 
   if [[ ! -f "$ENV_FILE" ]]; then
     return
@@ -30,16 +29,6 @@ load_port() {
   env_port=$(awk -F= '/^PORT=/{print $2; exit}' "$ENV_FILE" | tr -d '"[:space:]')
   if [[ "$env_port" =~ ^[0-9]+$ ]]; then
     PORT="$env_port"
-  fi
-
-  env_branch=$(awk -F= '/^REPO_BRANCH=/{print $2; exit}' "$ENV_FILE" | tr -d '"[:space:]')
-  if [[ -n "$env_branch" ]]; then
-    REPO_BRANCH="$env_branch"
-  fi
-
-  env_inst_ver=$(awk -F= '/^INSTALLER_VERSION=/{print $2; exit}' "$ENV_FILE" | tr -d '"[:space:]')
-  if [[ -n "$env_inst_ver" ]]; then
-    INSTALLED_VERSION="$env_inst_ver"
   fi
 
   # Read SPOKE_TLS to use the correct scheme for health checks
@@ -61,31 +50,6 @@ load_failure_count() {
 
 save_failure_count() {
   printf '%s\n' "$1" >"$STATE_FILE"
-}
-
-rerun_installer() {
-  local latest_installer_url installer_to_run installer_label
-
-  latest_installer_url="https://raw.githubusercontent.com/lbockenstedt/cs/${REPO_BRANCH}/installers/install-lxc.sh"
-  installer_to_run="$INSTALLER_PATH"
-  installer_label="$INSTALLER_PATH"
-
-  if curl -fsSL "$latest_installer_url" -o "$INSTALLER_TMP_PATH"; then
-    installer_to_run="$INSTALLER_TMP_PATH"
-    installer_label="$latest_installer_url"
-  else
-    log "installer_rerun_download_warning url=${latest_installer_url} fallback=${INSTALLER_PATH} after=5_failures"
-  fi
-
-  if [[ -f "$installer_to_run" ]]; then
-    if bash "$installer_to_run" --unattended >>"$LOG_FILE" 2>&1; then
-      log "installer_rerun_complete path=${installer_label}"
-    else
-      log "installer_rerun_failed path=${installer_label}"
-    fi
-  else
-    log "installer_rerun_missing path=${INSTALLER_PATH}"
-  fi
 }
 
 main() {
@@ -111,16 +75,6 @@ main() {
       log "recovered service=${WEBUI_SERVICE} port=${PORT} previous_failures=${FAILURE_COUNT}"
     fi
     save_failure_count 0
-
-    # Proactive update check: fetch the remote INSTALLER_VERSION and reinstall if newer.
-    remote_ver=$(curl -sSf --max-time 10 \
-      "https://raw.githubusercontent.com/lbockenstedt/cs/${REPO_BRANCH}/webui-spoke/INSTALLER_VERSION" \
-      2>/dev/null | tr -d '[:space:]')
-    if [[ -n "$remote_ver" && -n "$INSTALLED_VERSION" && "$remote_ver" != "$INSTALLED_VERSION" ]]; then
-      log "update_available installed=${INSTALLED_VERSION} remote=${remote_ver} — running installer"
-      rerun_installer
-    fi
-
     exit 0
   fi
 
@@ -137,9 +91,18 @@ main() {
     exit 0
   fi
 
+  # The watchdog runs as root but never runs the installer. It used to
+  # (after 5 failures, or whenever the version in the service-owned .env
+  # differed from GitHub's), and the installer then ran git, pip and the
+  # watchdog copy from directories the service user owns, so the service
+  # user could make root run its code. A service that is still down after
+  # two restarts needs an operator to re-run the installer as root.
   if (( failure_count_after >= 5 )); then
-    log "installer_rerun_start path=${INSTALLER_PATH} repo_branch=${REPO_BRANCH} after=5_failures"
-    rerun_installer
+    if systemctl restart "$WEBUI_SERVICE"; then
+      log "restart service=${WEBUI_SERVICE} after=5_failures installer_rerun_needed=run_install-lxc.sh_as_root"
+    else
+      log "restart_failed service=${WEBUI_SERVICE} after=5_failures installer_rerun_needed=run_install-lxc.sh_as_root"
+    fi
     save_failure_count 0
   fi
 }

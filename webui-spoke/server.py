@@ -4243,7 +4243,7 @@ async def _apply_relay_command_batch(remote_cmds: list[dict[str, Any]], ack_fn) 
         # Start a self-update in the background.
         if cmd_type == "self_update":
             if cmd_id:
-                await ack_fn(cmd_id, "executed", {"task_type": "self_update", "detail": "Self-update triggered"})
+                await ack_fn(cmd_id, "executed", _self_update_ack_result())
             asyncio.create_task(_run_self_update())
             continue
 
@@ -4967,7 +4967,7 @@ async def relay_sync_once() -> None:
                         ack_resp = await hc_ack.post(f"{base}/ack", json={
                             "command_id": cmd_id,
                             "status": "executed",
-                            "result": {"task_type": "self_update", "detail": "Self-update triggered"},
+                            "result": _self_update_ack_result(),
                         }, headers=headers)
                         ack_resp.raise_for_status()
                 asyncio.create_task(_run_self_update())
@@ -6838,6 +6838,7 @@ from services.proxmox_agent import (  # noqa: E402,F401 (re-export for internal 
     _run_rolling_reclone,
     _run_self_update,
     _run_update_all,
+    _self_update_ack_result,
     _sanitize_proxmox_tag,
     _save_commands,
     _save_proxmox_host_config,

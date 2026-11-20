@@ -14,7 +14,7 @@ The active LM spoke is `lm-spoke/` (`CSSpoke`), **relay-only** for Proxmox/USB a
 ## Entrypoints
 
 - **lm-spoke (native):** `python3 -m src.control_plane` (`CSControlPlane`), systemd `lm-cs.service`, `User=svc_lm`, `--port $CS_API_PORT --host $CS_API_HOST`. Installer `lm-spoke/install_cs.sh` (clones lm core `core/` to `/opt/lm/core`, cs to `/opt/lm/cs`, a cs-owned Kea DHCP instance `kea-dhcp4-sim` on the 2nd NIC, `lm-cs.service`, rollback watchdog + sudoers). `--standalone` opts out of hub mode.
-- **webui-spoke (legacy):** `uvicorn server:app` :8000. Installer `installers/install-lxc.sh`.
+- **webui-spoke (legacy):** `uvicorn server:app` :8000. Installer `installers/install-lxc.sh`. The service user has no sudo grant, so the legacy dashboard does not update itself: re-run the installer as root to update (self-update requests return `needs_root`). Its root watchdog timer only restarts the service and never re-runs the installer.
 - **Sim agents:** `clients/linux/agent.sh` (systemd `client-sim-agent.service`), `clients/windows/*.ps1`, `clients/t3/*`.
 
 > **Primarily a role now.** cs runs mainly as the **`simulation`** role hosted by the generic agent (`agent-<hostname>`, unit `lm-agent`): the agent opens a sub-spoke `{agent}-simulation` (module_type `simulation`, parent-auto-approved) and self-installs the role via `agent/src/agent_spoke.py::_install_role` — cloning `lbockenstedt/cs.git` + deps and running `install_cs.sh --infra-only` for the idempotent host prep (cs-owned Kea + 2nd NIC). The dedicated `lm-cs.service` / `install_cs.sh` `{module}-spoke-1` path below is the **legacy/standalone** alternative. Sim/provisioning config arrives via the hub push (WebUI), not a per-module `.env`.

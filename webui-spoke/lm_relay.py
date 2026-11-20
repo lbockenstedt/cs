@@ -213,11 +213,13 @@ class CSBridge:
             except Exception as exc:  # noqa: BLE001 - defensive
                 logger.exception("CSBridge CS_QUEUE_COMMAND (fleet %s) failed", cmd_type)
                 return {"status": "ERROR", "message": f"{type(exc).__name__}: {exc}"}
-            # A result flagged success=False is reported as an error with its detail message.
+            # A refusal is an error: either success=False with a detail, or the
+            # {error, message} shape (reseed block, self-update not run).
             result = holder.get("result")
-            if isinstance(result, dict) and result.get("success") is False:
+            if isinstance(result, dict) and (result.get("success") is False or result.get("error")):
                 return {"status": "ERROR",
-                        "message": str(result.get("detail") or "operation failed"),
+                        "message": str(result.get("detail") or result.get("message")
+                                       or result.get("error") or "operation failed"),
                         "result": result}
             return {"status": "SUCCESS", "result": result}
 
