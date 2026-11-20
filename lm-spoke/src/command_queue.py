@@ -230,17 +230,54 @@ def _hostnames_match(left: Any, right: Any) -> bool:
     return bool(la and la.intersection(_hostname_aliases(right)))
 
 
-def _write_atomic(path: Path, text: str) -> None:
-    """Write ``text`` to ``path`` atomically via a temp file."""
+def _write_atomic(path: Path, text: str, mode: Optional[int] = None) -> None:
+    """Write ``text`` to ``path`` atomically via a temp file.
+
+    With ``mode`` (0o600 for a file holding a secret) the temp file is
+    created with that mode, so the content is never readable by other local
+    users, not even between the write and the rename."""
     # Write the temp file, then swap it in.
     tmp = path.with_suffix(path.suffix + ".tmp")
     try:
-        tmp.write_text(text, encoding="utf-8")
+        if mode is None:
+            tmp.write_text(text, encoding="utf-8")
+        else:
+            # A left-over temp file keeps its old mode under os.open, so
+            # remove it and create a new one (O_EXCL: never follow a link).
+            tmp.unlink(missing_ok=True)
+            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, mode)
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                f.write(text)
         tmp.replace(path)
     # On failure remove the temp file and re-raise.
     except Exception:
         tmp.unlink(missing_ok=True)
         raise
+
+
+def _make_private(path: Path, *legacy_tmps: Path) -> None:
+    """Best-effort chmod 0600 of an existing secret file, at load time.
+
+    Tightens a file an older version wrote with the default umask (often
+    0644), without waiting for the next save. Also deletes a temp file a
+    crash left behind (``_write_atomic``'s ``<name>.tmp`` and any older temp
+    names in ``legacy_tmps``): it holds a copy of the secrets, possibly at
+    0644, and nothing would otherwise remove it. Call it only where no write
+    of the same file can be in flight (a loader, or the event loop that does
+    the synchronous TLS writes), so it never deletes a temp file mid-write."""
+    # Tighten the file itself.
+    try:
+        if path.exists():
+            os.chmod(path, 0o600)
+    # A file we cannot chmod is only logged; the spoke keeps running.
+    except OSError as exc:
+        logger.warning("could not restrict %s to 0600: %s", path, exc)
+    # Remove crash leftovers; a write never reads them back.
+    for tmp in (path.with_suffix(path.suffix + ".tmp"), *legacy_tmps):
+        try:
+            tmp.unlink(missing_ok=True)
+        except OSError as exc:
+            logger.warning("could not remove stale temp file %s: %s", tmp, exc)
 
 
 # ── CommandQueue ─────────────────────────────────────────────────────────────

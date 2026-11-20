@@ -44,6 +44,8 @@ from pathlib import Path
 # Type hints only.
 from typing import Any, Callable, Dict, List, Optional
 
+from command_queue import _make_private, _write_atomic
+
 # Logger for this module.
 logger = logging.getLogger("ClientRegistry")
 
@@ -155,7 +157,9 @@ class ClientRegistry:
     # ── persistence ────────────────────────────────────────────────────────
     def _load(self) -> None:
         """Load the saved clients from disk (empty on any problem)."""
-        # Read the file if it exists ("" is treated as empty).
+        # Overrides can hold a JIT dot1x_password: tighten a file an older
+        # version wrote 0644, then read it ("" is treated as empty).
+        _make_private(self._path)
         try:
             if self._path.exists():
                 raw = self._path.read_text(encoding="utf-8")
@@ -175,9 +179,8 @@ class ClientRegistry:
         # Clear the dirty flag and write the whole map.
         try:
             self._dirty = False
-            self._path.write_text(
-                json.dumps(self.clients, sort_keys=True),
-                encoding="utf-8")
+            _write_atomic(self._path, json.dumps(self.clients, sort_keys=True),
+                          mode=0o600)
         # Write failures are only logged.
         except Exception as exc:  # noqa: BLE001
             logger.warning("could not persist %s: %s", self._path, exc)
@@ -224,9 +227,9 @@ class ClientRegistry:
 
                 def _write() -> None:
                     """Write the snapshot to disk (runs in a worker thread)."""
-                    # Serialise and write the file.
-                    self._path.write_text(
-                        json.dumps(clients, sort_keys=True), encoding="utf-8")
+                    # Serialise and write the file, private (it can hold secrets).
+                    _write_atomic(self._path, json.dumps(clients, sort_keys=True),
+                                  mode=0o600)
 
                 # Do the write off the event loop.
                 await asyncio.to_thread(_write)
