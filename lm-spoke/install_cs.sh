@@ -1829,6 +1829,26 @@ mkdir -p /var/lib/lm 2>/dev/null || true
 chown "$SVC_USER:$SVC_USER" /var/lib/lm 2>/dev/null || true
 chmod 755 /var/lib/lm 2>/dev/null || true
 
+# Replace recovery files that an older helper left root-owned in the spoke's
+# state dirs. The helper used to run update_recovery.py as root, so a rollback
+# left bad_commits.json (and bad_versions.json / the failed marker) root-owned
+# in /var/lib/lm/<id>. It now runs as the caller, which could no longer update
+# them: a later bad commit would go unrecorded and could be re-applied.
+# This runs AS the spoke user, never with root's rights: the user owns its
+# state dir, so it may copy a readable file and rename the copy over it. A
+# link or a race planted by that user can only reach what it could already
+# reach. Dirs it does not own (a co-located hub's root-owned state/) fail the
+# copy and are left alone.
+migrate_recovery_owner() {
+    local base="$1" svc="$2"
+    runuser -u "$svc" -- bash -c '
+        find "$1" -mindepth 2 -maxdepth 2 -type f ! -user "$2" -print0 |
+        while IFS= read -r -d "" f; do
+            cp -- "$f" "$f.lm-own" && mv -f -- "$f.lm-own" "$f"
+        done' migrate "$base" "$svc" 2>/dev/null || true
+}
+migrate_recovery_owner /var/lib/lm "$SVC_USER"
+
 # ── Failed-update rollback watchdog + sudoers ─────────────────────────────────
 # Per-spoke recovery state lives in /var/lib/lm/<spoke_id>/ (created on demand at
 # runtime by the spoke): pre-swap code snapshot, pending-update manifest, healthy
@@ -1869,8 +1889,10 @@ cat > /usr/local/bin/lm-component-update-restart <<'HELPER'
 #
 # State-file ops delegate to the Python CLI update_recovery.py (SINGLE SOURCE OF
 # TRUTH for the on-disk recovery state machine). Only poll/systemd/git logic
-# lives here. This file is the canonical source; install_cs.sh / install_pxmx.sh
-# / install_agent.sh embed it verbatim via here-doc — keep them in sync.
+# lives here. The canonical copy is lm/scripts/lm-component-update-restart.
+# This cs copy differs on purpose: it runs the caller's steps as the caller
+# (as_caller) and pins a non-root caller to lm-cs. The lm and pxmx copies
+# still need the same privilege fix in their own changes.
 set -uo pipefail
 
 UNIT="" STATE_DIR="" REPO_ROOT="" INSTALL_DIR="" DEADLINE=90 CORE_REPO_ROOT=""
@@ -1880,11 +1902,24 @@ RECOVERY_PY="/opt/lm/core/src/update_recovery.py"
 # process survives the `systemctl restart <unit>` it issues (otherwise the
 # restart kills us before we can poll or roll back). The guard prevents an
 # infinite re-exec loop. Mirrors lm-update-restart's transient-unit trick.
-if [ -z "${LM_COMP_UPDATE_GUARD:-}" ]; then
-    export LM_COMP_UPDATE_GUARD=1
+#
+# Privilege boundary: a spoke reaches this script through `sudo -n` as its
+# non-root service user, and every argument (--repo-root, --state-dir,
+# --recovery-py, ...) is chosen by that user. So everything that touches a
+# caller-named path (git, the recovery CLI, the state files) runs AS THE CALLER
+# via as_caller(); only systemctl runs as root. Running git or python as root
+# on a service-owned repo or script would hand root to the service user (a
+# repo's own config or filters, or an edited update_recovery.py). The caller is
+# SUDO_USER, which sudo always sets and the caller cannot override; it is
+# passed into the transient unit with --setenv because systemd-run drops the
+# environment. A sudo invocation (SUDO_USER set) is ALWAYS re-executed, so a
+# caller cannot skip to the trusted branch by setting the guard variable.
+if [ -z "${LM_COMP_UPDATE_GUARD:-}" ] || [ -n "${SUDO_USER:-}" ]; then
+    _caller="${SUDO_USER:-$(id -un)}"
     exec systemd-run --no-block --quiet --collect \
         --unit="lm-comp-update-$$-$RANDOM" --service-type=oneshot \
         --setenv=LM_COMP_UPDATE_GUARD=1 \
+        --setenv=LM_COMP_UPDATE_CALLER="$_caller" \
         /usr/local/bin/lm-component-update-restart "$@"
 fi
 
@@ -1901,6 +1936,48 @@ while [ $# -gt 0 ]; do
     esac
 done
 
+# Refuse anything but an lm-* unit and a deadline of 0-3600 seconds: the
+# unit is restarted as root, a non-numeric or overflowing deadline would
+# skip straight to rollback, and a huge one would leave the root watchdog
+# sleeping for years (core passes 90).
+case "$UNIT" in
+    lm-*) ;;
+    *) echo "lm-component-update-restart: refusing unit '$UNIT' (not lm-*)" >&2; exit 2;;
+esac
+case "$UNIT$DEADLINE" in
+    *[!A-Za-z0-9_.@-]*) echo "lm-component-update-restart: invalid --unit/--deadline" >&2; exit 2;;
+esac
+case "$DEADLINE" in
+    ''|*[!0-9]*|?????*) echo "lm-component-update-restart: invalid --deadline" >&2; exit 2;;
+esac
+if [ "$DEADLINE" -gt 3600 ]; then
+    echo "lm-component-update-restart: --deadline over 3600s" >&2; exit 2
+fi
+
+CALLER="${LM_COMP_UPDATE_CALLER:-root}"
+CALLER_HOME="$(getent passwd "$CALLER" 2>/dev/null | cut -d: -f6)"
+if [ -z "$CALLER_HOME" ]; then
+    echo "lm-component-update-restart: unknown caller '$CALLER'" >&2
+    exit 2
+fi
+# The sudoers grant is for the standalone spoke's service user only, and that
+# spoke restarts only lm-cs (control_plane.get_service_name). A non-root caller
+# may not restart any other LM service sharing the host; root may.
+if [ "$CALLER" != "root" ] && [ "$UNIT" != "lm-cs" ]; then
+    echo "lm-component-update-restart: caller '$CALLER' may restart only lm-cs" >&2
+    exit 2
+fi
+
+# Run a command as the user who scheduled this watchdog (see the privilege
+# boundary note above). A root caller (the agent) runs it directly.
+as_caller() {
+    if [ "$CALLER" = "root" ]; then
+        "$@"
+    else
+        runuser -u "$CALLER" -- env HOME="$CALLER_HOME" "$@"
+    fi
+}
+
 HEALTHY="$STATE_DIR/healthy"
 PENDING="$STATE_DIR/pending_update.json"
 
@@ -1910,7 +1987,7 @@ PENDING="$STATE_DIR/pending_update.json"
 # is the natural place to keep lmctl current WITHOUT a reinstall. Idempotent.
 for _lmctl in /opt/lm/scripts/lmctl /opt/lm/cs/lm-spoke/scripts/lmctl; do
     if [ -f "$_lmctl" ]; then
-        chmod +x "$_lmctl" 2>/dev/null || true
+        as_caller chmod +x "$_lmctl" 2>/dev/null || true
         ln -sf "$_lmctl" /usr/local/bin/lmctl 2>/dev/null || true
         break
     fi
@@ -1919,7 +1996,7 @@ done
 # 0 if the component is healthy (marker present) OR booted-but-pending-auth
 # (active, not crash-looping); 1 if still failing (crash-loop / failed / unknown).
 unit_ok() {
-    [ -f "$HEALTHY" ] && return 0
+    as_caller test -f "$HEALTHY" && return 0
     local a n
     a="$(systemctl show "$UNIT" -p ActiveState --value 2>/dev/null || echo "")"
     n="$(systemctl show "$UNIT" -p NRestarts --value 2>/dev/null || echo 0)"
@@ -1929,14 +2006,14 @@ unit_ok() {
 }
 
 clear_and_prune() {
-    python3 "$RECOVERY_PY" clearpending --state-dir "$STATE_DIR" >/dev/null 2>&1 || true
-    python3 "$RECOVERY_PY" prune --state-dir "$STATE_DIR" >/dev/null 2>&1 || true
+    as_caller python3 "$RECOVERY_PY" clearpending --state-dir "$STATE_DIR" >/dev/null 2>&1 || true
+    as_caller python3 "$RECOVERY_PY" prune --state-dir "$STATE_DIR" >/dev/null 2>&1 || true
 }
 
 # 1) Wait up to DEADLINE for the new code to boot + re-auth (healthy marker).
 waited=0
 while [ "$waited" -lt "$DEADLINE" ]; do
-    if [ -f "$HEALTHY" ]; then
+    if as_caller test -f "$HEALTHY"; then
         clear_and_prune
         exit 0
     fi
@@ -1951,7 +2028,7 @@ if unit_ok; then
 fi
 
 # 3) Crash-loop or failed → roll back to the pre-swap code.
-pending="$(cat "$PENDING" 2>/dev/null || true)"
+pending="$(as_caller cat "$PENDING" 2>/dev/null || true)"
 bdir="$(printf '%s' "$pending" | jq -r '.backup_dir // empty' 2>/dev/null)"
 from_commit="$(printf '%s' "$pending" | jq -r '.from_commit // empty' 2>/dev/null)"
 to_commit="$(printf '%s' "$pending" | jq -r '.to_commit // empty' 2>/dev/null)"
@@ -1964,20 +2041,20 @@ echo "lm-component-update-restart: $UNIT failed to boot (crash-loop/failed); rol
 if [ -n "$REPO_ROOT" ]; then
     # Spoke (git repo): reset hard to the pre-update commit + clean stray files.
     if [ -n "$from_commit" ]; then
-        git -C "$REPO_ROOT" reset --hard "$from_commit" >/dev/null 2>&1 || true
-        git -C "$REPO_ROOT" clean -fd >/dev/null 2>&1 || true
+        as_caller git -C "$REPO_ROOT" reset --hard "$from_commit" >/dev/null 2>&1 || true
+        as_caller git -C "$REPO_ROOT" clean -fd >/dev/null 2>&1 || true
     fi
     if [ -n "$to_commit" ]; then
-        python3 "$RECOVERY_PY" markbadcommit "$to_commit" --state-dir "$STATE_DIR" >/dev/null 2>&1 || true
+        as_caller python3 "$RECOVERY_PY" markbadcommit "$to_commit" --state-dir "$STATE_DIR" >/dev/null 2>&1 || true
     fi
 elif [ -n "$INSTALL_DIR" ]; then
     # Agent (non-git install dir): file-tree restore from the pre-swap snapshot.
     if [ -n "$bdir" ] && [ -d "$bdir/src" ]; then
-        python3 "$RECOVERY_PY" rollback --hub-root "$INSTALL_DIR" --backup-dir "$bdir" \
+        as_caller python3 "$RECOVERY_PY" rollback --hub-root "$INSTALL_DIR" --backup-dir "$bdir" \
             --tree src --state-dir "$STATE_DIR" --chown-user root >/dev/null 2>&1 || true
     fi
     if [ -n "$to_v" ]; then
-        python3 "$RECOVERY_PY" markbad "$to_v" --state-dir "$STATE_DIR" >/dev/null 2>&1 || true
+        as_caller python3 "$RECOVERY_PY" markbad "$to_v" --state-dir "$STATE_DIR" >/dev/null 2>&1 || true
     fi
 fi
 
@@ -1989,14 +2066,14 @@ fi
 # behavior is unchanged.
 if [ -n "$CORE_REPO_ROOT" ] && [ -n "$core_from" ]; then
     echo "lm-component-update-restart: rolling back shared core at $CORE_REPO_ROOT to $core_from." >&2
-    git -C "$CORE_REPO_ROOT" reset --hard "$core_from" >/dev/null 2>&1 || true
-    git -C "$CORE_REPO_ROOT" clean -fd >/dev/null 2>&1 || true
+    as_caller git -C "$CORE_REPO_ROOT" reset --hard "$core_from" >/dev/null 2>&1 || true
+    as_caller git -C "$CORE_REPO_ROOT" clean -fd >/dev/null 2>&1 || true
     if [ -n "$core_to" ]; then
-        python3 "$RECOVERY_PY" markbadcommit "$core_to" --state-dir "$STATE_DIR" >/dev/null 2>&1 || true
+        as_caller python3 "$RECOVERY_PY" markbadcommit "$core_to" --state-dir "$STATE_DIR" >/dev/null 2>&1 || true
     fi
 fi
 
-python3 "$RECOVERY_PY" clearpending --state-dir "$STATE_DIR" >/dev/null 2>&1 || true
+as_caller python3 "$RECOVERY_PY" clearpending --state-dir "$STATE_DIR" >/dev/null 2>&1 || true
 systemctl restart "$UNIT" 2>/dev/null || true
 
 # 4) Did the rolled-back code come back? (marker OR active-and-stable.)
@@ -2004,14 +2081,14 @@ waited=0
 while [ "$waited" -lt 30 ]; do
     if unit_ok; then
         echo "lm-component-update-restart: $UNIT rolled back; marked bad; recovered." >&2
-        python3 "$RECOVERY_PY" prune --state-dir "$STATE_DIR" >/dev/null 2>&1 || true
+        as_caller python3 "$RECOVERY_PY" prune --state-dir "$STATE_DIR" >/dev/null 2>&1 || true
         exit 0
     fi
     sleep 5; waited=$((waited + 5))
 done
 
 # 5) Rolled-back code ALSO failed — last-resort marker for manual recovery.
-python3 "$RECOVERY_PY" writefailed --to-version "${to_v:-${to_commit:-unknown}}" \
+as_caller python3 "$RECOVERY_PY" writefailed --to-version "${to_v:-${to_commit:-unknown}}" \
     --backup-dir "$bdir" --reason "rollback did not come healthy within 30s" \
     --state-dir "$STATE_DIR" >/dev/null 2>&1 || true
 echo "lm-component-update-restart: $UNIT rollback also failed; left for manual recovery (snapshot at $bdir)." >&2
