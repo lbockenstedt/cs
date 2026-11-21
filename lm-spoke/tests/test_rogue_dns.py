@@ -748,7 +748,9 @@ function Test-WwwRunning { Test-ScriptRunning -ScriptName 'www_traffic.ps1' }
 $script:username = 'tester'
 $script:simulation_id = 's0'
 $script:random_pool = 'off'
+$script:web_server = 'off'
 if ($env:OVERRIDE_REMOVED) { $script:random_pool = 'on'; $script:rogueDnsUser = 'on'; $script:rogueDnsBase = $env:OVERRIDE_REMOVED }
+if ($env:WEB_SERVER) { $script:random_pool = 'off'; $script:web_server = 'on' }
 $script:rogue_dns = $env:FLAG
 $script:kill_switch = $env:KILL
 $script:www_traffic = $env:WWW
@@ -817,6 +819,11 @@ Set-Content -LiteralPath (Join-Path $env:TEST_ROOT 'rogue_dns.state') -Value '{"
     # Random pool: a removed [username] override stops rogue_dns unless the roll had it on.
     ("midcycle_override_removed", "Update-RogueDnsGate", "on", "off", True, "", "static", "[simulation]\nkill_switch=off\n[s0]\nrogue_dns=on\n", ["cleanup", "flag off"], ["restore-only"]),
     ("midcycle_override_removed_rolled_on", "Update-RogueDnsGate", "on", "off", True, "", "static", "[simulation]\nkill_switch=off\n[s0]\nrogue_dns=on\n", ["flag on"], ["cleanup"]),
+    # Hub engine (web_server=on, random_pool off): same fallback as Linux, the roll not the bucket.
+    ("midcycle_override_removed_web_server", "Update-RogueDnsGate", "on", "off", True, "", "static", "[simulation]\nkill_switch=off\n[s0]\nrogue_dns=on\n", ["cleanup", "flag off"], ["restore-only"]),
+    ("midcycle_override_removed_web_rolled_on", "Update-RogueDnsGate", "on", "off", True, "", "static", "[simulation]\nkill_switch=off\n[s0]\nrogue_dns=on\n", ["flag on"], ["cleanup"]),
+    # rogue_dns process tree (10 -> firefox 11) is spared; unrelated firefox 12 stopped.
+    ("firefox_procid", "Stop-SimFirefox", "off", "off", True, "", "static", "", ["stop 12"], ["stop 10", "stop 11"]),
     ("midcycle_still_on", "Update-RogueDnsGate", "on", "off", True, "", "static", "[simulation]\nkill_switch=off\n[s0]\nrogue_dns=on\n", ["flag on", "stamp synced True"], ["cleanup"]),
     # simulation.conf unchanged since the cycle start: not re-parsed, so no stop.
     ("midcycle_conf_same", "Update-RogueDnsGate", "on", "off", True, "", "static", "[simulation]\nkill_switch=off\n[s0]\nrogue_dns=off\n", ["flag on"], ["cleanup"]),
@@ -872,7 +879,7 @@ def test_windows_orchestrator_cancels_and_recovers(tmp_path, scenario, action, f
     env = dict(os.environ, TEST_ROOT=str(tmp_path), ACTION=action, FLAG=flag, KILL=kill, MODE=mode,
                WWW="on" if scenario.startswith("browse") else "off",
                CONF_SAME="1" if scenario == "midcycle_conf_same" else "",
-               OVERRIDE_REMOVED=("on" if scenario.endswith("rolled_on") else "off") if "override_removed" in scenario else "", RETRY="1" if scenario == "retry_owed" else "")
+               OVERRIDE_REMOVED=("on" if scenario.endswith("rolled_on") else "off") if "override_removed" in scenario else "", WEB_SERVER="1" if "web_" in scenario else "", RETRY="1" if scenario == "retry_owed" else "")
     result = subprocess.run([powershell, "-NoProfile", "-NonInteractive", "-File", str(tmp_path / "harness.ps1")],
                             env=env, capture_output=True, text=True, timeout=30)
     assert result.returncode == 0 and not result.stderr, result.stdout + result.stderr

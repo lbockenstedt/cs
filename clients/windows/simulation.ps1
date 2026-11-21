@@ -563,13 +563,15 @@ function Update-RogueDnsGate {
         # turn an ambient-rolled rogue_dns off.
         $user = [string](& $get $script:username 'rogue_dns')
         $bucket = [string](& $get $script:simulation_id 'rogue_dns')
+        # Same as Linux: random pool or hub engine (web_server) means ambient-rolled.
+        $ambient = $script:random_pool -eq 'on' -or $script:web_server -eq 'on'
         if ($user -ne [string]$script:rogueDnsUser) {
             # A removed override falls back to what the cycle would have run without it.
             if ($user) { $flag = $user }
-            elseif ($script:random_pool -eq 'on') { $flag = [string]$script:rogueDnsBase }
+            elseif ($ambient) { $flag = [string]$script:rogueDnsBase }
             else { $flag = $bucket }
             if (-not $flag) { $flag = 'off' }
-        } elseif (-not $user -and $script:random_pool -ne 'on' -and $bucket -ne [string]$script:rogueDnsBucket) {
+        } elseif (-not $user -and -not $ambient -and $bucket -ne [string]$script:rogueDnsBucket) {
             $flag = $bucket; if (-not $flag) { $flag = 'off' }
         }
     }
@@ -611,10 +613,10 @@ function Stop-SimFirefox {
         ($_.Name -eq 'powershell.exe' -and [string]::IsNullOrWhiteSpace([string]$_.CommandLine))
     } | ForEach-Object { $queue.Enqueue([int]$_.ProcessId) }
     while ($queue.Count) {
-        $id = $queue.Dequeue()
-        if ($keep.ContainsKey($id)) { continue }
-        $keep[$id] = $true
-        $procs | Where-Object { [int]$_.ParentProcessId -eq $id } | ForEach-Object { $queue.Enqueue([int]$_.ProcessId) }
+        $procId = $queue.Dequeue()
+        if ($keep.ContainsKey($procId)) { continue }
+        $keep[$procId] = $true
+        $procs | Where-Object { [int]$_.ParentProcessId -eq $procId } | ForEach-Object { $queue.Enqueue([int]$_.ProcessId) }
     }
     Get-Process -Name firefox -ErrorAction SilentlyContinue |
         Where-Object { -not $keep.ContainsKey([int]$_.Id) } |
