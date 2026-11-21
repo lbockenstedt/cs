@@ -259,3 +259,40 @@ def test_usb_config_payload_emits_t3_exclude_hosts(spoke_loop):
 def test_usb_config_payload_t3_exclude_hosts_defaults_empty(spoke_loop):
     spoke, loop = spoke_loop
     assert spoke.settings.usb_config_payload()["t3_exclude_hosts"] == []
+
+@pytest.mark.parametrize("gc,pushed", [
+    ({"github_token": "tok", "repo_url": "https://evil.example/acme/sims"}, False),
+    ({"github_token": "tok", "repo_url": "acme/sims", "repo_branch": "a..b"}, False),
+    ({"github_token": "tok", "repo_url": "acme/sims", "repo_branch": "main"}, True),
+])
+def test_config_update_reports_github_only_when_it_will_push(tmp_path, gc, pushed):
+    """With source=github and a token, a repo_url or branch the push refuses
+    keeps the edit as a hub override and reports it as such; only a valid
+    repo is reported as a GitHub write and gets a push."""
+    cfg_dir = tmp_path / "configs"
+    cfg_dir.mkdir()
+    data = tmp_path / "data"
+    data.mkdir()
+    spoke, loop = _make_spoke(data, cfg_dir)
+    spoke._github_config = dict(gc)
+    pushes = []
+    spoke._schedule_github_push = pushes.append
+    spoke._schedule_client_refresh = lambda: None
+    try:
+        resp = _run(loop, spoke.handle_command("CS_CONFIG_UPDATE", {
+            "sim_conf_override": "[simulation]\nsim_phy = ethernet\n",
+        }))
+        assert resp["status"] == "SUCCESS"
+        if pushed:
+            assert "simulation.conf:github" in resp["applied"]
+            assert pushes == [{"configs/simulation.conf": "[simulation]\nsim_phy = ethernet\n"}]
+            assert not (cfg_dir / "hub-sim-overrides.conf").exists()
+        else:
+            assert "sim_conf_override:updated" in resp["applied"]
+            assert not any(a.endswith(":github") for a in resp["applied"])
+            assert pushes == []
+            assert "ethernet" in (cfg_dir / "hub-sim-overrides.conf").read_text(encoding="utf-8")
+            assert not (cfg_dir / "simulation.conf").exists()
+    finally:
+        loop.close()
+        asyncio.set_event_loop(None)
