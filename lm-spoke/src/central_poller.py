@@ -1134,6 +1134,15 @@ class CentralPoller:
         # Report the result.
         return {"status": "SUCCESS", "spokes": [{
             "spoke_id": self.spoke.spoke_id, "spoke_name": self.spoke.spoke_id,
-            "token_state": self._client._token_state() if self._client else None,
+            "token_state": self._token_summary(),
             "token_valid": token_valid, "status": msg,
         }]}
+
+    def _token_summary(self) -> str:
+        """Say whether a Central token is cached, without revealing it.
+
+        The client's token cache holds the live access and refresh tokens, and
+        this reply travels to the hub and on to the browser. Use the same
+        "present"/"missing" strings as the hub's test_central_from_config."""
+        state = self._client._token_state() if self._client else {}
+        return "present" if state.get("access_token") else "missing"
