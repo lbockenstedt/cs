@@ -143,6 +143,9 @@ class CSSettings:
         "client_api_key": "",
     }
 
+    # Secrets update() never echoes back (fleet rule 5.2): replaced by *_set flags.
+    _SECRET_KEYS = ("client_api_key",)
+
     def __init__(self, data_dir: Path, config_dir: Path) -> None:
         """Load settings from ``data_dir`` and make sure a client API key exists."""
         # Where settings are stored, and where the simulation config files live.
@@ -198,12 +201,16 @@ class CSSettings:
         return v
 
     def update(self, patch: Dict[str, Any]) -> Dict[str, Any]:
-        """Merge ``patch`` into the settings, save, and return a copy of all settings."""
+        """Merge ``patch`` into the settings, save, and return a masked copy of all settings."""
         # Apply the changes and save them.
         self.settings.update(patch or {})
         self._save()
-        # Return a copy so callers cannot change the internal dict.
-        return dict(self.settings)
+        # Return a copy with the secrets masked, so a caller (the hub's
+        # UPDATE_SETTINGS reply) never receives them.
+        out = dict(self.settings)
+        for k in self._SECRET_KEYS:
+            out[k + "_set"] = bool(out.pop(k, ""))
+        return out
 
     def protected_vmids(self) -> Set[int]:
         """Return the set of VM ids that must never be modified."""

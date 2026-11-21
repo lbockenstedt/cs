@@ -119,6 +119,109 @@ def test_client_key_endpoint_allows_sim_segment(client, spoke):
     assert r.json() == {"client_api_key": "secret"}
 
 
+# ── operator surface (/sim/api, /status, /config, /simulate/trigger, /) ─────
+_ADMIN_ROUTES = [
+    ("get", "/sim/api/t1/kill-switch", None),
+    ("post", "/sim/api/t1/kill-switch", {"enabled": True}),
+    ("put", "/sim/api/tenant/t1/hub-config", {"config_source": "github"}),
+    ("delete", "/sim/api/proxmox/host/pve1", None),
+    ("get", "/status", None),
+    ("get", "/config", None),
+    ("post", "/config", {"x": 1}),
+    ("post", "/simulate/trigger", None),
+]
+
+
+@pytest.mark.parametrize("method,path,body", _ADMIN_ROUTES)
+def test_admin_routes_refuse_sim_segment_and_client_key(client, spoke, method, path, body):
+    """A sim VM (on-segment, and holding client_api_key from /api/client/key)
+    must not reach the operator surface."""
+    called = []
+
+    async def handle_command(cmd, data):
+        """Record that a command got through."""
+        called.append(cmd)
+        return {"status": "SUCCESS"}
+    spoke.handle_command = handle_command
+    kw = {"json": body} if body is not None else {}
+    for headers in ({}, {"X-Client-Key": spoke.settings.get("client_api_key")}):
+        r = getattr(client, method)(path, headers=headers, **kw)
+        assert r.status_code == 403, (path, headers, r.text)
+    assert called == []
+
+
+_LOCAL = {"host": "127.0.0.1:8080"}
+
+
+def test_admin_route_allows_loopback_only(client, monkeypatch):
+    """Loopback (the spoke itself or an SSH tunnel) is the only way in; the
+    removed operator-key header/cookie and the client key open nothing."""
+    assert client.get("/status", headers={"X-CS-UI-Key": "x", **_LOCAL}).status_code == 403
+    monkeypatch.setattr(client_api, "_is_loopback", lambda host: True)
+    assert client.get("/status", headers=_LOCAL).status_code == 200
+    assert client.get("/status", headers={"host": "localhost:9090"}).status_code == 200
+    assert client.get("/status", headers={"host": "[::1]:8080"}).status_code == 200
+
+
+@pytest.mark.parametrize("headers", [
+    {"host": "evil.example:8080"},                                   # DNS rebinding
+    {"host": "testserver"},
+    {**_LOCAL, "origin": "https://evil.example"},                    # CSRF
+    {**_LOCAL, "origin": "null"},
+    {**_LOCAL, "sec-fetch-site": "cross-site"},
+    {**_LOCAL, "sec-fetch-site": "same-site"},
+])
+def test_admin_route_refuses_rebinding_and_cross_site(client, spoke, monkeypatch, headers):
+    """A browser on the spoke (or behind a tunnel) is a loopback peer, so a
+    hostile page must still be refused: a text/plain POST is parsed as JSON."""
+    called = []
+
+    async def handle_command(cmd, data):
+        """Record that a command got through."""
+        called.append(cmd)
+        return {"status": "SUCCESS"}
+    spoke.handle_command = handle_command
+    monkeypatch.setattr(client_api, "_is_loopback", lambda host: True)
+    r = client.post("/sim/api/t1/kill-switch", content='{"enabled": true}',
+                    headers={"content-type": "text/plain", **headers})
+    assert r.status_code == 403, r.text
+    assert called == []
+
+
+def test_admin_route_allows_same_origin_browser(client, monkeypatch):
+    """The dashboard's own same-origin fetches still work."""
+    monkeypatch.setattr(client_api, "_is_loopback", lambda host: True)
+    r = client.get("/status", headers={**_LOCAL, "origin": "http://127.0.0.1:8080",
+                                       "sec-fetch-site": "same-origin"})
+    assert r.status_code == 200
+
+
+@pytest.mark.parametrize("host,expected", [
+    ("127.0.0.1", True), ("::1", True), ("::ffff:127.0.0.1", True),
+    ("169.253.1.20", False), ("10.0.0.5", False), ("testclient", False), (None, False),
+])
+def test_is_loopback(host, expected):
+    assert client_api._is_loopback(host) is expected
+
+
+def test_dashboard_remote_gets_instructions_not_ui(client, monkeypatch):
+    """A remote browser gets a static how-to-reach-it page, not the dashboard."""
+    r = client.get("/")
+    assert r.status_code == 403 and "SSH tunnel" in r.text
+    assert "sim-views.js" not in r.text
+    monkeypatch.setattr(client_api, "_is_loopback", lambda host: True)
+    assert client.get("/", headers={"host": "evil.example"}).status_code == 403
+    r = client.get("/", headers=_LOCAL)
+    assert r.status_code == 200 and "SSH tunnel" not in r.text
+
+
+def test_settings_update_masks_client_key(spoke):
+    """The UPDATE_SETTINGS reply never carries the client API key."""
+    out = spoke.settings.update({"protected_vmids": "100"})
+    assert "client_api_key" not in out and out["client_api_key_set"] is True
+    assert out["protected_vmids"] == "100"
+
+
 def test_apersist_round_trips_to_disk(tmp_path):
     """_apersist is now a DEBOUNCED dirty-mark (coalesced flush, ≤1 write per
     ~5s); the actual write still runs json.dumps + write in a worker thread.
