@@ -445,7 +445,7 @@ sudo bash <(curl -fsSL https://raw.githubusercontent.com/lbockenstedt/cs/main/in
 
 #### Self-update
 
-The installer version is written to `INSTALLER_VERSION` and shown in the UI. The frontend build version is written to `VERSION`. The spoke can check for newer installer versions and re-run the installer in place during self-update, and `server.py` cache-busts `app.js` and `style.css` with `?v=<app_version>` so browsers pick up the refreshed UI immediately after deploy/update.
+The installer version is written to `INSTALLER_VERSION` and shown in the UI. The frontend build version is written to `VERSION`. The service runs as the unprivileged `dashboard` user with no sudo grant (every installer run first removes an old `/etc/sudoers.d/client-sim-dashboard` and disables an old installer-running watchdog, before it reads anything the service user can write), so it cannot re-run the installer itself: the daily check only logs that a newer installer exists, and a UI or hub self-update request returns a `needs_root` error. To update, re-run the installer as root with the command above. The root `webui-watchdog` timer only restarts the service; after 5 failed health checks in a row it logs `installer_rerun_needed` and never downloads or runs the installer, because it would run code from directories the service user can write. `server.py` cache-busts `app.js` and `style.css` with `?v=<app_version>` so browsers pick up the refreshed UI immediately after deploy/update.
 
 ### Docker (development / lab use)
 

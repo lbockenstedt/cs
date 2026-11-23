@@ -31,6 +31,8 @@ from pathlib import Path
 # Type hints only.
 from typing import Any, Dict
 
+from command_queue import _make_private, _write_atomic
+
 # Logger for this module.
 logger = logging.getLogger("LocalStore")
 
@@ -238,7 +240,10 @@ class LocalStore:
 
     def _load(self) -> None:
         """Load the saved data (empty if missing or corrupt)."""
-        # Read the JSON file.
+        # The store holds Central/Mist credentials: tighten a file an older
+        # version wrote 0644 (and its crash leftover, which older versions
+        # named local_store.tmp), then read it.
+        _make_private(self._path, self._path.with_suffix(".tmp"))
         try:
             with open(self._path, "r", encoding="utf-8") as f:
                 self._data = json.load(f) or {}
@@ -252,13 +257,10 @@ class LocalStore:
             self._data = {}
 
     def _save(self) -> None:
-        """Save the data to disk atomically; failures only log a warning."""
-        # Write a temp file, then swap it in.
+        """Save the data to disk atomically and 0600; failures only log a warning."""
+        # Write a private temp file, then swap it in (the store holds secrets).
         try:
-            tmp = self._path.with_suffix(".tmp")
-            with open(tmp, "w", encoding="utf-8") as f:
-                json.dump(self._data, f, indent=2)
-            os.replace(tmp, self._path)
+            _write_atomic(self._path, json.dumps(self._data, indent=2), mode=0o600)
         # Log and continue on failure.
         except Exception as exc:  # noqa: BLE001
             logger.warning("LocalStore: save failed (%s): %s", self._path, exc)

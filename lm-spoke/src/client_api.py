@@ -9,7 +9,8 @@ gateway. This module builds the FastAPI app that simulation clients call:
   * ``/api/config``(+``/overrides``/``/parsed``)  — simulation.conf delivery
   * ``/api/scripts/{platform}/...``               — client script distribution
   * ``/api/clients`` + ``/api/clients/{h}/control`` — registry / per-host overrides
-  * ``/api/commands`` / ``/api/inbox``(/ack)      — command queue (HTTP fallback)
+  * ``/api/commands`` / ``/api/inbox``(/ack)      — command queue (HTTP fallback;
+                                                    listing and ack are loopback only)
   * ``ws://…/ws/client``                           — primary agent channel
   * ``/status`` / ``/simulate/trigger`` / ``/config`` / ``/version`` — mgmt
 
@@ -398,9 +399,11 @@ async def push_pending(spoke, hostname: str) -> bool:
     ws = client_ws_connections.get(hn)
     if ws is None:
         return False
-    # Collect pending commands and push them.
+    # Collect pending commands and push them. Only sim clients hold a
+    # /ws/client socket (Proxmox agents poll through the hub), so this is a
+    # non-fleet poll: no "proxmox" or VM commands, whatever the hostname.
     try:
-        res = await spoke.queue.poll_agent_inbox(hn)
+        res = await spoke.queue.poll_agent_inbox(hn, fleet=False)
         cmds = res.get("commands") or []
         if cmds:
             await ws.send_json({"type": "commands", "commands": cmds})
@@ -876,9 +879,12 @@ def build_client_api_app(spoke) -> FastAPI:
         # Empty when there is no registry.
         return spoke.registry.get_all() if spoke.registry is not None else {}
 
-    @app.post("/api/clients/{hostname}/control", dependencies=[Depends(require_key)])
+    # Overrides and new commands steer other clients and the Proxmox hosts,
+    # so they are operator surfaces (loopback only, like /status): a sim VM
+    # passes require_key by segment, and can read client_api_key anyway.
+    @app.post("/api/clients/{hostname}/control", dependencies=[Depends(require_admin)])
     async def api_clients_control(hostname: str, body: Dict[str, Any]) -> Dict[str, Any]:
-        """Set per-client overrides for ``hostname``."""
+        """Set per-client overrides for ``hostname`` (loopback only)."""
         # Overrides must be an object.
         overrides = body.get("overrides", {})
         if not isinstance(overrides, dict):
@@ -887,17 +893,18 @@ def build_client_api_app(spoke) -> FastAPI:
         entry = await spoke.registry.set_overrides(hostname, overrides)
         return {"status": "ok", "client": entry}
 
-    @app.delete("/api/clients/{hostname}/control", dependencies=[Depends(require_key)])
+    @app.delete("/api/clients/{hostname}/control", dependencies=[Depends(require_admin)])
     async def api_clients_control_delete(hostname: str) -> Dict[str, Any]:
-        """Clear all overrides for ``hostname``."""
+        """Clear all overrides for ``hostname`` (loopback only)."""
         # Clear and confirm.
         await spoke.registry.clear_overrides(hostname)
         return {"status": "ok"}
 
     # ── command queue (HTTP fallback / admin) ──────────────────────────────
-    @app.post("/api/commands", dependencies=[Depends(require_key)])
+    @app.post("/api/commands", dependencies=[Depends(require_admin)])
     async def api_commands_post(body: Dict[str, Any]) -> Dict[str, Any]:
-        """Queue a command and push it to the target agent if connected."""
+        """Queue a command and push it to the target agent if connected
+        (loopback only: a "proxmox" delete_vm reaches the Proxmox hosts)."""
         # Read the target and action (action required).
         target = str(body.get("target") or "proxmox")
         action = str(body.get("action") or "").strip()
@@ -914,21 +921,35 @@ def build_client_api_app(spoke) -> FastAPI:
         await push_pending(spoke, target)
         return res
 
-    @app.get("/api/commands", dependencies=[Depends(require_key)])
+    @app.get("/api/commands", dependencies=[Depends(require_admin)])
     async def api_commands_list() -> Dict[str, Any]:
-        """Return all queued commands."""
+        """Return all queued commands (operator surface: every command's id,
+        target and args, so loopback only, like ``/status``)."""
         # List them.
         return {"commands": await spoke.queue.list_commands()}
 
     @app.get("/api/inbox", dependencies=[Depends(require_key)])
-    async def api_inbox(hostname: str = Query(...)) -> Dict[str, Any]:
-        """Poll the inbox for ``hostname`` (marks commands delivered)."""
-        # Delegate to the queue.
-        return await spoke.queue.poll_agent_inbox(hostname)
+    async def api_inbox(request: Request, hostname: str = Query(...)) -> Dict[str, Any]:
+        """Poll the inbox for ``hostname`` (marks commands delivered).
 
-    @app.post("/api/inbox/ack", dependencies=[Depends(require_key)])
+        Only the local operator (``_admin_refusal`` passes: loopback) gets a
+        fleet poll with "proxmox" and VM commands. Everyone else gets a
+        non-fleet poll, keyed or not: every sim VM can fetch client_api_key
+        from /api/client/key, and port 8080 binds all interfaces, so the key
+        and the source address identify no Proxmox agent. The Proxmox agents
+        poll through the hub (CS_POLL_AGENT_INBOX), never this route."""
+        # Fleet only for the local operator.
+        fleet = _admin_refusal(request) is None
+        return await spoke.queue.poll_agent_inbox(hostname, fleet=fleet)
+
+    @app.post("/api/inbox/ack", dependencies=[Depends(require_admin)])
     async def api_inbox_ack(body: Dict[str, Any]) -> Dict[str, Any]:
-        """Acknowledge a command result."""
+        """Acknowledge a command result (operator surface: loopback only).
+
+        Sim clients ack over /ws/client, where the ack is checked against the
+        socket's hostname; the Proxmox agents ack through the hub
+        (CS_ACK_COMMAND). An HTTP ack could only name a hostname of the
+        caller's choosing, so it is not offered to them."""
         # Record the ack; unknown ids give 404.
         res = await spoke.queue.ack_command(body.get("id"), body.get("status"),
                                              body.get("message"), body.get("result"))
@@ -989,12 +1010,14 @@ def build_client_api_app(spoke) -> FastAPI:
                     _thr = _client_throttle_interval(spoke)
                     if _thr:
                         await ws.send_json({"type": "throttle", "interval": _thr})
-                # Command ack: record it and confirm.
+                # Command ack: record it and confirm. The socket is a sim
+                # client's, so it may only ack its own sim-client commands.
                 elif mtype == "ack":
                     p = msg.get("payload") or {}
                     res = await spoke.queue.ack_command(
                         p.get("id"), p.get("status"),
-                        p.get("message"), p.get("result"))
+                        p.get("message"), p.get("result"),
+                        hostname=hn, fleet=False)
                     await ws.send_json({"type": "ack_ok", "id": p.get("id"),
                                         "ok": bool(res.get("ok"))})
                 # Sync request: push pending commands.

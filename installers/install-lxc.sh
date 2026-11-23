@@ -21,6 +21,31 @@ export PATH="/usr/sbin:/sbin:/usr/bin:/bin:$PATH"
 export DEBIAN_FRONTEND=noninteractive
 
 ###############################################################################
+# Close the old service-user-to-root paths before anything else.
+# Older installs gave the service user a sudo grant to run
+# <repo cache>/install-lxc.sh, and a root watchdog that re-ran an installer
+# chosen by the service-owned .env branch or taken from the service-owned repo
+# cache. Either let the service user run code as root. Whenever root runs this
+# script, with any arguments, remove both first: before argument parsing, hub
+# tenant resolution, the .env read or the bootstrap, any of which can exit, so
+# no bad input or failed run can keep them in place. Step 8 installs the
+# restart-only watchdog (marked below) and re-enables its timer.
+###############################################################################
+SUDOERS_FILE="/etc/sudoers.d/client-sim-dashboard"
+WATCHDOG_BIN="/usr/local/bin/webui-watchdog.sh"
+if [[ "$EUID" -eq 0 ]]; then
+  if [[ -e "$SUDOERS_FILE" ]]; then
+    rm -f "$SUDOERS_FILE"
+    echo "[security] Removed the old self-update sudoers grant ($SUDOERS_FILE)"
+  fi
+  if [[ -e "$WATCHDOG_BIN" ]] && ! grep -q '^# webui-watchdog: restart-only' "$WATCHDOG_BIN"; then
+    systemctl disable --now webui-watchdog.timer >/dev/null 2>&1 || true
+    rm -f "$WATCHDOG_BIN"
+    echo "[security] Disabled the old installer-running watchdog ($WATCHDOG_BIN)"
+  fi
+fi
+
+###############################################################################
 # Flags
 ###############################################################################
 REINSTALL=0
@@ -204,8 +229,16 @@ else
 ADMIN_PASSWORD_VAL="${ADMIN_PASSWORD_ARG:-}"
 fi
 
+# A branch name is safe to put in a raw.githubusercontent.com URL only if it
+# cannot climb out of lbockenstedt/cs: no "..", no leading "/" or "-", no "//".
+# Without this, a branch like "../../<owner>/<repo>/<ref>" made the bootstrap
+# below run another repo's installer as root.
+valid_branch() {
+  [[ "$1" =~ ^[A-Za-z0-9][A-Za-z0-9._/-]*$ && "$1" != *..* && "$1" != *//* && "$1" != */ ]]
+}
+
 # Validate branch name
-if [[ ! "$REPO_BRANCH" =~ ^[a-zA-Z0-9._/\-]+$ ]]; then
+if ! valid_branch "$REPO_BRANCH"; then
   echo "ERROR: Invalid branch name '${REPO_BRANCH}'" >&2
   exit 1
 fi
@@ -225,12 +258,18 @@ fi
 ###############################################################################
 if [[ -z "${_CLIENT_SIM_BOOTSTRAPPED:-}" ]]; then
   export _CLIENT_SIM_BOOTSTRAPPED=1
-  # If REPO_BRANCH is still the default "main", try reading from the installed
-  # .env file — this happens when the WebUI calls the script without --branch.
-  # Only inherit the stored branch if it is not the legacy lrb value.
-  if [[ "${REPO_BRANCH}" == "main" && -f "${INSTALL_DIR}/.env" ]]; then
+  # With no --branch and REPO_BRANCH still the default "main", read the branch
+  # from the installed .env. An explicit --branch always wins, so an operator
+  # can recover from a bad .env value. Only inherit the stored branch if it is
+  # not the legacy lrb value.
+  if [[ -z "$CLI_BRANCH" && "${REPO_BRANCH}" == "main" && -f "${INSTALL_DIR}/.env" ]]; then
     _env_br=$(grep '^REPO_BRANCH=' "${INSTALL_DIR}/.env" 2>/dev/null | head -1 | cut -d= -f2 | tr -d '"'"'"' ')
     [[ -n "${_env_br}" && "${_env_br}" != "lrb" ]] && REPO_BRANCH="${_env_br}"
+    # .env is written by the service user, so check its branch the same way.
+    if ! valid_branch "$REPO_BRANCH"; then
+      echo "ERROR: Invalid REPO_BRANCH '${REPO_BRANCH}' in ${INSTALL_DIR}/.env — pass --branch" >&2
+      exit 1
+    fi
   fi
   _bs_url="https://raw.githubusercontent.com/lbockenstedt/cs/${REPO_BRANCH}/installers/install-lxc.sh"
   _local_ver=$(grep '^VERSION=' "$0" 2>/dev/null | head -1 | tr -d '"' | cut -d= -f2)
@@ -818,7 +857,7 @@ EOF
 
 info "Installing WebUI watchdog..."
 install -d -m 755 /usr/local/bin /etc/systemd/system /var/lib/webui-watchdog
-install -m 755 "$INSTALL_DIR/watchdog.sh" /usr/local/bin/webui-watchdog.sh
+install -m 755 "$INSTALL_DIR/watchdog.sh" "$WATCHDOG_BIN"
 install -m 644 "$INSTALL_DIR/webui-watchdog.service" /etc/systemd/system/webui-watchdog.service
 install -m 644 "$INSTALL_DIR/webui-watchdog.timer" /etc/systemd/system/webui-watchdog.timer
 
@@ -837,22 +876,8 @@ chown -R "$SERVICE_USER:$SERVICE_USER" "$INSTALL_DIR"
 chown -R "$SERVICE_USER:$SERVICE_USER" "$REPO_CACHE"
 # Write installer version so the dashboard can display it and detect updates
 echo "$VERSION" > "$INSTALL_DIR/INSTALLER_VERSION"
-# Allow service user to self-update by re-running this installer as root
-SUDOERS_FILE="/etc/sudoers.d/client-sim-dashboard"
-SUDOERS_LINE="${SERVICE_USER} ALL=(root) NOPASSWD: /bin/bash ${REPO_CACHE}/install-lxc.sh *"
-mkdir -p /etc/sudoers.d
-# Remove old file first (may have 440 perms from a prior install)
-rm -f "$SUDOERS_FILE"
-# Write to a temp file, validate syntax, then install atomically
-_sudoers_tmp=$(mktemp)
-echo "$SUDOERS_LINE" > "$_sudoers_tmp"
-if visudo -c -f "$_sudoers_tmp" >>"$LOG" 2>&1; then
-  install -m 440 -o root -g root "$_sudoers_tmp" "$SUDOERS_FILE"
-  ok "Sudoers entry written for self-update"
-else
-  warn "visudo validation failed — skipping sudoers entry (self-update button will require manual sudo setup)"
-fi
-rm -f "$_sudoers_tmp"
+# The service user gets no sudo grant (an old one is removed at the
+# top of this script). Updates are applied by re-running this installer as root.
 ok "Permissions set"
 
 ###############################################################################
