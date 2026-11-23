@@ -1189,6 +1189,13 @@ class CSSpoke(AgentCommandsMixin, SimCommandsMixin, ConfigCommandsMixin,
         if not repo_url:
             logger.warning("github push[%s]: no repo_url configured — skipping", sid)
             return False
+        # Push only to a github.com repo on a plain branch (see repo_sync.github_remote).
+        from repo_sync import github_remote, rejection_reason
+        remote = github_remote(gc)
+        if remote is None:
+            logger.warning("github push[%s]: %s — skipping", sid, rejection_reason(gc))
+            return False
+        repo_url, branch = remote
         if not (repo_dir / ".git").exists():
             logger.warning("github push[%s]: %s is not a git repo — skipping",
                            sid, repo_dir)

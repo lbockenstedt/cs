@@ -1340,6 +1340,19 @@ class ConfigCommandsMixin:
         cfg_dir = self.settings.config_dir
         source = self._config_source_for(patch)
         has_token = bool(str((self._github_config or {}).get("github_token") or "").strip())
+        # The push only goes to a github.com repo on a plain branch, so a token
+        # with a rejected repo_url or branch can't push either. Handle it like
+        # the no-token case: warn and keep the edit as a local hub override, so
+        # the reply never reports a GitHub write that will not be pushed.
+        can_push = has_token
+        if source == "github" and has_token:
+            from repo_sync import github_remote, rejection_reason
+            if github_remote(self._github_config or {}) is None:
+                can_push = False
+                logger.warning("CS_CONFIG_UPDATE[%s]: will NOT push to GitHub (%s); "
+                               "the edit is kept as a hub override on this spoke. "
+                               "Fix the repository or branch in Setup → Sim Config → GitHub.",
+                               self.spoke_id, rejection_reason(self._github_config or {}))
         push_map = {}  # repo-relative path -> content
         # Write each override.
         for override_key, hub_filename, repo_filename in overrides:
@@ -1358,7 +1371,7 @@ class ConfigCommandsMixin:
                     "GitHub) to re-deliver the token.",
                     self.spoke_id, repo_filename)
             # GitHub source with a token: write the repo file and queue a push.
-            if source == "github" and has_token and text is not None:
+            if source == "github" and can_push and text is not None:
                 try:
                     _atomic_write(cfg_dir / repo_filename, str(text))
                     hub_path = cfg_dir / hub_filename  # drop stale hub override
