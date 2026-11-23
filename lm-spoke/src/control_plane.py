@@ -69,6 +69,8 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 # The cs spoke module and the client API app builder.
 from cs_spoke import CSSpoke
+# Shared atomic writer and permission helper.
+from command_queue import _make_private, _write_atomic
 from client_api import build_client_api_app
 # Shared base class for hosting agents (lm core package or bare module).
 try:
@@ -204,6 +206,9 @@ class CSControlPlane(AgentHostingControlPlane):
         # Expected cert and key files.
         d = self._tls_dir()
         cert, key = d / "fullchain.pem", d / "privkey.pem"
+        # Tighten a key an older version left readable to others, and delete
+        # a crash-left privkey.pem.tmp even when the final key never landed.
+        _make_private(key)
         # Return them only if both exist.
         if cert.is_file() and key.is_file():
             return str(cert), str(key)
@@ -227,9 +232,11 @@ class CSControlPlane(AgentHostingControlPlane):
         """Delete any persisted local-webui cert so the client API binds plaintext.
         Called on startup and whenever an INSTALL_CERT is refused, so a stray le
         cert can't linger and flip 8080 to HTTPS on the next restart."""
-        # Delete each cert file that exists, logging the removal.
+        # Delete each cert file that exists, including a crash-left temp copy
+        # of either file (the key's may be readable by others), logging it.
         d = self._tls_dir()
-        for name in ("fullchain.pem", "privkey.pem"):
+        for name in ("fullchain.pem", "privkey.pem",
+                     "fullchain.pem.tmp", "privkey.pem.tmp"):
             p = d / name
             try:
                 if p.exists():
@@ -266,20 +273,10 @@ class CSControlPlane(AgentHostingControlPlane):
         return cert, key
 
     @staticmethod
-    def _atomic_write_text(path: Path, text: str) -> None:
-        """Write ``text`` to ``path`` via a temp file and an atomic rename."""
-        # Write the temp file, then swap it in.
-        tmp = path.with_suffix(path.suffix + ".tmp")
-        tmp.write_text(text, encoding="utf-8")
-        os.replace(tmp, path)
-
-    @staticmethod
-    def _atomic_write_bytes(path: Path, data: bytes) -> None:
-        """Write ``data`` to ``path`` via a temp file and an atomic rename."""
-        # Write the temp file, then swap it in.
-        tmp = path.with_suffix(path.suffix + ".tmp")
-        tmp.write_bytes(data)
-        os.replace(tmp, path)
+    def _atomic_write_text(path: Path, text: str, mode: Optional[int] = None) -> None:
+        """Write ``text`` to ``path`` via a temp file and an atomic rename
+        (the shared command_queue writer; ``mode`` as there)."""
+        _write_atomic(path, text, mode=mode)
 
     async def _rebind_api_server(self, ssl_certfile=None, ssl_keyfile=None) -> None:
         """Tear down the current 8080 uvicorn server and start a fresh one,
@@ -351,8 +348,9 @@ class CSControlPlane(AgentHostingControlPlane):
             cert_p, key_p = d / "fullchain.pem", d / "privkey.pem"
             self._atomic_write_text(cert_p, fullchain)
             os.chmod(cert_p, 0o644)
-            self._atomic_write_bytes(key_p, privkey.encode("utf-8"))
-            os.chmod(key_p, 0o600)
+            # 0600 from creation: a chmod after the rename left the key
+            # world-readable for a moment.
+            self._atomic_write_text(key_p, privkey, mode=0o600)
         except Exception as exc:  # noqa: BLE001
             return {"status": "ERROR", "message": f"write failed: {exc}"}
         # Re-bind the 8080 server with HTTPS.

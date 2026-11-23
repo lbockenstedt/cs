@@ -193,11 +193,12 @@ def spoke(tmp_path) -> CSSpoke:
 
 @pytest.fixture
 def client(spoke, configs, monkeypatch) -> TestClient:
-    # TestClient requests don't originate from the isolated sim segment; treat
-    # them as on-segment so the key-gated /api/clients/{h}/control calls below
-    # keep working (see test_client_api.py's fixture for the same rationale).
+    # Send every request as the local operator (loopback peer and Host), so
+    # the loopback-only /api/clients/{h}/control calls below work; the
+    # /api/config renders under test don't depend on the caller.
     monkeypatch.setattr(client_api, "_on_sim_segment", lambda host: True)
-    return TestClient(build_client_api_app(spoke))
+    monkeypatch.setattr(client_api, "_is_loopback", lambda host: True)
+    return TestClient(build_client_api_app(spoke), headers={"host": "127.0.0.1:8080"})
 
 
 HOSTS = ["kbell-1", "jdoe-7", "orphan", ""]
