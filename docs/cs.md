@@ -179,6 +179,36 @@ retains the static state for retry. Only successful restoration starts a new
 DHCP window. Check `sim.log` in the platform's scripts directory. Do not delete
 that state file while recovery is pending.
 
+## Rogue DNS Burst — static IP + fixed DNS + query load
+
+`rogue_dns_burst` is a copy of `rogue_dns` (same DHCP → static → DHCP cycle,
+state in `rogue_dns_burst.state`, same restore behaviour) for Linux and
+Windows wireless clients. It trips the Rogue DNS server / DNS anomaly alert by
+adding a steady query load to the rogue server during the static window, while
+the headless Firefox browsing continues. `rogue_dns` is unchanged. Clients keep
+their IP, so the sim is in `QT_EXCLUDE_NONISOLATING_SIMS` and a client that
+never got an IP is still quarantined as a bad dongle. Requires the lm catalog
+entry (lm#2098); ship that first.
+
+| Section | Key | Default | Meaning |
+|---|---|---|---|
+| `[s0]`–`[s9]` | `rogue_dns_burst` | `off` | Enable the simulation |
+| `[address]` | `rogue_dns_burst_server` | blank | Rogue DNS server IPv4; blank or invalid skips the sim |
+| `[address]` | `rogue_dns_burst_domains` | `www.google.com www.youtube.com www.linkedin.com` | Domains queried round-robin (space/comma separated; one per line in the editor) |
+| `[simulation]` | `rogue_dns_burst_dhcp_interval` | `1800` | Seconds on DHCP before each static phase |
+| `[simulation]` | `rogue_dns_burst_duration` | `3600` | Seconds in the static phase |
+| `[simulation]` | `rogue_dns_burst_browse_interval` | `60` | Seconds between browse requests |
+| `[simulation]` | `rogue_dns_burst_rate` | `20` | Queries launched per second, before the DNS ceiling |
+| `[simulation]` | `rogue_dns_burst_max_pending` | `40` | Maximum queries in flight; waits on the oldest when full |
+
+Each second a background loop launches the configured number of queries
+(`dig -r @<server> <domain> A +time=2 +tries=1` on Linux; `Resolve-DnsName`
+with a 2-second limit in a background job on Windows). The rate passes through
+the shared `dns_ceiling_rate` and the gateway circuit breaker; there is no
+second throttle. The loop and its own children are stopped before DHCP is
+restored (also on INT/TERM/exit) and nothing is killed by name. If `dig` is
+missing, Linux logs it and runs without the burst.
+
 ## WWW Discover — Network Diagnostics
 
 `www_discover` is an independent Linux/Windows browsing simulation, default

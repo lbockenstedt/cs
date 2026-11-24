@@ -115,7 +115,7 @@ function Send-Status {
         }
 
         $activeSimulations = @()
-        foreach ($name in @('dns_fail','dns_latency','collab','iperf','download','www_traffic','www_discover','rogue_dns','ping_test','ssidpw_fail','auth_fail','mac_auth_fail','dhcp_fail','client_offline')) {
+        foreach ($name in @('dns_fail','dns_latency','collab','iperf','download','www_traffic','www_discover','rogue_dns','rogue_dns_burst','ping_test','ssidpw_fail','auth_fail','mac_auth_fail','dhcp_fail','client_offline')) {
             if ((Get-Variable -Name $name -Scope Script -ValueOnly -ErrorAction SilentlyContinue) -eq 'on') {
                 $activeSimulations += $name
             }
@@ -146,6 +146,7 @@ function Send-Status {
                 iperf = [string]$script:iperf
                 www_traffic = [string]$script:www_traffic
                 rogue_dns = [string]$script:rogue_dns
+                rogue_dns_burst = [string]$script:rogue_dns_burst
                 www_discover = [string]$script:www_discover
                 download = [string]$script:download
                 ping_test = [string]$script:ping_test
@@ -414,6 +415,9 @@ function Apply-UserOverrides {
 if ((Test-Path 'C:\Scripts\rogue_dns.ps1') -and -not (Test-ScriptRunning -ScriptName 'rogue_dns.ps1')) {
     & 'C:\Scripts\rogue_dns.ps1' -RestoreOnly
 }
+if ((Test-Path 'C:\Scripts\rogue_dns_burst.ps1') -and -not (Test-ScriptRunning -ScriptName 'rogue_dns_burst.ps1')) {
+    & 'C:\Scripts\rogue_dns_burst.ps1' -RestoreOnly
+}
 
 while ($true) {
     $global:iniConfig = Parse-IniFile 'C:\Scripts\simulation.conf'
@@ -469,6 +473,8 @@ while ($true) {
     $script:www_traffic = get_value $script:simulation_id 'www_traffic'
     $script:rogue_dns = get_value $script:simulation_id 'rogue_dns'
     if (-not $script:rogue_dns) { $script:rogue_dns = 'off' }
+    $script:rogue_dns_burst = get_value $script:simulation_id 'rogue_dns_burst'
+    if (-not $script:rogue_dns_burst) { $script:rogue_dns_burst = 'off' }
     $script:rogueDnsBrowseReady = $true
     $script:www_discover = get_value $script:simulation_id 'www_discover'
     if (-not $script:www_discover) { $script:www_discover = 'off' }
@@ -497,7 +503,7 @@ while ($true) {
         $randomBucket = 's' + (Get-Random -Minimum 0 -Maximum 10)
         Write-SimLog "Ambient random pool: rolling behaviour from bucket $randomBucket"
         $randomizableList = $randomizableSims -split '\s+' | Where-Object { $_ }
-        foreach ($sim in @('dhcp_fail','dns_fail','dns_latency','collab','assoc_fail','port_flap','ssidpw_fail','auth_fail','mac_auth_fail','ping_test','download','iperf','www_traffic','www_discover','rogue_dns')) {
+        foreach ($sim in @('dhcp_fail','dns_fail','dns_latency','collab','assoc_fail','port_flap','ssidpw_fail','auth_fail','mac_auth_fail','ping_test','download','iperf','www_traffic','www_discover','rogue_dns','rogue_dns_burst')) {
             if ($randomizableList -contains $sim) {
                 Set-Variable -Name $sim -Scope Script -Value (get_value $randomBucket $sim)
             } else {
@@ -526,6 +532,8 @@ while ($true) {
         'wsite','sim_phy','ssid','ssidpw','ssid_auth','dhcp_fail','dns_fail','dns_latency','collab','assoc_fail','port_flap','ping_test',
         'download','iperf','www_traffic','www_discover','ssidpw_fail','auth_fail','mac_auth_fail','mac_auth_fail_mac','smb_address','ping_address',
         'rogue_dns','rogue_dns_server','rogue_dns_dhcp_interval','rogue_dns_duration','rogue_dns_browse_interval',
+        'rogue_dns_burst','rogue_dns_burst_server','rogue_dns_burst_dhcp_interval','rogue_dns_burst_duration',
+        'rogue_dns_burst_browse_interval','rogue_dns_burst_rate','rogue_dns_burst_max_pending','rogue_dns_burst_domains',
         'dns_bad_ip_1','dns_bad_ip_2','dns_bad_ip_3',
         'dns_bad_record_1','dns_bad_record_2','dns_bad_record_3','iperf_server',
         'collab_app','collab_bw','collab_time','collab_server','dot1x_password','dot1x_eap','web_server','client_offline'
@@ -700,6 +708,9 @@ while ($true) {
                 }
                 if ($script:rogue_dns -eq 'on' -and -not (Test-ScriptRunning -ScriptName 'rogue_dns.ps1')) {
                     Run-Simulation -ScriptName 'rogue_dns.ps1'
+                }
+                if ($script:rogue_dns_burst -eq 'on' -and -not (Test-ScriptRunning -ScriptName 'rogue_dns_burst.ps1')) {
+                    Run-Simulation -ScriptName 'rogue_dns_burst.ps1'
                 }
                 if ($script:www_discover -eq 'on' -and -not (Test-ScriptRunning -ScriptName 'www_discover.ps1')) {
                     Run-Simulation -ScriptName 'www_discover.ps1'
