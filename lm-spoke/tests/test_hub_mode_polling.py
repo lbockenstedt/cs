@@ -162,3 +162,25 @@ def test_test_connection_never_returns_tokens(spoke_loop, instance):
     poller._client = _TokenClient({})
     row = loop.run_until_complete(poller.test_connection())["spokes"][0]
     assert row["token_state"] == "missing"
+
+
+@pytest.mark.parametrize("kind, cfg, expect", [
+    ("central", {"cluster_url": "https://10.0.0.5"}, "Central cluster URL rejected"),
+    ("central", {"cluster_url": ""}, "Central not configured."),
+    ("mist", {"api_token": "t", "org_id": "o", "host": "evil.example.com"},
+     "Mist host rejected"),
+    ("mist", {"api_token": "", "org_id": "o", "host": "api.mist.com"}, "Mist not configured."),
+])
+def test_rejected_endpoint_is_not_reported_as_unconfigured(spoke_loop, kind, cfg, expect):
+    """A URL or host that was set but refused as unsafe is its own state:
+    Test and the browse tabs say it was rejected, not "not configured"."""
+    from aruba import ArubaClient
+    from mist import MistClient
+    spoke, loop = spoke_loop
+    if kind == "central":
+        poller, poller._client = spoke.central_poller, ArubaClient(cfg)
+    else:
+        poller, poller._client = spoke.mist_poller, MistClient(cfg)
+    row = loop.run_until_complete(poller.test_connection())["spokes"][0]
+    assert row["status"].startswith(expect)
+    assert loop.run_until_complete(poller.browse())["warning"].startswith(expect)

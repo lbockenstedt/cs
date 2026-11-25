@@ -1065,6 +1065,10 @@ class CentralPoller:
         result = await self._client.available_checks()
         return {"status": "SUCCESS", **result}
 
+    def _not_configured_reason(self) -> str:
+        """Return why the client can't be used: a rejected URL, or not configured."""
+        return getattr(self._client, "config_error", "") or "Central not configured."
+
     async def browse(self) -> Dict[str, Any]:
         """On-demand FULL Central inventory for the Central → Sites/Alerts/Clients
         tabs — every site, alert, insight and client from Central, independent of
@@ -1076,7 +1080,7 @@ class CentralPoller:
         if not self._client or not self._client.is_configured():
             return {"status": "SUCCESS", "sites": [], "alerts": [], "insights": [],
                     "clients": [], "devices_by_site": {}, "clients_by_site": {},
-                    "os_counts": {}, "warning": "Central not configured.",
+                    "os_counts": {}, "warning": self._not_configured_reason(),
                     "fetched_at": time.time()}
         # Fetch everything and add OS counts.
         try:
@@ -1104,12 +1108,12 @@ class CentralPoller:
         live probe), so when a row shows all-— it means the spoke hasn't relayed
         a populated central block yet — check this log for the real reason."""
         if not self._client or not self._client.is_configured():
-            logger.info("test_connection [%s]: Central not configured (no cluster_url)",
-                        self.spoke.spoke_id)
+            reason = self._not_configured_reason()
+            logger.info("test_connection [%s]: %s", self.spoke.spoke_id, reason)
             return {"status": "SUCCESS", "spokes": [{
                 "spoke_id": self.spoke.spoke_id, "spoke_name": self.spoke.spoke_id,
                 "token_state": None, "token_valid": False,
-                "status": "Central not configured.",
+                "status": reason,
             }]}
         # Note the config hash and mode for logging.
         chash = getattr(self._client, "_config_hash", "?")

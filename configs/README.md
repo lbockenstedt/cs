@@ -233,6 +233,16 @@ phase state for recovery after a crash/reboot; Windows also restores stale
 static state at orchestrator startup. See [Rogue DNS recovery and configuration](../docs/cs.md#rogue-dns--static-ip--fixed-dns)
 for the platform-specific restore behaviour and state-file paths.
 
+#### Rogue DNS Burst (wireless Linux/Windows)
+
+`rogue_dns_burst=on` (default `off` in all buckets) runs the same cycle as
+`rogue_dns` and adds a DNS query load to the rogue server during the static
+phase. Keys: `[address] rogue_dns_burst_server` (blank skips the sim),
+`rogue_dns_burst_domains`; `[simulation] rogue_dns_burst_dhcp_interval=1800`,
+`rogue_dns_burst_duration=3600`, `rogue_dns_burst_browse_interval=60`,
+`rogue_dns_burst_rate=20` (queries/s), `rogue_dns_burst_max_pending=40`.
+See [Rogue DNS Burst](../docs/cs.md#rogue-dns-burst--static-ip--fixed-dns--query-load).
+
 #### How many clients does a simulation need to fire an alert?
 
 Each alert or insight in Aruba Central has a minimum number of clients that must
