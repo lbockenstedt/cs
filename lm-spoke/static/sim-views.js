@@ -2427,7 +2427,7 @@ window.csDemoClear = async function (btn) {
 // Alphabetical so the sim knobs + the Simulation facet dropdown list in order.
 const CS_CONTROL_FLAGS = ['assoc_fail', 'auth_fail', 'client_offline', 'collab', 'dhcp_fail', 'dns_fail',
     'dns_latency', 'download', 'iperf', 'kill_switch', 'mac_auth_fail', 'ping_test', 'port_flap',
-    'rogue_dns', 'ssidpw_fail', 'www_discover', 'www_traffic'];
+    'rogue_dns', 'rogue_dns_burst', 'ssidpw_fail', 'www_discover', 'www_traffic'];
 
 
 
@@ -4255,7 +4255,7 @@ const CS_ONOFF_KEYS = new Set([
     'client_offline', 'kill_switch', 'rapid_update', 'github_repo', 'smb_repo', 'site_based_ssid',
     'ssidpw_fail', 'auth_fail', 'mac_auth_fail', 'syslog', 'web_server',
     'dhcp_fail', 'dns_fail', 'dns_latency', 'assoc_fail', 'port_flap', 'ping_test',
-    'download', 'www_traffic', 'www_discover', 'rogue_dns', 'collab', 'iperf',
+    'download', 'www_traffic', 'www_discover', 'rogue_dns', 'rogue_dns_burst', 'collab', 'iperf',
 ]);
 
 // Choices shared by the structured editor and the Pool & SSID matrix.
@@ -4308,6 +4308,11 @@ const CS_SIM_SECTION_FIELDS = {
         ['rogue_dns_dhcp_interval', 'Rogue DNS DHCP Interval (s)'],
         ['rogue_dns_duration', 'Rogue DNS Duration (s)'],
         ['rogue_dns_browse_interval', 'Rogue DNS Browse Interval (s)'],
+        ['rogue_dns_burst_dhcp_interval', 'Rogue DNS Burst DHCP Interval (s)'],
+        ['rogue_dns_burst_duration', 'Rogue DNS Burst Duration (s)'],
+        ['rogue_dns_burst_browse_interval', 'Rogue DNS Burst Browse Interval (s)'],
+        ['rogue_dns_burst_rate', 'Rogue DNS Burst Rate (queries/s)'],
+        ['rogue_dns_burst_max_pending', 'Rogue DNS Burst Max In-Flight Queries'],
         ['dns_max_inflight', 'DNS Max In-Flight Digs'],
         ['gw_ping_timeout_s', 'Gateway Ping Timeout'],
     ],
@@ -4315,6 +4320,8 @@ const CS_SIM_SECTION_FIELDS = {
     address: [
         ['smb_address', 'Smb Address'], ['ping_address', 'Ping Address'],
         ['rogue_dns_server', 'Rogue DNS Server (IPv4)'],
+        ['rogue_dns_burst_server', 'Rogue DNS Burst Server IP'],
+        ['rogue_dns_burst_domains', 'Rogue DNS Burst Domains (one per line)', 'list'],
         ['dns_latency', 'DNS Latency Servers (one per line — unlimited; sim auto-selects a slow one + rotates off blacklisted)', 'list'],
         ['dns_bad_ip_1', 'Dns Bad Ip 1'], ['dns_bad_ip_2', 'Dns Bad Ip 2'],
         ['dns_bad_ip_3', 'Dns Bad Ip 3'],
@@ -4331,7 +4338,7 @@ const CS_SIM_BUCKET_FIELDS = [
     ['dhcp_fail', 'Dhcp Fail'], ['dns_fail', 'Dns Fail'], ['dns_latency', 'Dns Latency'],
     ['assoc_fail', 'Assoc Fail'], ['port_flap', 'Port Flap'],
     ['ping_test', 'Ping Test'], ['download', 'Download'],
-    ['www_traffic', 'Www Traffic'], ['www_discover', 'WWW Discover'], ['rogue_dns', 'Rogue DNS'], ['collab', 'Collab'], ['iperf', 'Iperf'],
+    ['www_traffic', 'Www Traffic'], ['www_discover', 'WWW Discover'], ['rogue_dns', 'Rogue DNS'], ['rogue_dns_burst', 'Rogue DNS Burst'], ['collab', 'Collab'], ['iperf', 'Iperf'],
     ['sim_phy', 'Sim Phy'], ['l1', 'L1'],
 ];
 const CS_SIM_BUCKETS = ['s0', 's1', 's2', 's3', 's4', 's5', 's6', 's7', 's8', 's9'];
@@ -4379,7 +4386,7 @@ function csSimField(section, key, label, value, type) {
     }
     if (CS_ONOFF_KEYS.has(key)) {
         const lc = v.toLowerCase();
-        const on = lc === 'on', off = lc === 'off';
+        const on = ['on', 'true', '1'].includes(lc), off = ['off', 'false', '0'].includes(lc);
         // A missing/empty value shows "— default —" (empty), NOT "off" — so a
         // field absent from the source is never silently saved as off (which had
         // been flipping web_server off and disabling clients). Empty serializes
@@ -6879,7 +6886,7 @@ function csUOField(user, key, value) {
     const attrs = `data-cs-uo-user="${csEscape(user)}" data-cs-uo-key="${csEscape(key)}"`;
     if (CS_ONOFF_KEYS.has(key)) {
         const lc = v.toLowerCase();
-        const on = lc === 'on', off = lc === 'off';
+        const on = ['on', 'true', '1'].includes(lc), off = ['off', 'false', '0'].includes(lc);
         return `<div class="flex flex-col gap-1">
           <label class="text-[10px] text-slate-500 uppercase font-bold tracking-wider">${csEscape(label)}</label>
           <select ${attrs} onchange="csUOSet(this)"

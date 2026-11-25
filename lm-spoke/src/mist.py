@@ -48,7 +48,7 @@ logger = logging.getLogger(__name__)
 # api.gc1.mist.com (Global 02), api.ac2.mist.com (Global 03), api.ac5.mist.com
 # (APAC). The operator picks the region their org lives in at Setup → Mist API.
 _DEFAULT_MIST_HOST = "api.mist.com"
-# Region hosts we recognise (others only log a warning).
+# Region hosts the client will call (others are refused).
 _KNOWN_MIST_HOSTS = {
     "api.mist.com", "api.eu.mist.com", "api.gc1.mist.com",
     "api.ac2.mist.com", "api.ac5.mist.com",
@@ -129,14 +129,15 @@ def _coerce_host(host: str) -> str:
 def validate_mist_host(host: str) -> str:
     """Return a normalized Mist API host, warning on an unknown region.
 
-    Unlike Aruba's ``validate_cluster_url`` we do NOT resolve/DNS-check the host
-    here — Mist's region hosts are a fixed, well-known set and the spoke's own
-    SSRF guard (the hub route's validator) runs before creds are ever accepted.
+    No DNS check is needed: MistClient only uses a host from the fixed
+    _KNOWN_MIST_HOSTS set. The warning does not name the host, because a
+    pasted URL can carry userinfo (https://user:password@host) and WARNING
+    lines reach the hub Logs view (rule 5.2).
     """
     # Normalise, and warn if the host is not a known region.
     h = _coerce_host(host)
     if h not in _KNOWN_MIST_HOSTS:
-        logger.warning("Mist API host %s is not a known region host", h)
+        logger.warning("Mist API host is not a known region host; Mist stays unconfigured")
     return h
 
 
@@ -188,7 +189,16 @@ class MistClient:
         # Copy the config and read the credentials.
         self.config = dict(config)
         self.api_token = str(self.config.get("api_token") or "").strip()
-        self.host = _coerce_host(self.config.get("host"))
+        # The API token is sent to this host, so only a known Mist region
+        # host is used, as the hub enforces on save (an unknown host leaves
+        # the client not configured).
+        host = validate_mist_host(self.config.get("host"))
+        self.host = host if host in _KNOWN_MIST_HOSTS else ""
+        # A host that was set but refused is its own state, so Test and the
+        # Mist tabs say why instead of "not configured".
+        self.config_error = ""
+        if str(self.config.get("host") or "").strip() and not self.host:
+            self.config_error = "Mist host rejected: not a known Mist region host."
         self.org_id = str(self.config.get("org_id") or "").strip()
         # Short hash of the config, used as the cache key.
         self._config_hash = hashlib.md5(
@@ -196,13 +206,15 @@ class MistClient:
         ).hexdigest()[:8]
 
     def is_configured(self) -> bool:
-        """Return ``True`` when a Mist API token + org id are present."""
-        # Need both a token and an org id.
-        return bool(self.api_token and self.org_id)
+        """Return ``True`` when a Mist API token, org id and known region host are present."""
+        # Need a token, an org id and a known region host.
+        return bool(self.api_token and self.org_id and self.host)
 
     def _base_url(self) -> str:
         """Return the base HTTPS URL for the configured host."""
-        # Build the base URL.
+        # Never build a URL for an unknown host (see __init__).
+        if not self.host:
+            raise ValueError("Mist host is not a known Mist region host")
         return f"https://{self.host}"
 
     def _headers(self) -> dict[str, str]:

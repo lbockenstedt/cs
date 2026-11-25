@@ -375,6 +375,10 @@ class MistPoller:
         result = await self._client.available_checks()
         return {"status": "SUCCESS", **result}
 
+    def _not_configured_reason(self) -> str:
+        """Return why the client can't be used: a rejected host, or not configured."""
+        return getattr(self._client, "config_error", "") or "Mist not configured."
+
     async def browse(self) -> Dict[str, Any]:
         """On-demand FULL Mist inventory for the Mist → Sites/Alerts/Clients
         tabs — every site, alarm, insight and client from Mist, independent of
@@ -383,7 +387,7 @@ class MistPoller:
         if not self._client or not self._client.is_configured():
             return {"status": "SUCCESS", "sites": [], "alerts": [], "insights": [],
                     "clients": [], "devices_by_site": {}, "clients_by_site": {},
-                    "os_counts": {}, "warning": "Mist not configured."}
+                    "os_counts": {}, "warning": self._not_configured_reason()}
         # Fetch everything and add the client OS breakdown.
         try:
             data = await self._client.browse_all()
@@ -402,12 +406,12 @@ class MistPoller:
         single entry describing this spoke."""
         # Not configured: report that in the expected shape.
         if not self._client or not self._client.is_configured():
-            logger.info("test_connection [%s]: Mist not configured (no api_token/org_id)",
-                        self.spoke.spoke_id)
+            reason = self._not_configured_reason()
+            logger.info("test_connection [%s]: %s", self.spoke.spoke_id, reason)
             return {"status": "SUCCESS", "spokes": [{
                 "spoke_id": self.spoke.spoke_id, "spoke_name": self.spoke.spoke_id,
                 "token_state": None, "token_valid": False,
-                "status": "Mist not configured.",
+                "status": reason,
             }]}
         # Config fingerprint used in log messages.
         chash = getattr(self._client, "_config_hash", "?")
