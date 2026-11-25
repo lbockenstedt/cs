@@ -625,7 +625,7 @@ curl_api_status() {
 }
 
 post_progress_event() {
-    local event_type="$1" payload_json="${2:-{}}"
+    local event_type="$1" payload_json="${2:-"{}"}"
     local event_json event_file
     mkdir -p "$PROGRESS_EVENT_QUEUE_DIR" || return 0
     event_json=$(python3 - "$event_type" "$payload_json" <<'PY' 2>/dev/null || true
@@ -3978,7 +3978,7 @@ run_reseed_command() {
 }
 
 process_backup_ws_command() {
-    local raw="${1:-{}}"
+    local raw="${1:-"{}"}"
     local parsed
     local -a fields=()
     parsed=$(python3 - "$raw" <<'PY' 2>/dev/null || printf '[]\n\n\n\n\n3\n\n'
@@ -4008,7 +4008,7 @@ PY
 }
 
 process_reseed_ws_command() {
-    local raw="${1:-{}}"
+    local raw="${1:-"{}"}"
     local parsed
     local -a fields=()
     parsed=$(python3 - "$raw" <<'PY' 2>/dev/null || printf '\n100\n\n'
@@ -4184,7 +4184,7 @@ execute_vm_command() {
 }
 
 process_single_ws_command() {
-    local raw="${1:-{}}"
+    local raw="${1:-"{}"}"
     local parsed cmd_id action vmid guest_type source_vmid branch repo_raw cmd_type status message
     parsed=$(python3 - "$raw" <<'PY' 2>/dev/null || true
 import json, sys
@@ -4234,15 +4234,15 @@ if [[ "${1:-}" == "--collect-telemetry" ]]; then
     exit 0
 fi
 if [[ "${1:-}" == "--process-single-command" ]]; then
-    process_single_ws_command "${2:-{}}"
+    process_single_ws_command "${2:-"{}"}"
     exit 0
 fi
 if [[ "${1:-}" == "--process-backup-command" ]]; then
-    process_backup_ws_command "${2:-{}}"
+    process_backup_ws_command "${2:-"{}"}"
     exit 0
 fi
 if [[ "${1:-}" == "--process-reseed-command" ]]; then
-    process_reseed_ws_command "${2:-{}}"
+    process_reseed_ws_command "${2:-"{}"}"
     exit 0
 fi
 

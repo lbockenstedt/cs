@@ -8,19 +8,23 @@ sudo dhcpcd enp6s18
 #Setting route metric for wired interface for script update process
 sudo ifmetric enp6s18 10
 echo "Updating Simulation Script" | tee -a /usr/scripts/wireless.log
-sudo wget https://raw.githubusercontent.com/lbockenstedt/cs/main/clients/t3/wireless.sh -O /tmp/wireless.sh
-sudo wget https://raw.githubusercontent.com/lbockenstedt/cs/main/clients/t3/update_script.sh -O /tmp/update_script.sh
-sudo wget https://raw.githubusercontent.com/lbockenstedt/cs/main/clients/t3/agent.sh -O /tmp/agent.sh
-#Checking to see if the file downloaded from GitHub is 0 Bytes, if so deleting it as the download failed
-sudo find /tmp -type f -size 0 | sudo xargs -r -o rm -v -f
-#Moving file to script repo - put in tmp location because if the download fails it overwrites the existing script
-sudo mv -f /tmp/wireless.sh /usr/scripts/wireless.sh
-sudo mv -f /tmp/update_script.sh /usr/scripts/update_script.sh
-sudo mv -f /tmp/agent.sh /usr/scripts/agent.sh
-#Setting permission to execute the script
-sudo chmod 777 /usr/scripts/wireless.sh
-sudo chmod 777 /usr/scripts/update_script.sh
-sudo chmod 777 /usr/scripts/agent.sh
+# Download into a private temp folder (not fixed /tmp names another user could
+# plant), and replace a script only when its download is non-empty. mv swaps
+# the inode, so this running script and the agent keep their old copy.
+tmpd=$(sudo mktemp -d) || tmpd=""
+if [[ -n "$tmpd" ]]; then
+  for f in wireless.sh update_script.sh agent.sh; do
+    if sudo wget https://raw.githubusercontent.com/lbockenstedt/cs/main/clients/t3/$f -O "$tmpd/$f" && sudo test -s "$tmpd/$f"; then
+      sudo chmod 755 "$tmpd/$f"
+      sudo mv -f "$tmpd/$f" /usr/scripts/$f
+    fi
+  done
+  sudo rm -rf "$tmpd"
+fi
+#Setting permission to execute the script (root runs these; never world-writable)
+sudo chmod 755 /usr/scripts/wireless.sh
+sudo chmod 755 /usr/scripts/update_script.sh
+sudo chmod 755 /usr/scripts/agent.sh
 sudo chmod -x /etc/udev/rules.d/90-Wireless.rules
 #Shutting down wired interface so the simulations are forced out the WLAN
 sudo ifconfig enp6s18 down

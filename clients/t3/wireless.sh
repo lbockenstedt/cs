@@ -36,9 +36,9 @@ ping -c1 $github
    sudo wget --waitretry=10 --read-timeout=20 --timeout=15 https://raw.githubusercontent.com/lbockenstedt/cs/main/clients/t3/agent.sh -O /usr/local/scripts/agent.sh
    sleep 1
 fi
-sudo chmod 777 /usr/scripts/wireless.sh
-sudo chmod 777 /usr/scripts/update_script.sh
-sudo chmod 777 /usr/scripts/agent.sh
+sudo chmod 755 /usr/scripts/wireless.sh
+sudo chmod 755 /usr/scripts/update_script.sh
+sudo chmod 755 /usr/scripts/agent.sh
 #--------------------------------------------------------------------------------------------------------
 echo "Script Version " $scriptver | tee -a /usr/scripts/wireless.log
 echo "Starting DHCP Daemon" | tee -a /usr/scripts/wireless.log

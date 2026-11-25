@@ -97,6 +97,7 @@ _scripts_sync_decision() {
         f="${line%%:*}"; h="${line#*:}"
         f="${f//[\"[:space:]]/}"; h="${h//[\"[:space:]]/}"
         [[ -z "$f" || -z "$h" ]] && continue
+        _safe_script_name "$f" || continue
         if [[ ! -f "/usr/local/scripts/$f" ]]; then decision="changed"; break; fi
         local_h=$(sha256sum "/usr/local/scripts/$f" 2>/dev/null | awk '{print $1}')
         [[ "$local_h" != "$h" ]] && { decision="changed"; break; }
@@ -104,6 +105,15 @@ _scripts_sync_decision() {
         # (a change in the last file would otherwise go undetected).
     done < <(printf '%s\n' "$manifest" | tr -d '{}' | tr ',' '\n')
     echo "$decision"
+}
+
+#------------------------------------------------------------
+# True if $1 is a bare script file name the spoke may serve: letters, digits,
+# '.', '_' and '-', not starting with '.'. A served list or manifest is used
+# to build local paths, so a name with '/' or '..' must never reach one.
+#------------------------------------------------------------
+_safe_script_name() {
+    [[ "$1" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]]
 }
 
 #------------------------------------------------------------
@@ -334,8 +344,16 @@ check_api_up() {
     port=$(echo "$url" | sed -E 's|https?://[^:]+:([0-9]+).*|\1|')
     [[ -z "$port" ]] && port=80
 
+    # server_url comes from the served simulation.conf: accept only a plain
+    # host name or IPv4 address and a numeric port, and pass them to the
+    # child shell as arguments, never as part of its program text.
+    if [[ ! "$host" =~ ^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?$ || ! "$port" =~ ^[0-9]{1,5}$ ]]; then
+        echo "server_url host/port is not valid — API is DOWN" | tee -a "$debug" "$log"
+        return 1
+    fi
+
     echo "Checking TCP $host:$port ..." | tee -a "$debug"
-    if ! timeout 3 bash -c "cat < /dev/null > /dev/tcp/$host/$port" 2>/dev/null; then
+    if ! timeout 3 bash -c 'cat < /dev/null > "/dev/tcp/$1/$2"' _ "$host" "$port" 2>/dev/null; then
         echo "TCP port $port on $host is not open — API is DOWN" | tee -a "$debug" "$log"
         return 1
     fi
@@ -521,6 +539,10 @@ if [[ "$web_server" == "on" && -n "$server_url" ]]; then
                 else
                     for fname in $(echo "$script_list" | tr -d '[]"' | tr ',' '\n' | tr -d ' '); do
                         [[ -z "$fname" ]] && continue
+                        if ! _safe_script_name "$fname"; then
+                            echo "Skipping unsafe script name from spoke: ${fname//[^A-Za-z0-9._\/-]/?}" | tee -a "$debug" "$log"
+                            continue
+                        fi
                         fcode=$(curl -sS --max-time 15 \
                             -o "$tmp_web/$fname" \
                             -w "%{http_code}" \

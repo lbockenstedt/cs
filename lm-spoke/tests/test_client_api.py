@@ -153,6 +153,13 @@ def test_admin_routes_refuse_sim_segment_and_client_key(client, spoke, method, p
 _LOCAL = {"host": "127.0.0.1:8080"}
 
 
+def _operator(monkeypatch):
+    """Headers for a request from the local operator (loopback peer and Host):
+    the queue and per-client override routes are loopback only."""
+    monkeypatch.setattr(client_api, "_is_loopback", lambda host: True)
+    return _LOCAL
+
+
 def test_admin_route_allows_loopback_only(client, monkeypatch):
     """Loopback (the spoke itself or an SSH tunnel) is the only way in; the
     removed operator-key header/cookie and the client key open nothing."""
@@ -335,7 +342,7 @@ def _ambient_pct(text):
     return m.group(1) if m else None
 
 
-def test_exclusive_sim_suppresses_ambient(client, spoke):
+def test_exclusive_sim_suppresses_ambient(client, spoke, monkeypatch):
     """multi_capable contract: an EXCLUSIVE sim (multi_capable=False, e.g.
     dhcp_fail) monopolizes its client — no gateway, so no other sim can run.
     The spoke must suppress ambient_pct for THAT client (serve-time, driven by
@@ -349,11 +356,11 @@ def test_exclusive_sim_suppresses_ambient(client, spoke):
     # Baseline: no exclusive sim → ambient_pct is the served base (50).
     assert _ambient_pct(client.get("/api/config", params={"hostname": h}).text) == "50"
     # Assign an EXCLUSIVE sim via the registry override (the engine's path).
-    client.post(f"/api/clients/{h}/control", json={"overrides": {"dhcp_fail": "on"}})
+    client.post(f"/api/clients/{h}/control", headers=_operator(monkeypatch), json={"overrides": {"dhcp_fail": "on"}})
     assert _ambient_pct(client.get("/api/config", params={"hostname": h}).text) == "0"
     # A SHAREABLE sim does not suppress ambient — it may stack.
-    client.delete(f"/api/clients/{h}/control")
-    client.post(f"/api/clients/{h}/control", json={"overrides": {"iperf": "on"}})
+    client.delete(f"/api/clients/{h}/control", headers=_operator(monkeypatch))
+    client.post(f"/api/clients/{h}/control", headers=_operator(monkeypatch), json={"overrides": {"iperf": "on"}})
     assert _ambient_pct(client.get("/api/config", params={"hostname": h}).text) == "50"
 
 
@@ -394,41 +401,47 @@ def test_resolve_script_path_traversal_guard():
 
 
 # ── command queue (HTTP) ─────────────────────────────────────────────────────
-def test_commands_enqueue_and_list(client):
+def _listed(client, monkeypatch):
+    """List the queue as the local operator (GET /api/commands is loopback only)."""
+    monkeypatch.setattr(client_api, "_is_loopback", lambda host: True)
+    return client.get("/api/commands", headers=_LOCAL).json()["commands"]
+
+
+def test_commands_enqueue_and_list(client, monkeypatch):
     # Non-proxmox target, non-VM action → accepted (no safeguard).
-    r = client.post("/api/commands", json={
+    r = client.post("/api/commands", headers=_operator(monkeypatch), json={
         "target": "sim-host-1", "action": "reboot", "args": {}, "type": "client",
     })
     assert r.status_code == 200, r.text
     assert r.json()["created"] is True
 
-    listed = client.get("/api/commands").json()["commands"]
+    listed = _listed(client, monkeypatch)
     assert any(c["action"] == "reboot" for c in listed)
 
 
-def test_commands_safeguard_refuse_low_vmid(client):
+def test_commands_safeguard_refuse_low_vmid(client, monkeypatch):
     # proxmox VM action with vmid < SIM_VMIN (90000) → safeguard refuse → 400.
-    r = client.post("/api/commands", json={
+    r = client.post("/api/commands", headers=_operator(monkeypatch), json={
         "target": "proxmox", "action": "start_vm", "args": {"vmid": 100},
     })
     assert r.status_code == 400
     assert "90000" in r.text or "Client-Simulation range" in r.text
 
 
-def test_commands_safeguard_accept_sim_vmid(client):
-    r = client.post("/api/commands", json={
+def test_commands_safeguard_accept_sim_vmid(client, monkeypatch):
+    r = client.post("/api/commands", headers=_operator(monkeypatch), json={
         "target": "proxmox", "action": "start_vm", "args": {"vmid": 91000},
     })
     assert r.status_code == 200, r.text
 
 
 # ── client control (overrides) ───────────────────────────────────────────────
-def test_client_control_overrides(client):
-    r = client.post("/api/clients/sim-1/control", json={"overrides": {"sim_load": "0"}})
+def test_client_control_overrides(client, monkeypatch):
+    r = client.post("/api/clients/sim-1/control", headers=_operator(monkeypatch), json={"overrides": {"sim_load": "0"}})
     assert r.status_code == 200
     assert client.get("/api/clients").json()["sim-1"]["overrides"] == {"sim_load": "0"}
 
-    assert client.delete("/api/clients/sim-1/control").status_code == 200
+    assert client.delete("/api/clients/sim-1/control", headers=_operator(monkeypatch)).status_code == 200
     assert "overrides" not in client.get("/api/clients").json().get("sim-1", {})
 
 
@@ -442,10 +455,10 @@ def test_ws_hello_status_ping(client):
         assert ws.receive_json()["type"] == "pong"
 
 
-def test_ws_pushes_pending_command_and_acks(client):
+def test_ws_pushes_pending_command_and_acks(client, monkeypatch):
     # Enqueue a command targeting the host BEFORE it connects, so the
     # connect-time push delivers it immediately.
-    pr = client.post("/api/commands", json={
+    pr = client.post("/api/commands", headers=_operator(monkeypatch), json={
         "target": "ws-2", "action": "reboot", "args": {}, "type": "client",
     })
     assert pr.status_code == 200 and pr.json()["created"] is True
@@ -466,19 +479,127 @@ def test_ws_pushes_pending_command_and_acks(client):
 
         # A command queued WHILE connected is live-pushed (push_pending from the
         # POST handler) without waiting for the agent's next sync.
-        client.post("/api/commands", json={
-            "target": "ws-2", "action": "snapshot_vm", "args": {}, "type": "client",
+        client.post("/api/commands", headers=_operator(monkeypatch), json={
+            "target": "ws-2", "action": "update_now", "args": {}, "type": "client",
         })
         frame2 = ws.receive_json()
         assert frame2["type"] == "commands"
         assert len(frame2["commands"]) == 1
-        assert frame2["commands"][0]["action"] == "snapshot_vm"
+        assert frame2["commands"][0]["action"] == "update_now"
 
         # sync is fire-and-forget (no frame when nothing pending) — verify the
         # loop is still alive afterwards with a ping/pong round-trip.
         ws.send_json({"type": "sync"})
         ws.send_json({"type": "ping"})
         assert ws.receive_json()["type"] == "pong"
+
+
+def _statuses(client, monkeypatch):
+    return {c["action"]: c["status"] for c in _listed(client, monkeypatch)}
+
+
+def test_ws_sim_client_gets_only_its_sim_commands(client, monkeypatch):
+    """A sim client's socket never receives a "proxmox" (any agent) command
+    or a VM action, even one addressed to its own hostname; those stay
+    pending for the Proxmox agent's hub poll."""
+    for target, action, args in (("proxmox", "start_vm", {"vmid": 91000}),
+                                 ("ws-3", "delete_vm", {"vmid": 91001}),
+                                 ("ws-3", "reboot", {})):
+        assert client.post("/api/commands", headers=_operator(monkeypatch), json={
+            "target": target, "action": action, "args": args}).status_code == 200
+    with client.websocket_connect("/ws/client?hostname=ws-3") as ws:
+        assert ws.receive_json()["type"] == "hello"
+        frame = ws.receive_json()
+        assert [c["action"] for c in frame["commands"]] == ["reboot"]
+    st = _statuses(client, monkeypatch)
+    assert st["start_vm"] == "pending" and st["delete_vm"] == "pending"
+
+
+def test_ws_hostname_proxmox_gets_nothing(client, monkeypatch):
+    """Naming the socket "proxmox" does not make it a Proxmox agent."""
+    client.post("/api/commands", headers=_operator(monkeypatch), json={
+        "target": "proxmox", "action": "delete_vm", "args": {"vmid": 91000}})
+    with client.websocket_connect("/ws/client?hostname=proxmox") as ws:
+        assert ws.receive_json()["type"] == "hello"
+        ws.send_json({"type": "ping"})
+        assert ws.receive_json()["type"] == "pong"
+    assert _statuses(client, monkeypatch)["delete_vm"] == "pending"
+
+
+def test_ws_ack_of_foreign_command_is_refused(client, spoke, monkeypatch):
+    """A sim client can't mark a Proxmox command, or another client's
+    command, completed: the ack reads as not found and nothing changes."""
+    pve = client.post("/api/commands", headers=_operator(monkeypatch), json={
+        "target": "proxmox", "action": "delete_vm", "args": {"vmid": 91000}}).json()["command"]
+    other = client.post("/api/commands", headers=_operator(monkeypatch), json={
+        "target": "ws-other", "action": "reboot", "args": {}}).json()["command"]
+    with client.websocket_connect("/ws/client?hostname=ws-4") as ws:
+        assert ws.receive_json()["type"] == "hello"
+        for cid in (pve["id"], other["id"]):
+            ws.send_json({"type": "ack", "payload": {"id": cid, "status": "completed"}})
+            ack = ws.receive_json()
+            assert ack["type"] == "ack_ok" and ack["ok"] is False
+    assert set(_statuses(client, monkeypatch).values()) == {"pending"}
+
+
+def test_http_inbox_is_fleet_only_for_the_local_operator(client, spoke, monkeypatch):
+    """/api/inbox hands out "proxmox" commands only to the loopback operator.
+    A keyed caller gets a non-fleet poll on the sim segment and off it: any
+    sim VM can fetch the key from /api/client/key and 8080 binds every
+    interface, so neither the key nor the address identifies a Proxmox agent."""
+    client.post("/api/commands", headers=_operator(monkeypatch), json={
+        "target": "proxmox", "action": "start_vm", "args": {"vmid": 91000}})
+    key = {"X-Client-Key": spoke.settings.get("client_api_key")}
+    q = {"hostname": "pve1"}
+    assert client.get("/api/inbox", params=q, headers=key).json()["commands"] == []
+    monkeypatch.setattr(client_api, "_on_sim_segment", lambda host: False)
+    assert client.get("/api/inbox", params=q, headers=key).json()["commands"] == []
+    monkeypatch.setattr(client_api, "_is_loopback", lambda host: True)
+    local = client.get("/api/inbox", params=q, headers={**key, **_LOCAL}).json()
+    assert [c["action"] for c in local["commands"]] == ["start_vm"]
+
+
+def test_http_ack_and_list_are_loopback_only(client, spoke, monkeypatch):
+    """POST /api/inbox/ack and GET /api/commands refuse a sim-segment caller
+    and an off-segment keyed one (403, nothing changes); the loopback
+    operator can list and ack."""
+    pve = client.post("/api/commands", headers=_operator(monkeypatch), json={
+        "target": "proxmox", "action": "delete_vm", "args": {"vmid": 91000}}).json()["command"]
+    own = client.post("/api/commands", headers=_operator(monkeypatch), json={
+        "target": "sim-9", "action": "reboot", "args": {}}).json()["command"]
+    key = {"X-Client-Key": spoke.settings.get("client_api_key")}
+    for on_segment in (True, False):
+        monkeypatch.setattr(client_api, "_on_sim_segment", lambda host, v=on_segment: v)
+        assert client.get("/api/commands", headers=key).status_code == 403
+        for cmd, hn in ((pve, "proxmox"), (own, "sim-9")):
+            r = client.post("/api/inbox/ack", headers=key,
+                            json={"id": cmd["id"], "status": "completed", "hostname": hn})
+            assert r.status_code == 403
+    assert set(_statuses(client, monkeypatch).values()) == {"pending"}
+    r = client.post("/api/inbox/ack", headers=_LOCAL,
+                    json={"id": pve["id"], "status": "completed"})
+    assert r.status_code == 200
+    assert _statuses(client, monkeypatch)["delete_vm"] == "completed"
+
+
+def test_command_and_override_writes_are_loopback_only(client, spoke, monkeypatch):
+    """A sim VM (on the segment, no key needed) or an off-segment caller with
+    client_api_key can't create a command, e.g. a "proxmox" delete_vm the hub
+    would hand to a Proxmox host, nor set or clear another client's
+    overrides: 403, and nothing is queued or changed."""
+    key = {"X-Client-Key": spoke.settings.get("client_api_key")}
+    client.post("/api/clients/sim-2/control", headers=_operator(monkeypatch),
+                json={"overrides": {"iperf": "on"}})
+    for on_segment in (True, False):
+        monkeypatch.setattr(client_api, "_on_sim_segment", lambda host, v=on_segment: v)
+        for body in ({"target": "proxmox", "action": "delete_vm", "args": {"vmid": 91000}},
+                     {"target": "sim-2", "action": "reboot", "args": {}}):
+            assert client.post("/api/commands", headers=key, json=body).status_code == 403
+        assert client.post("/api/clients/sim-2/control", headers=key,
+                           json={"overrides": {"dhcp_fail": "on"}}).status_code == 403
+        assert client.delete("/api/clients/sim-2/control", headers=key).status_code == 403
+    assert _listed(client, monkeypatch) == []
+    assert spoke.registry.get_all()["sim-2"]["overrides"] == {"iperf": "on"}
 
 
 def test_ws_rejects_bad_key(client, spoke, monkeypatch):
@@ -505,14 +626,15 @@ def test_http_key_gating(client, spoke, monkeypatch):
     assert client.get("/api/health").status_code == 200
 
     # Sim-segment callers (the client fixture default) bypass the key.
-    assert client.get("/api/commands").status_code == 200
+    q = {"hostname": "sim-1"}
+    assert client.get("/api/inbox", params=q).status_code == 200
 
     # Off-segment: gated route without a key → 401.
     monkeypatch.setattr(client_api, "_on_sim_segment", lambda host: False)
-    assert client.get("/api/commands").status_code == 401
+    assert client.get("/api/inbox", params=q).status_code == 401
 
     # Off-segment with the right header → 200.
-    r = client.get("/api/commands", headers={"X-Client-Key": "secret"})
+    r = client.get("/api/inbox", params=q, headers={"X-Client-Key": "secret"})
     assert r.status_code == 200
 
 
@@ -522,7 +644,7 @@ def test_empty_key_denies_off_segment(client, spoke, monkeypatch):
     # be denied, not fall back to the old allow-all behavior.
     spoke.settings.settings["client_api_key"] = ""
     monkeypatch.setattr(client_api, "_on_sim_segment", lambda host: False)
-    assert client.get("/api/commands").status_code == 401
+    assert client.get("/api/inbox", params={"hostname": "x"}).status_code == 401
     assert client.get("/api/client/key").status_code == 403
     with pytest.raises(Exception):  # WebSocketDisconnect / close 4403
         with client.websocket_connect("/ws/client?hostname=nope") as ws:

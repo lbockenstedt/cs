@@ -22,10 +22,11 @@ $version = '0.01'
 . 'C:\Scripts\network_common.ps1'
 
 # New-WpaPskProfileXml — build the WPA2-PSK WLAN profile XML for netsh. Same
-# WPA2PSK / AES / passPhrase shape simulation.ps1 already uses (kept identical so
-# behavior matches); duplicated here so this file stands alone as a connect path.
+# WPA2PSK / AES / passPhrase shape. Values are XML-escaped (ConvertTo-XmlText).
 function New-WpaPskProfileXml {
     param([string]$Ssid, [string]$Password)
+    $Ssid = ConvertTo-XmlText $Ssid
+    $Password = ConvertTo-XmlText $Password
     return @"
 <?xml version="1.0"?>
 <WLANProfile xmlns="http://www.microsoft.com/networking/WLAN/profile/v1">

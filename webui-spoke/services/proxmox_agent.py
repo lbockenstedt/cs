@@ -2754,8 +2754,15 @@ async def check_for_update() -> None:
             _update_service_health("update_checker", ok=True)
             await _broadcast_update_state()
 
-            # Auto-apply if update available and spoke is idle
-            if (
+            # Auto-apply if update available and spoke is idle. A service not
+            # running as root can't update itself (see _run_self_update), so it
+            # only reports the new version.
+            if update_state["update_available"] and os.geteuid() != 0:
+                logger.info(
+                    "Auto-update: new version %s available — re-run the installer as root to apply it",
+                    available,
+                )
+            elif (
                 update_state["update_available"]
                 and not update_state["update_in_progress"]
                 and reclone_state.get("status") != "running"
@@ -2895,10 +2902,43 @@ async def _run_update_all() -> None:
 
 
 
+_SELF_UPDATE_NEEDS_ROOT = (
+    "Self-update needs root: re-run installers/install-lxc.sh as root on this host "
+    "(the service user has no sudo grant)"
+)
+
+
+def _self_update_ack_result() -> dict[str, str]:
+    """Return the ack result for a hub self_update command. Each case where
+    _run_self_update() will not start the installer (not root, one already
+    running, installer missing) is its own error, so the hub never sees a false
+    "triggered"."""
+    # Report refusals in the reseed-block error shape, in _run_self_update's order.
+    if update_state["update_in_progress"]:
+        return {"task_type": "self_update", "error": "in_progress", "message": "Self-update already running"}
+    if os.geteuid() != 0:
+        return {"task_type": "self_update", "error": "needs_root", "message": _SELF_UPDATE_NEEDS_ROOT}
+    if not _INSTALLER_PATH.exists():
+        return {"task_type": "self_update", "error": "installer_missing",
+                "message": f"Self-update: installer not found at {_INSTALLER_PATH}"}
+    return {"task_type": "self_update", "detail": "Self-update triggered"}
+
+
 async def _run_self_update() -> None:
-    """Re-run the installer from the synced repo. Systemd will restart the service."""
+    """Re-run the installer from the synced repo. Systemd will restart the service.
+
+    Only a service running as root can do this. The service user used to run
+    the installer through a sudo grant, but the installer it ran sat in the
+    repo cache, which the service user owns, so that was a path to root; the
+    installer now removes the grant and this records why no update ran."""
     # Only one self-update at a time.
     if update_state["update_in_progress"]:
+        return
+    # Without root there is nothing safe to run; say so instead of failing in sudo.
+    if os.geteuid() != 0:
+        logger.warning(_SELF_UPDATE_NEEDS_ROOT)
+        update_state["update_error"] = _SELF_UPDATE_NEEDS_ROOT
+        await _broadcast_update_state()
         return
     # Wait for any pending/delivered Proxmox agent commands (e.g. update_agent) to be
     # acked before restarting. Without this delay, the spoke restarts and loses the
@@ -2929,7 +2969,7 @@ async def _run_self_update() -> None:
     update_state["update_error"] = None
     await _broadcast_update_state()
     try:
-        import shlex as _shlex, os as _os
+        import shlex as _shlex
         # Use create_subprocess_shell so /bin/sh resolves bash via its own PATH.
         # This is more robust than exec when systemd strips the PATH env.
         full_path = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
@@ -2937,8 +2977,7 @@ async def _run_self_update() -> None:
         # Pass --branch and --port so the bootstrap step can curl the right branch.
         _branch = _shlex.quote(os.environ.get("REPO_BRANCH", "main"))
         _port   = _shlex.quote(os.environ.get("PORT", "8000"))
-        _base     = f'/bin/bash {installer} --branch {_branch} --port {_port}'
-        shell_cmd = _base if _os.geteuid() == 0 else f'sudo -n /bin/bash {installer} --branch {_branch} --port {_port}'
+        shell_cmd = f'/bin/bash {installer} --branch {_branch} --port {_port}'
         logger.info("Self-update: shell_cmd=%s", shell_cmd)
         proc = await asyncio.create_subprocess_shell(
             shell_cmd,

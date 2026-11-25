@@ -1,54 +1,15 @@
-function Remove-InlineComment {
+# Trim a value and unwrap matching outer quotes. There are no inline comments: the
+# spoke writes simulation.conf with Python's default configparser, which reads ;
+# and # inside a value as part of it, so "ab #12" must stay whole (as in the
+# Linux parser). Only whole-line comments are skipped (Parse-IniFile).
+function ConvertFrom-IniValue {
     param([string]$Value)
 
     if ([string]::IsNullOrEmpty($Value)) {
         return $Value
     }
 
-    $inSingleQuote = $false
-    $inDoubleQuote = $false
-    $stopParsing = $false
-    $builder = New-Object System.Text.StringBuilder
-
-    foreach ($character in $Value.ToCharArray()) {
-        switch ($character) {
-            "'" {
-                if (-not $inDoubleQuote) {
-                    $inSingleQuote = -not $inSingleQuote
-                }
-                [void]$builder.Append($character)
-            }
-            '"' {
-                if (-not $inSingleQuote) {
-                    $inDoubleQuote = -not $inDoubleQuote
-                }
-                [void]$builder.Append($character)
-            }
-            ';' {
-                if (-not $inSingleQuote -and -not $inDoubleQuote) {
-                    $stopParsing = $true
-                } else {
-                    [void]$builder.Append($character)
-                }
-            }
-            '#' {
-                if (-not $inSingleQuote -and -not $inDoubleQuote) {
-                    $stopParsing = $true
-                } else {
-                    [void]$builder.Append($character)
-                }
-            }
-            default {
-                [void]$builder.Append($character)
-            }
-        }
-
-        if ($stopParsing) {
-            break
-        }
-    }
-
-    $cleanValue = $builder.ToString().Trim()
+    $cleanValue = $Value.Trim()
     if ($cleanValue.Length -ge 2) {
         if (($cleanValue.StartsWith('"') -and $cleanValue.EndsWith('"')) -or ($cleanValue.StartsWith("'") -and $cleanValue.EndsWith("'"))) {
             $cleanValue = $cleanValue.Substring(1, $cleanValue.Length - 2)
@@ -86,7 +47,7 @@ function Parse-IniFile {
 
         if ($line -match '^([^=]+?)\s*=\s*(.*)$') {
             $key = $matches[1].Trim()
-            $value = Remove-InlineComment -Value $matches[2]
+            $value = ConvertFrom-IniValue -Value $matches[2]
             $ini[$section][$key] = $value
         }
     }

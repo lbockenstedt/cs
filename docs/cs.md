@@ -14,7 +14,7 @@ The active LM spoke is `lm-spoke/` (`CSSpoke`), **relay-only** for Proxmox/USB a
 ## Entrypoints
 
 - **lm-spoke (native):** `python3 -m src.control_plane` (`CSControlPlane`), systemd `lm-cs.service`, `User=svc_lm`, `--port $CS_API_PORT --host $CS_API_HOST`. Installer `lm-spoke/install_cs.sh` (clones lm core `core/` to `/opt/lm/core`, cs to `/opt/lm/cs`, a cs-owned Kea DHCP instance `kea-dhcp4-sim` on the 2nd NIC, `lm-cs.service`, rollback watchdog + sudoers). `--standalone` opts out of hub mode.
-- **webui-spoke (legacy):** `uvicorn server:app` :8000. Installer `installers/install-lxc.sh`.
+- **webui-spoke (legacy):** `uvicorn server:app` :8000. Installer `installers/install-lxc.sh`. The service user has no sudo grant, so the legacy dashboard does not update itself: re-run the installer as root to update (self-update requests return `needs_root`). Its root watchdog timer only restarts the service and never re-runs the installer.
 - **Sim agents:** `clients/linux/agent.sh` (systemd `client-sim-agent.service`), `clients/windows/*.ps1`, `clients/t3/*`.
 
 > **Primarily a role now.** cs runs mainly as the **`simulation`** role hosted by the generic agent (`agent-<hostname>`, unit `lm-agent`): the agent opens a sub-spoke `{agent}-simulation` (module_type `simulation`, parent-auto-approved) and self-installs the role via `agent/src/agent_spoke.py::_install_role` — cloning `lbockenstedt/cs.git` + deps and running `install_cs.sh --infra-only` for the idempotent host prep (cs-owned Kea + 2nd NIC). The dedicated `lm-cs.service` / `install_cs.sh` `{module}-spoke-1` path below is the **legacy/standalone** alternative. Sim/provisioning config arrives via the hub push (WebUI), not a per-module `.env`.
@@ -97,7 +97,9 @@ Implementation: `local_ui_routes.py` answers the same `/sim/api/*` REST contract
 
 **Client registry + per-client overrides.** Every sim VM that reports in is tracked in `client_registry.py` (persisted to `data/clients.json`): last-seen, SSID, gateway reachability, running sims, recent errors. The **per-client Control Panel** (11 fault toggles) writes *persisted* overrides into that registry. **Demo scenarios** (`demo_scenarios.py`) are the ephemeral counterpart: an in-memory, 120-minute-TTL override that flips one failure flag and auto-expires (or clears on reboot) back to whatever the operator had set — demos never mutate the persisted registry.
 
-**Hub-config store + command queue.** Auto-provisioning knobs (templates, VMID range, thresholds, dongle VID:PIDs) live in a local store (`local_store.py`) and/or arrive from the hub via `CS_CONFIG_UPDATE`. The command queue (`command_queue.py`) holds VM actions (`pending → delivered → completed/failed/expired`) with an idempotent enqueue and a sim-VMID safeguard (refuses anything below VMID 90000 or in `protected_vmids`, default `{1001}`) so the UI can only ever touch sim VMs.
+**Hub-config store + command queue.** Auto-provisioning knobs (templates, VMID range, thresholds, dongle VID:PIDs) live in a local store (`local_store.py`) and/or arrive from the hub via `CS_CONFIG_UPDATE`. The command queue (`command_queue.py`) holds VM actions (`pending → delivered → completed/failed/expired`) with an idempotent enqueue and a sim-VMID safeguard (for any target, refuses a `vmid`/`vm_id` or `delete_vms` id that is not a whole number, is below VMID 90000 or is in `protected_vmids`, default `{1001}`) so the UI can only ever touch sim VMs. Sim clients (`/ws/client`, or any HTTP `/api/inbox` caller other than the loopback operator, keyed or not) only receive and ack their own sim-client actions (`restart_sim`, `reboot`, `update_now`, `kill_switch`, `debug_mode`); `target:"proxmox"` and VM actions go only to the Proxmox agents' hub poll. `POST`/`GET /api/commands`, `POST /api/inbox/ack` and `POST`/`DELETE /api/clients/{h}/control` are loopback-only operator routes (a sim VM can neither queue a command nor change another client's overrides); sim clients ack over the WebSocket, and the hub WebUI drives the queue and overrides over the spoke's command channel.
+
+**Secret files.** The spoke writes its secret files mode `0600` from creation (temp file opened `0600`, then an atomic rename), so no other local user can read them even mid-write: `data/proxmox_tokens.json` (the Proxmox `root@pam` API tokens), `data/cs_settings.json` (holds `client_api_key`), `data/local_store.json` (the Central, Central on-prem and Mist credentials and tokens), `data/clients.json` (per-client overrides, including the JIT `dot1x_password` and pinned SSID passwords) and the local-webui TLS key `privkey.pem`. A file an older version left readable to others is tightened to `0600` when the spoke next loads it (a failed chmod is logged as a warning), and a temp copy a crash left behind (`<file>.tmp`, or the older `local_store.tmp`) is deleted at the same time. A crash-left `privkey.pem.tmp` is deleted at startup even when the final key never landed, on both the TLS and the default plaintext path.
 
 **The cs-owned sim DHCP.** cs owns its **own** Kea DHCP4 instance for the isolated sim-client network — this is **separate** from the `dhcp` module's Kea. `install_cs.sh` provisions it on an auto-detected **second NIC** at `169.253.1.1`, static subnet **`169.253.1.0/24`**, pool **`169.253.1.11`–`169.253.1.254`**, **no** router/gateway option (the network is deliberately isolated). Configs: `/etc/kea/kea-dhcp4-sim.conf` + `/etc/kea/kea-ctrl-agent-sim.conf`; the sim control agent listens on **127.0.0.1:8102** (the `dhcp` module's Kea control agent is on a different port); leases in `/var/lib/kea/kea-leases4-sim.csv`; units `kea-dhcp4-sim.service` + `kea-ctrl-agent-sim.service`. `dhcp_status.py` cheaply reads the lease CSV (not the ctrl-agent) and rides the 10s telemetry frame to the hub's DHCP-server card.
 
@@ -176,6 +178,36 @@ A failed apply or restore returns a non-zero exit status; a failed restore
 retains the static state for retry. Only successful restoration starts a new
 DHCP window. Check `sim.log` in the platform's scripts directory. Do not delete
 that state file while recovery is pending.
+
+## Rogue DNS Burst — static IP + fixed DNS + query load
+
+`rogue_dns_burst` is a copy of `rogue_dns` (same DHCP → static → DHCP cycle,
+state in `rogue_dns_burst.state`, same restore behaviour) for Linux and
+Windows wireless clients. It trips the Rogue DNS server / DNS anomaly alert by
+adding a steady query load to the rogue server during the static window, while
+the headless Firefox browsing continues. `rogue_dns` is unchanged. Clients keep
+their IP, so the sim is in `QT_EXCLUDE_NONISOLATING_SIMS` and a client that
+never got an IP is still quarantined as a bad dongle. Requires the lm catalog
+entry (lm#2098); ship that first.
+
+| Section | Key | Default | Meaning |
+|---|---|---|---|
+| `[s0]`–`[s9]` | `rogue_dns_burst` | `off` | Enable the simulation |
+| `[address]` | `rogue_dns_burst_server` | blank | Rogue DNS server IPv4; blank or invalid skips the sim |
+| `[address]` | `rogue_dns_burst_domains` | `www.google.com www.youtube.com www.linkedin.com` | Domains queried round-robin (space/comma separated; one per line in the editor) |
+| `[simulation]` | `rogue_dns_burst_dhcp_interval` | `1800` | Seconds on DHCP before each static phase |
+| `[simulation]` | `rogue_dns_burst_duration` | `3600` | Seconds in the static phase |
+| `[simulation]` | `rogue_dns_burst_browse_interval` | `60` | Seconds between browse requests |
+| `[simulation]` | `rogue_dns_burst_rate` | `20` | Queries launched per second, before the DNS ceiling |
+| `[simulation]` | `rogue_dns_burst_max_pending` | `40` | Maximum queries in flight; waits on the oldest when full |
+
+Each second a background loop launches the configured number of queries
+(`dig -r @<server> <domain> A +time=2 +tries=1` on Linux; `Resolve-DnsName`
+with a 2-second limit in a background job on Windows). The rate passes through
+the shared `dns_ceiling_rate` and the gateway circuit breaker; there is no
+second throttle. The loop and its own children are stopped before DHCP is
+restored (also on INT/TERM/exit) and nothing is killed by name. If `dig` is
+missing, Linux logs it and runs without the burst.
 
 ## WWW Discover — Network Diagnostics
 

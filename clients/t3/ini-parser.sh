@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+version=0.01
 # ============================================================================ #
 # GENERATED-COPY NOTICE — canonical source: clients/lib/ini-parser.sh          #
 # clients/linux/ini-parser.sh and clients/t3/ini-parser.sh are byte-identical  #
@@ -174,13 +175,15 @@ _ini_key_name()
     fi
 }
 
-# Cleanse a value: strip inline comments, trim, escape single quotes.              #
+# Cleanse a value: trim, escape single quotes. There are no inline comments: the   #
+# spoke writes simulation.conf with Python's default configparser, which writes    #
+# values unquoted and reads ; and # inside a value as part of it. Cutting at them  #
+# truncated passphrases such as "ab#12" or "ab #12". Only whole-line comments are  #
+# skipped (process_ini_file).                                                      #
 _ini_value()
 {
     local value=${1-}
-    value="${value%%\;*}"                     # Remove in line right comments
-    value="${value%%\#*}"                     # Remove in line right comments
-    value="${value##*( )}"                    # Remove leading spaces
+    value="${value##*([[:space:]])}"          # Remove leading spaces
     value="${value%%*( )}"                    # Remove trailing spaces
     value=${value//\'/SINGLE_QUOTE}           # escape_string
     _ini_result=${value}
@@ -388,7 +391,13 @@ function process_ini_file()
 
     # If the config file is missing/unreadable, return without populating so the
     # redirect below does not error out (fatal under a 'set -e'/'set -u' caller).
+    # Warn loudly first: an unreadable file (e.g. simulation.conf written 0600 by
+    # a root updater) is otherwise indistinguishable from "all flags off" and
+    # silently disables every simulation. Don't let it hide again.
     if [[ ! -r "$1" ]]; then
+        if [[ -e "$1" ]]; then
+            echo "WARN: ini-parser: '$1' exists but is not readable by $(id -un) — all values will be empty" >&2
+        fi
         return
     fi
 
@@ -411,7 +420,8 @@ function process_ini_file()
                 eval "${section}_values=()"  # Use eval to declare the values array
                 sections+=("${section}")  # Add the section name to the list
             fi
-        elif [[ ${line} =~ ^(.*)"="(.*) ]]; then  # Match pattern for a key=value pair
+        # The key ends at the FIRST "=", so a value may contain "=" (base64 keys).
+        elif [[ ${line} =~ ^([^=]*)"="(.*) ]]; then  # Match pattern for a key=value pair
             _ini_key_name "${BASH_REMATCH[1]}"
             key=${_ini_result}
             _ini_value "${BASH_REMATCH[2]}"

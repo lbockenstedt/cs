@@ -37,6 +37,9 @@ from pathlib import Path
 # Type hints only.
 from typing import Any, Dict, List, Optional
 
+# Shared atomic writer and permission helper.
+from command_queue import _make_private, _write_atomic
+
 # Dedicated logger for the token store.
 logger = logging.getLogger("TokenStore")
 
@@ -108,6 +111,8 @@ class TokenStore:
 
     def _load(self) -> None:
         """Load tokens from disk, ignoring a missing, empty or corrupt file."""
+        # The file holds Proxmox API tokens: make sure only the spoke can read it.
+        _make_private(self.path)
         try:
             # Only read a file that exists and is not empty.
             if self.path.exists() and self.path.stat().st_size > 0:
@@ -123,12 +128,13 @@ class TokenStore:
             self._tokens = {}
 
     def _save(self) -> None:
-        """Write all tokens to disk."""
+        """Write all tokens to disk atomically, readable only by the spoke."""
         try:
-            # Create the data directory if needed, then write all tokens as JSON.
+            # Create the data directory if needed, then write all tokens as
+            # JSON. Atomic, so a crash mid-write cannot empty the file, and
+            # 0600 from creation, since each token is a root@pam API token.
             self.path.parent.mkdir(parents=True, exist_ok=True)
-            with open(self.path, "w") as f:
-                json.dump(self._tokens, f)
+            _write_atomic(self.path, json.dumps(self._tokens), mode=0o600)
         # A write failure is logged but never crashes the spoke.
         except OSError as e:
             logger.warning("token_store save failed: %s", e)

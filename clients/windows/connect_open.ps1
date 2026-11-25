@@ -23,6 +23,7 @@ $version = '0.01'
 # profile XML for netsh. Same shape as New-WpaPskProfileXml minus the sharedKey.
 function New-OpenProfileXml {
     param([string]$Ssid)
+    $Ssid = ConvertTo-XmlText $Ssid
     return @"
 <?xml version="1.0"?>
 <WLANProfile xmlns="http://www.microsoft.com/networking/WLAN/profile/v1">

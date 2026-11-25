@@ -155,7 +155,18 @@ if [[ -n ${tempvar} ]]; then sim_phy=$tempvar; fi
 #------------------------------------------------------------
 #Configuring Syslog Server
 #------------------------------------------------------------
-if [[ "$syslog" == "on" ]]; then
+# _syslog_target_ok: accept only a host name, IPv4 or [IPv6] address with an
+# optional :port and an optional leading @ (rsyslog's TCP form). syslog_server
+# comes from the served simulation.conf and is spliced into `sudo sed` below,
+# where a | or newline adds sed commands (GNU sed's e flag runs a shell).
+_syslog_target_ok() {
+  [[ "${1-}" =~ ^@?([A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?|\[[0-9A-Fa-f:.]+\])(:[0-9]{1,5})?$ ]]
+}
+if [[ "$syslog" == "on" ]] && ! _syslog_target_ok "$syslog_server"; then
+  echo "Skipping Syslog Server Update - syslog_server is not a plain host[:port]" | tee -a /usr/local/scripts/sim.log
+elif [[ "$syslog" == "on" ]]; then
+  # The address is a regex in the comment-line check; escape . [ ] there.
+  _syslog_re=$(printf '%s' "$syslog_server" | sed 's/[][.]/\\&/g')
   #Ensure the remote syslog line exists, replace if different
   if grep -q '^\*\.\*@' /etc/rsyslog.conf; then
     sudo sed -i "s|^\*\.\*@.*|*.*@${syslog_server}|" /etc/rsyslog.conf
@@ -165,7 +176,7 @@ if [[ "$syslog" == "on" ]]; then
   fi
   #Add the comment line before the syslog line, if it doesn't exist
   if ! grep -Fxq "#Syslog Server" /etc/rsyslog.conf; then
-    sudo sed -i "/\*\.\*@${syslog_server}/i #Syslog Server" /etc/rsyslog.conf
+    sudo sed -i "/\*\.\*@${_syslog_re}/i #Syslog Server" /etc/rsyslog.conf
   fi
   #Ensure the imfile module exists before imuxsock
   if ! grep -Eq '^\s*(\$ModLoad\s+imfile|module\(load="imfile"\))' /etc/rsyslog.conf; then

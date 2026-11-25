@@ -128,12 +128,12 @@ flag.
 | `GET /api/scripts/list?platform=linux\|windows\|t3` | filenames in `clients/{platform}/` |
 | `GET /api/scripts/{platform}/{filename}` | `FileResponse` (path-traversal guarded) |
 | `GET /api/clients` | registry snapshot |
-| `POST /api/clients/{hostname}/control` | `{overrides}` → `registry.set_overrides` (key-gated) |
-| `DELETE /api/clients/{hostname}/control` | clear overrides (key-gated) |
-| `POST /api/commands` | `{target, action, args, type}` → `queue.enqueue` (key-gated; safeguard refuse → 400) |
-| `GET /api/commands` | `queue.list_commands()` (key-gated) |
-| `GET /api/inbox?hostname=` | `queue.poll_agent_inbox()` (key-gated) |
-| `POST /api/inbox/ack` | `{id, status, message, result}` → `queue.ack_command` (key-gated) |
+| `POST /api/clients/{hostname}/control` | `{overrides}` → `registry.set_overrides` (operator surface: loopback only, like `/status`; anyone else → 403) |
+| `DELETE /api/clients/{hostname}/control` | clear overrides (operator surface: loopback only; anyone else → 403) |
+| `POST /api/commands` | `{target, action, args, type}` → `queue.enqueue` (operator surface: loopback only, anyone else → 403, because a `"proxmox"` command reaches the Proxmox hosts; safeguard refuse → 400: a `vmid`/`vm_id`, or any `delete_vms` id, that is not a whole number, is below 90000 or is protected, for any target) |
+| `GET /api/commands` | `queue.list_commands()` (operator surface: loopback only, like `/status`; anyone else → 403) |
+| `GET /api/inbox?hostname=` | `queue.poll_agent_inbox()` (key-gated). Only the loopback operator gets a fleet poll. Any other caller, keyed or not, on the sim segment or off it, gets only that hostname's `SIM_CLIENT_ACTIONS` commands, never `target:"proxmox"` or VM actions: every sim VM can fetch the key. Proxmox agents poll through the hub (`CS_POLL_AGENT_INBOX`) |
+| `POST /api/inbox/ack` | `{id, status, message, result}` → `queue.ack_command` (operator surface: loopback only; anyone else → 403). Sim clients ack over `/ws/client`, Proxmox agents through the hub (`CS_ACK_COMMAND`); unknown id → 404 |
 | `WS /ws/client?hostname=&platform=&api_key=` | primary agent channel (see below) |
 | `GET /status` · `POST /simulate/trigger` · `GET\|POST /config` | mgmt (same as the old standalone surface; loopback only) |
 | `GET /version` | spoke version (public) |
@@ -141,8 +141,8 @@ flag.
 
 ### `/ws/client` protocol
 - Auth: sim-segment callers connect open (the t3 agent sends no key); else `secrets.compare_digest(api_key, key)`, close `4403` on mismatch. The linux agent fetches `/api/client/key` first (sim-segment only) when it wants to pass a key along.
-- On accept: server sends `{type:"hello"}`, then pushes pending commands (`{type:"commands", commands:[{id,action,args,type}]}`, marks them `delivered`).
-- Client → server: `{type:"status", payload}` → `{type:"status_ack"}`; `{type:"ack", payload:{id,status,message,...}}` → `queue.ack_command` → `{type:"ack_ok"}`; `{type:"sync"}` → re-push pending; `{type:"ping"}` → `{type:"pong"}`.
+- On accept: server sends `{type:"hello"}`, then pushes pending commands (`{type:"commands", commands:[{id,action,args,type}]}`, marks them `delivered`). Only commands addressed to this hostname whose action is a sim-client one (`restart_sim`, `reboot`, `update_now`, `kill_switch`, `debug_mode`) are pushed; `target:"proxmox"` and VM actions wait for the Proxmox agent's hub poll (`CS_POLL_AGENT_INBOX`).
+- Client → server: `{type:"status", payload}` → `{type:"status_ack"}`; `{type:"ack", payload:{id,status,message,...}}` → `queue.ack_command` → `{type:"ack_ok", ok}` (`ok:false` for a command this socket could not have been sent); `{type:"sync"}` → re-push pending; `{type:"ping"}` → `{type:"pong"}`.
 - Live push: `CS_QUEUE_COMMAND` (hub) calls `client_api.push_pending(spoke, target)` so a queued command reaches a connected agent immediately, without waiting for its next `sync`.
 
 ## Architecture

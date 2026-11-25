@@ -13,6 +13,7 @@ from server import (
     _get_repo_version,
     _run_self_update,
     _run_update_all,
+    _self_update_ack_result,
     _sync_repo_now,
     approved_proxmox_agents,
     asyncio,
@@ -151,6 +152,12 @@ async def api_self_update() -> dict[str, Any]:
     # Only one update at a time.
     if update_state["update_in_progress"]:
         raise HTTPException(status_code=409, detail="Update already in progress")
+    # A service that is not root can't run the installer: refuse before the
+    # version check, so the answer is never "started" or "up to date" for an
+    # update that can't run.
+    refused = _self_update_ack_result()
+    if refused.get("error"):
+        raise HTTPException(status_code=403, detail=refused["message"])
     # Sync from GitHub first so version check reflects the latest repo state
     try:
         await _sync_repo_now()

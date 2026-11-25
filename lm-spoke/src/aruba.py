@@ -9,9 +9,11 @@ Central tenants into Hub tenants.
 # Allow modern type-hint syntax without evaluating annotations at import time.
 from __future__ import annotations
 
+# Run the blocking DNS check off the event loop.
+import asyncio
 # Hashing and JSON for config hashes and payloads.
 import hashlib
-# Address checks for cluster URL validation.
+# Tell public from non-public resolved addresses.
 import ipaddress
 import json
 # Logging, DNS lookups and timing.
@@ -22,14 +24,67 @@ import time
 from dataclasses import dataclass, field
 # Type hints only.
 from typing import Any, Optional
-# URL parsing.
-from urllib.parse import urlparse
+# Host part of cluster_url / token_url for the DNS check.
+from urllib.parse import urlsplit
 
 # Async HTTP client.
 import httpx
 
+# Shared SSRF checks, the ones the hub uses when Central settings are saved.
+from core.src.access import is_internal_ip, safe_external_url
+
 # Logger for this module.
 logger = logging.getLogger(__name__)
+
+_NAT64_PREFIX = ipaddress.ip_network("64:ff9b::/96")
+
+
+def _is_non_public(addr: str) -> bool:
+    """Return True unless ``addr`` is a globally routable address.
+
+    core's is_internal_ip covers private, loopback, link-local and reserved,
+    but not CGNAT (100.64.0.0/10), benchmarking (198.18.0.0/15) or IPv6
+    site-local (fec0::/10). Credentials only ever go to a public Central
+    host, so anything that is not global is refused. An IPv6 address that
+    embeds an IPv4 one (mapped, 6to4, NAT64) is judged by the IPv4 address,
+    and a value that does not parse fails closed.
+    """
+    if is_internal_ip(addr):
+        return True
+    try:
+        ip = ipaddress.ip_address(addr.split("%", 1)[0])
+    except ValueError:
+        return True
+    # Judge an embedded IPv4 address, not the IPv6 wrapper around it.
+    if ip.version == 6:
+        if ip.ipv4_mapped is not None:
+            ip = ip.ipv4_mapped
+        elif ip.sixtofour is not None:
+            ip = ip.sixtofour
+        elif ip in _NAT64_PREFIX:
+            ip = ipaddress.IPv4Address(int(ip) & 0xFFFFFFFF)
+        elif ip.is_site_local:
+            return True
+    return not ip.is_global
+
+
+def _host_dns_state(host: str) -> str:
+    """Resolve host and return "external", "internal" or "unresolved".
+
+    Unlike core's host_resolves_external, which lets an unresolvable host
+    through for the save path, a host that does not resolve is its own state
+    here: credentials are about to be sent, so the check fails closed. The
+    answer is not cached, so every credential-bearing request checks again.
+    """
+    try:
+        infos = socket.getaddrinfo(host, None)
+    except OSError:
+        return "unresolved"
+    addrs = {i[4][0] for i in infos}
+    if not addrs:
+        return "unresolved"
+    return "internal" if any(_is_non_public(a) for a in addrs) else "external"
+
 
 # Default token endpoint for new Central.
 _NEW_CENTRAL_TOKEN_URL = "https://sso.common.cloud.hpe.com/as/token.oauth2"
@@ -54,9 +109,8 @@ _NC_GLOBAL_CACHE_TTL = 270  # 4.5 min — just under the 5-min poll interval
 # cache across instances with the same config reuses the still-valid token.
 # Value: {access_token, expires_at, [refresh_token]} — expiry handling unchanged.
 _token_cache: dict[str, dict[str, Any]] = {}
-# GreenLake token URL and known Central API gateway host suffixes.
+# GreenLake token URL.
 _GLP_TOKEN_URL_TEMPLATE = "https://global.api.greenlake.hpe.com/authorization/v2/oauth2/{workspace_id}/token"
-_KNOWN_CENTRAL_GATEWAY_SUFFIXES = (".api.central.arubanetworks.com", ".api.central.arubanetworks.com.cn")
 
 # Default checks offered for new Central tenants.
 DEFAULT_NEW_CENTRAL_MONITORED_CHECKS: tuple[dict[str, str], ...] = (
@@ -100,48 +154,6 @@ KNOWN_CLASSIC_INSIGHT_CATEGORIES: dict[str, str] = {
     "RELIABILITY": "Reliability",
     "SECURITY": "Security",
 }
-
-
-def validate_cluster_url(cluster_url: str) -> str:
-    """Validate and normalise an Aruba Central cluster URL.
-    Requires https and a hostname that resolves to a public address; logs a
-    warning if the host is not a known Central API gateway.
-    """
-    # Normalise and require a value.
-    normalized = str(cluster_url or "").strip().rstrip("/")
-    if not normalized:
-        raise ValueError("cluster_url is required")
-
-    # Require https and a hostname.
-    parsed = urlparse(normalized)
-    if parsed.scheme != "https":
-        raise ValueError("cluster_url must use https")
-    if not parsed.hostname:
-        raise ValueError("cluster_url must include a hostname")
-
-    # Resolve the hostname.
-    try:
-        addrinfo = socket.getaddrinfo(parsed.hostname, parsed.port or 443, type=socket.SOCK_STREAM)
-    except socket.gaierror as exc:
-        raise ValueError(f"cluster_url hostname could not be resolved: {exc}") from exc
-
-    # Reject private, loopback and link-local addresses.
-    for _, _, _, _, sockaddr in addrinfo:
-        ip = ipaddress.ip_address(sockaddr[0])
-        if ip.is_private or ip.is_loopback or ip.is_link_local:
-            raise ValueError(
-                f"cluster_url resolves to disallowed address {ip}"
-            )
-
-    # Warn about unknown gateway hosts.
-    hostname = parsed.hostname.casefold()
-    if not hostname.endswith(_KNOWN_CENTRAL_GATEWAY_SUFFIXES):
-        logger.warning(
-            "Aruba cluster_url host %s does not match known Central API gateway patterns",
-            parsed.hostname,
-        )
-
-    return normalized
 
 
 @dataclass
@@ -233,7 +245,22 @@ class ArubaClient:
         """Store the config and work out the cluster URL, API version and config hash."""
         # Copy the config and read the main settings.
         self.config = dict(config)
-        self.cluster_url = (self.config.get("cluster_url") or "").rstrip("/")
+        # The token exchange POSTs client_id/client_secret to {cluster_url},
+        # and every API GET carries the bearer token there. The hub saves only
+        # a public https cluster_url, but a value stored before that check,
+        # restored, or saved through the spoke's own Setup was never checked.
+        # So ignore anything that is not a public https URL, as the hub twin
+        # does; the client then reports not configured.
+        raw_cluster_url = (self.config.get("cluster_url") or "").strip().rstrip("/")
+        self.cluster_url = raw_cluster_url if safe_external_url(raw_cluster_url) else ""
+        # A URL that was set but refused is its own state, so Test and the
+        # Central tabs say why instead of "not configured".
+        self.config_error = ""
+        if raw_cluster_url and not self.cluster_url:
+            self.config_error = ("Central cluster URL rejected: not a public https:// URL "
+                                 "(internal hosts, IP literals and plain http are blocked).")
+            logger.warning("Aruba cluster_url ignored: not a public https:// URL "
+                           "(internal hosts, IP literals and plain http are blocked)")
         self.api_version = (self.config.get("api_version") or "classic").strip()
         # Short hash used for shared caches and log tags.
         self._config_hash = hashlib.md5(
@@ -251,8 +278,13 @@ class ArubaClient:
     def _new_central_token_url(self) -> str:
         """Return the new Central token URL (GreenLake when a workspace id is set)."""
         # A cluster outside the public list (e.g. a dev cluster) has its own SSO.
+        # The client secret is POSTed there, so it gets the same check as
+        # cluster_url (the hub's _check_token_url applies it on save).
         override = str(self.config.get("token_url") or "").strip()
         if override.lower().startswith("https://"):
+            if not safe_external_url(override):
+                raise ValueError("token_url must be a public https:// URL "
+                                 "(internal hosts and IP literals are blocked)")
             return override
         # Use the GreenLake URL when a workspace id is set.
         workspace_id = str(self.config.get("workspace_id") or "").strip()
@@ -260,8 +292,38 @@ class ArubaClient:
             return _GLP_TOKEN_URL_TEMPLATE.format(workspace_id=workspace_id)
         return _NEW_CENTRAL_TOKEN_URL
 
+    async def _check_hosts_resolve_external(self) -> None:
+        """Raise ValueError if cluster_url or a token_url override resolves
+        to an internal address, or does not resolve at all.
+
+        Why: safe_external_url is a string check only, so a public-looking
+        name that resolves to 10.x or 169.254.169.254 passes it. The hub
+        resolves the host when the settings are saved, but a standalone,
+        restored or older config never went through that save, so the
+        spoke checks again before it sends credentials or the bearer token.
+        """
+        urls = [self.cluster_url]
+        override = str(self.config.get("token_url") or "").strip()
+        # An override that fails the string check is refused, with its own
+        # message, by _new_central_token_url.
+        if self.api_version == "new_central" and safe_external_url(override):
+            urls.append(override)
+        for url in urls:
+            host = urlsplit(url).hostname or ""
+            if not host:
+                continue
+            # getaddrinfo blocks, so it runs in a thread (rule 8.6).
+            state = await asyncio.to_thread(_host_dns_state, host)
+            if state == "internal":
+                raise ValueError(f"Aruba host {host} resolves to an internal address")
+            if state == "unresolved":
+                raise ValueError(f"Aruba host {host} could not be resolved")
+
     async def _ensure_token(self, client: httpx.AsyncClient) -> str:
         """Return a valid access token, fetching or refreshing one if needed."""
+        # Every request to cluster_url and the token URL gets its token here,
+        # so check where those hosts resolve before any credential is sent.
+        await self._check_hosts_resolve_external()
         # Reuse a cached token that is still valid for at least a minute.
         now = time.time()
         token_state = self._token_state()

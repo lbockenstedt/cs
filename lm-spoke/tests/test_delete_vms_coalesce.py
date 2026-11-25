@@ -93,3 +93,36 @@ def test_mixed_batch_coalesces_deletes_keeps_others(spoke_loop):
     sv = [c for c in cmds if c["action"] == "stop_vm"]
     assert len(dv) == 1 and sorted(dv[0]["args"]["vmids"]) == [90001, 90002]
     assert len(sv) == 1 and sv[0]["args"]["vmid"] == 90003
+
+
+def test_one_bad_id_fails_only_that_item(spoke_loop):
+    """A low, protected or non-numeric id (or one hidden in vm_id) is that
+    item's error alone: the rest of the host's deletes still go out as one
+    delete_vms, like the agent's per-VM guard, and ``queued`` counts only
+    what was queued. A refused stop_vm is also an error, not queued."""
+    spoke, loop = spoke_loop
+    items = [_del(90001, "host-a"), _del(100, "host-a"), _del(1001, "host-a"),
+             _del("x", "host-a"), _del(90002, "host-a"),
+             {"action": "delete_vm", "args": {"vmid": 90003, "vm_id": 1001},
+              "target": "host-a"},
+             {"action": "stop_vm", "args": {"vmid": 100}, "target": "host-a"}]
+    res = _dispatch(spoke, loop, items)
+    dv = [c for c in _cmds(spoke, loop) if c["action"] == "delete_vms"]
+    assert len(dv) == 1 and sorted(dv[0]["args"]["vmids"]) == [90001, 90002]
+    assert res["queued"] == 2
+    assert len(res["errors"]) == 5
+    assert not [c for c in _cmds(spoke, loop) if c["action"] == "stop_vm"]
+
+
+def test_empty_vmid_uses_vm_id(spoke_loop):
+    """An empty or null vmid next to a valid vm_id batches the vm_id, as the
+    agent reads it (``vmid or vm_id``), instead of putting "" in the batch,
+    which would refuse every delete for that host."""
+    spoke, loop = spoke_loop
+    items = [_del(90001, "host-a"),
+             {"action": "delete_vm", "args": {"vmid": "", "vm_id": 90004}, "target": "host-a"},
+             {"action": "delete_vm", "args": {"vmid": None, "vm_id": 90005}, "target": "host-a"}]
+    res = _dispatch(spoke, loop, items)
+    dv = [c for c in _cmds(spoke, loop) if c["action"] == "delete_vms"]
+    assert len(dv) == 1 and sorted(dv[0]["args"]["vmids"]) == [90001, 90004, 90005]
+    assert res["queued"] == 3 and not res["errors"]

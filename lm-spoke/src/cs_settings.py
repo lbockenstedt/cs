@@ -35,6 +35,7 @@ from command_queue import (
     _parse_json_list,
     _sanitize_vm_set_override,
     _setting_bool,
+    _make_private,
     _write_atomic,
 )
 
@@ -173,6 +174,8 @@ class CSSettings:
 
     def _load(self) -> None:
         """Overlay saved settings from disk onto the defaults."""
+        # The file holds client_api_key: make sure only the spoke can read it.
+        _make_private(self.path)
         try:
             # Only read a file that exists ("" is treated as an empty object).
             if self.path.exists():
@@ -189,7 +192,8 @@ class CSSettings:
         try:
             # Create the data directory if needed and write the file atomically.
             self.data_dir.mkdir(parents=True, exist_ok=True)
-            _write_atomic(self.path, json.dumps(self.settings, default=str))
+            _write_atomic(self.path, json.dumps(self.settings, default=str),
+                          mode=0o600)
         # A write failure is logged but never crashes the spoke.
         except Exception as exc:  # noqa: BLE001
             logger.warning("CS settings save failed (%s): %s", self.path, exc)

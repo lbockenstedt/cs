@@ -180,11 +180,12 @@ while ($true) {
         iperf            = get_value $simulationId 'iperf'
         www_traffic      = get_value $simulationId 'www_traffic'
         rogue_dns        = get_value $simulationId 'rogue_dns'
+        rogue_dns_burst  = get_value $simulationId 'rogue_dns_burst'
         www_discover     = get_value $simulationId 'www_discover'
         collab           = get_value $simulationId 'collab'
     }
 
-    foreach ($key in @('kill_switch','sim_load','public_repo','repo_location','vh_server','site_based_ssid','iperf_bw','wsite','sim_phy','ssid','ssidpw','dhcp_fail','dns_fail','dns_latency','assoc_fail','port_flap','ping_test','download','iperf','www_traffic','www_discover','rogue_dns','collab','ssidpw_fail','auth_fail','mac_auth_fail')) {
+    foreach ($key in @('kill_switch','sim_load','public_repo','repo_location','vh_server','site_based_ssid','iperf_bw','wsite','sim_phy','ssid','ssidpw','dhcp_fail','dns_fail','dns_latency','assoc_fail','port_flap','ping_test','download','iperf','www_traffic','www_discover','rogue_dns','rogue_dns_burst','collab','ssidpw_fail','auth_fail','mac_auth_fail')) {
         Apply-Override -Section $username -Name $key -Config $config
     }
 
@@ -213,6 +214,7 @@ while ($true) {
         @{ Name = 'DNS Latency'; Value = $config.dns_latency },
         @{ Name = 'WWW Traffic'; Value = $config.www_traffic },
         @{ Name = 'Rogue DNS'; Value = $config.rogue_dns },
+        @{ Name = 'Rogue DNS Burst'; Value = $config.rogue_dns_burst },
         @{ Name = 'WWW Discover'; Value = $config.www_discover },
         @{ Name = 'Collab'; Value = $config.collab },
         @{ Name = 'Ping Test'; Value = $config.ping_test },
