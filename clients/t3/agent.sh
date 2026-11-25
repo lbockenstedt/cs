@@ -7,17 +7,26 @@ HOSTNAME_VAL="${CLIENT_SIM_HOSTNAME:-$(hostname)}"
 
 [[ -z "$SERVER_URL" ]] && exit 0
 
+# Print "<id>\t<action>" for a hub command. A malformed or non-object
+# command yields empty fields, and tabs/newlines are flattened so a crafted
+# id can't shift the fields `read` splits on.
 handle_command() {
-  local raw_cmd="${1:-{}}"
+  local raw_cmd="${1:-"{}"}"
   python3 - "$raw_cmd" <<'PY'
 import json, sys
-cmd = json.loads(sys.argv[1] or '{}')
-print(cmd.get('id',''), cmd.get('action',''), sep='\t')
+try:
+    cmd = json.loads(sys.argv[1] or '{}')
+except ValueError:
+    cmd = {}
+if not isinstance(cmd, dict):
+    cmd = {}
+flat = lambda v: ' '.join(str(v or '').split())
+print(flat(cmd.get('id')), flat(cmd.get('action')), sep='\t')
 PY
 }
 
 run_command() {
-  local raw_cmd="${1:-{}}"
+  local raw_cmd="${1:-"{}"}"
   local cmd_id action status message reboot_now
   IFS=$'\t' read -r cmd_id action < <(handle_command "$raw_cmd")
   status="completed"
@@ -41,14 +50,14 @@ run_command() {
       message="Unsupported action: $action"
       ;;
   esac
-  python3 - <<PY
-import json
-print(json.dumps({"id": "$cmd_id", "status": "$status", "message": "$message", "reboot": "$reboot_now"}))
-PY
+  # Values go through the environment, never into the program text, so a
+  # server-supplied id or action can't inject Python (same as linux/agent.sh).
+  CMD_ID="$cmd_id" CMD_STATUS="$status" CMD_MESSAGE="$message" CMD_REBOOT="$reboot_now" \
+    python3 -c 'import json,os; print(json.dumps({"id":os.environ["CMD_ID"],"status":os.environ["CMD_STATUS"],"message":os.environ["CMD_MESSAGE"],"reboot":os.environ["CMD_REBOOT"]}))'
 }
 
 if [[ "${1:-}" == "--handle-command" ]]; then
-  run_command "${2:-{}}"
+  run_command "${2:-"{}"}"
   exit 0
 fi
 
@@ -131,10 +140,17 @@ async def handle_command(ws, command):
         stderr=asyncio.subprocess.DEVNULL,
     )
     stdout, _ = await proc.communicate()
-    lines = stdout.decode().strip().splitlines()
-    if not lines:
-        return
-    ack = json.loads(lines[-1])
+    lines = stdout.decode(errors="replace").strip().splitlines()
+    # Always ack, even when the worker printed nothing usable: an exception
+    # here would drop the socket, and the hub would redeliver the same
+    # command on reconnect forever.
+    try:
+        ack = json.loads(lines[-1]) if lines else None
+    except ValueError:
+        ack = None
+    if not isinstance(ack, dict):
+        ack = {"id": str(command.get("id") or "") if isinstance(command, dict) else "",
+               "status": "failed", "message": "agent could not run the command", "reboot": "false"}
     await ws.send(json.dumps({"type": "ack", "payload": ack}))
     if ack.get("reboot") == "true":
         subprocess.Popen(["sudo", "reboot"])
@@ -154,9 +170,17 @@ async def main():
                 sender = asyncio.create_task(send_loop(ws))
                 try:
                     async for message in ws:
-                        payload = json.loads(message)
+                        # Skip a frame that isn't a JSON object rather than
+                        # reconnecting on it.
+                        try:
+                            payload = json.loads(message)
+                        except ValueError:
+                            continue
+                        if not isinstance(payload, dict):
+                            continue
                         if str(payload.get("type") or "").lower() == "commands":
-                            for command in payload.get("commands") or []:
+                            commands = payload.get("commands")
+                            for command in commands if isinstance(commands, list) else []:
                                 await handle_command(ws, command)
                 finally:
                     sender.cancel()

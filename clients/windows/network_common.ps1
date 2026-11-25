@@ -309,6 +309,14 @@ function Remove-WifiProfileByName {
     netsh wlan delete profile name="$ProfileName" 2>&1 | Out-Null
 }
 
+# ConvertTo-XmlText — escape a config value (SSID, passphrase, username) for an
+# XML element, so a & < > ' or " in it can't break or reshape the profile XML.
+function ConvertTo-XmlText {
+    param([AllowNull()][string]$Value)
+    if ($null -eq $Value) { return '' }
+    return [System.Security.SecurityElement]::Escape($Value)
+}
+
 # Add-WifiProfileXml — write $Xml to a temp file and `netsh wlan add profile`
 # (all-user). Returns the profile-file path (deleted by the caller after connect).
 # Shared by the PSK and 1X connect paths so the add step lives in one place.
@@ -320,7 +328,8 @@ function Add-WifiProfileXml {
     }
     $safe = ($ProfileName -replace '[^A-Za-z0-9._-]', '_')
     $path = Join-Path $tempDir ("wifi-$safe.xml")
-    Set-Content -LiteralPath $path -Value $Xml -Encoding ASCII
+    # UTF8, not ASCII: ASCII turned a non-ASCII SSID or passphrase into '?'.
+    Set-Content -LiteralPath $path -Value $Xml -Encoding UTF8
     netsh wlan add profile filename="$path" user=all 2>&1 | Out-Null
     return $path
 }

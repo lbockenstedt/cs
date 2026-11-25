@@ -421,8 +421,7 @@ def test_apply_local_cert_rejects_invalid_material(monkeypatch, tmp_path):
     monkeypatch.setenv("LM_CS_ALLOW_LOCAL_CERT", "1")
     cp = CSControlPlane("test-cs", "secret")
     wrote = []
-    cp._atomic_write_text = lambda p, t: wrote.append(("text", p))  # type: ignore
-    cp._atomic_write_bytes = lambda p, d: wrote.append(("bytes", p))  # type: ignore
+    cp._atomic_write_text = lambda p, t, mode=None: wrote.append(("text", p))  # type: ignore
     res = _run(cp._apply_local_cert("not a cert", "not a key"))
     assert res["status"] == "ERROR"
     assert "invalid cert material" in res["message"]

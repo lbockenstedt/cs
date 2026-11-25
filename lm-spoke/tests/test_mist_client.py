@@ -302,3 +302,25 @@ def test_browse_all_shape(monkeypatch):
     assert "MIA" in out["devices_by_site"]
     assert out["clients_by_site"]["MIA"]["wireless"] == 1
     assert out["insights"] == []  # SLE insights are a follow-on chunk
+
+@pytest.mark.parametrize("host", ["169.254.169.254", "evil.example", "localhost:8080",
+                                  "https://u:p@api.mist.com.evil.example/x"])
+def test_unknown_host_is_never_called(host):
+    """The API token goes to the host, so only a known Mist region is used."""
+    client = _new_client(host=host)
+    assert not client.is_configured()
+    with pytest.raises(ValueError):
+        client._base_url()
+
+
+def test_known_region_host_from_pasted_url_is_used():
+    client = _new_client(host="https://api.eu.mist.com/")
+    assert client.is_configured() and client._base_url() == "https://api.eu.mist.com"
+
+
+def test_unknown_host_warning_never_logs_userinfo(caplog):
+    """A pasted URL with a password never reaches a log line (rule 5.2)."""
+    caplog.set_level("DEBUG")
+    _new_client(host="https://u:SECRET99@evil.example/x")
+    assert "not a known region host" in caplog.text
+    assert "SECRET99" not in caplog.text

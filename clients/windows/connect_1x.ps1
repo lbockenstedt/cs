@@ -55,6 +55,7 @@ function Get-Dot1xPassword {
 # Set-Peap1xUserCredentials (netsh has no verb for EAP user data).
 function New-Peap1xProfileXml {
     param([string]$Ssid, [string]$Identity)
+    $Ssid = ConvertTo-XmlText $Ssid
     return @"
 <?xml version="1.0"?>
 <WLANProfile xmlns="http://www.microsoft.com/networking/WLAN/profile/v1">
@@ -112,18 +113,14 @@ function New-Peap1xProfileXml {
 "@
 }
 
-# Set-Peap1xUserCredentials — inject the PEAP MSCHAPv2 username/password into an
-# already-added profile so association is HEADLESS (no Windows credential popup).
-#
-# NOTE — this is the ONE WLAN step netsh cannot do: netsh exposes no verb for EAP
-# *user data*, so we call the WlanApi WlanSetProfileEapXmlUserData directly via a
-# small P/Invoke. Everything else (add profile, connect, disconnect, scan) stays
-# on netsh per the client convention. Wrapped in try/catch: if the interop fails
-# on a given box we log and fall through to the plain connect (a lab RADIUS with
-# cached creds may still associate) rather than aborting the sim.
-function Set-Peap1xUserCredentials {
-    param([string]$ProfileName, [string]$Username, [string]$Password)
-    $userDataXml = @"
+# New-Peap1xUserDataXml — the EAP user-data XML (PEAP MSCHAPv2 username and
+# password) that Set-Peap1xUserCredentials hands to WlanSetProfileEapXmlUserData.
+# Values are XML-escaped (ConvertTo-XmlText).
+function New-Peap1xUserDataXml {
+    param([string]$Username, [string]$Password)
+    $Username = ConvertTo-XmlText $Username
+    $Password = ConvertTo-XmlText $Password
+    return @"
 <EapHostUserCredentials xmlns="http://www.microsoft.com/provisioning/EapHostUserCredentials"
     xmlns:eapCommon="http://www.microsoft.com/provisioning/EapCommon"
     xmlns:baseEap="http://www.microsoft.com/provisioning/BaseEapMethodUserCredentials">
@@ -150,6 +147,20 @@ function Set-Peap1xUserCredentials {
     </Credentials>
 </EapHostUserCredentials>
 "@
+}
+
+# Set-Peap1xUserCredentials — inject the PEAP MSCHAPv2 username/password into an
+# already-added profile so association is HEADLESS (no Windows credential popup).
+#
+# NOTE — this is the ONE WLAN step netsh cannot do: netsh exposes no verb for EAP
+# *user data*, so we call the WlanApi WlanSetProfileEapXmlUserData directly via a
+# small P/Invoke. Everything else (add profile, connect, disconnect, scan) stays
+# on netsh per the client convention. Wrapped in try/catch: if the interop fails
+# on a given box we log and fall through to the plain connect (a lab RADIUS with
+# cached creds may still associate) rather than aborting the sim.
+function Set-Peap1xUserCredentials {
+    param([string]$ProfileName, [string]$Username, [string]$Password)
+    $userDataXml = New-Peap1xUserDataXml -Username $Username -Password $Password
     try {
         if (-not ([System.Management.Automation.PSTypeName]'LmWlan.Native').Type) {
             Add-Type -Namespace 'LmWlan' -Name 'Native' -MemberDefinition @'
