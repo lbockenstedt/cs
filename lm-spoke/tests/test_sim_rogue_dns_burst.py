@@ -46,7 +46,9 @@ def prepare(tmp_path, *, with_dig=True, domains="a.test b.test"):
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
     (bin_dir / "nmcli").write_text(NMCLI)
-    tools = {"timeout": 'shift 3\nexec "$@"\n'}
+    # No default route: a real `ip route` on a Linux runner finds a gateway, and the
+    # burst loop then pings it and holds instead of sending queries.
+    tools = {"timeout": 'shift 3\nexec "$@"\n', "ip": "exit 0\n"}
     if with_dig:
         tools["dig"] = 'echo "dig $*" >> "$TEST_ROOT/dig_calls"\n'
     for name, body in tools.items():
